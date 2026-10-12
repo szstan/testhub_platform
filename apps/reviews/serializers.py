@@ -128,6 +128,52 @@ class TestCaseReviewCreateSerializer(serializers.ModelSerializer):
         
         return review
 
+    def update(self, instance, validated_data):
+        # 弹出关系字段（write_only 的 ListField / IntegerField），单独处理，
+        # 否则默认 update 会把 template 整数 id 直接赋给 FK（触发 ValueError），
+        # 也会把 testcases/projects/reviewers 当普通属性 set，无法正确更新 M2M。
+        testcases_ids = validated_data.pop('testcases', None)
+        reviewers_ids = validated_data.pop('reviewers', None)
+        projects_ids = validated_data.pop('projects', None)
+        template_id = validated_data.pop('template', None)
+
+        # 普通字段交给默认逻辑（title/description/priority/deadline）
+        instance = super().update(instance, validated_data)
+
+        # 项目关联
+        if projects_ids is not None:
+            instance.projects.set(projects_ids)
+
+        # 模板关联（id -> ReviewTemplate 实例）
+        if template_id is not None:
+            try:
+                from .models import ReviewTemplate
+                instance.template = ReviewTemplate.objects.get(id=template_id)
+            except ReviewTemplate.DoesNotExist:
+                instance.template = None
+            instance.save()
+        elif template_id is None and 'template' in self.initial_data:
+            # 显式传 null/0 时清空模板
+            instance.template = None
+            instance.save()
+
+        # 测试用例
+        if testcases_ids is not None:
+            instance.testcases.set(testcases_ids)
+
+        # 评审人员（through=ReviewAssignment，需重建）
+        if reviewers_ids is not None:
+            instance.reviewassignment_set.all().delete()
+            from apps.users.models import User
+            for reviewer_id in reviewers_ids:
+                try:
+                    reviewer = User.objects.get(id=reviewer_id)
+                    ReviewAssignment.objects.create(review=instance, reviewer=reviewer)
+                except User.DoesNotExist:
+                    continue
+
+        return instance
+
 
 class ReviewTemplateCreateSerializer(serializers.ModelSerializer):
     default_reviewers = serializers.ListField(child=serializers.IntegerField(), write_only=True, required=False)

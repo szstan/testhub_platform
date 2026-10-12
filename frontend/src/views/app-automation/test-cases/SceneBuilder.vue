@@ -1,7 +1,7 @@
 <template>
     <div class="ui-test-scene-builder">
         <div class="page-header">
-            <h3>App自动化用例编排</h3>
+            <h3>{{ $t('appAutomation.sceneBuilder.header.title') }}</h3>
             <div class="header-actions">
                 <el-button
                     type="primary"
@@ -10,10 +10,10 @@
                     :loading="saving"
                     @click="saveScene"
                 >
-                    保存用例
+                    {{ $t('appAutomation.sceneBuilder.header.saveCase') }}
                 </el-button>
                 <el-button size="small" :icon="Refresh" @click="resetScene">
-                    重置
+                    {{ $t('appAutomation.common.reset') }}
                 </el-button>
             </div>
         </div>
@@ -22,26 +22,26 @@
             <el-form :model="sceneForm" label-width="120px" size="small">
                 <el-row :gutter="16">
                     <el-col :span="8">
-                        <el-form-item label="场景名称" required>
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.sceneName')" required>
                             <el-input
                                 v-model.trim="sceneForm.name"
-                                placeholder="请输入场景名称"
+                                :placeholder="$t('appAutomation.sceneBuilder.form.sceneNamePlaceholder')"
                                 clearable
                             />
                         </el-form-item>
                     </el-col>
                     <el-col :span="8">
-                        <el-form-item label="所属项目">
-                            <el-select v-model="sceneForm.project" placeholder="请选择项目" clearable filterable style="width:100%">
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.belongProject')">
+                            <el-select v-model="sceneForm.project" :placeholder="$t('appAutomation.sceneBuilder.form.pleaseSelectProject')" clearable filterable style="width:100%">
                                 <el-option v-for="p in projectList" :key="p.id" :label="p.name" :value="p.id" />
                             </el-select>
                         </el-form-item>
                     </el-col>
                     <el-col :span="8">
-                        <el-form-item label="场景描述">
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.sceneDescription')">
                             <el-input
                                 v-model.trim="sceneForm.description"
-                                placeholder="可选"
+                                :placeholder="$t('appAutomation.sceneBuilder.form.optional')"
                                 clearable
                             />
                         </el-form-item>
@@ -49,7 +49,7 @@
                 </el-row>
                 <el-row :gutter="16">
                     <el-col :span="24">
-                        <el-form-item label="场景变量">
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.sceneVariables')">
                             <div class="scene-variables">
                                 <div
                                     v-for="(item, index) in sceneVariables"
@@ -58,14 +58,14 @@
                                 >
                                     <el-input
                                         v-model.trim="item.name"
-                                        placeholder="变量名"
+                                        :placeholder="$t('appAutomation.sceneBuilder.form.variableName')"
                                         size="small"
                                     />
-                                    <el-select v-model="item.scope" placeholder="作用域" size="small">
+                                    <el-select v-model="item.scope" :placeholder="$t('appAutomation.sceneBuilder.form.scopePlaceholder')" size="small">
                                         <el-option label="local" value="local" />
                                         <el-option label="global" value="global" />
                                     </el-select>
-                                    <el-select v-model="item.type" placeholder="类型" size="small">
+                                    <el-select v-model="item.type" :placeholder="$t('appAutomation.sceneBuilder.form.typePlaceholder')" size="small">
                                         <el-option label="string" value="string" />
                                         <el-option label="number" value="number" />
                                         <el-option label="boolean" value="boolean" />
@@ -74,20 +74,20 @@
                                     </el-select>
                                     <el-input
                                         v-model.trim="item.value"
-                                        placeholder="默认值"
+                                        :placeholder="$t('appAutomation.sceneBuilder.form.defaultValue')"
                                         size="small"
                                     />
                                     <el-input
                                         v-model.trim="item.description"
-                                        placeholder="说明"
+                                        :placeholder="$t('appAutomation.sceneBuilder.form.descriptionPlaceholder')"
                                         size="small"
                                     />
                                     <el-button link size="small" @click="removeSceneVariable(index)">
-                                        删除
+                                        {{ $t('appAutomation.common.delete') }}
                                     </el-button>
                                 </div>
                                 <el-button link size="small" @click="addSceneVariable">
-                                    + 添加变量
+                                    + {{ $t('appAutomation.sceneBuilder.form.addVariable') }}
                                 </el-button>
                             </div>
                         </el-form-item>
@@ -106,7 +106,7 @@
                 </el-row>
                 <el-row :gutter="16">
                     <el-col :span="8">
-                        <el-form-item label="重试次数">
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.retryTimes')">
                             <el-input
                                 v-model.number="sceneRuntime.retry_times"
                                 type="number"
@@ -116,7 +116,7 @@
                         </el-form-item>
                     </el-col>
                     <el-col :span="8">
-                        <el-form-item label="重试间隔(秒)">
+                        <el-form-item :label="$t('appAutomation.sceneBuilder.form.retryInterval')">
                             <el-input
                                 v-model.number="sceneRuntime.retry_interval"
                                 type="number"
@@ -134,19 +134,19 @@
                 <el-card class="palette-card" shadow="never">
                     <template #header>
                         <div class="card-title">
-                            <span>组件库</span>
+                            <span>{{ $t('appAutomation.sceneBuilder.palette.title') }}</span>
                             <div class="palette-toolbar">
                                 <el-button type="primary" size="small" :icon="Upload" @click="openPackageDialog">
-                                    导入组件包
+                                    {{ $t('appAutomation.sceneBuilder.palette.importPackage') }}
                                 </el-button>
                                 <el-button type="success" size="small" :icon="Download" @click="openExportDialog">
-                                    导出组件包
+                                    {{ $t('appAutomation.sceneBuilder.palette.exportPackage') }}
                                 </el-button>
                             </div>
                         </div>
                     </template>
                     <el-tabs v-model="paletteTab" stretch>
-                        <el-tab-pane label="基础组件" name="base">
+                        <el-tab-pane :label="$t('appAutomation.sceneBuilder.palette.baseComponents')" name="base">
                             <draggable
                                 class="palette-list"
                                 :list="componentPalette"
@@ -165,12 +165,12 @@
                                 </template>
                                 <template #footer>
                                     <div v-if="componentPalette.length === 0" class="palette-empty">
-                                        暂无基础组件
+                                        {{ $t('appAutomation.sceneBuilder.palette.noBaseComponents') }}
                                     </div>
                                 </template>
                             </draggable>
                         </el-tab-pane>
-                        <el-tab-pane label="自定义组件" name="custom">
+                        <el-tab-pane :label="$t('appAutomation.sceneBuilder.palette.customComponents')" name="custom">
                             <draggable
                                 class="palette-list"
                                 :list="customComponentPalette"
@@ -189,7 +189,7 @@
                                         </div>
                                         <div class="palette-actions">
                                             <el-button link size="small" @click.stop="openEditCustomComponent(element)">
-                                                编辑
+                                                {{ $t('appAutomation.common.edit') }}
                                             </el-button>
                                             <el-button
                                                 link
@@ -197,14 +197,14 @@
                                                 style="color: #f56c6c"
                                                 @click.stop="deleteCustomComponent(element)"
                                             >
-                                                删除
+                                                {{ $t('appAutomation.common.delete') }}
                                             </el-button>
                                         </div>
                                     </div>
                                 </template>
                                 <template #footer>
                                     <div v-if="customComponentPalette.length === 0" class="palette-empty">
-                                        暂无自定义组件
+                                        {{ $t('appAutomation.sceneBuilder.palette.noCustomComponents') }}
                                     </div>
                                 </template>
                             </draggable>
@@ -217,7 +217,7 @@
                 <el-card class="scene-card" shadow="never">
                     <template #header>
                         <div class="card-title">
-                            <span>场景步骤</span>
+                            <span>{{ $t('appAutomation.sceneBuilder.steps.title') }}</span>
                             <el-button
                                 type="primary"
                                 size="small"
@@ -225,12 +225,12 @@
                                 :disabled="scenarioSteps.length === 0"
                                 @click="openCustomComponentDialog"
                             >
-                                另存为自定义组件
+                                {{ $t('appAutomation.sceneBuilder.steps.saveAsCustomComponent') }}
                             </el-button>
                         </div>
                     </template>
                     <div class="scene-hint" v-if="scenarioSteps.length === 0">
-                        从左侧拖动组件到此处，组成UI测试场景
+                        {{ $t('appAutomation.sceneBuilder.steps.dragHint') }}
                     </div>
                     <draggable
                         v-model="scenarioSteps"
@@ -243,7 +243,7 @@
                             <div class="scene-item-wrapper">
                                 <div
                                     class="scene-item"
-                                    :class="{ 
+                                    :class="{
                                         active: selectedIndex === index && selectedSubIndex === null,
                                         'is-expanded': element._expanded
                                     }"
@@ -253,7 +253,7 @@
                                         <span class="scene-index">{{ index + 1 }}</span>
                                         <span class="scene-name">{{ element.name }}</span>
                                         <span class="scene-type">{{ element.type }}</span>
-                                        <el-tag v-if="element.kind === 'custom'" size="small" type="info">自定义</el-tag>
+                                        <el-tag v-if="element.kind === 'custom'" size="small" type="info">{{ $t('appAutomation.sceneBuilder.custom') }}</el-tag>
                                     </div>
                                     <div class="scene-item-actions">
                                         <el-button
@@ -262,21 +262,21 @@
                                             size="small"
                                             @click.stop="toggleExpandCustomStep(index)"
                                         >
-                                            {{ element._expanded ? '收起' : '展开' }}
+                                            {{ element._expanded ? $t('appAutomation.sceneBuilder.steps.collapse') : $t('appAutomation.sceneBuilder.steps.expand') }}
                                         </el-button>
                                         <el-button
                                             link
                                             size="small"
                                             @click.stop="duplicateStep(index)"
                                         >
-                                            复制
+                                            {{ $t('appAutomation.sceneBuilder.steps.copy') }}
                                         </el-button>
                                         <el-button
                                             link
                                             size="small"
                                             @click.stop="removeStep(index)"
                                         >
-                                            删除
+                                            {{ $t('appAutomation.common.delete') }}
                                         </el-button>
                                     </div>
                                 </div>
@@ -295,13 +295,13 @@
                                             <span class="scene-type">{{ subStep.type }}</span>
                                         </div>
                                         <div class="scene-item-actions">
-                                            <el-button link size="small" @click.stop="duplicateSubStep(index, subIdx)">复制</el-button>
-                                            <el-button link size="small" @click.stop="removeSubStep(index, subIdx)">删除</el-button>
+                                            <el-button link size="small" @click.stop="duplicateSubStep(index, subIdx)">{{ $t('appAutomation.sceneBuilder.steps.copy') }}</el-button>
+                                            <el-button link size="small" @click.stop="removeSubStep(index, subIdx)">{{ $t('appAutomation.common.delete') }}</el-button>
                                         </div>
                                     </div>
                                     <div class="sub-step-toolbar">
                                         <el-button size="small" type="primary" link @click.stop="addSubStep(index)">
-                                            + 添加子步骤
+                                            + {{ $t('appAutomation.sceneBuilder.steps.addSubStep') }}
                                         </el-button>
                                     </div>
                                 </div>
@@ -315,114 +315,114 @@
                 <el-card class="config-card" shadow="never">
                     <template #header>
                         <div class="card-title">
-                            组件配置
-                            <el-button 
-                                type="success" 
-                                size="small" 
+                            {{ $t('appAutomation.sceneBuilder.config.title') }}
+                            <el-button
+                                type="success"
+                                size="small"
                                 :icon="Camera"
                                 style="margin-left: auto;"
                                 @click="openCaptureElementDialog"
                             >
-                                创建元素工具
+                                {{ $t('appAutomation.sceneBuilder.config.createElementTool') }}
                             </el-button>
                         </div>
                     </template>
                     <div v-if="!activeStep" class="config-empty">
-                        请选择场景步骤进行配置
+                        {{ $t('appAutomation.sceneBuilder.config.selectStepHint') }}
                     </div>
                     <!-- 选中自定义组件父级时提示展开编辑 -->
                     <div v-else-if="activeParentStep && activeParentStep.kind === 'custom' && selectedSubIndex === null" class="config-form">
                         <el-form label-width="110px" size="small">
-                            <el-form-item label="步骤名称">
+                            <el-form-item :label="$t('appAutomation.sceneBuilder.config.stepName')">
                                 <el-input v-model.trim="activeParentStep.name" />
                             </el-form-item>
-                            <el-form-item label="组件类型">
+                            <el-form-item :label="$t('appAutomation.sceneBuilder.config.componentType')">
                                 <el-input :model-value="activeParentStep.type" disabled />
                             </el-form-item>
-                            <el-form-item label="子步骤数">
-                                <span>{{ (activeParentStep.steps || []).length }} 个</span>
+                            <el-form-item :label="$t('appAutomation.sceneBuilder.config.subStepCount')">
+                                <span>{{ $t('appAutomation.sceneBuilder.config.subStepCountValue', { count: (activeParentStep.steps || []).length }) }}</span>
                             </el-form-item>
                             <el-alert
                                 type="info"
                                 :closable="false"
                                 style="margin-top: 8px;"
                             >
-                                点击左侧"展开"按钮可查看和编辑子步骤，修改仅影响当前用例。
+                                {{ $t('appAutomation.sceneBuilder.config.customParentHint') }}
                             </el-alert>
                         </el-form>
                     </div>
                     <div v-else class="config-form">
                         <el-form :model="activeStep" label-width="110px" size="small">
-                            <el-form-item label="步骤名称">
+                            <el-form-item :label="$t('appAutomation.sceneBuilder.config.stepName')">
                                 <el-input v-model.trim="activeStep.name" />
                             </el-form-item>
-                            
-                            
-                            <div class="variable-hint" v-pre>
-                                支持变量：{{local.xxx}} / {{global.xxx}} / {{outputs.last.xxx}} / {{steps.step_id.xxx}}
+
+
+                            <div class="variable-hint">
+                                <span>{{ $t('appAutomation.sceneBuilder.config.variableHint') }}</span><span v-pre>{{local.xxx}} / {{global.xxx}} / {{outputs.last.xxx}} / {{steps.step_id.xxx}}</span>
                             </div>
                             <div v-if="activeStep && activeStep.type === 'image_exists_click'" class="variable-hint hint-danger">
-                                逻辑：先检测图片A，存在则点击A；不存在则点击B。
+                                {{ $t('appAutomation.sceneBuilder.config.logicImageExistsClick') }}
                             </div>
                             <div v-if="activeStep && activeStep.type === 'image_exists_click_chain'" class="variable-hint hint-danger">
-                                逻辑：图片A存在则点击A，再点击B；不存在则直接点击B。
+                                {{ $t('appAutomation.sceneBuilder.config.logicImageExistsClickChain') }}
                             </div>
                             <div v-if="activeStep && activeStep.type === 'foreach_assert'" class="variable-hint hint-danger">
-                                逻辑：先点击，后断言。
+                                {{ $t('appAutomation.sceneBuilder.config.logicForeachAssert') }}
                             </div>
                             <div v-if="activeStep && activeStep.type === 'api_request'" class="api-template-block">
-                                <div class="tool-hint">API 示例模板</div>
+                                <div class="tool-hint">{{ $t('appAutomation.sceneBuilder.config.apiTemplateTitle') }}</div>
                                 <div class="template-list">
                                     <div v-for="item in apiRequestTemplates" :key="item.name" class="template-item">
                                         <span class="template-name">{{ item.name }}</span>
                                         <div class="template-actions">
                                             <el-button link size="small" @click="applyApiRequestTemplate(item, activeStep)">
-                                                使用
+                                                {{ $t('appAutomation.sceneBuilder.config.use') }}
                                             </el-button>
                                         </div>
                                     </div>
-                                    <div v-if="apiRequestTemplates.length === 0" class="tool-hint">暂无模板</div>
+                                    <div v-if="apiRequestTemplates.length === 0" class="tool-hint">{{ $t('appAutomation.sceneBuilder.config.noTemplate') }}</div>
                                 </div>
                             </div>
                             <!-- 统一的字段分组显示 -->
                             <template v-if="schemaFields.length > 0">
-                                <div 
-                                    v-for="group in getFieldGroups()" 
-                                    :key="group.key" 
+                                <div
+                                    v-for="group in getFieldGroups()"
+                                    :key="group.key"
                                     class="field-group"
                                 >
                                     <div class="group-header">
                                         <span class="group-title">{{ group.title }}</span>
                                         <!-- 定位类分组显示选择按钮 -->
-                                        <el-button 
+                                        <el-button
                                             v-if="group.key !== 'other'"
-                                            type="primary" 
-                                            size="small" 
+                                            type="primary"
+                                            size="small"
                                             @click="openElementSelector(group.key)"
                                         >
                                             <el-icon><Link /></el-icon>
-                                            {{ linkedElements[group.key] ? '更换元素' : '选择元素' }}
+                                            {{ linkedElements[group.key] ? $t('appAutomation.sceneBuilder.config.changeElement') : $t('appAutomation.sceneBuilder.config.selectElement') }}
                                         </el-button>
                                     </div>
-                                    
+
                                     <!-- 关联状态提示 -->
-                                    <el-alert 
-                                        v-if="linkedElements[group.key]" 
-                                        type="success" 
-                                        :closable="false" 
+                                    <el-alert
+                                        v-if="linkedElements[group.key]"
+                                        type="success"
+                                        :closable="false"
                                         class="element-linked-alert"
                                     >
-                                        已关联: {{ linkedElements[group.key].name }} ({{ linkedElements[group.key].type }})
-                                        <el-button 
-                                            link 
-                                            type="danger" 
-                                            @click="clearLinkedElement(group.key)" 
+                                        {{ $t('appAutomation.sceneBuilder.config.linkedElement', { name: linkedElements[group.key].name, type: linkedElements[group.key].type }) }}
+                                        <el-button
+                                            link
+                                            type="danger"
+                                            @click="clearLinkedElement(group.key)"
                                             style="margin-left: 10px;"
                                         >
-                                            清除
+                                            {{ $t('appAutomation.sceneBuilder.config.clear') }}
                                         </el-button>
                                     </el-alert>
-                                    
+
                                     <!-- 字段列表 -->
                                     <el-form-item
                                         v-for="field in group.fields"
@@ -449,7 +449,7 @@
                                         <el-select
                                             v-else-if="getFieldOptions(field).length"
                                             v-model="activeStep.config[field]"
-                                            placeholder="请选择"
+                                            :placeholder="$t('appAutomation.sceneBuilder.config.pleaseSelect')"
                                             :filterable="isImageScopeField(field)"
                                         >
                                             <el-option
@@ -479,9 +479,9 @@
                                     </el-form-item>
                                 </div>
                             </template>
-                            
+
                             <!-- 无配置字段 -->
-                            <div v-else class="config-empty">该组件未配置 schema</div>
+                            <div v-else class="config-empty">{{ $t('appAutomation.sceneBuilder.config.noSchema') }}</div>
                         </el-form>
                     </div>
                 </el-card>
@@ -495,32 +495,32 @@
         />
 
         <el-dialog
-            title="导入组件包"
+            :title="$t('appAutomation.sceneBuilder.dialog.importPackage')"
             v-model="packageDialogVisible"
             width="520px"
             :close-on-click-modal="false"
             @close="resetPackageDialog"
         >
             <el-form label-width="110px" size="small">
-                <el-form-item label="覆盖已有组件">
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.overwriteExisting')">
                     <el-switch v-model="packageOverwrite" />
                 </el-form-item>
-                <el-form-item label="选择文件">
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.selectFile')">
                     <el-upload
                         :show-file-list="false"
                         :http-request="handlePackageUpload"
                         accept=".json,.yaml,.yml"
                     >
                         <el-button size="small" type="primary" :loading="packageUploading">
-                            选择组件包
+                            {{ $t('appAutomation.sceneBuilder.dialog.selectPackage') }}
                         </el-button>
                         <template #tip>
-                            <div class="el-upload__tip">支持 .json/.yaml/.yml</div>
+                            <div class="el-upload__tip">{{ $t('appAutomation.sceneBuilder.dialog.supportedFormats') }}</div>
                         </template>
                     </el-upload>
                 </el-form-item>
                 <el-divider></el-divider>
-                <div class="package-title">已导入组件包</div>
+                <div class="package-title">{{ $t('appAutomation.sceneBuilder.dialog.importedPackages') }}</div>
                 <div class="package-list" v-loading="packageLoading">
                     <div v-for="item in packageList" :key="item.id" class="package-item">
                         <div class="package-name">{{ item.name }}</div>
@@ -529,33 +529,33 @@
                             <span>{{ item.updated_at || item.created_at || "-" }}</span>
                         </div>
                     </div>
-                    <div v-if="packageList.length === 0" class="package-empty">暂无组件包</div>
+                    <div v-if="packageList.length === 0" class="package-empty">{{ $t('appAutomation.sceneBuilder.dialog.noPackage') }}</div>
                 </div>
             </el-form>
             <template #footer>
                 <div class="dialog-footer">
-                    <el-button @click="packageDialogVisible = false">关闭</el-button>
+                    <el-button @click="packageDialogVisible = false">{{ $t('appAutomation.common.close') }}</el-button>
                 </div>
             </template>
         </el-dialog>
 
         <el-dialog
-            title="导出组件包"
+            :title="$t('appAutomation.sceneBuilder.dialog.exportPackage')"
             v-model="exportDialogVisible"
             width="420px"
             :close-on-click-modal="false"
             @close="resetExportDialog"
         >
             <el-form label-width="110px" size="small">
-                <el-form-item label="导出含禁用">
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.exportIncludeDisabled')">
                     <el-switch v-model="packageIncludeDisabled" />
                 </el-form-item>
             </el-form>
             <template #footer>
                 <div class="dialog-footer">
-                    <el-button type="primary" plain @click="exportPackage('yaml')">导出YAML</el-button>
-                    <el-button type="primary" plain @click="exportPackage('json')">导出JSON</el-button>
-                    <el-button @click="exportDialogVisible = false">关闭</el-button>
+                    <el-button type="primary" plain @click="exportPackage('yaml')">{{ $t('appAutomation.sceneBuilder.dialog.exportYaml') }}</el-button>
+                    <el-button type="primary" plain @click="exportPackage('json')">{{ $t('appAutomation.sceneBuilder.dialog.exportJson') }}</el-button>
+                    <el-button @click="exportDialogVisible = false">{{ $t('appAutomation.common.close') }}</el-button>
                 </div>
             </template>
         </el-dialog>
@@ -568,23 +568,23 @@
             @close="resetCustomDialog"
         >
             <el-form ref="customFormRef" :model="customForm" :rules="customRules" label-width="110px">
-                <el-form-item label="组件名称" prop="name">
-                    <el-input v-model.trim="customForm.name" placeholder="请输入组件名称" />
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.componentName')" prop="name">
+                    <el-input v-model.trim="customForm.name" :placeholder="$t('appAutomation.sceneBuilder.dialog.componentNamePlaceholder')" />
                 </el-form-item>
-                <el-form-item label="组件类型" prop="type">
-                    <el-input v-model.trim="customForm.type" placeholder="例如 login_flow" />
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.componentType')" prop="type">
+                    <el-input v-model.trim="customForm.type" :placeholder="$t('appAutomation.sceneBuilder.dialog.componentTypePlaceholder')" />
                 </el-form-item>
-                <el-form-item label="组件描述">
-                    <el-input v-model.trim="customForm.description" placeholder="可选" />
+                <el-form-item :label="$t('appAutomation.sceneBuilder.dialog.componentDescription')">
+                    <el-input v-model.trim="customForm.description" :placeholder="$t('appAutomation.sceneBuilder.dialog.optional')" />
                 </el-form-item>
             </el-form>
             <!-- 组件步骤编辑区域（独占整行，不受 form label-width 约束） -->
             <div v-if="customDialogMode === 'edit'" class="custom-steps-section">
-                <div class="custom-steps-label">组件步骤</div>
+                <div class="custom-steps-label">{{ $t('appAutomation.sceneBuilder.dialog.componentSteps') }}</div>
                 <div class="custom-edit-steps">
                         <div class="custom-step-list">
                             <div class="custom-step-toolbar">
-                                <el-select v-model="editStepType" placeholder="选择基础组件" size="small">
+                                <el-select v-model="editStepType" :placeholder="$t('appAutomation.sceneBuilder.dialog.selectBaseComponent')" size="small">
                                     <el-option
                                         v-for="item in componentPalette"
                                         :key="item.type"
@@ -592,7 +592,7 @@
                                         :value="item.type"
                                     />
                                 </el-select>
-                                <el-button size="small" @click="addEditStep">添加</el-button>
+                                <el-button size="small" @click="addEditStep">{{ $t('appAutomation.common.add') }}</el-button>
                             </div>
                             <draggable
                                 v-model="editingCustomSteps"
@@ -618,14 +618,14 @@
                                                 size="small"
                                                 @click.stop="duplicateEditStep(index)"
                                             >
-                                                复制
+                                                {{ $t('appAutomation.sceneBuilder.steps.copy') }}
                                             </el-button>
                                             <el-button
                                                 link
                                                 size="small"
                                                 @click.stop="removeEditStep(index)"
                                             >
-                                                删除
+                                                {{ $t('appAutomation.common.delete') }}
                                             </el-button>
                                         </div>
                                     </div>
@@ -634,28 +634,28 @@
                         </div>
                         <div class="custom-step-config">
                             <div v-if="!editingActiveStep" class="config-empty">
-                                请选择步骤进行配置
+                                {{ $t('appAutomation.sceneBuilder.config.selectStepHintEdit') }}
                             </div>
                             <div v-else class="config-form">
                                 <el-form :model="editingActiveStep" label-width="110px" size="small">
-                                    <el-form-item label="步骤名称">
+                                    <el-form-item :label="$t('appAutomation.sceneBuilder.config.stepName')">
                                         <el-input v-model.trim="editingActiveStep.name" />
                                     </el-form-item>
-                                    <div class="variable-hint" v-pre>
-                                        支持变量：{{local.xxx}} / {{global.xxx}}
+                                    <div class="variable-hint">
+                                        <span>{{ $t('appAutomation.sceneBuilder.config.variableHintShort') }}</span><span v-pre>{{local.xxx}} / {{global.xxx}}</span>
                                     </div>
                                     <div v-if="editingActiveStep && editingActiveStep.type === 'api_request'" class="api-template-block">
-                                        <div class="tool-hint">API 示例模板</div>
+                                        <div class="tool-hint">{{ $t('appAutomation.sceneBuilder.config.apiTemplateTitle') }}</div>
                                         <div class="template-list">
                                             <div v-for="item in apiRequestTemplates" :key="item.name" class="template-item">
                                                 <span class="template-name">{{ item.name }}</span>
                                                 <div class="template-actions">
                                                     <el-button link size="small" @click="applyApiRequestTemplate(item, editingActiveStep)">
-                                                        使用
+                                                        {{ $t('appAutomation.sceneBuilder.config.use') }}
                                                     </el-button>
                                                 </div>
                                             </div>
-                                            <div v-if="apiRequestTemplates.length === 0" class="tool-hint">暂无模板</div>
+                                            <div v-if="apiRequestTemplates.length === 0" class="tool-hint">{{ $t('appAutomation.sceneBuilder.config.noTemplate') }}</div>
                                         </div>
                                     </div>
                                     <!-- 分组显示（与场景步骤配置面板一致） -->
@@ -674,7 +674,7 @@
                                                     @click="openElementSelector(group.key)"
                                                 >
                                                     <el-icon><Link /></el-icon>
-                                                    {{ linkedElements[group.key] ? '更换元素' : '选择元素' }}
+                                                    {{ linkedElements[group.key] ? $t('appAutomation.sceneBuilder.config.changeElement') : $t('appAutomation.sceneBuilder.config.selectElement') }}
                                                 </el-button>
                                             </div>
                                             <el-alert
@@ -683,14 +683,14 @@
                                                 :closable="false"
                                                 class="element-linked-alert"
                                             >
-                                                已关联: {{ linkedElements[group.key].name }} ({{ linkedElements[group.key].type }})
+                                                {{ $t('appAutomation.sceneBuilder.config.linkedElement', { name: linkedElements[group.key].name, type: linkedElements[group.key].type }) }}
                                                 <el-button
                                                     link
                                                     type="danger"
                                                     @click="clearLinkedElement(group.key)"
                                                     style="margin-left: 10px;"
                                                 >
-                                                    清除
+                                                    {{ $t('appAutomation.sceneBuilder.config.clear') }}
                                                 </el-button>
                                             </el-alert>
                                             <el-form-item
@@ -718,7 +718,7 @@
                                                 <el-select
                                                     v-else-if="getFieldOptions(field).length"
                                                     v-model="editingActiveStep.config[field]"
-                                                    placeholder="请选择"
+                                                    :placeholder="$t('appAutomation.sceneBuilder.config.pleaseSelect')"
                                                     :filterable="isImageScopeField(field)"
                                                 >
                                                     <el-option
@@ -748,7 +748,7 @@
                                             </el-form-item>
                                         </div>
                                     </template>
-                                    <div v-else class="config-empty">该组件未配置 schema</div>
+                                    <div v-else class="config-empty">{{ $t('appAutomation.sceneBuilder.config.noSchema') }}</div>
                                 </el-form>
                             </div>
                         </div>
@@ -756,8 +756,8 @@
                 </div>
             <template #footer>
                 <div class="dialog-footer">
-                    <el-button @click="customDialogVisible = false">取消</el-button>
-                    <el-button type="primary" :loading="customSaving" @click="saveCustomComponent">保存</el-button>
+                    <el-button @click="customDialogVisible = false">{{ $t('appAutomation.common.cancel') }}</el-button>
+                    <el-button type="primary" :loading="customSaving" @click="saveCustomComponent">{{ $t('appAutomation.common.save') }}</el-button>
                 </div>
             </template>
         </el-dialog>
@@ -765,7 +765,7 @@
         <!-- 元素选择对话框 -->
         <el-dialog
             v-model="elementSelectorVisible"
-            title="选择元素"
+            :title="$t('appAutomation.sceneBuilder.elementSelector.title')"
             width="1200px"
             destroy-on-close
         >
@@ -774,15 +774,15 @@
                 <div class="element-selector-filter">
                     <el-space wrap>
                         <el-radio-group v-model="elementFilterType" @change="loadElementsForSelector">
-                            <el-radio-button value="">全部</el-radio-button>
-                            <el-radio-button value="image">图片</el-radio-button>
-                            <el-radio-button value="pos">坐标</el-radio-button>
-                            <el-radio-button value="region">区域</el-radio-button>
+                            <el-radio-button value="">{{ $t('appAutomation.common.all') }}</el-radio-button>
+                            <el-radio-button value="image">{{ $t('appAutomation.sceneBuilder.elementSelector.image') }}</el-radio-button>
+                            <el-radio-button value="pos">{{ $t('appAutomation.sceneBuilder.elementSelector.coordinate') }}</el-radio-button>
+                            <el-radio-button value="region">{{ $t('appAutomation.sceneBuilder.elementSelector.region') }}</el-radio-button>
                         </el-radio-group>
-                        
+
                         <el-input
                             v-model="elementSearchKeyword"
-                            placeholder="搜索元素"
+                            :placeholder="$t('appAutomation.sceneBuilder.elementSelector.searchPlaceholder')"
                             style="width: 250px"
                             clearable
                             @change="loadElementsForSelector"
@@ -803,21 +803,21 @@
                     highlight-current-row
                     @row-click="handleElementRowClick"
                 >
-                    <el-table-column prop="name" label="元素名称" width="200">
+                    <el-table-column prop="name" :label="$t('appAutomation.sceneBuilder.elementSelector.elementName')" width="200">
                         <template #default="{ row }">
                             <el-link type="primary">{{ row.name }}</el-link>
                         </template>
                     </el-table-column>
-                    
-                    <el-table-column prop="element_type" label="类型" width="100">
+
+                    <el-table-column prop="element_type" :label="$t('appAutomation.sceneBuilder.elementSelector.type')" width="100">
                         <template #default="{ row }">
                             <el-tag :type="getTypeTagColor(row.element_type)">
                                 {{ row.element_type_display }}
                             </el-tag>
                         </template>
                     </el-table-column>
-                    
-                    <el-table-column label="图片分类" width="120">
+
+                    <el-table-column :label="$t('appAutomation.sceneBuilder.elementSelector.imageCategory')" width="120">
                         <template #default="{ row }">
                             <el-tag v-if="row.element_type === 'image' && row.config?.image_category" type="info" size="small">
                                 {{ row.config.image_category }}
@@ -825,8 +825,8 @@
                             <span v-else style="color: #909399;">-</span>
                         </template>
                     </el-table-column>
-                    
-                    <el-table-column prop="tags" label="标签" width="180">
+
+                    <el-table-column prop="tags" :label="$t('appAutomation.sceneBuilder.elementSelector.tags')" width="180">
                         <template #default="{ row }">
                             <el-tag
                                 v-for="tag in row.tags"
@@ -838,8 +838,8 @@
                             </el-tag>
                         </template>
                     </el-table-column>
-                    
-                    <el-table-column label="预览" width="200" align="center">
+
+                    <el-table-column :label="$t('appAutomation.sceneBuilder.elementSelector.preview')" width="200" align="center">
                         <template #default="{ row }">
                             <div v-if="row.element_type === 'image'" class="preview-image">
                                 <el-image
@@ -868,16 +868,16 @@
                             </div>
                         </template>
                     </el-table-column>
-                    
-                    <el-table-column label="操作" width="100" fixed="right">
+
+                    <el-table-column :label="$t('appAutomation.common.operation')" width="100" fixed="right">
                         <template #default="{ row }">
                             <el-button size="small" type="primary" @click.stop="applyElement(row)">
-                                应用
+                                {{ $t('appAutomation.sceneBuilder.elementSelector.apply') }}
                             </el-button>
                         </template>
                     </el-table-column>
                 </el-table>
-                
+
                 <!-- 分页 -->
                 <el-pagination
                     v-model:current-page="elementCurrentPage"
@@ -890,9 +890,9 @@
                     style="margin-top: 15px; justify-content: flex-end"
                 />
             </div>
-            
+
             <template #footer>
-                <el-button @click="elementSelectorVisible = false">关闭</el-button>
+                <el-button @click="elementSelectorVisible = false">{{ $t('appAutomation.common.close') }}</el-button>
             </template>
         </el-dialog>
     </div>
@@ -902,6 +902,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { Upload, Download, FolderAdd, DocumentCopy, Check, Search, Link, Refresh, Camera } from '@element-plus/icons-vue'
 import draggable from "vuedraggable"
 import CaptureElementDialog from '../elements/components/CaptureElementDialog.vue'
@@ -925,6 +926,7 @@ import {
 // Route
 const route = useRoute()
 const router = useRouter()
+const { t } = useI18n()
 
 // Reactive state
 const saving = ref(false)
@@ -952,9 +954,9 @@ const selectedSubIndex = ref(null)    // 当前选中的子步骤索引（展开
 const componentDefinitions = ref({})
 const customComponentDefinitions = ref({})
 const editingCaseId = ref(null)
-const apiRequestTemplates = ref([
+const apiRequestTemplates = computed(() => [
     {
-        name: "VIP初始化",
+        name: t('appAutomation.sceneBuilder.config.vipInitTemplate'),
         config: {
             method: "POST",
             url: "/api/ui_test/configs/vip-setup/",
@@ -993,10 +995,10 @@ const packageList = ref([])
 const packageLoading = ref(false)
 const exportDialogVisible = ref(false)
 const captureElementDialogVisible = ref(false)
-const customRules = ref({
-    name: [{ required: true, message: "请输入组件名称", trigger: "blur" }],
-    type: [{ required: true, message: "请输入组件类型", trigger: "blur" }]
-})
+const customRules = computed(() => ({
+    name: [{ required: true, message: t('appAutomation.sceneBuilder.dialog.rules.nameRequired'), trigger: "blur" }],
+    type: [{ required: true, message: t('appAutomation.sceneBuilder.dialog.rules.typeRequired'), trigger: "blur" }]
+}))
 
 // 元素选择器相关状态
 const elementSelectorVisible = ref(false)
@@ -1096,7 +1098,7 @@ const editingSchemaRequired = computed(() => {
 })
 
 const customDialogTitle = computed(() => {
-    return customDialogMode.value === "edit" ? "编辑自定义组件" : "另存为自定义组件"
+    return customDialogMode.value === "edit" ? t('appAutomation.sceneBuilder.dialog.editCustomComponent') : t('appAutomation.sceneBuilder.dialog.saveAsCustomComponent')
 })
 
 const schemaFields = computed(() => {
@@ -1484,7 +1486,7 @@ const addSubStep = (parentIndex) => {
     const newStep = {
         id: generateStepId(),
         type: 'click',
-        name: '点击',
+        name: t('appAutomation.sceneBuilder.action.click'),
         config: { ...(componentDefinitions.value['click']?.default_config || { selector_type: 'image', timeout: 5 }) }
     }
     parentStep.steps.push(newStep)
@@ -1498,7 +1500,7 @@ const duplicateSubStep = (parentIndex, subIndex) => {
     if (!source) return
     const copy = JSON.parse(JSON.stringify(source))
     copy.id = generateStepId()
-    copy.name = `${source.name || source.type}-复制`
+    copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: source.name || source.type })
     parentStep.steps.splice(subIndex + 1, 0, copy)
 }
 
@@ -1530,8 +1532,8 @@ const duplicateStep = (index) => {
     }
     const copy = JSON.parse(JSON.stringify(source))
     copy.id = generateStepId()
-    const baseName = source.name || source.type || "步骤"
-    copy.name = `${baseName}-复制`
+    const baseName = source.name || source.type || t('appAutomation.sceneBuilder.steps.step')
+    copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: baseName })
     scenarioSteps.value.splice(index + 1, 0, copy)
     selectStep(index + 1)
 }
@@ -1554,12 +1556,12 @@ const resetScene = () => {
 
 const openCustomComponentDialog = () => {
     if (scenarioSteps.value.length === 0) {
-        ElMessage.warning("请先选择要保存的步骤")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.selectStepsToSave'))
         return
     }
     const hasCustomStep = scenarioSteps.value.some(step => step.kind === "custom")
     if (hasCustomStep) {
-        ElMessage.warning("自定义组件中不支持嵌套自定义组件")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.noNestedCustom'))
         return
     }
     customDialogVisible.value = true
@@ -1613,12 +1615,12 @@ const selectEditStep = (index) => {
 
 const addEditStep = () => {
     if (!editStepType.value) {
-        ElMessage.warning("请选择基础组件")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.selectBaseComponent'))
         return
     }
     const item = componentPalette.value.find(component => component.type === editStepType.value)
     if (!item) {
-        ElMessage.warning("基础组件不存在")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.baseComponentNotFound'))
         return
     }
     const step = {
@@ -1649,17 +1651,17 @@ const duplicateEditStep = (index) => {
     }
     const copy = JSON.parse(JSON.stringify(source))
     copy.id = generateStepId()
-    const baseName = source.name || source.type || "步骤"
-    copy.name = `${baseName}-复制`
+    const baseName = source.name || source.type || t('appAutomation.sceneBuilder.steps.step')
+    copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: baseName })
     editingCustomSteps.value.splice(index + 1, 0, copy)
     editingSelectedIndex.value = index + 1
 }
 
 const deleteCustomComponent = async (item) => {
     try {
-        await ElMessageBox.confirm(`确定删除自定义组件 ${item.name} 吗？`, "提示", {
-            confirmButtonText: "确定",
-            cancelButtonText: "取消",
+        await ElMessageBox.confirm(t('appAutomation.sceneBuilder.messages.deleteCustomComponentConfirm', { name: item.name }), t('appAutomation.sceneBuilder.messages.tip'), {
+            confirmButtonText: t('appAutomation.common.confirm'),
+            cancelButtonText: t('appAutomation.common.cancel'),
             type: "warning"
         })
     } catch (error) {
@@ -1667,7 +1669,7 @@ const deleteCustomComponent = async (item) => {
     }
     try {
         await apiDeleteCustomComponent(item.id)
-        ElMessage.success("删除成功")
+        ElMessage.success(t('appAutomation.common.deleteSuccess'))
         customComponentPalette.value = customComponentPalette.value.filter(
             component => component.id !== item.id
         )
@@ -1675,7 +1677,7 @@ const deleteCustomComponent = async (item) => {
         paletteTab.value = "custom"
     } catch (error) {
         console.error("删除自定义组件失败:", error)
-        ElMessage.error("删除失败")
+        ElMessage.error(t('appAutomation.common.deleteFailed'))
     }
 }
 
@@ -1685,11 +1687,11 @@ const saveCustomComponent = () => {
             return
         }
         if (customDialogMode.value === "create" && scenarioSteps.value.length === 0) {
-            ElMessage.warning("请先添加场景步骤")
+            ElMessage.warning(t('appAutomation.sceneBuilder.messages.addSceneStepsFirst'))
             return
         }
         if (customDialogMode.value === "edit" && editingCustomSteps.value.length === 0) {
-            ElMessage.warning("请先添加组件步骤")
+            ElMessage.warning(t('appAutomation.sceneBuilder.messages.addComponentStepsFirst'))
             return
         }
         customSaving.value = true
@@ -1722,17 +1724,17 @@ const saveCustomComponent = () => {
                 : await apiCreateCustomComponent(payload)
             const data = response?.data || response
             if (data && (data.success || data.id)) {
-                ElMessage.success(customDialogMode.value === "edit" ? "自定义组件已更新" : "自定义组件已保存")
+                ElMessage.success(customDialogMode.value === "edit" ? t('appAutomation.sceneBuilder.messages.customComponentUpdated') : t('appAutomation.sceneBuilder.messages.customComponentSaved'))
                 customDialogVisible.value = false
                 await loadCustomComponentPalette()
                 paletteTab.value = "custom"
             } else {
-                ElMessage.error(response.data?.message || "保存失败")
+                ElMessage.error(response.data?.message || t('appAutomation.common.saveFailed'))
             }
         } catch (error) {
             console.error("保存自定义组件失败:", error)
             const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
-            ElMessage.error(`保存失败: ${errorMsg}`)
+            ElMessage.error(t('appAutomation.sceneBuilder.messages.saveFailedWithError', { error: errorMsg }))
         } finally {
             customSaving.value = false
         }
@@ -1770,11 +1772,11 @@ const loadComponentPalette = async () => {
         } else {
             componentPalette.value = []
             componentDefinitions.value = {}
-            ElMessage.warning('暂无组件定义，请先初始化组件库（后端运行：python manage.py init_components）')
+            ElMessage.warning(t('appAutomation.sceneBuilder.messages.noComponentDef'))
         }
     } catch (error) {
         console.error("加载组件库失败:", error)
-        ElMessage.error('加载组件库失败: ' + (error.message || '未知错误'))
+        ElMessage.error(t('appAutomation.sceneBuilder.messages.loadPaletteFailed', { error: error.message || t('appAutomation.sceneBuilder.messages.unknownError') }))
         componentPalette.value = []
         componentDefinitions.value = {}
     }
@@ -1861,7 +1863,7 @@ const loadCaseDetail = async (caseId) => {
         }
     } catch (error) {
         console.error("加载用例失败:", error)
-        ElMessage.error("加载用例失败")
+        ElMessage.error(t('appAutomation.sceneBuilder.messages.loadCaseFailed'))
     }
 }
 
@@ -1894,54 +1896,54 @@ const getFieldGroups = (fieldsOverride = null) => {
     const groupRules = [
         {
             key: 'selector',
-            title: '定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.selector'),
             fields: ['selector_type', 'selector', 'image_scope', 'image_threshold'],
             hasFields: () => allFields.includes('selector_type')
         },
         {
             key: 'fallback',
-            title: '备用定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.fallback'),
             fields: ['fallback_selector_type', 'fallback_selector', 'fallback_image_scope', 'fallback_image_threshold'],
             hasFields: () => allFields.includes('fallback_selector_type')
         },
         {
             key: 'click',
-            title: '点击定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.click'),
             fields: ['click_selector_type', 'click_selector', 'image_scope', 'image_threshold'],
             hasFields: () => allFields.includes('click_selector_type')
         },
         {
             key: 'ocr',
-            title: 'OCR定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.ocr'),
             fields: ['ocr_selector_type', 'ocr_selector'],
             hasFields: () => allFields.includes('ocr_selector_type')
         },
         {
             key: 'start',
-            title: '起始定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.start'),
             fields: ['start_selector_type', 'start_selector', 'image_scope', 'image_threshold'],
             hasFields: () => allFields.includes('start_selector_type')
         },
         {
             key: 'end',
-            title: '结束定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.end'),
             fields: ['end_selector_type', 'end_selector', 'image_scope', 'image_threshold'],
             hasFields: () => allFields.includes('end_selector_type')
         },
         {
             key: 'target',
-            title: '目标定位',
+            title: t('appAutomation.sceneBuilder.fieldGroup.target'),
             fields: ['target_selector_type', 'target_selector', 'image_scope', 'image_threshold'],
             hasFields: () => allFields.includes('target_selector_type')
         },
         {
             key: 'expected',
-            title: '断言配置',
+            title: t('appAutomation.sceneBuilder.fieldGroup.expected'),
             fields: ['assert_type', 'expected', 'expected_list', 'expected_image_scope', 'match_mode'],
             hasFields: () => allFields.includes('assert_type') || allFields.includes('expected')
         }
     ]
-    
+
     // 检测每个组是否存在
     groupRules.forEach(rule => {
         if (rule.hasFields()) {
@@ -1956,16 +1958,16 @@ const getFieldGroups = (fieldsOverride = null) => {
             }
         }
     })
-    
+
     // 其他字段
     const otherFields = allFields.filter(f => !usedFields.has(f))
     if (otherFields.length > 0) {
         // 计算定位类分组的数量（排除 'other'）
         const selectorGroupCount = groups.length
-        
+
         // 如果没有定位类分组，标题为"配置"；否则为"其他配置"
-        const otherTitle = selectorGroupCount === 0 ? '配置' : '其他配置'
-        
+        const otherTitle = selectorGroupCount === 0 ? t('appAutomation.sceneBuilder.fieldGroup.config') : t('appAutomation.sceneBuilder.fieldGroup.otherConfig')
+
         groups.push({
             key: 'other',
             title: otherTitle,
@@ -1982,88 +1984,88 @@ const getEditingFieldGroups = () => {
 
 const getFieldLabel = (field) => {
     const labels = {
-        selector_type: "定位方式",
-        selector: "定位值",
-        fallback_selector_type: "备用定位方式",
-        fallback_selector: "备用定位值",
-        fallback_image_scope: "备用图片路径",
-        fallback_image_threshold: "备用图片匹配阈值",
-        value: "输入内容",
-        send_enter: "输入后发送回车",
-        direction: "滑动方向",
-        timeout: "超时时间",
-        expected: "断言文本",
-        assert_type: "断言类型",
-        expected_exists: "断言存在",
-        duration: "耗时",
-        image_scope: "图片路径",
-        expected_image_scope: "期望图片路径",
-        image_threshold: "图片匹配阈值",
-        expected_list: "期望列表",
-        click_selector_type: "点击定位方式",
-        click_selector: "点击定位值",
-        ocr_selector_type: "OCR定位方式",
-        ocr_selector: "OCR定位值",
-        start_selector_type: "起点定位方式",
-        start_selector: "起点定位值",
-        end_selector_type: "终点定位方式",
-        end_selector: "终点定位值",
-        target_selector_type: "目标定位方式",
-        target_selector: "目标定位值",
-        max_swipes: "最大次数",
-        interval: "间隔(秒)",
-        max_loops: "循环次数",
-        note: "备注",
-        match_mode: "匹配模式",
-        name: "变量名",
-        value_type: "变量类型",
-        scope: "作用域",
-        source: "来源",
-        path: "提取路径",
-        method: "请求方法",
-        url: "请求地址",
-        headers: "请求头",
-        params: "查询参数",
-        data: "请求体(data)",
-        json: "请求体(json)",
-        expected_status: "期望状态码",
-        response_type: "响应类型",
-        save_as: "保存为变量",
-        extracts: "批量提取",
-        left: "条件左值",
-        operator: "条件运算",
-        right: "条件右值",
-        then_steps: "条件为真步骤",
-        else_steps: "条件为假步骤",
-        mode: "循环模式",
-        times: "循环次数",
-        items: "遍历列表",
-        item_var: "遍历变量名",
-        item_scope: "遍历变量域",
-        steps: "子步骤列表",
-        branches: "并行分支",
-        merge_strategy: "合并策略",
-        try_steps: "Try步骤",
-        catch_steps: "Catch步骤",
-        finally_steps: "Finally步骤",
-        error_var: "错误变量名",
-        error_scope: "错误变量域",
-        min: "最小值",
-        max: "最大值",
-        retry_times: "重试次数",
-        retry_interval: "重试间隔(秒)"
+        selector_type: t('appAutomation.sceneBuilder.fieldLabel.selectorType'),
+        selector: t('appAutomation.sceneBuilder.fieldLabel.selector'),
+        fallback_selector_type: t('appAutomation.sceneBuilder.fieldLabel.fallbackSelectorType'),
+        fallback_selector: t('appAutomation.sceneBuilder.fieldLabel.fallbackSelector'),
+        fallback_image_scope: t('appAutomation.sceneBuilder.fieldLabel.fallbackImageScope'),
+        fallback_image_threshold: t('appAutomation.sceneBuilder.fieldLabel.fallbackImageThreshold'),
+        value: t('appAutomation.sceneBuilder.fieldLabel.value'),
+        send_enter: t('appAutomation.sceneBuilder.fieldLabel.sendEnter'),
+        direction: t('appAutomation.sceneBuilder.fieldLabel.direction'),
+        timeout: t('appAutomation.sceneBuilder.fieldLabel.timeout'),
+        expected: t('appAutomation.sceneBuilder.fieldLabel.expected'),
+        assert_type: t('appAutomation.sceneBuilder.fieldLabel.assertType'),
+        expected_exists: t('appAutomation.sceneBuilder.fieldLabel.expectedExists'),
+        duration: t('appAutomation.sceneBuilder.fieldLabel.duration'),
+        image_scope: t('appAutomation.sceneBuilder.fieldLabel.imageScope'),
+        expected_image_scope: t('appAutomation.sceneBuilder.fieldLabel.expectedImageScope'),
+        image_threshold: t('appAutomation.sceneBuilder.fieldLabel.imageThreshold'),
+        expected_list: t('appAutomation.sceneBuilder.fieldLabel.expectedList'),
+        click_selector_type: t('appAutomation.sceneBuilder.fieldLabel.clickSelectorType'),
+        click_selector: t('appAutomation.sceneBuilder.fieldLabel.clickSelector'),
+        ocr_selector_type: t('appAutomation.sceneBuilder.fieldLabel.ocrSelectorType'),
+        ocr_selector: t('appAutomation.sceneBuilder.fieldLabel.ocrSelector'),
+        start_selector_type: t('appAutomation.sceneBuilder.fieldLabel.startSelectorType'),
+        start_selector: t('appAutomation.sceneBuilder.fieldLabel.startSelector'),
+        end_selector_type: t('appAutomation.sceneBuilder.fieldLabel.endSelectorType'),
+        end_selector: t('appAutomation.sceneBuilder.fieldLabel.endSelector'),
+        target_selector_type: t('appAutomation.sceneBuilder.fieldLabel.targetSelectorType'),
+        target_selector: t('appAutomation.sceneBuilder.fieldLabel.targetSelector'),
+        max_swipes: t('appAutomation.sceneBuilder.fieldLabel.maxSwipes'),
+        interval: t('appAutomation.sceneBuilder.fieldLabel.interval'),
+        max_loops: t('appAutomation.sceneBuilder.fieldLabel.maxLoops'),
+        note: t('appAutomation.sceneBuilder.fieldLabel.note'),
+        match_mode: t('appAutomation.sceneBuilder.fieldLabel.matchMode'),
+        name: t('appAutomation.sceneBuilder.fieldLabel.name'),
+        value_type: t('appAutomation.sceneBuilder.fieldLabel.valueType'),
+        scope: t('appAutomation.sceneBuilder.fieldLabel.scope'),
+        source: t('appAutomation.sceneBuilder.fieldLabel.source'),
+        path: t('appAutomation.sceneBuilder.fieldLabel.path'),
+        method: t('appAutomation.sceneBuilder.fieldLabel.method'),
+        url: t('appAutomation.sceneBuilder.fieldLabel.url'),
+        headers: t('appAutomation.sceneBuilder.fieldLabel.headers'),
+        params: t('appAutomation.sceneBuilder.fieldLabel.params'),
+        data: t('appAutomation.sceneBuilder.fieldLabel.data'),
+        json: t('appAutomation.sceneBuilder.fieldLabel.json'),
+        expected_status: t('appAutomation.sceneBuilder.fieldLabel.expectedStatus'),
+        response_type: t('appAutomation.sceneBuilder.fieldLabel.responseType'),
+        save_as: t('appAutomation.sceneBuilder.fieldLabel.saveAs'),
+        extracts: t('appAutomation.sceneBuilder.fieldLabel.extracts'),
+        left: t('appAutomation.sceneBuilder.fieldLabel.left'),
+        operator: t('appAutomation.sceneBuilder.fieldLabel.operator'),
+        right: t('appAutomation.sceneBuilder.fieldLabel.right'),
+        then_steps: t('appAutomation.sceneBuilder.fieldLabel.thenSteps'),
+        else_steps: t('appAutomation.sceneBuilder.fieldLabel.elseSteps'),
+        mode: t('appAutomation.sceneBuilder.fieldLabel.mode'),
+        times: t('appAutomation.sceneBuilder.fieldLabel.times'),
+        items: t('appAutomation.sceneBuilder.fieldLabel.items'),
+        item_var: t('appAutomation.sceneBuilder.fieldLabel.itemVar'),
+        item_scope: t('appAutomation.sceneBuilder.fieldLabel.itemScope'),
+        steps: t('appAutomation.sceneBuilder.fieldLabel.steps'),
+        branches: t('appAutomation.sceneBuilder.fieldLabel.branches'),
+        merge_strategy: t('appAutomation.sceneBuilder.fieldLabel.mergeStrategy'),
+        try_steps: t('appAutomation.sceneBuilder.fieldLabel.trySteps'),
+        catch_steps: t('appAutomation.sceneBuilder.fieldLabel.catchSteps'),
+        finally_steps: t('appAutomation.sceneBuilder.fieldLabel.finallySteps'),
+        error_var: t('appAutomation.sceneBuilder.fieldLabel.errorVar'),
+        error_scope: t('appAutomation.sceneBuilder.fieldLabel.errorScope'),
+        min: t('appAutomation.sceneBuilder.fieldLabel.min'),
+        max: t('appAutomation.sceneBuilder.fieldLabel.max'),
+        retry_times: t('appAutomation.sceneBuilder.fieldLabel.retryTimes'),
+        retry_interval: t('appAutomation.sceneBuilder.fieldLabel.retryInterval')
     }
     const config = getActiveConfigForField()
     const currentStep = activeStep.value || editingActiveStep.value
     if (field === "value" && currentStep && currentStep.type === "set_variable") {
-        return "变量值"
+        return t('appAutomation.sceneBuilder.fieldLabel.variableValue')
     }
     if (config && config.assert_type === "image") {
         if (field === "expected") {
-            return "期望图片"
+            return t('appAutomation.sceneBuilder.fieldLabel.expectedImage')
         }
         if (field === "expected_list") {
-            return "期望图片列表"
+            return t('appAutomation.sceneBuilder.fieldLabel.expectedImageList')
         }
     }
     return labels[field] || field
@@ -2071,96 +2073,96 @@ const getFieldLabel = (field) => {
 
 const getFieldPlaceholder = (field) => {
             const config = getActiveConfigForField()
-            
+
             // 动态占位符：根据定位方式返回不同提示
             const getDynamicPlaceholder = (selectorField, typeField) => {
                 if (!config) return null
                 const type = config[typeField] || 'image'
-                if (type === 'image') return 'image: 文件名'
+                if (type === 'image') return t('appAutomation.sceneBuilder.fieldPlaceholder.imageFile')
                 if (type === 'pos') return 'pos: x,y'
                 if (type === 'region') return 'region: x1,y1,x2,y2'
                 return null
             }
-            
+
             if (field === 'selector') {
-                return getDynamicPlaceholder('selector', 'selector_type') || "image: 文件名 | pos: x,y | region: x1,y1,x2,y2"
+                return getDynamicPlaceholder('selector', 'selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorFull')
             }
             if (field === 'fallback_selector') {
-                return getDynamicPlaceholder('fallback_selector', 'fallback_selector_type') || "image: 文件名 | pos: x,y | region: x1,y1,x2,y2"
+                return getDynamicPlaceholder('fallback_selector', 'fallback_selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorFull')
             }
             if (field === 'click_selector') {
-                return getDynamicPlaceholder('click_selector', 'click_selector_type') || "image: 文件名 | pos: x,y"
+                return getDynamicPlaceholder('click_selector', 'click_selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos')
             }
             if (field === 'start_selector') {
-                return getDynamicPlaceholder('start_selector', 'start_selector_type') || "image: 文件名 | pos: x,y"
+                return getDynamicPlaceholder('start_selector', 'start_selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos')
             }
             if (field === 'end_selector') {
-                return getDynamicPlaceholder('end_selector', 'end_selector_type') || "image: 文件名 | pos: x,y"
+                return getDynamicPlaceholder('end_selector', 'end_selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos')
             }
             if (field === 'target_selector') {
-                return getDynamicPlaceholder('target_selector', 'target_selector_type') || "image: 文件名"
+                return getDynamicPlaceholder('target_selector', 'target_selector_type') || t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImage')
             }
             if (field === 'ocr_selector') {
                 return getDynamicPlaceholder('ocr_selector', 'ocr_selector_type') || "region: x1,y1,x2,y2 | pos: x,y"
             }
-            
+
             const placeholders = {
-                selector: "image: 文件名 | pos: x,y | region: x1,y1,x2,y2",
-                fallback_selector: "image: 文件名 | pos: x,y | region: x1,y1,x2,y2",
-                start_selector: "image: 文件名 | pos: x,y",
-                end_selector: "image: 文件名 | pos: x,y",
-                target_selector: "image: 文件名",
-                click_selector: "image: 文件名 | pos: x,y",
+                selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorFull'),
+                fallback_selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorFull'),
+                start_selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos'),
+                end_selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos'),
+                target_selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImage'),
+                click_selector: t('appAutomation.sceneBuilder.fieldPlaceholder.selectorImagePos'),
                 ocr_selector: "region: x1,y1,x2,y2 | pos: x,y",
-                value: "请输入内容",
-                send_enter: "勾选后输入文本后自动发送回车键",
-                expected: "期望文本，如是数字匹配：格式为1,000,000",
-                note: "备注",
-                image_scope: "图片目录名（位于 Template/ 下），默认 common 或输入自定义目录名",
-                expected_image_scope: "图片目录名（位于 Template/ 下），默认 common 或输入自定义目录名",
-                fallback_image_scope: "图片目录名（位于 Template/ 下），默认 common 或输入自定义目录名",
+                value: t('appAutomation.sceneBuilder.fieldPlaceholder.value'),
+                send_enter: t('appAutomation.sceneBuilder.fieldPlaceholder.sendEnter'),
+                expected: t('appAutomation.sceneBuilder.fieldPlaceholder.expected'),
+                note: t('appAutomation.sceneBuilder.fieldPlaceholder.note'),
+                image_scope: t('appAutomation.sceneBuilder.fieldPlaceholder.imageScope'),
+                expected_image_scope: t('appAutomation.sceneBuilder.fieldPlaceholder.imageScope'),
+                fallback_image_scope: t('appAutomation.sceneBuilder.fieldPlaceholder.imageScope'),
                 image_threshold: "0.7 ~ 1.0",
                 fallback_image_threshold: "0.7 ~ 1.0",
-                expected_list: "例如 100,200,300 或多行",
-                name: "例如 token 或 user.id",
+                expected_list: t('appAutomation.sceneBuilder.fieldPlaceholder.expectedList'),
+                name: t('appAutomation.sceneBuilder.fieldPlaceholder.name'),
                 value_type: "string/number/boolean/array/object",
-                scope: "local 或 global",
-                source: "例如 outputs.last 或 steps.step_id",
-                path: "例如 data.id",
+                scope: t('appAutomation.sceneBuilder.fieldPlaceholder.scope'),
+                source: t('appAutomation.sceneBuilder.fieldPlaceholder.source'),
+                path: t('appAutomation.sceneBuilder.fieldPlaceholder.path'),
                 method: "GET/POST/PUT/PATCH/DELETE",
-                url: "例如 https://api.example.com/login",
-                headers: "JSON 对象，如 {\"Authorization\": \"Bearer ...\"}",
-                params: "JSON 对象，如 {\"page\":1}",
-                data: "JSON 对象或字符串",
-                json: "JSON 对象",
-                expected_status: "例如 200",
+                url: t('appAutomation.sceneBuilder.fieldPlaceholder.url'),
+                headers: t('appAutomation.sceneBuilder.fieldPlaceholder.headers'),
+                params: t('appAutomation.sceneBuilder.fieldPlaceholder.params'),
+                data: t('appAutomation.sceneBuilder.fieldPlaceholder.data'),
+                json: t('appAutomation.sceneBuilder.fieldPlaceholder.json'),
+                expected_status: t('appAutomation.sceneBuilder.fieldPlaceholder.expectedStatus'),
                 response_type: "auto/json/text",
-                save_as: "变量名，如 login_response",
+                save_as: t('appAutomation.sceneBuilder.fieldPlaceholder.saveAs'),
                 extracts: "[{\"name\":\"token\",\"path\":\"data.token\"}]",
-                left: "支持变量表达式",
+                left: t('appAutomation.sceneBuilder.fieldPlaceholder.variableExpression'),
                 operator: "== != > >= < <= contains regex truthy",
-                right: "支持变量表达式",
-                items: "JSON 数组，如 [\"a\",\"b\"]",
-                item_var: "默认 item",
-                item_scope: "local 或 global",
-                steps: "JSON 数组，填入子步骤",
-                then_steps: "JSON 数组，填入子步骤",
-                else_steps: "JSON 数组，填入子步骤",
-                branches: "JSON 数组，形如 [[...],[...]]",
-                try_steps: "JSON 数组，填入子步骤",
-                catch_steps: "JSON 数组，填入子步骤",
-                finally_steps: "JSON 数组，填入子步骤"
+                right: t('appAutomation.sceneBuilder.fieldPlaceholder.variableExpression'),
+                items: t('appAutomation.sceneBuilder.fieldPlaceholder.items'),
+                item_var: t('appAutomation.sceneBuilder.fieldPlaceholder.itemVar'),
+                item_scope: t('appAutomation.sceneBuilder.fieldPlaceholder.scope'),
+                steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
+                then_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
+                else_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
+                branches: t('appAutomation.sceneBuilder.fieldPlaceholder.branches'),
+                try_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
+                catch_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
+                finally_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps')
     }
     const currentStep = activeStep.value || editingActiveStep.value
     if (field === "value" && currentStep && currentStep.type === "set_variable") {
-        return "支持变量表达式或字面量"
+        return t('appAutomation.sceneBuilder.fieldPlaceholder.valueExpression')
     }
     if (config && config.assert_type === "image") {
         if (field === "expected") {
-            return "例如 upgrade_button.png"
+            return t('appAutomation.sceneBuilder.fieldPlaceholder.expectedImage')
         }
         if (field === "expected_list") {
-            return "例如 a.png,b.png 或多行"
+            return t('appAutomation.sceneBuilder.fieldPlaceholder.expectedImageList')
         }
     }
     return placeholders[field] || ""
@@ -2169,7 +2171,7 @@ const getFieldPlaceholder = (field) => {
 const applyApiRequestTemplate = (template, targetStep) => {
     const step = targetStep || activeStep.value || editingActiveStep.value
     if (!step || !step.config) {
-        ElMessage.warning("请先选择步骤")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.selectStepFirst'))
         return
     }
     const config = template && template.config
@@ -2178,7 +2180,7 @@ const applyApiRequestTemplate = (template, targetStep) => {
     Object.keys(config).forEach(key => {
         step.config[key] = config[key]
     })
-    ElMessage.success(`已应用模板：${template.name}`)
+    ElMessage.success(t('appAutomation.sceneBuilder.messages.templateApplied', { name: template.name }))
 }
 
 // 判断是否是图片分类相关字段
@@ -2488,7 +2490,7 @@ const openCaptureElementDialog = () => {
 }
 
 const handleElementCreated = () => {
-    ElMessage.success('元素创建成功')
+    ElMessage.success(t('appAutomation.sceneBuilder.messages.elementCreated'))
     // 如果元素选择器对话框打开，可以刷新元素列表
     if (elementSelectorVisible.value) {
         loadElementsForSelector()
@@ -2520,16 +2522,16 @@ const handlePackageUpload = async (option) => {
         const response = await importComponentPackage(formData)
         const data = response.data || response
         if (data.success || data.data) {
-            ElMessage.success("组件包已导入")
+            ElMessage.success(t('appAutomation.sceneBuilder.messages.packageImported'))
             await loadComponentPalette()
             await loadPackageList()
         } else {
-            ElMessage.error(data.message || "导入失败")
+            ElMessage.error(data.message || t('appAutomation.sceneBuilder.messages.importFailed'))
         }
     } catch (error) {
         console.error("导入组件包失败:", error)
         const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
-        ElMessage.error(errorMsg || "导入失败")
+        ElMessage.error(errorMsg || t('appAutomation.sceneBuilder.messages.importFailed'))
     } finally {
         packageUploading.value = false
     }
@@ -2545,12 +2547,12 @@ const exportPackage = async (format) => {
         const filename = getDownloadFilename(response.headers["content-disposition"])
             || `ui-component-pack.${format === "json" ? "json" : "yaml"}`
         downloadBlob(blob, filename)
-        ElMessage.success("组件包已导出")
+        ElMessage.success(t('appAutomation.sceneBuilder.messages.packageExported'))
         exportDialogVisible.value = false
     } catch (error) {
         console.error("导出组件包失败:", error)
         const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
-        ElMessage.error(errorMsg || "导出失败")
+        ElMessage.error(errorMsg || t('appAutomation.sceneBuilder.messages.exportFailed'))
     }
 }
 
@@ -2578,11 +2580,11 @@ const downloadBlob = (blob, filename) => {
 
 const saveScene = async () => {
     if (!sceneForm.value.name) {
-        ElMessage.warning("请输入场景名称")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.inputSceneName'))
         return
     }
     if (scenarioSteps.value.length === 0) {
-        ElMessage.warning("请至少添加一个场景步骤")
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.addAtLeastOneStep'))
         return
     }
 
@@ -2611,17 +2613,17 @@ const saveScene = async () => {
 
         const responseData = caseResponse.data || caseResponse
         if (responseData && (responseData.id || responseData.success)) {
-            ElMessage.success(editingCaseId.value ? "场景更新成功" : "场景保存成功")
+            ElMessage.success(editingCaseId.value ? t('appAutomation.sceneBuilder.messages.sceneUpdateSuccess') : t('appAutomation.sceneBuilder.messages.sceneSaveSuccess'))
             if (responseData.id && !editingCaseId.value) {
                 editingCaseId.value = responseData.id
             }
         } else {
-            ElMessage.success("场景已提交保存")
+            ElMessage.success(t('appAutomation.sceneBuilder.messages.sceneSubmitted'))
         }
     } catch (error) {
         console.error("保存场景失败:", error)
         const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
-        ElMessage.error(`保存场景失败: ${errorMsg}`)
+        ElMessage.error(t('appAutomation.sceneBuilder.messages.saveSceneFailed', { error: errorMsg }))
     } finally {
         saving.value = false
     }
@@ -2650,7 +2652,7 @@ const loadElementsForSelector = async () => {
         elementTotal.value = data?.count || selectorElements.value.length
     } catch (error) {
         console.error('加载元素列表失败:', error)
-        ElMessage.error('加载元素列表失败')
+        ElMessage.error(t('appAutomation.sceneBuilder.messages.loadElementsFailed'))
     } finally {
         elementSelectorLoading.value = false
     }
@@ -2717,7 +2719,7 @@ const fillFieldsByTarget = (element, config, target) => {
     if (element.element_type === 'image') {
         if (element.config && element.config.image_path) {
             const fileName = element.config.image_path.split('/').pop()
-            
+
             // 设置定位类型和值
             if (target === 'expected') {
                 // 断言字段特殊处理
@@ -2736,49 +2738,49 @@ const fillFieldsByTarget = (element, config, target) => {
                     config[scopeField] = element.config.image_category
                 }
             }
-            
-            ElMessage.success(`已关联 ${getTargetTitle(target)}: ${element.name} (图片)`)
+
+            ElMessage.success(t('appAutomation.sceneBuilder.messages.linkedElement', { target: getTargetTitle(target), name: element.name, type: t('appAutomation.sceneBuilder.elementSelector.image') }))
         } else {
-            ElMessage.warning('该图片元素缺少文件路径')
+            ElMessage.warning(t('appAutomation.sceneBuilder.messages.imageMissingPath'))
         }
     } else if (element.element_type === 'pos') {
         if (element.config && element.config.x !== undefined && element.config.y !== undefined) {
             const posValue = `${element.config.x}, ${element.config.y}`
-            
+
             config[typeField] = 'pos'
             config[valueField] = posValue
-            
-            ElMessage.success(`已关联 ${getTargetTitle(target)}: ${element.name} (坐标)`)
+
+            ElMessage.success(t('appAutomation.sceneBuilder.messages.linkedElement', { target: getTargetTitle(target), name: element.name, type: t('appAutomation.sceneBuilder.elementSelector.coordinate') }))
         }
     } else if (element.element_type === 'region') {
-        if (element.config && 
-            element.config.x1 !== undefined && 
+        if (element.config &&
+            element.config.x1 !== undefined &&
             element.config.y1 !== undefined &&
-            element.config.x2 !== undefined && 
+            element.config.x2 !== undefined &&
             element.config.y2 !== undefined) {
             const regionValue = `${element.config.x1}, ${element.config.y1}, ${element.config.x2}, ${element.config.y2}`
-            
+
             config[typeField] = 'region'
             config[valueField] = regionValue
-            
-            ElMessage.success(`已关联 ${getTargetTitle(target)}: ${element.name} (区域)`)
+
+            ElMessage.success(t('appAutomation.sceneBuilder.messages.linkedElement', { target: getTargetTitle(target), name: element.name, type: t('appAutomation.sceneBuilder.elementSelector.region') }))
         }
     } else {
-        ElMessage.warning(`元素类型 ${element.element_type} 不适用于 ${getTargetTitle(target)}`)
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.elementTypeNotApplicable', { type: element.element_type, target: getTargetTitle(target) }))
     }
 }
 
 // 获取目标组的显示标题
 const getTargetTitle = (target) => {
     const titleMap = {
-        selector: '定位',
-        fallback: '备用定位',
-        click: '点击定位',
-        ocr: 'OCR定位',
-        start: '起始定位',
-        end: '结束定位',
-        target: '目标定位',
-        expected: '断言配置'
+        selector: t('appAutomation.sceneBuilder.fieldGroup.selector'),
+        fallback: t('appAutomation.sceneBuilder.fieldGroup.fallback'),
+        click: t('appAutomation.sceneBuilder.fieldGroup.click'),
+        ocr: t('appAutomation.sceneBuilder.fieldGroup.ocr'),
+        start: t('appAutomation.sceneBuilder.fieldGroup.start'),
+        end: t('appAutomation.sceneBuilder.fieldGroup.end'),
+        target: t('appAutomation.sceneBuilder.fieldGroup.target'),
+        expected: t('appAutomation.sceneBuilder.fieldGroup.expected')
     }
     return titleMap[target] || target
 }
@@ -2790,7 +2792,7 @@ const applyElement = (element) => {
         : activeStep.value
     
     if (!targetStep) {
-        ElMessage.warning('请先选择一个步骤')
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.selectStepFirst'))
         return
     }
     
@@ -2815,7 +2817,7 @@ const applyElement = (element) => {
         // 填充对应的字段
         fillFieldsByTarget(element, config, target)
     } else {
-        ElMessage.warning('未指定有效的字段组')
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.noValidFieldGroup'))
     }
     
     console.log('config after:', JSON.stringify(config))
@@ -2875,7 +2877,7 @@ const clearLinkedElement = (target) => {
         }
     }
     
-    ElMessage.info(`已清除 ${getTargetTitle(target)} 关联`)
+    ElMessage.info(t('appAutomation.sceneBuilder.messages.clearedLink', { target: getTargetTitle(target) }))
 }
 
 const getTypeTagColor = (type) => {

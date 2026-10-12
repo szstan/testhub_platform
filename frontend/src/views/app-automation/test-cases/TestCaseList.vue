@@ -2,7 +2,7 @@
   <div class="ui-flow-case-list">
     <!-- 页面标题 -->
     <div class="page-header">
-      <h3>APP测试用例</h3>
+      <h3>{{ $t('appAutomation.testCase.title') }}</h3>
       <div class="header-actions">
         <el-button
           type="primary"
@@ -11,7 +11,7 @@
           :loading="loading"
           @click="loadTestCases"
         >
-          刷新
+          {{ $t('appAutomation.common.refresh') }}
         </el-button>
       </div>
     </div>
@@ -21,10 +21,10 @@
       <el-form :model="form" label-width="100px" size="small">
         <el-row :gutter="16">
           <el-col :span="5">
-            <el-form-item label="所属项目">
+            <el-form-item :label="$t('appAutomation.testCase.belongProject')">
               <el-select
                 v-model="form.projectId"
-                placeholder="全部项目"
+                :placeholder="$t('appAutomation.testCase.allProjects')"
                 clearable
                 filterable
                 style="width: 100%"
@@ -40,10 +40,10 @@
             </el-form-item>
           </el-col>
           <el-col :span="5">
-            <el-form-item label="选择设备" required>
+            <el-form-item :label="$t('appAutomation.testCase.selectDevice')" required>
               <el-select
                 v-model="form.deviceId"
-                placeholder="请选择设备"
+                :placeholder="$t('appAutomation.testCase.selectDevicePlaceholder')"
                 filterable
                 style="width: 100%"
                 :loading="devicesLoading"
@@ -59,10 +59,10 @@
             </el-form-item>
           </el-col>
           <el-col :span="5">
-            <el-form-item label="选择应用">
+            <el-form-item :label="$t('appAutomation.testCase.selectApp')">
               <el-select
                 v-model="form.packageId"
-                placeholder="请选择应用（可选）"
+                :placeholder="$t('appAutomation.testCase.selectAppPlaceholder')"
                 clearable
                 filterable
                 style="width: 100%"
@@ -77,10 +77,10 @@
             </el-form-item>
           </el-col>
           <el-col :span="9">
-            <el-form-item label="搜索用例">
+            <el-form-item :label="$t('appAutomation.testCase.searchCase')">
               <el-input
                 v-model="searchQuery"
-                placeholder="搜索测试用例名称"
+                :placeholder="$t('appAutomation.testCase.searchCasePlaceholder')"
                 clearable
                 @clear="loadTestCases"
                 @keyup.enter="loadTestCases"
@@ -89,7 +89,7 @@
                   <el-icon><Search /></el-icon>
                 </template>
                 <template #append>
-                  <el-button :icon="Search" @click="loadTestCases">搜索</el-button>
+                  <el-button :icon="Search" @click="loadTestCases">{{ $t('appAutomation.common.search') }}</el-button>
                 </template>
               </el-input>
             </el-form-item>
@@ -100,12 +100,12 @@
 
     <!-- 批量操作栏 -->
     <div v-if="selectedCases.length > 0" class="batch-bar">
-      <span>已选择 <strong>{{ selectedCases.length }}</strong> 个用例</span>
+      <span>{{ $t('appAutomation.testCase.selectedCasesCount', { count: selectedCases.length }) }}</span>
       <el-button type="success" size="small" @click="batchRun">
-        批量执行
+        {{ $t('appAutomation.testCase.batchRun') }}
       </el-button>
       <el-button size="small" @click="clearSelection">
-        取消选择
+        {{ $t('appAutomation.testCase.cancelSelection') }}
       </el-button>
     </div>
 
@@ -115,31 +115,31 @@
       v-loading="loading"
       :data="testCases"
       style="width: 100%; margin-top: 16px"
-      empty-text="暂无测试用例"
+      :empty-text="$t('appAutomation.testCase.noTestCases')"
       @selection-change="handleSelectionChange"
     >
       <el-table-column type="selection" width="50" />
-      <el-table-column prop="name" label="用例名称" min-width="200" />
-      <el-table-column label="场景描述" min-width="250">
+      <el-table-column prop="name" :label="$t('appAutomation.testCase.caseName')" min-width="200" />
+      <el-table-column :label="$t('appAutomation.testCase.sceneDescription')" min-width="250">
         <template #default="{ row }">
           {{ row.description || '-' }}
         </template>
       </el-table-column>
-      <el-table-column prop="updated_at" label="更新时间" width="180">
+      <el-table-column prop="updated_at" :label="$t('appAutomation.common.updateTime')" width="180">
         <template #default="{ row }">
           {{ formatDateTime(row.updated_at) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="200">
+      <el-table-column :label="$t('appAutomation.common.operation')" width="200">
         <template #default="{ row }">
           <el-button link type="success" size="small" @click="runCase(row)">
-            运行
+            {{ $t('appAutomation.common.run') }}
           </el-button>
           <el-button link type="primary" size="small" @click="editCase(row)">
-            编辑
+            {{ $t('appAutomation.common.edit') }}
           </el-button>
           <el-button link type="danger" size="small" @click="deleteCase(row)">
-            删除
+            {{ $t('appAutomation.common.delete') }}
           </el-button>
         </template>
       </el-table-column>
@@ -162,13 +162,13 @@
     <el-card class="execution-card" style="margin-top: 20px">
       <template #header>
         <div class="card-header">
-          <span>最近测试执行记录</span>
+          <span>{{ $t('appAutomation.testCase.recentExecutions') }}</span>
           <div class="card-actions">
             <el-button link type="primary" @click="refreshExecutions">
-              刷新
+              {{ $t('appAutomation.common.refresh') }}
             </el-button>
             <el-button link type="primary" @click="viewAllExecutions">
-              查看全部
+              {{ $t('appAutomation.testCase.viewAll') }}
             </el-button>
           </div>
         </div>
@@ -179,17 +179,17 @@
         :data="executionData.results"
         style="width: 100%"
       >
-        <el-table-column prop="case_name" label="测试用例" width="200" />
-        <el-table-column prop="device_name" label="设备" width="150" />
-        <el-table-column prop="user_name" label="测试人员" width="120" />
-        <el-table-column prop="status" label="状态" width="100">
+        <el-table-column prop="case_name" :label="$t('appAutomation.testCase.testCaseColumn')" width="200" />
+        <el-table-column prop="device_name" :label="$t('appAutomation.testCase.device')" width="150" />
+        <el-table-column prop="user_name" :label="$t('appAutomation.testCase.tester')" width="120" />
+        <el-table-column prop="status" :label="$t('appAutomation.common.status')" width="100">
           <template #default="{ row }">
             <el-tag :type="getDisplayStatus(row.status, row.result).type" size="small">
               {{ getDisplayStatus(row.status, row.result).text }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="执行进度" width="280">
+        <el-table-column :label="$t('appAutomation.testCase.executionProgress')" width="280">
           <template #default="{ row }">
             <div class="progress-wrapper">
               <el-progress
@@ -203,17 +203,17 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="started_at" label="开始时间" width="180">
+        <el-table-column prop="started_at" :label="$t('appAutomation.testCase.startTime')" width="180">
           <template #default="{ row }">
             {{ formatDateTime(row.started_at) }}
           </template>
         </el-table-column>
-        <el-table-column prop="finished_at" label="结束时间" width="180">
+        <el-table-column prop="finished_at" :label="$t('appAutomation.testCase.endTime')" width="180">
           <template #default="{ row }">
             {{ row.finished_at ? formatDateTime(row.finished_at) : '-' }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150">
+        <el-table-column :label="$t('appAutomation.common.operation')" width="150">
           <template #default="{ row }">
             <el-button
               v-if="row.status === 'completed' || row.status === 'error'"
@@ -222,7 +222,7 @@
               size="small"
               @click="viewReport(row)"
             >
-              查看报告
+              {{ $t('appAutomation.testCase.viewReport') }}
             </el-button>
             <el-button
               v-if="row.status === 'running'"
@@ -231,7 +231,7 @@
               size="small"
               @click="stopTest(row)"
             >
-              停止
+              {{ $t('appAutomation.common.stop') }}
             </el-button>
           </template>
         </el-table-column>
@@ -245,6 +245,7 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
+import { useI18n } from 'vue-i18n'
 import {
   getTestCaseList,
   deleteTestCase as apiDeleteTestCase,
@@ -260,6 +261,7 @@ import { getDeviceList } from '@/api/app-automation'
 import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
 
 const router = useRouter()
+const { t } = useI18n()
 
 // 响应式数据
 const loading = ref(false)
@@ -416,7 +418,7 @@ const viewAllExecutions = () => {
 
 const viewReport = (execution) => {
   if (!execution.report_path) {
-    ElMessage.info('报告路径不存在')
+    ElMessage.info(t('appAutomation.testCase.reportNotExist'))
     return
   }
   const reportUrl = `/api/app-automation/executions/${execution.id}/report/`
@@ -427,21 +429,21 @@ const viewReport = (execution) => {
 const stopTest = async (execution) => {
   try {
     await ElMessageBox.confirm(
-      '确定要停止这个测试吗？',
-      '确认停止',
+      t('appAutomation.testCase.stopConfirm'),
+      t('appAutomation.testCase.confirmStop'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
 
     const res = await apiStopExecution(execution.id)
     if (res.data.success) {
-      ElMessage.success('已停止执行')
+      ElMessage.success(t('appAutomation.testCase.stoppedExecution'))
       loadExecutions()
     } else {
-      ElMessage.error(res.data.message || '停止失败')
+      ElMessage.error(res.data.message || t('appAutomation.testCase.stopFailed'))
     }
   } catch (error) {
     // 用户取消
@@ -451,7 +453,7 @@ const stopTest = async (execution) => {
 // 运行测试用例
 const runCase = async (testCase) => {
   if (!form.value.deviceId) {
-    ElMessage.warning('请先选择设备')
+    ElMessage.warning(t('appAutomation.testCase.pleaseSelectDevice'))
     return
   }
 
@@ -466,12 +468,12 @@ const runCase = async (testCase) => {
         params.package_name = selected.package_name
       }
     }
-    
+
     const res = await apiExecuteTestCase(testCase.id, params)
     const data = res.data
-    
+
     if (data.success || data.execution_id) {
-      ElMessage.success('测试已提交执行')
+      ElMessage.success(t('appAutomation.testCase.submitted'))
       const executionId = data.execution?.id || data.execution_id
       if (executionId) {
         trackExecution(executionId)
@@ -482,10 +484,10 @@ const runCase = async (testCase) => {
         loadExecutions()
       }, 1000)
     } else {
-      ElMessage.error('执行失败: ' + (data.message || '未知错误'))
+      ElMessage.error(t('appAutomation.testCase.executionFailed', { message: data.message || t('appAutomation.testCase.unknownError') }))
     }
   } catch (error) {
-    ElMessage.error('执行失败: ' + (error.message || '未知错误'))
+    ElMessage.error(t('appAutomation.testCase.executionFailed', { message: error.message || t('appAutomation.testCase.unknownError') }))
   }
 }
 
@@ -496,7 +498,7 @@ const checkExecutionStatus = (executionId) => {
       const data = res.data
       const status = data.status || data.data?.status
       if (status === 'pending') {
-        ElMessage.warning('任务未开始，请确认 Celery worker/Redis 已启动')
+        ElMessage.warning(t('appAutomation.testCase.taskNotStarted'))
       }
     } catch (error) {
       console.error('检查执行状态失败:', error)
@@ -516,21 +518,21 @@ const editCase = (testCase) => {
 const deleteCase = async (testCase) => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除测试用例 "${testCase.name}" 吗？`,
-      '确认删除',
+      t('appAutomation.testCase.deleteConfirm', { name: testCase.name }),
+      t('appAutomation.common.confirmDelete'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
 
     await apiDeleteTestCase(testCase.id)
-    ElMessage.success('删除成功')
+    ElMessage.success(t('appAutomation.common.deleteSuccess'))
     loadTestCases()
   } catch (error) {
     if (error !== 'cancel') {
-      ElMessage.error('删除失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.testCase.deleteFailedMsg', { message: error.message || t('appAutomation.testCase.unknownError') }))
     }
   }
 }
@@ -576,9 +578,9 @@ const startPolling = (executionId) => {
         })
         if (['completed', 'error', 'stopped'].includes(res.data.status)) {
           stopPolling(executionId)
-          if (res.data.result === 'passed') ElMessage.success('测试执行通过')
-          else if (res.data.result === 'failed') ElMessage.error('测试用例失败')
-          else if (res.data.status === 'error') ElMessage.error('执行异常')
+          if (res.data.result === 'passed') ElMessage.success(t('appAutomation.testCase.executionPassed'))
+          else if (res.data.result === 'failed') ElMessage.error(t('appAutomation.testCase.caseFailed'))
+          else if (res.data.status === 'error') ElMessage.error(t('appAutomation.testCase.executionException'))
         }
       }
     } catch (e) {
@@ -618,9 +620,9 @@ const connectWebSocket = (executionId) => {
       updateExecutionData(data)
       if (data.status && lastStatusMessages.value[executionId] !== data.status) {
         lastStatusMessages.value[executionId] = data.status
-        if (data.result === 'passed') ElMessage.success('测试执行通过')
-        else if (data.result === 'failed') ElMessage.error('测试用例失败')
-        else if (data.status === 'error') ElMessage.error('执行异常')
+        if (data.result === 'passed') ElMessage.success(t('appAutomation.testCase.executionPassed'))
+        else if (data.result === 'failed') ElMessage.error(t('appAutomation.testCase.caseFailed'))
+        else if (data.status === 'error') ElMessage.error(t('appAutomation.testCase.executionException'))
       }
       if (['completed', 'error', 'stopped'].includes(data.status)) {
         closeWebSocket(executionId)
@@ -687,19 +689,19 @@ const clearSelection = () => {
 
 const batchRun = async () => {
   if (!form.value.deviceId) {
-    ElMessage.warning('请先选择设备')
+    ElMessage.warning(t('appAutomation.testCase.pleaseSelectDevice'))
     return
   }
   if (selectedCases.value.length === 0) {
-    ElMessage.warning('请至少选择一个用例')
+    ElMessage.warning(t('appAutomation.testCase.pleaseSelectAtLeastOneCase'))
     return
   }
 
   try {
     await ElMessageBox.confirm(
-      `确定要批量执行选中的 ${selectedCases.value.length} 个用例吗？`,
-      '确认批量执行',
-      { confirmButtonText: '执行', cancelButtonText: '取消', type: 'info' }
+      t('appAutomation.testCase.batchRunConfirm', { count: selectedCases.value.length }),
+      t('appAutomation.testCase.confirmBatchRun'),
+      { confirmButtonText: t('appAutomation.common.execute'), cancelButtonText: t('appAutomation.common.cancel'), type: 'info' }
     )
 
     const deviceIdStr = availableDevices.value.find(d => d.id === form.value.deviceId)?.device_id
@@ -722,7 +724,7 @@ const batchRun = async () => {
       }
     }
 
-    ElMessage.success(`已提交 ${submitted} 个用例执行`)
+    ElMessage.success(t('appAutomation.testCase.submittedCount', { count: submitted }))
     clearSelection()
     setTimeout(() => loadExecutions(), 1500)
   } catch (error) {

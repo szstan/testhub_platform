@@ -232,10 +232,16 @@ export default {
     messageError: '❌Error',
     clear: 'Clear',
     // Response
-    response: 'Response',
+    response: 'Response Info',
     responseBody: 'Body',
     responseHeaders: 'Headers',
     assertionResults: 'Assertion Results',
+    // Request Info
+    requestInfo: 'Request Info',
+    requestHeaders: 'Request Headers',
+    requestBody: 'Request Body',
+    noRequestHeaders: 'No request headers',
+    noRequestBody: 'No request body',
     // Assertions
     assertions: 'Assertions',
     addAssertion: 'Add Assertion',
@@ -268,7 +274,8 @@ export default {
       addRequest: 'Add Request',
       addSubCollection: 'Add Sub-collection',
       edit: 'Edit',
-      delete: 'Delete'
+      delete: 'Delete',
+      copy: 'Copy'
     },
     // Others
     newRequest: 'New Request',

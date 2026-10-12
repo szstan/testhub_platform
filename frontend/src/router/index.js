@@ -315,6 +315,47 @@ const routes = [
         ]
     },
     {
+        path: '/defects',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'DefectDashboard',
+                component: () => import('@/views/defects/DefectDashboard.vue')
+            },
+            {
+                path: 'list',
+                name: 'DefectList',
+                component: () => import('@/views/defects/DefectList.vue')
+            },
+            {
+                path: 'create',
+                name: 'DefectCreate',
+                component: () => import('@/views/defects/DefectForm.vue')
+            },
+            {
+                path: 'reports',
+                name: 'DefectReport',
+                component: () => import('@/views/defects/DefectReport.vue')
+            },
+            {
+                path: ':id',
+                name: 'DefectDetail',
+                component: () => import('@/views/defects/DefectDetail.vue')
+            },
+            {
+                path: ':id/edit',
+                name: 'DefectEdit',
+                component: () => import('@/views/defects/DefectForm.vue')
+            }
+        ]
+    },
+    {
         path: '/data-factory',
         name: 'DataFactory',
         component: () => import('@/views/data-factory/DataFactory.vue'),
@@ -374,6 +415,49 @@ const routes = [
                         component: () => import('@/views/configuration/DifyConfig.vue')
                     }
                 ]
+            }
+        ]
+    },
+    // 智能评分器路由
+    {
+        path: '/llm-judge',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'JudgeDashboard',
+                component: () => import('@/views/llm-judge/Dashboard.vue')
+            },
+            {
+                path: 'single',
+                name: 'JudgeSingle',
+                component: () => import('@/views/llm-judge/SingleJudge.vue')
+            },
+            {
+                path: 'batch',
+                name: 'JudgeBatch',
+                component: () => import('@/views/llm-judge/BatchJudge.vue')
+            },
+            {
+                path: 'history',
+                name: 'JudgeHistory',
+                component: () => import('@/views/llm-judge/HistoryList.vue')
+            },
+            {
+                path: 'rubrics',
+                name: 'JudgeRubrics',
+                component: () => import('@/views/llm-judge/RubricList.vue')
+            },
+            {
+                path: 'knowledge',
+                name: 'JudgeKnowledgeBase',
+                component: () => import('@/views/llm-judge/KnowledgeBase.vue')
+
             }
         ]
     },
@@ -447,6 +531,131 @@ const routes = [
                 path: 'reports',
                 name: 'AppReportList',
                 component: () => import('@/views/app-automation/reports/ReportList.vue')
+            }
+        ]
+    }
+    {
+        path: '/monitor',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'MonitorDashboard',
+                component: () => import('@/views/monitor/Dashboard.vue')
+            },
+            {
+                path: 'checks',
+                name: 'MonitorCheckLogs',
+                component: () => import('@/views/monitor/CheckLogs.vue')
+            },
+            {
+                path: 'alerts',
+                name: 'MonitorAlerts',
+                component: () => import('@/views/monitor/Alerts.vue')
+            },
+            {
+                path: 'targets',
+                name: 'MonitorTargets',
+                component: () => import('@/views/monitor/MonitorTargets.vue')
+            },
+            {
+                path: 'channels',
+                name: 'NotificationChannels',
+                component: () => import('@/views/monitor/NotificationChannels.vue')
+            }
+        ]
+    },
+    {
+        path: '/performance-testing',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'PerfDashboard',
+                component: () => import('@/views/performance-testing/Dashboard.vue')
+            },
+            {
+                path: 'projects',
+                name: 'PerfProjects',
+                component: () => import('@/views/performance-testing/ProjectManagement.vue')
+            },
+            {
+                path: 'scenarios',
+                name: 'PerfScenarios',
+                component: () => import('@/views/performance-testing/ScenarioList.vue')
+            },
+            {
+                path: 'scenarios/:id',
+                name: 'PerfScenarioEditor',
+                component: () => import('@/views/performance-testing/ScenarioEditor.vue')
+            },
+            {
+                path: 'executions',
+                name: 'PerfExecutions',
+                component: () => import('@/views/performance-testing/ExecutionList.vue')
+            },
+            {
+                path: 'executions/:id',
+                name: 'PerfExecutionReport',
+                component: () => import('@/views/performance-testing/ExecutionReport.vue')
+            },
+            {
+                path: 'executions/:id/monitor',
+                name: 'PerfExecutionMonitor',
+                component: () => import('@/views/performance-testing/ExecutionMonitor.vue')
+            },
+            {
+                path: 'comparison',
+                name: 'PerfComparison',
+                component: () => import('@/views/performance-testing/Comparison.vue')
+            },
+            {
+                path: 'comparison-reports',
+                name: 'PerfComparisonReports',
+                component: () => import('@/views/performance-testing/Comparison.vue')Reports
+            },
+            {
+                path: 'scheduled',
+                name: 'PerfScheduled',
+                component: () => import('@/views/performance-testing/ScheduledTasks.vue')
+            }
+        ]
+    },
+    {
+        path: '/mcp',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'console'
+            },
+            {
+                path: 'console',
+                name: 'McpConsole',
+                component: () => import('@/views/mcp/McpConsole.vue')
+            }
+        ]
+    },
+    {
+        path: '/docs-center',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                name: 'DocsCenter',
+                component: () => import('@/views/docs-center/DocsCenter.vue')
             }
         ]
     }

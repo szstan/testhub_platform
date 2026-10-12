@@ -192,3 +192,4 @@ numpy==1.26.4
 daphne==4.2.1
 channels==4.3.2
 channels-redis==4.3.0
+cbor2==5.6.2

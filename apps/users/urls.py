@@ -3,6 +3,9 @@ from . import views, test_views
 from rest_framework_simplejwt.views import TokenRefreshView
 
 urlpatterns = [
+    # /api/users/ 直接作为用户列表入口：该 urls 模块同时挂在 api/auth/ 与 api/users/ 下，
+    # 列表原位于 users/ 子路径，导致 /api/users/ 返回 404，故补充根路由别名
+    path('', views.UserListView.as_view()),
     path('me/', views.get_current_user, name='get_current_user'),
     path('register/', views.RegisterView.as_view(), name='register'),
     path('test-register/', test_views.test_register, name='test-register'),  # 测试注册接口

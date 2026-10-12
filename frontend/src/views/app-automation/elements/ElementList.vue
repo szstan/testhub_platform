@@ -6,22 +6,22 @@
         <div class="header-actions">
           <el-space wrap>
             <!-- 项目筛选 -->
-            <el-select v-model="projectFilter" placeholder="全部项目" clearable filterable style="width: 160px" @change="handleSearch">
+            <el-select v-model="projectFilter" :placeholder="$t('appAutomation.element.allProjects')" clearable filterable style="width: 160px" @change="handleSearch">
               <el-option v-for="p in projectList" :key="p.id" :label="p.name" :value="p.id" />
             </el-select>
 
             <!-- 类型切换 -->
             <el-radio-group v-model="typeFilter" @change="loadElements">
-              <el-radio-button value="">全部</el-radio-button>
-              <el-radio-button value="image">图片</el-radio-button>
-              <el-radio-button value="pos">坐标</el-radio-button>
-              <el-radio-button value="region">区域</el-radio-button>
+              <el-radio-button value="">{{ $t('appAutomation.common.all') }}</el-radio-button>
+              <el-radio-button value="image">{{ $t('appAutomation.element.types.image') }}</el-radio-button>
+              <el-radio-button value="pos">{{ $t('appAutomation.element.types.pos') }}</el-radio-button>
+              <el-radio-button value="region">{{ $t('appAutomation.element.types.region') }}</el-radio-button>
             </el-radio-group>
-            
+
             <!-- 搜索 -->
             <el-input
               v-model="searchQuery"
-              placeholder="搜索元素名称/标签"
+              :placeholder="$t('appAutomation.element.searchPlaceholder')"
               style="width: 250px"
               clearable
               @clear="handleSearch"
@@ -47,11 +47,11 @@
           <el-space>
             <el-button type="success" @click="showCaptureDialog">
               <el-icon><Camera /></el-icon>
-              从设备创建
+              {{ $t('appAutomation.element.createFromDevice') }}
             </el-button>
             <el-button type="primary" @click="showCreateDialog">
               <el-icon><Plus /></el-icon>
-              手动创建
+              {{ $t('appAutomation.element.createManually') }}
             </el-button>
           </el-space>
         </div>
@@ -66,23 +66,23 @@
       >
         <el-table-column type="selection" width="55" />
         
-        <el-table-column prop="name" label="元素名称" width="200" fixed="left">
+        <el-table-column prop="name" :label="$t('appAutomation.element.elementName')" width="200" fixed="left">
           <template #default="{ row }">
             <el-link type="primary" @click="handleView(row)">
               {{ row.name }}
             </el-link>
           </template>
         </el-table-column>
-        
-        <el-table-column prop="element_type" label="类型" width="100">
+
+        <el-table-column prop="element_type" :label="$t('appAutomation.element.type')" width="100">
           <template #default="{ row }">
             <el-tag :type="getTypeColor(row.element_type)">
               {{ getTypeName(row.element_type) }}
             </el-tag>
           </template>
         </el-table-column>
-        
-        <el-table-column label="图片分类" width="120">
+
+        <el-table-column :label="$t('appAutomation.element.imageCategory')" width="120">
           <template #default="{ row }">
             <el-tag v-if="row.element_type === 'image' && row.config?.image_category" type="info" size="small">
               {{ row.config.image_category }}
@@ -90,8 +90,8 @@
             <span v-else style="color: #909399;">-</span>
           </template>
         </el-table-column>
-        
-        <el-table-column prop="tags" label="标签" width="200">
+
+        <el-table-column prop="tags" :label="$t('appAutomation.element.tags')" width="200">
           <template #default="{ row }">
             <el-tag
               v-for="tag in row.tags"
@@ -105,7 +105,7 @@
         </el-table-column>
         
         <!-- 预览 -->
-        <el-table-column label="预览" width="200" align="center">
+        <el-table-column :label="$t('appAutomation.element.preview')" width="200" align="center">
           <template #default="{ row }">
             <!-- 图片类型 -->
             <div v-if="row.element_type === 'image'" class="preview-image">
@@ -142,24 +142,24 @@
           </template>
         </el-table-column>
         
-        <el-table-column prop="usage_count" label="使用次数" width="100" sortable />
-        
-        <el-table-column prop="created_at" label="创建时间" width="180">
+        <el-table-column prop="usage_count" :label="$t('appAutomation.element.usageCount')" width="100" sortable />
+
+        <el-table-column prop="created_at" :label="$t('appAutomation.common.createTime')" width="180">
           <template #default="{ row }">
             {{ formatDateTime(row.created_at) }}
           </template>
         </el-table-column>
-        
-        <el-table-column label="操作" width="280" fixed="right">
+
+        <el-table-column :label="$t('appAutomation.common.operation')" width="280" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" @click="handleEdit(row)">
-              编辑
+              {{ $t('appAutomation.common.edit') }}
             </el-button>
             <el-button size="small" @click="handleDuplicate(row)">
-              复制
+              {{ $t('appAutomation.element.copy') }}
             </el-button>
             <el-button size="small" type="danger" @click="handleDelete(row)">
-              删除
+              {{ $t('appAutomation.common.delete') }}
             </el-button>
           </template>
         </el-table-column>
@@ -168,9 +168,9 @@
       <!-- 批量操作栏 -->
       <div v-if="selectedElements.length > 0" class="batch-actions">
         <el-space>
-          <span>已选择 {{ selectedElements.length }} 项</span>
+          <span>{{ $t('appAutomation.element.selectedCount', { count: selectedElements.length }) }}</span>
           <el-button type="danger" size="small" @click="handleBatchDelete">
-            批量删除
+            {{ $t('appAutomation.common.batchDelete') }}
           </el-button>
         </el-space>
       </div>
@@ -206,26 +206,26 @@
     <!-- 查看详情对话框 -->
     <el-dialog
       v-model="detailDialogVisible"
-      title="元素详情"
+      :title="$t('appAutomation.element.elementDetail')"
       width="800px"
     >
       <el-descriptions :column="2" border v-if="viewingElement">
-        <el-descriptions-item label="元素名称">{{ viewingElement.name }}</el-descriptions-item>
-        <el-descriptions-item label="元素类型">
+        <el-descriptions-item :label="$t('appAutomation.element.elementName')">{{ viewingElement.name }}</el-descriptions-item>
+        <el-descriptions-item :label="$t('appAutomation.element.elementType')">
           <el-tag :type="getTypeColor(viewingElement.element_type)">
             {{ getTypeName(viewingElement.element_type) }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="标签" :span="2">
+        <el-descriptions-item :label="$t('appAutomation.element.tags')" :span="2">
           <el-tag v-for="tag in viewingElement.tags" :key="tag" size="small" style="margin-right: 5px">
             {{ tag }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="配置信息" :span="2">
+        <el-descriptions-item :label="$t('appAutomation.element.configInfo')" :span="2">
           <pre style="margin: 0; padding: 10px; background: #f5f7fa; border-radius: 4px;">{{ JSON.stringify(viewingElement.config, null, 2) }}</pre>
         </el-descriptions-item>
-        <el-descriptions-item label="使用次数">{{ viewingElement.usage_count || 0 }}</el-descriptions-item>
-        <el-descriptions-item label="创建时间">{{ formatDateTime(viewingElement.created_at) }}</el-descriptions-item>
+        <el-descriptions-item :label="$t('appAutomation.element.usageCount')">{{ viewingElement.usage_count || 0 }}</el-descriptions-item>
+        <el-descriptions-item :label="$t('appAutomation.common.createTime')">{{ formatDateTime(viewingElement.created_at) }}</el-descriptions-item>
       </el-descriptions>
     </el-dialog>
   </div>
@@ -242,8 +242,11 @@ import {
 } from '@/api/app-automation'
 import { Search, Plus, Camera } from '@element-plus/icons-vue'
 import { formatDateTime } from '@/utils/app-automation-helpers'
+import { useI18n } from 'vue-i18n'
 import CaptureElementDialog from './components/CaptureElementDialog.vue'
 import ManualElementDialog from './components/ManualElementDialog.vue'
+
+const { t } = useI18n()
 
 // 状态
 const loading = ref(false)
@@ -285,7 +288,7 @@ const loadElements = async () => {
     elements.value = res.data.results || []
     total.value = res.data.count || 0
   } catch (error) {
-    ElMessage.error('加载元素列表失败: ' + (error.message || '未知错误'))
+    ElMessage.error(t('appAutomation.element.messages.loadFailed') + ': ' + (error.message || t('appAutomation.element.messages.unknownError')))
   } finally {
     loading.value = false
   }
@@ -319,16 +322,18 @@ const handleEdit = (element) => {
 
 // 智能生成唯一的副本名称
 const findAvailableName = (baseName) => {
+  const copySuffix = t('appAutomation.element.copySuffix')
   // 先尝试 "原名_副本"
-  const firstCandidate = `${baseName}_副本`
+  const firstCandidate = `${baseName}${copySuffix}`
   if (!elements.value.some(el => el.name === firstCandidate)) {
     return firstCandidate
   }
-  
+
   // 查找 "原名_副本(n)" 中的最大 n
-  const pattern = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_副本\\((\\d+)\\)$`)
+  const escapedSuffix = copySuffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${escapedSuffix}\\((\\d+)\\)$`)
   let maxNum = 1
-  
+
   elements.value.forEach(el => {
     const match = el.name.match(pattern)
     if (match) {
@@ -338,8 +343,8 @@ const findAvailableName = (baseName) => {
       }
     }
   })
-  
-  return `${baseName}_副本(${maxNum + 1})`
+
+  return `${baseName}${copySuffix}(${maxNum + 1})`
 }
 
 const handleDuplicate = async (element) => {
@@ -366,14 +371,14 @@ const handleDuplicate = async (element) => {
     }
     
     await createAppElement(duplicateData)
-    ElMessage.success(`已复制为 "${newName}"`)
+    ElMessage.success(t('appAutomation.element.messages.copiedAs', { name: newName }))
     loadElements()
   } catch (error) {
     console.error('复制失败:', error)
     const errorMsg = error.response?.data?.config?.[0] ||
-                     error.response?.data?.name?.[0] || 
-                     error.response?.data?.message || 
-                     '复制失败'
+                     error.response?.data?.name?.[0] ||
+                     error.response?.data?.message ||
+                     t('appAutomation.element.messages.copyFailed')
     ElMessage.error(errorMsg)
   }
 }
@@ -389,26 +394,26 @@ const handleSelectionChange = (selection) => {
 const handleBatchDelete = async () => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除选中的 ${selectedElements.value.length} 个元素吗？`,
-      '批量删除确认',
+      t('appAutomation.element.messages.batchDeleteConfirm', { count: selectedElements.value.length }),
+      t('appAutomation.element.messages.batchDeleteTitle'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
-    
+
     for (const element of selectedElements.value) {
       await apiDeleteAppElement(element.id)
     }
-    
-    ElMessage.success('批量删除成功')
+
+    ElMessage.success(t('appAutomation.element.messages.batchDeleteSuccess'))
     selectedElements.value = []
     loadElements()
   } catch (error) {
     if (error !== 'cancel') {
       console.error('批量删除失败:', error)
-      ElMessage.error('批量删除失败')
+      ElMessage.error(t('appAutomation.element.messages.batchDeleteFailed'))
     }
   }
 }
@@ -416,22 +421,22 @@ const handleBatchDelete = async () => {
 const handleDelete = async (element) => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除元素 "${element.name}" 吗？`,
-      '删除确认',
+      t('appAutomation.element.messages.deleteConfirm', { name: element.name }),
+      t('appAutomation.common.confirmDelete'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
-    
+
     await apiDeleteAppElement(element.id)
-    ElMessage.success('删除成功')
+    ElMessage.success(t('appAutomation.common.deleteSuccess'))
     loadElements()
   } catch (error) {
     if (error !== 'cancel') {
       console.error('删除失败:', error)
-      ElMessage.error('删除失败')
+      ElMessage.error(t('appAutomation.common.deleteFailed'))
     }
   }
 }
@@ -454,12 +459,12 @@ const getTypeColor = (type) => {
 }
 
 const getTypeName = (type) => {
-  const nameMap = {
-    'image': '图片',
-    'pos': '坐标',
-    'region': '区域'
-  }
-  return nameMap[type] || type
+  const nameKey = {
+    'image': 'image',
+    'pos': 'pos',
+    'region': 'region'
+  }[type]
+  return nameKey ? t(`appAutomation.element.types.${nameKey}`) : type
 }
 
 // formatDateTime 已从 app-automation-helpers 导入

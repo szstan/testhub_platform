@@ -271,16 +271,23 @@ export default {
     messageError: '❌错误',
     clear: '清除',
     // 响应
-    response: '响应',
+    response: '响应信息',
     responseBody: 'Body',
     responseHeaders: 'Headers',
     assertionResults: '断言结果',
+    // 请求信息
+    requestInfo: '请求信息',
+    requestHeaders: '请求头',
+    requestBody: '请求体',
+    noRequestHeaders: '无请求头',
+    noRequestBody: '无请求体',
     // 右键菜单
     contextMenu: {
       addRequest: '添加请求',
       addSubCollection: '添加子集合',
       edit: '编辑',
-      delete: '删除'
+      delete: '删除',
+      copy: '复制'
     },
     // 其他
     newRequest: '新建请求',

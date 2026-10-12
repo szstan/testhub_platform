@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     v-model="dialogVisible"
-    title="从设备截图创建元素"
+    :title="$t('appAutomation.element.capture.title')"
     width="94vw"
     top="4vh"
     @close="handleClose"
@@ -44,7 +44,7 @@
           </div>
         </div>
         <div v-else class="empty-state">
-          <el-empty description="请先从设备截图" />
+          <el-empty :description="$t('appAutomation.element.capture.emptyState')" />
         </div>
       </div>
 
@@ -52,82 +52,82 @@
       <div class="capture-right">
         <el-form :model="formData" ref="formRef" label-width="110px" size="small">
           <!-- 设备选择和截图 -->
-          <el-form-item label="选择设备">
-            <el-select v-model="selectedDevice" placeholder="选择设备" style="width: 100%" :loading="devicesLoading">
-              <el-option 
-                v-for="device in devices" 
-                :key="device.id" 
-                :label="device.device_id" 
-                :value="device.id" 
+          <el-form-item :label="$t('appAutomation.element.capture.selectDevice')">
+            <el-select v-model="selectedDevice" :placeholder="$t('appAutomation.element.capture.selectDevicePlaceholder')" style="width: 100%" :loading="devicesLoading">
+              <el-option
+                v-for="device in devices"
+                :key="device.id"
+                :label="device.device_id"
+                :value="device.id"
               />
             </el-select>
           </el-form-item>
 
           <el-form-item>
             <el-button type="primary" :loading="capturing" :disabled="!selectedDevice" @click="captureScreen">
-              从设备截图
+              {{ $t('appAutomation.element.capture.captureFromDevice') }}
             </el-button>
           </el-form-item>
 
           <!-- Region和Pos值（根据元素类型显示） -->
-          <el-form-item label="Region 值" v-if="formData.element_type === 'region'">
-            <el-input v-model="regionValue" readonly placeholder="在截图上拖拽框选区域" />
+          <el-form-item :label="$t('appAutomation.element.capture.regionValue')" v-if="formData.element_type === 'region'">
+            <el-input v-model="regionValue" readonly :placeholder="$t('appAutomation.element.capture.dragToSelectTip')" />
           </el-form-item>
 
-          <el-form-item label="Pos 值" v-if="formData.element_type === 'pos'">
-            <el-input v-model="posValue" readonly placeholder="在截图上单击选择坐标" />
+          <el-form-item :label="$t('appAutomation.element.capture.posValue')" v-if="formData.element_type === 'pos'">
+            <el-input v-model="posValue" readonly :placeholder="$t('appAutomation.element.capture.clickToSelectTip')" />
           </el-form-item>
 
-          <el-divider content-position="left">元素信息</el-divider>
+          <el-divider content-position="left">{{ $t('appAutomation.element.capture.elementInfo') }}</el-divider>
 
           <!-- 元素名称 -->
-          <el-form-item label="元素名称" required>
-            <el-input v-model="formData.name" placeholder="如：登录按钮" />
+          <el-form-item :label="$t('appAutomation.element.capture.elementName')" required>
+            <el-input v-model="formData.name" :placeholder="$t('appAutomation.element.capture.elementNamePlaceholder')" />
           </el-form-item>
 
           <!-- 所属项目 -->
-          <el-form-item label="所属项目">
-            <el-select v-model="formData.project" placeholder="请选择项目" clearable filterable style="width: 100%">
+          <el-form-item :label="$t('appAutomation.element.capture.project')">
+            <el-select v-model="formData.project" :placeholder="$t('appAutomation.common.selectProject')" clearable filterable style="width: 100%">
               <el-option v-for="p in projectList" :key="p.id" :label="p.name" :value="p.id" />
             </el-select>
           </el-form-item>
 
           <!-- 元素类型 -->
-          <el-form-item label="元素类型" required>
+          <el-form-item :label="$t('appAutomation.element.capture.elementType')" required>
             <el-radio-group v-model="formData.element_type">
-              <el-radio value="image">图片元素</el-radio>
-              <el-radio value="pos">坐标元素</el-radio>
-              <el-radio value="region">区域元素</el-radio>
+              <el-radio value="image">{{ $t('appAutomation.element.capture.imageElement') }}</el-radio>
+              <el-radio value="pos">{{ $t('appAutomation.element.capture.posElement') }}</el-radio>
+              <el-radio value="region">{{ $t('appAutomation.element.capture.regionElement') }}</el-radio>
             </el-radio-group>
           </el-form-item>
 
           <!-- 标签 -->
-          <el-form-item label="标签">
-            <el-select v-model="formData.tags" multiple filterable allow-create placeholder="输入标签后回车" style="width: 100%">
-              <el-option label="登录" value="登录" />
+          <el-form-item :label="$t('appAutomation.element.capture.tags')">
+            <el-select v-model="formData.tags" multiple filterable allow-create :placeholder="$t('appAutomation.element.capture.tagsPlaceholder')" style="width: 100%">
+              <el-option :label="$t('appAutomation.element.capture.exampleTag')" value="登录" />
             </el-select>
             <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-              💡 提示：输入标签回车创建
+              💡 {{ $t('appAutomation.element.capture.tagsTip') }}
             </div>
           </el-form-item>
 
           <!-- 图片类型特有配置 -->
           <template v-if="formData.element_type === 'image'">
-            <el-divider content-position="left">图片配置</el-divider>
+            <el-divider content-position="left">{{ $t('appAutomation.element.capture.imageConfig') }}</el-divider>
 
             <!-- 图片分类 -->
-            <el-form-item label="图片分类" required>
+            <el-form-item :label="$t('appAutomation.element.capture.imageCategory')" required>
               <div style="display: flex; gap: 10px;">
                 <el-select
                   v-model="formData.image_category"
-                  placeholder="选择分类"
+                  :placeholder="$t('appAutomation.element.capture.selectCategory')"
                   filterable
                   style="flex: 1;"
                 >
-                  <el-option 
-                    v-for="cat in imageCategories" 
-                    :key="cat.name || cat" 
-                    :label="cat.name || cat" 
+                  <el-option
+                    v-for="cat in imageCategories"
+                    :key="cat.name || cat"
+                    :label="cat.name || cat"
                     :value="cat.name || cat"
                   >
                     <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
@@ -139,33 +139,33 @@
                         link
                         :icon="Delete"
                         @click.stop="handleDeleteCategory(cat.name || cat)"
-                        title="删除分类"
+                        :title="$t('appAutomation.element.capture.deleteCategory')"
                         style="padding: 0; margin-left: 8px;"
                       />
                     </div>
                   </el-option>
                 </el-select>
-                <el-button 
-                  type="primary" 
-                  :icon="Plus" 
+                <el-button
+                  type="primary"
+                  :icon="Plus"
                   @click="showCreateCategoryDialog"
-                  title="创建新分类"
+                  :title="$t('appAutomation.element.capture.createCategoryTitle')"
                 />
               </div>
               <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-                💡 提示：图片将保存到 Template/&lt;分类&gt;/ 目录下
+                💡 {{ $t('appAutomation.element.capture.imageCategoryTip') }}
               </div>
             </el-form-item>
 
-            <el-form-item label="模板文件名" required>
-              <el-input v-model="templateFileName" placeholder="如：login_btn.png" />
+            <el-form-item :label="$t('appAutomation.element.capture.templateFileName')" required>
+              <el-input v-model="templateFileName" :placeholder="$t('appAutomation.element.capture.templateFileNamePlaceholder')" />
               <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-                💡 提示：建议使用有意义的英文文件名
+                💡 {{ $t('appAutomation.element.capture.templateFileNameTip') }}
               </div>
             </el-form-item>
 
             <!-- 当前保存路径 -->
-            <el-form-item label="保存路径">
+            <el-form-item :label="$t('appAutomation.element.capture.savePath')">
               <el-input :value="imageSavePath" readonly>
                 <template #prepend>
                   <el-icon><FolderOpened /></el-icon>
@@ -173,21 +173,21 @@
               </el-input>
             </el-form-item>
 
-            <el-form-item label="匹配阈值">
+            <el-form-item :label="$t('appAutomation.element.capture.threshold')">
               <el-slider v-model="formData.config.image_threshold" :min="0.5" :max="1.0" :step="0.05" show-input />
               <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-                💡 提示：值越高匹配越严格，默认 0.7
+                💡 {{ $t('appAutomation.element.capture.thresholdTip') }}
               </div>
             </el-form-item>
 
-            <el-form-item label="颜色模式">
+            <el-form-item :label="$t('appAutomation.element.capture.colorMode')">
               <el-switch
                 v-model="formData.config.rgb"
-                active-text="RGB彩色"
-                inactive-text="灰度"
+                :active-text="$t('appAutomation.element.capture.rgbColor')"
+                :inactive-text="$t('appAutomation.element.capture.grayscale')"
               />
               <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-                💡 提示：RGB彩色适用于彩色界面，灰度适用于单色或对颜色不敏感的场景
+                💡 {{ $t('appAutomation.element.capture.colorModeTip') }}
               </div>
             </el-form-item>
           </template>
@@ -196,34 +196,34 @@
     </div>
 
     <template #footer>
-      <el-button @click="handleClose">取消</el-button>
+      <el-button @click="handleClose">{{ $t('appAutomation.common.cancel') }}</el-button>
       <el-button type="primary" @click="handleSubmit" :loading="submitting" :disabled="!canSave">
-        保存元素
+        {{ $t('appAutomation.element.capture.saveElement') }}
       </el-button>
     </template>
   </el-dialog>
-  
+
   <!-- 创建图片分类对话框 -->
   <el-dialog
     v-model="createCategoryVisible"
-    title="创建图片分类"
+    :title="$t('appAutomation.element.capture.createCategoryDialog')"
     width="400px"
   >
     <el-form>
-      <el-form-item label="分类名称">
-        <el-input 
-          v-model="newCategoryName" 
-          placeholder="如：button, icon, menu"
+      <el-form-item :label="$t('appAutomation.element.capture.categoryName')">
+        <el-input
+          v-model="newCategoryName"
+          :placeholder="$t('appAutomation.element.capture.categoryNamePlaceholder')"
           @keyup.enter="handleCreateCategory"
         />
         <div style="color: #909399; font-size: 12px; margin-top: 5px;">
-          💡 只能包含字母、数字、下划线和中划线
+          💡 {{ $t('appAutomation.element.capture.categoryNameTip') }}
         </div>
       </el-form-item>
     </el-form>
     <template #footer>
-      <el-button @click="createCategoryVisible = false">取消</el-button>
-      <el-button type="primary" @click="handleCreateCategory" :loading="creatingCategory">创建</el-button>
+      <el-button @click="createCategoryVisible = false">{{ $t('appAutomation.common.cancel') }}</el-button>
+      <el-button type="primary" @click="handleCreateCategory" :loading="creatingCategory">{{ $t('appAutomation.element.capture.create') }}</el-button>
     </template>
   </el-dialog>
 </template>
@@ -247,6 +247,9 @@ import {
   createAppImageCategory,
   deleteAppImageCategory
 } from '@/api/app-automation'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -376,7 +379,7 @@ const loadDevices = async () => {
     devices.value = data.results || []
   } catch (error) {
     console.error('加载设备列表失败:', error)
-    ElMessage.error('加载设备列表失败')
+    ElMessage.error(t('appAutomation.element.capture.messages.loadDevicesFailed'))
   } finally {
     devicesLoading.value = false
   }
@@ -385,26 +388,26 @@ const loadDevices = async () => {
 // 从设备截图
 const captureScreen = async () => {
   if (!selectedDevice.value) {
-    ElMessage.warning('请先选择设备')
+    ElMessage.warning(t('appAutomation.element.capture.messages.selectDeviceRequired'))
     return
   }
 
   capturing.value = true
   try {
     const { data } = await captureDeviceScreenshot(selectedDevice.value)
-    
+
     if (data.success && data.data) {
       capturedImage.value = data.data.content || data.content || ''
       if (!capturedImage.value) {
-        throw new Error('截图数据为空')
+        throw new Error(t('appAutomation.element.capture.messages.emptyScreenshot'))
       }
-      ElMessage.success('截图成功')
+      ElMessage.success(t('appAutomation.element.capture.messages.captureSuccess'))
     } else {
-      ElMessage.error(data.message || '截图失败')
+      ElMessage.error(data.message || t('appAutomation.element.capture.messages.captureFailed'))
     }
   } catch (error) {
     console.error('截图失败:', error)
-    ElMessage.error('截图失败')
+    ElMessage.error(t('appAutomation.element.capture.messages.captureFailed'))
   } finally {
     capturing.value = false
   }
@@ -565,31 +568,31 @@ const clearSelection = () => {
 // 提交表单
 const handleSubmit = async () => {
   if (!formData.name) {
-    ElMessage.warning('请输入元素名称')
+    ElMessage.warning(t('appAutomation.element.capture.messages.elementNameRequired'))
     return
   }
 
   if (formData.element_type === 'image') {
     if (!capturedImage.value) {
-      ElMessage.warning('请先截图')
+      ElMessage.warning(t('appAutomation.element.capture.messages.captureRequired'))
       return
     }
     if (!templateFileName.value) {
-      ElMessage.warning('请输入模板文件名')
+      ElMessage.warning(t('appAutomation.element.capture.messages.templateFileNameRequired'))
       return
     }
     if (!formData.image_category) {
-      ElMessage.warning('请选择图片分类')
+      ElMessage.warning(t('appAutomation.element.capture.messages.imageCategoryRequired'))
       return
     }
   } else if (formData.element_type === 'pos') {
     if (!formData.config.x || !formData.config.y) {
-      ElMessage.warning('请设置坐标')
+      ElMessage.warning(t('appAutomation.element.capture.messages.coordinateRequired'))
       return
     }
   } else if (formData.element_type === 'region') {
     if (!formData.config.x1 || !formData.config.y1 || !formData.config.x2 || !formData.config.y2) {
-      ElMessage.warning('请框选区域')
+      ElMessage.warning(t('appAutomation.element.capture.messages.regionRequired'))
       return
     }
   }
@@ -636,42 +639,42 @@ const handleSubmit = async () => {
       }
 
       if (!imageBlob) {
-        ElMessage.error('图片处理失败')
+        ElMessage.error(t('appAutomation.element.capture.messages.imageProcessFailed'))
         submitting.value = false
         return
       }
 
       const file = new File([imageBlob], templateFileName.value, { type: 'image/png' })
-      
+
       try {
         const { data: uploadData } = await uploadAppElementImage(
           file,
           formData.image_category || 'common'
         )
-        
+
         if (uploadData.success) {
           formData.config.image_path = uploadData.data.image_path
           formData.config.file_hash = uploadData.data.file_hash
-          ElMessage.success(`图片已上传: ${uploadData.data.image_path}`)
+          ElMessage.success(t('appAutomation.element.capture.messages.imageUploaded', { path: uploadData.data.image_path }))
         } else {
           // 显示详细的错误信息
-          let errorMessage = uploadData.message || '上传图片失败'
-          
+          let errorMessage = uploadData.message || t('appAutomation.element.capture.messages.uploadImageFailed')
+
           if (uploadData.detail) {
             errorMessage += `\n\n${uploadData.detail}`
           }
           if (uploadData.suggestion) {
-            errorMessage += `\n\n💡 建议：${uploadData.suggestion}`
+            errorMessage += `\n\n💡 ${t('appAutomation.element.capture.messages.suggestion')}：${uploadData.suggestion}`
           }
-          
+
           if (uploadData.data?.existing_element) {
             const existing = uploadData.data.existing_element
-            errorMessage += `\n\n已存在元素：${existing.name} (ID: ${existing.id})`
+            errorMessage += `\n\n${t('appAutomation.element.capture.messages.existingElement', { name: existing.name, id: existing.id })}`
             if (existing.image_path) {
-              errorMessage += `\n文件路径：${existing.image_path}`
+              errorMessage += `\n${t('appAutomation.element.capture.messages.filePath')}${existing.image_path}`
             }
           }
-          
+
           ElMessage.error({
             message: errorMessage,
             duration: 8000,
@@ -682,15 +685,15 @@ const handleSubmit = async () => {
         }
       } catch (uploadError) {
         console.error('图片上传异常:', uploadError)
-        let errorMessage = '图片上传失败'
-        
+        let errorMessage = t('appAutomation.element.capture.messages.uploadImageFailed')
+
         if (uploadError.response?.data) {
           const data = uploadError.response.data
           errorMessage = data.message || data.detail || errorMessage
         } else if (uploadError.message) {
           errorMessage += `: ${uploadError.message}`
         }
-        
+
         ElMessage.error({
           message: errorMessage,
           duration: 5000,
@@ -715,15 +718,15 @@ const handleSubmit = async () => {
 
     // DRF ModelViewSet 的 create 方法直接返回序列化数据，没有 success 字段
     await createAppElement(submitData)
-    ElMessage.success('创建成功')
+    ElMessage.success(t('appAutomation.common.createSuccess'))
     emit('success')
     handleClose()
   } catch (error) {
     console.error('创建失败:', error)
-    
+
     // 显示详细的错误信息
-    let errorMessage = '创建失败'
-    
+    let errorMessage = t('appAutomation.element.capture.messages.createFailed')
+
     if (error.response?.data) {
       const data = error.response.data
       if (data.message) {
@@ -733,18 +736,18 @@ const handleSubmit = async () => {
       } else if (data.config) {
         const configErrors = data.config
         if (Array.isArray(configErrors)) {
-          errorMessage = `配置错误: ${configErrors.join(', ')}`
+          errorMessage = t('appAutomation.element.capture.messages.configError', { detail: configErrors.join(', ') })
         } else if (typeof configErrors === 'object') {
-          errorMessage = `配置错误: ${JSON.stringify(configErrors)}`
+          errorMessage = t('appAutomation.element.capture.messages.configError', { detail: JSON.stringify(configErrors) })
         }
       }
-      errorMessage += ` (状态码: ${error.response.status})`
+      errorMessage += t('appAutomation.element.capture.messages.statusCode', { code: error.response.status })
     } else if (error.request) {
-      errorMessage = '网络错误: 无法连接到服务器，请检查网络连接'
+      errorMessage = t('appAutomation.element.capture.messages.networkError')
     } else if (error.message) {
-      errorMessage = `错误: ${error.message}`
+      errorMessage = t('appAutomation.element.capture.messages.errorWithMessage', { message: error.message })
     }
-    
+
     ElMessage.error({
       message: errorMessage,
       duration: 8000,
@@ -816,16 +819,16 @@ const showCreateCategoryDialog = () => {
 // 创建新分类
 const handleCreateCategory = async () => {
   if (!newCategoryName.value.trim()) {
-    ElMessage.warning('请输入分类名称')
+    ElMessage.warning(t('appAutomation.element.capture.messages.categoryNameRequired'))
     return
   }
-  
+
   try {
     creatingCategory.value = true
     const { data } = await createAppImageCategory(newCategoryName.value.trim())
-    
+
     if (data.success) {
-      ElMessage.success('创建成功')
+      ElMessage.success(t('appAutomation.common.createSuccess'))
       // 刷新分类列表
       await loadImageCategories()
       // 自动选中新创建的分类
@@ -833,11 +836,11 @@ const handleCreateCategory = async () => {
       // 关闭对话框
       createCategoryVisible.value = false
     } else {
-      ElMessage.error(data.message || '创建失败')
+      ElMessage.error(data.message || t('appAutomation.element.capture.messages.createFailed'))
     }
   } catch (error) {
     console.error('创建分类失败:', error)
-    ElMessage.error('创建失败')
+    ElMessage.error(t('appAutomation.element.capture.messages.createFailed'))
   } finally {
     creatingCategory.value = false
   }
@@ -847,19 +850,19 @@ const handleCreateCategory = async () => {
 const handleDeleteCategory = async (categoryName) => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除分类 "${categoryName}" 吗？只能删除空目录。`,
-      '删除确认',
+      t('appAutomation.element.capture.messages.deleteCategoryConfirm', { name: categoryName }),
+      t('appAutomation.common.confirmDelete'),
       {
-        confirmButtonText: '删除',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.delete'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning',
       }
     )
-    
+
     const { data } = await deleteAppImageCategory(categoryName)
-    
+
     if (data.success) {
-      ElMessage.success('删除成功')
+      ElMessage.success(t('appAutomation.common.deleteSuccess'))
       // 刷新分类列表
       await loadImageCategories()
       // 如果当前选中的分类被删除，切换到 common
@@ -867,12 +870,12 @@ const handleDeleteCategory = async (categoryName) => {
         formData.image_category = 'common'
       }
     } else {
-      ElMessage.error(data.message || '删除失败')
+      ElMessage.error(data.message || t('appAutomation.common.deleteFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
       console.error('删除分类失败:', error)
-      ElMessage.error('删除失败')
+      ElMessage.error(t('appAutomation.common.deleteFailed'))
     }
   }
 }
