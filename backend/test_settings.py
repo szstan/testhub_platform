@@ -18,7 +18,7 @@ MIGRATION_MODULES = DisableMigrations()
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+        'NAME': '/tmp/testhub_sync.sqlite3',
     }
 }
 
