@@ -95,7 +95,18 @@
 <script setup>
 import { ref, reactive, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
-import * as echarts from 'echarts'
+import * as echarts from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GraphicComponent, GridComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+
+echarts.use([
+  LineChart,
+  GraphicComponent,
+  GridComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
 import { Delete, Plus, TrendCharts } from '@element-plus/icons-vue'
 import { computeLoadProfilePoints, computeAxisBounds } from './loadProfile.js'
 

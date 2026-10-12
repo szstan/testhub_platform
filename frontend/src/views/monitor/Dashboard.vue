@@ -115,7 +115,18 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import * as echarts from 'echarts'
+import * as echarts from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GraphicComponent, GridComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+
+echarts.use([
+  LineChart,
+  GraphicComponent,
+  GridComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
 import {
   Odometer, Refresh, CircleCheck, CircleClose, Warning, DataAnalysis, Bell
 } from '@element-plus/icons-vue'

@@ -46,4 +46,4 @@ CACHES = {
     }
 }
 
-MEDIA_ROOT = BASE_DIR / 'test_media'
+MEDIA_ROOT = Path('/tmp/testhub_sync_media')
