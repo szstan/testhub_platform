@@ -1,6 +1,5 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
-import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -37,8 +36,6 @@ async function init() {
   app.use(router)
   app.use(i18n)
 
-  // Element Plus 语言由 App.vue 的 el-config-provider 动态配置
-  app.use(ElementPlus)
 
   app.mount('#app')
 }

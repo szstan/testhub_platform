@@ -1,5 +1,7 @@
 # 忽略虚拟环境及项目产生的临时文件
 .venv/
+venv/
+venv-prod/
 .idea/
 .claude/
 .vscode/

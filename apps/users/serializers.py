@@ -45,6 +45,9 @@ class LoginSerializer(serializers.Serializer):
         if username and password:
             user = authenticate(username=username, password=password)
             if not user:
+                inactive_user = User.objects.filter(username=username, is_active=False).first()
+                if inactive_user and inactive_user.check_password(password):
+                    raise serializers.ValidationError('用户已被禁用')
                 raise serializers.ValidationError('用户名或密码错误')
             if not user.is_active:
                 raise serializers.ValidationError('用户已被禁用')

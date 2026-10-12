@@ -4,6 +4,8 @@
 后端域名/IP：`172.13.6.230`  
 前端部署：独立部署在 `/opt/testhub_platform/frontend/dist`
 
+> 当前共享主机的 TestHub 发布边界：Daphne 使用 `8002`，前端 Nginx 容器使用 `8003`；既有 `80/8001` 服务不属于 TestHub 发布流程，不得停止或重配置。前端构建、Compose、健康检查和代理配置以 [frontend/README.Docker.md](../../frontend/README.Docker.md) 为准。当前 systemd 服务保持 `active` 但 `disabled`，不要在发布脚本中自动 `enable`。
+
 ---
 
 ## 1) 创建用户与目录
@@ -35,13 +37,35 @@ sudo chown -R testhub:testhub /opt/testhub_platform
 
 ## 2) Python 依赖与虚拟环境
 
+Web/Daphne 环境只安装仓库中的核心生产依赖清单 `requirements-prod.txt`。不要在生产 Web venv 执行 `pip install -r requirements.txt`，该文件包含面向开发或自动化场景的额外依赖。
+
 ```bash
 cd /opt/testhub_platform
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-pip install daphne channels channels-redis
+python3 -m venv venv-prod
+source venv-prod/bin/activate
+pip install -r requirements-prod.txt
 ```
+
+### 可选自动化依赖边界
+
+以下清单只用于独立自动化执行环境，当前 Web/Daphne 服务不安装、不启动这些能力：
+
+- `requirements-ui-optional.txt`：Playwright、Selenium、webdriver-manager、browser-use。
+- `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy。
+- `requirements-report-optional.txt`：Allure pytest 插件及运行时。
+
+需要执行对应 UI、APP/OCR 或 Allure 任务时，创建独立环境并只安装所需清单；不要复用 `venv-prod`：
+
+```bash
+cd /opt/testhub_platform
+python3 -m venv venv-automation
+source venv-automation/bin/activate
+pip install -r requirements-ui-optional.txt
+# 按任务需要再选择 requirements-app-optional.txt 或 requirements-report-optional.txt
+```
+
+API 测试管理页面和核心 API 服务随 Web 环境发布；需要浏览器、设备、OCR 或 Allure 的执行 worker 属于独立部署边界。未安装可选依赖时，Web 登录、项目/用例/套件管理、执行记录、报告统计和评审 API 仍应可用。
+
 
 ---
 
@@ -227,8 +251,7 @@ fi
 source "$VENV_DIR/bin/activate"
 
 echo "=== 2) 安装依赖 ==="
-pip install -r "$APP_DIR/requirements.txt"
-pip install daphne channels channels-redis
+pip install -r "$APP_DIR/requirements-prod.txt"
 
 echo "=== 3) 写入 .env ==="
 cat > "$APP_DIR/.env" <<EOF

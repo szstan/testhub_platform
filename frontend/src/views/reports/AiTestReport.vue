@@ -147,7 +147,20 @@ import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Collection, Document, CircleCheck, Warning, Download } from '@element-plus/icons-vue'
-import * as echarts from 'echarts'
+import * as echarts from 'echarts/core'
+import { BarChart, LineChart, PieChart } from 'echarts/charts'
+import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+
+echarts.use([
+  BarChart,
+  LineChart,
+  PieChart,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
 import api from '@/utils/api'
 
 const { t } = useI18n()
@@ -268,7 +281,7 @@ const loadChartsData = async () => {
         type: 'line',
         stack: 'Total',
         smooth: true,
-        areaStyle: { opacity: 0.3, color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: '#409EFF' }, { offset: 1, color: '#fff' }]) },
+        areaStyle: { opacity: 0.3, color: 'rgba(64, 158, 255, 0.25)' },
         itemStyle: { color: '#409EFF' },
         data: counts
       }]
