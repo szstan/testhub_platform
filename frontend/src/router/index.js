@@ -533,7 +533,7 @@ const routes = [
                 component: () => import('@/views/app-automation/reports/ReportList.vue')
             }
         ]
-    }
+    },
     {
         path: '/monitor',
         component: Layout,
