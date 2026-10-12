@@ -54,6 +54,9 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           const normalizedId = id.replaceAll('\\', '/')
+          if (normalizedId.includes('/src/locales/')) {
+            return 'locales'
+          }
           if (normalizedId.includes('/node_modules/zrender/')) {
             return 'vendor-echarts-renderers'
           }
