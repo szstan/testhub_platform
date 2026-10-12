@@ -134,9 +134,9 @@ class TestJmeterEngine(unittest.TestCase):
 
     def test_non_c_env_redirects_tmp_and_java_tmpdir(self):
         """non_c_env 必须把 TMP/TEMP/TMPDIR 与 java.io.tmpdir 指向非 C 目录。"""
-        from apps.perf_testing.engines.workspace import non_c_env
+        from apps.perf_testing.engines.workspace import non_c_env, workspace_root
 
-        target = 'F:\\TJC-Work\\PythonProject\\testhub_platform\\perf_workspace\\demo'
+        target = os.path.join(workspace_root(), 'test_non_c_env_{}'.format(os.getpid()))
         try:
             env = non_c_env(target)
             self.assertEqual(env['TMP'], target)

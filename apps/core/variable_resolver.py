@@ -10,9 +10,9 @@ from datetime import datetime, timedelta
 
 # 设置标准输出编码为 UTF-8，避免 Windows 系统上的编码问题
 if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
 
 # 导入数据工厂的工具类
 from apps.data_factory.tools.random_tools import RandomTools
