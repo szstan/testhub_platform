@@ -622,7 +622,7 @@ const routes = [
             {
                 path: 'comparison-reports',
                 name: 'PerfComparisonReports',
-                component: () => import('@/views/performance-testing/Comparison.vue')Reports
+                component: () => import('@/views/performance-testing/ComparisonReports.vue')
             },
             {
                 path: 'scheduled',
