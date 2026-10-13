@@ -27,6 +27,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
+from drf_spectacular.utils import extend_schema_view, extend_schema
 
 from .confirm import ConfirmError, approve_pending, reject_pending
 from .models import McpCallLog, McpPendingConfirm
@@ -106,6 +107,7 @@ def _serialize_tool(meta, input_schema, stats, detail=False):
     return data
 
 
+@extend_schema_view(get=extend_schema(operation_id='mcp_tool_catalog'))
 class McpToolCatalogView(APIView):
     """工具目录：汇总（总数/分类计数/近 7 天调用量）+ 全量工具列表。"""
     permission_classes = [IsAuthenticated]
@@ -121,6 +123,7 @@ class McpToolCatalogView(APIView):
         return Response({'summary': summary, 'tools': items})
 
 
+@extend_schema_view(get=extend_schema(operation_id='mcp_tool_detail'))
 class McpToolDetailView(APIView):
     """单工具详情：目录字段 + 完整描述。"""
     permission_classes = [IsAuthenticated]

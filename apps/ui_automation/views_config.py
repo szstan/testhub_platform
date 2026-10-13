@@ -1,5 +1,6 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 import shutil
@@ -371,6 +372,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+    @extend_schema(operation_id='ui_ai_model_test_connection_preview')
     @action(detail=False, methods=['post'], url_path='test_connection')
     def test_connection_preview(self, request):
         """
@@ -447,6 +449,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @extend_schema(operation_id='ui_ai_model_test_connection')
     @action(detail=True, methods=['post'])
     def test_connection(self, request, pk=None):
         """
@@ -527,3 +530,27 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 {'error': f'连接异常: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+@extend_schema_view(
+    list=extend_schema(operation_id='ui_config_ai_mode_list'),
+    retrieve=extend_schema(operation_id='ui_config_ai_mode_retrieve'),
+    test_connection_preview=extend_schema(operation_id='ui_config_ai_mode_test_connection_preview'),
+    test_connection=extend_schema(operation_id='ui_config_ai_mode_test_connection'),
+)
+class AIConfigModeAliasViewSet(AIIntelligentModeConfigViewSet):
+    """Configuration-center route with stable OpenAPI operation identifiers."""
+
+    pass
+
+
+@extend_schema_view(
+    list=extend_schema(operation_id='ui_ai_models_list'),
+    retrieve=extend_schema(operation_id='ui_ai_models_retrieve'),
+    test_connection_preview=extend_schema(operation_id='ui_ai_models_test_connection_preview'),
+    test_connection=extend_schema(operation_id='ui_ai_models_test_connection'),
+)
+class AIModelConfigAliasViewSet(AIIntelligentModeConfigViewSet):
+    """Second route alias with distinct OpenAPI operation identifiers."""
+
+    pass

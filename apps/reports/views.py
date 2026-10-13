@@ -1,6 +1,7 @@
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q, Sum, F, Avg
 from django.db.models.functions import TruncDate, Length
 from django.utils import timezone
@@ -17,6 +18,10 @@ def get_accessible_projects(user):
         Q(owner=user) | Q(members=user)
     ).distinct()
 
+@extend_schema_view(
+    list=extend_schema(operation_id='test_reports_list'),
+    retrieve=extend_schema(operation_id='test_reports_retrieve'),
+)
 class TestReportViewSet(viewsets.ModelViewSet):
     """测试报告视图集"""
     queryset = TestReport.objects.all()

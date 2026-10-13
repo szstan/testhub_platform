@@ -12,6 +12,7 @@ class PerfTestingConfig(AppConfig):
         仅在主进程执行一次（避免 runserver 自动重载时重复执行），
         且失败不得影响服务启动。
         """
+        import apps.perf_testing.checks  # noqa: F401
         import os
         import sys
 

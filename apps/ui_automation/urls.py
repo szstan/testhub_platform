@@ -23,7 +23,11 @@ from .views import (
     OperationRecordViewSet,
     UiDashboardViewSet
 )
-from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
+from .views_config import (
+    EnvironmentConfigViewSet,
+    AIConfigModeAliasViewSet,
+    AIModelConfigAliasViewSet,
+)
 
 router = DefaultRouter()
 router.register(r'dashboard', UiDashboardViewSet, basename='dashboard')
@@ -50,8 +54,8 @@ router.register(r'operation-records', OperationRecordViewSet)
 
 # Configuration Center APIs
 router.register(r'config/environment', EnvironmentConfigViewSet, basename='config-environment')
-router.register(r'config/ai-mode', AIIntelligentModeConfigViewSet, basename='config-ai-mode')
-router.register(r'ai-models', AIIntelligentModeConfigViewSet, basename='ai-models')
+router.register(r'config/ai-mode', AIConfigModeAliasViewSet, basename='config-ai-mode')
+router.register(r'ai-models', AIModelConfigAliasViewSet, basename='ai-models')
 
 urlpatterns = [
     path('', include(router.urls)),

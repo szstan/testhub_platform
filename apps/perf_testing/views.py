@@ -20,6 +20,7 @@ from django.db import transaction
 from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -1415,6 +1416,7 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
             'created_at': report.created_at,
         }
 
+    @extend_schema(operation_id='perf_comparison_reports_list')
     def list(self, request):
         qs = PerfComparisonReport.objects.select_related('created_by')
         project_id = request.query_params.get('project')
@@ -1424,6 +1426,7 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         rows = qs.order_by('-created_at')[:200]
         return Response({'items': [self._brief(r) for r in rows], 'total': total})
 
+    @extend_schema(operation_id='perf_comparison_reports_retrieve')
     def retrieve(self, request, pk=None):
         report = PerfComparisonReport.objects.filter(id=pk).select_related('created_by').first()
         if not report:
@@ -1433,12 +1436,14 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         data['ai_analysis'] = report.ai_analysis
         return Response(data)
 
+    @extend_schema(operation_id='perf_comparison_reports_destroy')
     def destroy(self, request, pk=None):
         deleted, _ = PerfComparisonReport.objects.filter(id=pk).delete()
         if not deleted:
             return Response({'error': '对照报告不存在'}, status=status.HTTP_404_NOT_FOUND)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @extend_schema(operation_id='perf_comparison_reports_create')
     def create(self, request):
         raw_ids = request.data.get('execution_ids') or []
         ids = list(dict.fromkeys(int(i) for i in raw_ids

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend-performance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-prod.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements-prod.txt
+
+      - name: Run backend performance checks
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+          DB_HOST: 127.0.0.1
+          DB_NAME: testhub_ci
+          DB_USER: root
+          DB_PASSWORD: ''
+          PERF_MAX_CONCURRENCY: '1000'
+          PERF_MAX_TARGET_RPS: '5000'
+          PERF_MAX_DURATION: '7200'
+          PERF_MAX_CONCURRENT_EXECUTIONS: '2'
+          PERF_RETENTION_DAYS: '90'
+          PERF_ARTIFACT_RETENTION_DAYS: '30'
+          PERF_LOAD_GEN_CPU_WARN: '85'
+        run: python scripts/ci_perf_checks.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
