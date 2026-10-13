@@ -30,6 +30,10 @@ apps/*/migrations/*
 # 使用否定模式，例外地跟踪 __init__.py 文件
 !apps/*/migrations/__init__.py
 
+# 质量智能 app 的迁移必须可追踪
+!apps/quality_intelligence/migrations/
+!apps/quality_intelligence/migrations/*.py
+
 # 忽略 allure-static 下的所有文件（运行时生成）
 media/allure-static/*
 !media/allure-static/.gitkeep

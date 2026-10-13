@@ -356,6 +356,30 @@
             </el-menu-item>
           </template>
 
+          <!-- 质量洞察模块菜单 -->
+          <template v-else-if="currentModule === 'quality-intelligence' && qualityIntelligenceEnabled">
+            <el-menu-item index="/quality-intelligence/dashboard">
+              <el-icon><DataAnalysis /></el-icon>
+              <span>{{ $t('menu.qualityDashboard') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/quality-intelligence/runs">
+              <el-icon><VideoPlay /></el-icon>
+              <span>{{ $t('menu.qualityRuns') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/quality-intelligence/failures">
+              <el-icon><Warning /></el-icon>
+              <span>{{ $t('menu.qualityFailures') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/quality-intelligence/profiles">
+              <el-icon><Aim /></el-icon>
+              <span>{{ $t('menu.qualityProfiles') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/quality-intelligence/baselines">
+              <el-icon><TrendCharts /></el-icon>
+              <span>{{ $t('menu.qualityBaselines') }}</span>
+            </el-menu-item>
+          </template>
+
           <!-- MCP 管理端模块菜单 -->
           <template v-else-if="currentModule === 'mcp'">
             <el-menu-item index="/mcp/console">
@@ -444,7 +468,7 @@ import {
   Monitor, Folder, Document, Flag, Check, Collection, VideoPlay,
   DataAnalysis, ChatDotRound, DocumentCopy, Link, MagicStick,
   Odometer, Timer, Setting, AlarmClock, Bell, Aim, Edit, Cpu, ArrowDown, Cellphone, Connection, FolderOpened, Tickets, Plus,
-  SetUp, TrendCharts
+  SetUp, TrendCharts, Warning
 } from '@element-plus/icons-vue'
 import logoSvg from '@/assets/images/logo.svg'
 import logoHomePng from '@/assets/images/logo_home.png'
@@ -453,7 +477,8 @@ const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 const appStore = useAppStore()
-const { t } = useI18n()
+const QUALITY_INTELLIGENCE_ENABLED = String(import.meta.env.VITE_QUALITY_INTELLIGENCE_ENABLED || '').toLowerCase() === 'true'
+const qualityIntelligenceEnabled = QUALITY_INTELLIGENCE_ENABLED
 
 const logoImage = computed(() => {
 		return route.path === '/home' ? logoSvg : logoHomePng
@@ -482,6 +507,7 @@ const currentModule = computed(() => {
   if (route.path.startsWith('/llm-judge')) return 'llm-judge'
   if (route.path.startsWith('/monitor')) return 'monitor'
   if (route.path.startsWith('/performance-testing')) return 'performance-testing'
+  if (route.path.startsWith('/quality-intelligence')) return 'quality-intelligence'
   if (route.path.startsWith('/mcp')) return 'mcp'
   if (route.path.startsWith('/docs-center')) return 'docs'
   return ''
@@ -499,6 +525,7 @@ const moduleName = computed(() => {
     'llm-judge': t('modules.llmJudge'),
     'monitor': t('modules.monitor'),
     'performance-testing': t('modules.performanceTesting'),
+    'quality-intelligence': t('modules.qualityIntelligence'),
     'mcp': t('modules.mcp'),
     'docs': t('modules.docs')
   }
@@ -585,6 +612,12 @@ const breadcrumbTitle = computed(() => {
     '/llm-judge/history': t('menu.judgeHistory'),
     '/llm-judge/rubrics': t('menu.judgeRubrics'),
     '/llm-judge/knowledge': t('menu.judgeKnowledgeBase'),
+
+    '/quality-intelligence/dashboard': t('menu.qualityDashboard'),
+    '/quality-intelligence/runs': t('menu.qualityRuns'),
+    '/quality-intelligence/failures': t('menu.qualityFailures'),
+    '/quality-intelligence/profiles': t('menu.qualityProfiles'),
+    '/quality-intelligence/baselines': t('menu.qualityBaselines'),
 
     '/profile': t('nav.profile')
   }

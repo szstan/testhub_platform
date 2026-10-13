@@ -35,6 +35,7 @@ urlpatterns = [
     path('api/data-factory/', include('apps.data_factory.urls')),
     path('api/llm-judge/', include('apps.llm_judge.urls')),
     path('api/perf-testing/', include('apps.perf_testing.urls')),  # 性能测试
+    path('api/quality-intelligence/', include('apps.quality_intelligence.urls')),
     path('api/monitor/', include('apps.monitor.urls')),
     # MCP 管理端 REST（日志/待确认）；协议端点 /api/mcp/ 在 ASGI 层分流
     path('api/mcp/', include('apps.mcp.urls')),

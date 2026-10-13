@@ -10,6 +10,8 @@ const Layout = () => import('@/layout/index.vue')
 const ProjectList = () => import('@/views/projects/ProjectList.vue')
 const Home = () => import('@/views/Home.vue')
 
+const QUALITY_INTELLIGENCE_ENABLED = String(import.meta.env.VITE_QUALITY_INTELLIGENCE_ENABLED || '').toLowerCase() === 'true'
+
 /** @type {import('vue-router').RouteRecordRaw[]} */
 const routes = [
     {
@@ -632,6 +634,47 @@ const routes = [
         ]
     },
     {
+        path: '/quality-intelligence',
+        component: Layout,
+        meta: { requiresAuth: true, featureFlag: 'quality-intelligence' },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'QualityDashboard',
+                component: () => import('@/views/quality-intelligence/QualityDashboard.vue')
+            },
+            {
+                path: 'runs',
+                name: 'QualityRuns',
+                component: () => import('@/views/quality-intelligence/QualityRunList.vue')
+            },
+            {
+                path: 'runs/:id',
+                name: 'QualityRunDetail',
+                component: () => import('@/views/quality-intelligence/QualityRunDetail.vue')
+            },
+            {
+                path: 'failures',
+                name: 'QualityFailures',
+                component: () => import('@/views/quality-intelligence/FailureExplorer.vue')
+            },
+            {
+                path: 'profiles',
+                name: 'QualityProfiles',
+                component: () => import('@/views/quality-intelligence/ProfileQuarantine.vue')
+            },
+            {
+                path: 'baselines',
+                name: 'QualityBaselines',
+                component: () => import('@/views/quality-intelligence/BaselineView.vue')
+            }
+        ]
+    },
+    {
         path: '/mcp',
         component: Layout,
         meta: { requiresAuth: true },
@@ -707,7 +750,9 @@ router.beforeEach(async (to, _from, next) => {
         }
     }
 
-    if (to.meta.requiresAuth && !userStore.isAuthenticated) {
+    if (to.meta.featureFlag === 'quality-intelligence' && !QUALITY_INTELLIGENCE_ENABLED) {
+        next('/home')
+    } else if (to.meta.requiresAuth && !userStore.isAuthenticated) {
         next('/login')
     } else if (to.meta.requiresGuest && userStore.isAuthenticated) {
         next('/home')

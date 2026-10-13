@@ -53,6 +53,11 @@ REGISTRATION_STATS_VISIBLE_USERNAMES = config(
 APP_USE_HTTPS = config('APP_USE_HTTPS', default=not DEBUG, cast=bool)
 TRUST_PROXY_SSL_HEADER = config('TRUST_PROXY_SSL_HEADER', default=APP_USE_HTTPS, cast=bool)
 
+QUALITY_INTELLIGENCE_ENABLED = config(
+    'QUALITY_INTELLIGENCE_ENABLED', default=False, cast=bool
+)
+QUALITY_AI_ENABLED = config('QUALITY_AI_ENABLED', default=False, cast=bool)
+
 # MCP Server 总开关（协议端点 /api/mcp/，需 Daphne/ASGI 部署）
 MCP_ENABLED = config('MCP_ENABLED', default=True, cast=bool)
 # MCP 危险操作人工审批模式：开启后 confirm_* 不再直接执行，
@@ -89,6 +94,7 @@ LOCAL_APPS = [
     'apps.monitor',  # 监控中心
     'apps.perf_testing.apps.PerfTestingConfig',  # 性能测试
     'apps.mcp.apps.McpConfig',  # MCP Server（外部 Agent 驱动）
+    'apps.quality_intelligence.apps.QualityIntelligenceConfig',
 ]
 
 if ANALYTICS_ENABLED or REGISTRATION_STATS_ENABLED:

@@ -16,6 +16,7 @@ export default {
     llmJudge: '智能评分器',
     monitor: '监控中心',
     performanceTesting: '性能测试',
+    qualityIntelligence: '质量洞察',
     mcp: 'MCP 管理端',
     docs: '文档中心'
   },
@@ -99,6 +100,13 @@ export default {
     perfComparison: '对比分析',
     perfComparisonReports: '对照报告',
     perfScheduled: '定时压测',
+
+    // 质量洞察
+    qualityDashboard: '质量看板',
+    qualityRuns: '质量运行',
+    qualityFailures: '失败探索',
+    qualityProfiles: '测试画像与隔离',
+    qualityBaselines: '质量基线',
 
     // MCP
     mcpConsole: 'MCP 控制台',

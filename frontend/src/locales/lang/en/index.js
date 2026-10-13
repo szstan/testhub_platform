@@ -21,6 +21,7 @@ import monitorModule from './monitor.js'
 import performanceTestingModule from './performance-testing.js'
 import mcpModule from './mcp.js'
 import docsModule from './docs.js'
+import qualityIntelligence from './quality-intelligence.js'
 
 export default {
   // 模块化导出
@@ -93,6 +94,9 @@ export default {
 
   // Docs Center
   docs: docsModule.docs,
+
+  // Quality Intelligence module
+  qualityIntelligence,
 
   // Element Plus 语言包
   ...elementEn

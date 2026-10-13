@@ -16,6 +16,7 @@ export default {
     llmJudge: 'Smart Judge',
     monitor: 'Monitor Center',
     performanceTesting: 'Performance Testing',
+    qualityIntelligence: 'Quality Intelligence',
     mcp: 'MCP Console',
     docs: 'Docs Center'
   },
@@ -99,6 +100,13 @@ export default {
     perfComparison: 'Comparison',
     perfComparisonReports: 'Comparison Reports',
     perfScheduled: 'Scheduled',
+
+    // Quality Intelligence
+    qualityDashboard: 'Quality Dashboard',
+    qualityRuns: 'Quality Runs',
+    qualityFailures: 'Failure Explorer',
+    qualityProfiles: 'Test Profiles',
+    qualityBaselines: 'Quality Baselines',
 
     // MCP
     mcpConsole: 'MCP Console',
