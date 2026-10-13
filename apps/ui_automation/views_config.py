@@ -1,5 +1,6 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -533,10 +534,22 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(operation_id='ui_config_ai_mode_list'),
-    retrieve=extend_schema(operation_id='ui_config_ai_mode_retrieve'),
-    test_connection_preview=extend_schema(operation_id='ui_config_ai_mode_test_connection_preview'),
-    test_connection=extend_schema(operation_id='ui_config_ai_mode_test_connection'),
+    list=extend_schema(operation_id='ui_config_ai_mode_list', responses=OpenApiTypes.OBJECT),
+    retrieve=extend_schema(operation_id='ui_config_ai_mode_retrieve', responses=OpenApiTypes.OBJECT),
+    create=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    partial_update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    destroy=extend_schema(responses=OpenApiTypes.OBJECT),
+    test_connection_preview=extend_schema(
+        operation_id='ui_config_ai_mode_test_connection_preview',
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    ),
+    test_connection=extend_schema(
+        operation_id='ui_config_ai_mode_test_connection',
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    ),
 )
 class AIConfigModeAliasViewSet(AIIntelligentModeConfigViewSet):
     """Configuration-center route with stable OpenAPI operation identifiers."""
@@ -545,10 +558,22 @@ class AIConfigModeAliasViewSet(AIIntelligentModeConfigViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(operation_id='ui_ai_models_list'),
-    retrieve=extend_schema(operation_id='ui_ai_models_retrieve'),
-    test_connection_preview=extend_schema(operation_id='ui_ai_models_test_connection_preview'),
-    test_connection=extend_schema(operation_id='ui_ai_models_test_connection'),
+    list=extend_schema(operation_id='ui_ai_models_list', responses=OpenApiTypes.OBJECT),
+    retrieve=extend_schema(operation_id='ui_ai_models_retrieve', responses=OpenApiTypes.OBJECT),
+    create=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    partial_update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    destroy=extend_schema(responses=OpenApiTypes.OBJECT),
+    test_connection_preview=extend_schema(
+        operation_id='ui_ai_models_test_connection_preview',
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    ),
+    test_connection=extend_schema(
+        operation_id='ui_ai_models_test_connection',
+        request=OpenApiTypes.OBJECT,
+        responses=OpenApiTypes.OBJECT,
+    ),
 )
 class AIModelConfigAliasViewSet(AIIntelligentModeConfigViewSet):
     """Second route alias with distinct OpenAPI operation identifiers."""

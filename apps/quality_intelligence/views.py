@@ -15,6 +15,8 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 
 from apps.quality_intelligence.adapters.base import (
     AdapterError,
@@ -512,6 +514,7 @@ class ComparisonViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewse
         return apply_quality_filters(queryset, self.request.query_params)
 
 
+@extend_schema(responses=OpenApiTypes.OBJECT)
 class SummaryView(APIView):
     permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
 
@@ -546,6 +549,7 @@ class SummaryView(APIView):
         )
 
 
+@extend_schema(responses=OpenApiTypes.OBJECT)
 class TrendView(APIView):
     permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
 

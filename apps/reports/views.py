@@ -1,12 +1,14 @@
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q, Sum, F, Avg
 from django.db.models.functions import TruncDate, Length
 from django.utils import timezone
 from datetime import timedelta, datetime
 from .models import TestReport, ReportTemplate
+from .serializers import TestReportSerializer
 from apps.executions.models import TestPlan, TestRun, TestRunCase
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
@@ -19,13 +21,21 @@ def get_accessible_projects(user):
     ).distinct()
 
 @extend_schema_view(
-    list=extend_schema(operation_id='test_reports_list'),
-    retrieve=extend_schema(operation_id='test_reports_retrieve'),
+    list=extend_schema(operation_id='test_reports_list', responses=OpenApiTypes.OBJECT),
+    retrieve=extend_schema(operation_id='test_reports_retrieve', responses=OpenApiTypes.OBJECT),
+    create=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    partial_update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    destroy=extend_schema(responses=OpenApiTypes.OBJECT),
 )
 class TestReportViewSet(viewsets.ModelViewSet):
     """测试报告视图集"""
     queryset = TestReport.objects.all()
+    serializer_class = TestReportSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save(generated_by=self.request.user)
 
     def get_queryset(self):
         return self.queryset.filter(

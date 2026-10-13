@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from rest_framework import serializers
+from drf_spectacular.utils import extend_schema_field
 
 from apps.quality_intelligence.models import (
     QualityBaseline,
@@ -52,7 +53,8 @@ def _safe_text(value: Any, max_length: int = 4096) -> str:
 class PublicModelSerializer(serializers.ModelSerializer):
     classification_mode = serializers.SerializerMethodField()
 
-    def get_classification_mode(self, obj):
+    @extend_schema_field(serializers.CharField())
+    def get_classification_mode(self, obj) -> str:
         return "deterministic"
 
     def to_representation(self, instance):
