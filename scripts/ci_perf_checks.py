@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKS = [
     [sys.executable, "manage.py", "check"],
     [sys.executable, "manage.py", "makemigrations", "--check", "--dry-run"],
+    [sys.executable, "scripts/ci_schema_check.py"],
     [
         sys.executable,
         "-m",
