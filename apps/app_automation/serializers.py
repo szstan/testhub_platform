@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from typing import Optional
+
 from rest_framework import serializers
 from django.utils import timezone
 from .models import (
@@ -33,7 +35,7 @@ class AppProjectSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
-    def get_owner_name(self, obj):
+    def get_owner_name(self, obj) -> Optional[str]:
         return obj.owner.username if obj.owner else None
 
     def get_member_count(self, obj):
@@ -83,7 +85,7 @@ class AppDeviceSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_locked_by_name(self, obj):
+    def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None
 
 
@@ -98,10 +100,10 @@ class AppElementSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'usage_count', 'last_used_at')
     
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
     
-    def get_preview_url(self, obj):
+    def get_preview_url(self, obj) -> Optional[str]:
         """获取图片预览 URL"""
         if obj.element_type == 'image' and obj.config:
             image_path = obj.config.get('image_path')
@@ -163,7 +165,7 @@ class AppPackageSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -177,7 +179,7 @@ class AppTestCaseSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -223,7 +225,7 @@ class AppComponentPackageSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -278,7 +280,7 @@ class AppTestSuiteSerializer(serializers.ModelSerializer):
             'passed_count', 'failed_count', 'last_run_at',
         )
 
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
     def get_test_case_count(self, obj):
@@ -359,12 +361,12 @@ class AppScheduledTaskSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
 
-    def get_device_name(self, obj):
+    def get_device_name(self, obj) -> str:
         if obj.device:
             return obj.device.name or obj.device.device_id
         return ''
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         return obj.get_notification_type_display() if obj.notification_type else '-'
 
     def validate(self, attrs):
@@ -426,19 +428,19 @@ class AppNotificationLogSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'sent_at']
 
-    def get_recipient_names(self, obj):
+    def get_recipient_names(self, obj) -> str:
         return obj.get_recipient_names()
 
-    def get_retry_status(self, obj):
+    def get_retry_status(self, obj) -> str:
         return obj.get_retry_status()
 
-    def get_task_type_display(self, obj):
+    def get_task_type_display(self, obj) -> str:
         if obj.task_type:
             choices = dict(AppScheduledTask.TASK_TYPE_CHOICES)
             return choices.get(obj.task_type, obj.task_type)
         return '未记录'
 
-    def get_actual_notification_type_display(self, obj):
+    def get_actual_notification_type_display(self, obj) -> str:
         if obj.webhook_bot_info:
             bot_type = obj.webhook_bot_info.get('type', '') or obj.webhook_bot_info.get('bot_type', '')
             type_map = {'wechat': '企微机器人', 'feishu': '飞书机器人', 'dingtalk': '钉钉机器人'}
