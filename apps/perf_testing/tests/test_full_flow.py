@@ -15,7 +15,7 @@ import os
 import shutil
 import tempfile
 import threading
-import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -576,7 +576,7 @@ class ComparisonBaselineTest(PerfTestBase):
 
     def _finished_execution(self, summary, status='COMPLETED'):
         ex = PerfExecution.objects.create(
-            scenario=self.scenario, project=self.project, execution_no='C' + str(time.time_ns()),
+            scenario=self.scenario, project=self.project, execution_no='C' + uuid.uuid4().hex,
             status=status, trigger_type='MANUAL', summary=summary)
         PerfMetricSample.objects.create(
             execution=ex, ts_offset=1, active_users=5, tps=summary.get('tps', 0),
