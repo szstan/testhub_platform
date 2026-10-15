@@ -54,21 +54,28 @@ class MonitorTargetSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = (
             'status', 'last_check_at', 'consecutive_failures',
-            'next_check_at', 'created_at', 'updated_at',
+            'next_check_at', 'created_at', 'updated_at', 'created_by',
         )
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        # retrieve（详情/编辑）返回明文，便于查看与修改；list/看板掩码敏感键
-        view = self.context.get('view')
-        action = getattr(view, 'action', None)
-        if action == 'retrieve':
-            data['check_config'] = instance.get_decrypted_check_config()
-        else:
-            data['check_config'] = mask_secrets(data.get('check_config') or {})
+        data['check_config'] = mask_secrets(data.get('check_config') or {})
         return data
 
-    def update(self, instance, validated_data):
+    def _validate_channels(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not getattr(user, 'is_staff', False):
+            if any(channel.created_by_id != user.id for channel in value):
+                raise serializers.ValidationError('不能绑定其他用户的通知渠道')
+        return value
+
+    def validate_primary_channels(self, value):
+        return self._validate_channels(value)
+
+    def validate_secondary_channels(self, value):
+        return self._validate_channels(value)
+
         incoming = validated_data.get('check_config')
         if incoming is not None:
             validated_data['check_config'] = merge_config(
@@ -81,17 +88,11 @@ class NotificationChannelSerializer(serializers.ModelSerializer):
     class Meta:
         model = NotificationChannel
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at')
+        read_only_fields = ('created_at', 'updated_at', 'created_by')
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        # retrieve（编辑回显）返回明文配置；list 等掩码敏感键
-        view = self.context.get('view')
-        action = getattr(view, 'action', None)
-        if action == 'retrieve':
-            data['config'] = instance.get_decrypted_config()
-        else:
-            data['config'] = mask_secrets(data.get('config') or {})
+        data['config'] = mask_secrets(data.get('config') or {})
         return data
 
     def update(self, instance, validated_data):

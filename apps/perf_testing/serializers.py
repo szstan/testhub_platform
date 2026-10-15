@@ -12,6 +12,7 @@ from rest_framework import serializers
 from .models import (PerfBaseline, PerfDataFile, PerfExecution, PerfMetricSample,
                      PerfProject, PerfRequestStat, PerfScenario, PerfScenarioStep,
                      PerfScheduledTask)
+from .access import can_access_project
 from .services.variables import mask_secrets, merge_secret_values
 
 User = get_user_model()
@@ -250,6 +251,13 @@ class PerfScenarioStepSerializer(serializers.ModelSerializer):
                   'method', 'url', 'headers', 'params', 'body_type', 'body', 'files',
                   'extractors', 'assertions', 'think_time', 'weight', 'is_setup']
 
+    def validate_scenario(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not can_access_project(user, value.project):
+            raise serializers.ValidationError('无权使用该性能项目')
+        return value
+
     def validate_name(self, value):
         value = (value or '').strip()
         if not value:
@@ -393,6 +401,13 @@ class PerfScenarioSerializer(serializers.ModelSerializer):
 
     def get_has_active_execution(self, obj):
         return obj.has_active_execution()
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not can_access_project(user, value):
+            raise serializers.ValidationError('无权使用该性能项目')
+        return value
 
     def validate_load_config(self, value):
         return validate_load_config(value or {})
@@ -558,6 +573,21 @@ class PerfBaselineSerializer(serializers.ModelSerializer):
                   'metrics', 'tolerance', 'note', 'set_by_name', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
 
+    def validate_scenario(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not can_access_project(user, value.project):
+            raise serializers.ValidationError('无权使用该性能项目')
+        return value
+
+    def validate_execution(self, value):
+        if value is not None:
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            if user is not None and not can_access_project(user, value.project):
+                raise serializers.ValidationError('无权使用该性能执行记录')
+        return value
+
     def get_set_by_name(self, obj):
         return obj.set_by.username if obj.set_by else ''
 
@@ -588,6 +618,13 @@ class PerfDataFileSerializer(serializers.ModelSerializer):
         # columns/row_count/meta 一律由 ViewSet 解析后写入，不接受前端伪造
         read_only_fields = ['columns', 'row_count', 'meta', 'created_at']
 
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not can_access_project(user, value):
+            raise serializers.ValidationError('无权使用该性能项目')
+        return value
+
     def get_uploaded_by_name(self, obj):
         return obj.uploaded_by.username if obj.uploaded_by else ''
 
@@ -615,6 +652,11 @@ class PerfScheduledTaskSerializer(serializers.ModelSerializer):
                             'fail_count', 'last_error', 'created_at', 'updated_at']
 
     def validate(self, attrs):
+        scenario = attrs.get('scenario') or getattr(self.instance, 'scenario', None)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if scenario is not None and user is not None and not can_access_project(user, scenario.project):
+            raise serializers.ValidationError({'scenario': '无权使用该性能项目'})
         trigger = attrs.get('trigger_type') or getattr(self.instance, 'trigger_type', 'CRON')
         if trigger == 'CRON':
             expr = attrs.get('cron_expression') or getattr(self.instance, 'cron_expression', '')

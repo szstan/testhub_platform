@@ -20,10 +20,10 @@ class PerfExecutionConsumer(AsyncJsonWebsocketConsumer):
 
     async def connect(self):
         try:
+            self.execution_id = self.scope['url_route']['kwargs']['execution_id']
             if not await self._authenticate():
                 await self.close()
                 return
-            self.execution_id = self.scope['url_route']['kwargs']['execution_id']
             self.group_name = f'perf_execution_{self.execution_id}'
             await self.channel_layer.group_add(self.group_name, self.channel_name)
             await self.accept()
@@ -41,14 +41,28 @@ class PerfExecutionConsumer(AsyncJsonWebsocketConsumer):
         """
         user = self.scope.get('user')
         if user is not None and getattr(user, 'is_authenticated', False):
-            return True
+            return await self._user_can_access_execution(user)
         token = self._extract_token()
         if not token:
             return False
         execution = await self._lookup_by_token(token)
-        return execution is not None
+        return execution is not None and str(execution.id) == str(self.execution_id)
+
+    async def _user_can_access_execution(self, user):
+        from channels.db import database_sync_to_async
+
+        @database_sync_to_async
+        def _check():
+            from .access import can_access_project
+            from .models import PerfExecution
+            execution = PerfExecution.objects.select_related('project').filter(
+                id=self.execution_id).first()
+            return bool(execution and can_access_project(user, execution.project))
+
+        return await _check()
 
     def _extract_token(self):
+
         qs = self.scope.get('query_string', b'')
         if isinstance(qs, bytes):
             qs = qs.decode('utf-8')

@@ -23,6 +23,7 @@ from .serializers import (
     AlertEventSerializer,
 )
 from .utils.notifiers import send_via_channel
+from .access import is_monitor_admin, scope_owned, scope_target_related
 from .utils.scheduler_heartbeat import get_scheduler_status
 
 
@@ -40,7 +41,7 @@ class MonitorTargetViewSet(viewsets.ModelViewSet):
     pagination_class = MonitorPagination
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = scope_owned(super().get_queryset(), self.request.user)
         # 性能优化：消除 N+1 查询（created_by FK + channels M2M）
         qs = qs.select_related('created_by').prefetch_related(
             'primary_channels', 'secondary_channels')
@@ -70,7 +71,9 @@ class MonitorTargetViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def debug_test(self, request):
-        """调试测试：用前端提交的探测配置（未保存）模拟执行一次探测，返回实时结果。"""
+        """管理员调试一次探测；普通用户只能探测已保存且归属自己的目标。"""
+        if not is_monitor_admin(request.user):
+            return Response({'detail': '仅管理员可以执行未保存目标探测'}, status=403)
         from .utils.probes import run_probe, ProbeResult
 
         probe_type = request.data.get('type', 'HTTP')
@@ -108,6 +111,9 @@ class NotificationChannelViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = MonitorPagination
 
+    def get_queryset(self):
+        return scope_owned(super().get_queryset(), self.request.user)
+
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
@@ -130,7 +136,7 @@ class MonitorCheckLogViewSet(viewsets.ModelViewSet):
     pagination_class = MonitorPagination
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = scope_target_related(super().get_queryset(), self.request.user)
         target = self.request.query_params.get('target')
         status = self.request.query_params.get('status')
         start = self.request.query_params.get('start_time')
@@ -155,7 +161,7 @@ class AlertEventViewSet(viewsets.ModelViewSet):
     pagination_class = MonitorPagination
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = scope_target_related(super().get_queryset(), self.request.user)
         status = self.request.query_params.get('status')
         target = self.request.query_params.get('target')
         start = self.request.query_params.get('start_time')
@@ -212,7 +218,7 @@ class DashboardViewSet(viewsets.ViewSet):
         now = timezone.now()
 
         # 1) 概览：基于目标当前 status（冗余字段，看板直读）
-        targets = MonitorTarget.objects
+        targets = scope_owned(MonitorTarget.objects, request.user)
         total = targets.count()
         by_status = dict(
             targets.values_list('status').order_by('status')
@@ -225,9 +231,11 @@ class DashboardViewSet(viewsets.ViewSet):
         disabled = total - enabled
         checked = up + down
         availability = round(up / checked * 100, 1) if checked else None
-        active_alerts = AlertEvent.objects.filter(
-            status__in=[AlertStatus.FIRING, AlertStatus.ACKED]
-        ).count()
+        active_alerts = scope_target_related(
+            AlertEvent.objects.filter(
+                status__in=[AlertStatus.FIRING, AlertStatus.ACKED]
+            ), request.user).count()
+
 
         # 2) 按类型分布
         by_type_rows = (
@@ -249,8 +257,8 @@ class DashboardViewSet(viewsets.ViewSet):
         #    槽起点按本地时区对齐整点（分桶与标签同基准），ts 输出带 +08:00 偏移，避免前端显示 UTC 小时。
         start = timezone.localtime(now).replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
         buckets = {}
-        for log in (MonitorCheckLog.objects
-                    .filter(checked_at__gte=start)
+        for log in (scope_target_related(
+            MonitorCheckLog.objects.filter(checked_at__gte=start), request.user)
                     .only('status', 'checked_at')):
             idx = int((log.checked_at - start).total_seconds() // 3600)
             if 0 <= idx < 24:
@@ -272,8 +280,8 @@ class DashboardViewSet(viewsets.ViewSet):
 
         # 4) 最近失败（最新 10 条 DOWN 记录，带目标信息）
         recent_failures = []
-        for log in (MonitorCheckLog.objects
-                    .filter(status=TargetStatus.DOWN)
+        for log in (scope_target_related(
+            MonitorCheckLog.objects.filter(status=TargetStatus.DOWN), request.user)
                     .select_related('target')
                     .order_by('-checked_at')[:10]):
             t = log.target

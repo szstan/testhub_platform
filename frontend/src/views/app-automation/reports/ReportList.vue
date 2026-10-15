@@ -476,7 +476,7 @@ async function viewSuiteAllureReport(suite) {
     const records = res.data.data || res.data.results || res.data || []
     const withReport = records.find(r => r.report_path)
     if (withReport) {
-      window.open(`/api/app-automation/executions/${withReport.id}/report/`, '_blank')
+      window.open(`/api/app-automation/executions/${withReport.id}/report/${encodeURIComponent(withReport.report_access_token)}/`, '_blank')
     } else {
       ElMessage.warning(t('appAutomation.report.messages.noAllureReport'))
     }
@@ -569,8 +569,8 @@ function viewCaseDetail(row) {
 }
 
 function viewAllureReport(row) {
-  if (!row.report_path) return ElMessage.warning(t('appAutomation.report.messages.noAllureReportForRecord'))
-  window.open(`/api/app-automation/executions/${row.id}/report/`, '_blank')
+  if (!row.report_path || !row.report_access_token) return ElMessage.warning(t('appAutomation.report.messages.noAllureReportForRecord'))
+  window.open(`/api/app-automation/executions/${row.id}/report/${encodeURIComponent(row.report_access_token)}/`, '_blank')
 }
 
 async function deleteCaseReport(row) {

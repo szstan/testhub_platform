@@ -9,6 +9,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 import logging
 
 from ..models import AppTestSuite, AppTestSuiteCase, AppTestCase, AppDevice, AppTestExecution
+from ..access import scope_project, scope_test_cases
 from .test_case_views import AppPagination
 from ..serializers import (
     AppTestSuiteSerializer,
@@ -37,6 +38,9 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
             return AppTestSuiteUpdateSerializer
         return AppTestSuiteSerializer
 
+    def get_queryset(self):
+        return scope_project(super().get_queryset(), self.request.user, 'project')
+
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
@@ -60,6 +64,11 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
         if not test_case_id:
             return Response({'success': False, 'message': '请提供 test_case_id'},
                             status=status.HTTP_400_BAD_REQUEST)
+
+        if not scope_test_cases(
+                AppTestCase.objects.filter(pk=test_case_id), request.user).exists():
+            return Response({'success': False, 'message': '无权使用该测试用例'},
+                            status=status.HTTP_403_FORBIDDEN)
 
         # 默认排在最后
         if order is None:
@@ -88,6 +97,13 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
         if not test_case_ids:
             return Response({'success': False, 'message': '请提供 test_case_ids'},
                             status=status.HTTP_400_BAD_REQUEST)
+
+        allowed_ids = set(scope_test_cases(
+            AppTestCase.objects.filter(id__in=test_case_ids), request.user
+        ).values_list('id', flat=True))
+        if any(tc_id not in allowed_ids for tc_id in test_case_ids):
+            return Response({'success': False, 'message': '包含无权使用的测试用例'},
+                            status=status.HTTP_403_FORBIDDEN)
 
         max_order = suite.suite_cases.order_by('-order').values_list('order', flat=True).first()
         current_order = (max_order or 0) + 1

@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
 
-    initial = True
+    initial = False
 
     dependencies = [
         ("projects", "0002_initial"),

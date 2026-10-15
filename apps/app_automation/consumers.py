@@ -1,5 +1,6 @@
 import logging
 
+from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 
 logger = logging.getLogger(__name__)
@@ -9,6 +10,13 @@ class AppExecutionConsumer(AsyncJsonWebsocketConsumer):
     async def connect(self):
         try:
             self.execution_id = self.scope["url_route"]["kwargs"]["execution_id"]
+            user = self.scope.get('user')
+            if user is None or not getattr(user, 'is_authenticated', False):
+                await self.close()
+                return
+            if not await self._can_access_execution(user):
+                await self.close()
+                return
             self.group_name = f"app_execution_{self.execution_id}"
             await self.channel_layer.group_add(self.group_name, self.channel_name)
             await self.accept()
@@ -16,6 +24,14 @@ class AppExecutionConsumer(AsyncJsonWebsocketConsumer):
         except Exception as e:
             logger.error(f"WebSocket 连接失败: {e}")
             await self.close()
+
+    @database_sync_to_async
+    def _can_access_execution(self, user):
+        from .access import scope_executions
+        from .models import AppTestExecution
+        return scope_executions(
+            AppTestExecution.objects.filter(id=self.execution_id), user
+        ).exists()
 
     async def disconnect(self, close_code):
         try:

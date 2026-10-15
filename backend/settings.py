@@ -51,6 +51,7 @@ REGISTRATION_STATS_VISIBLE_USERNAMES = config(
     cast=parse_csv,
 )
 APP_USE_HTTPS = config('APP_USE_HTTPS', default=not DEBUG, cast=bool)
+APP_DEVICE_ALLOWED_CIDRS = parse_csv(config('APP_DEVICE_ALLOWED_CIDRS', default=''))
 TRUST_PROXY_SSL_HEADER = config('TRUST_PROXY_SSL_HEADER', default=APP_USE_HTTPS, cast=bool)
 
 QUALITY_INTELLIGENCE_ENABLED = config(
@@ -404,9 +405,8 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='webmaster@localhost')
 # For 163 email with SSL, you might need this setting
 EMAIL_TIMEOUT = 30
 
-# 确保日志目录存在
+# Logging directories are created by SafeFileHandler when logging is configured.
 log_dir = os.path.join(BASE_DIR, 'logs')
-os.makedirs(log_dir, exist_ok=True)
 
 # Logging
 LOGGING = {
@@ -425,13 +425,13 @@ LOGGING = {
     'handlers': {
         'file': {
             'level': 'INFO',
-            'class': 'logging.FileHandler',
+            'class': 'apps.core.logging_handlers.SafeFileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'app.log'),
             'formatter': 'verbose',
         },
         'error_file': {
             'level': 'ERROR',
-            'class': 'logging.FileHandler',
+            'class': 'apps.core.logging_handlers.SafeFileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'error.log'),
             'formatter': 'verbose',
         },
@@ -569,8 +569,6 @@ JUDGE_RULE_LLM_FALLBACK = config('JUDGE_RULE_LLM_FALLBACK', default=False, cast=
 # Rubric / KB 目录（放 MEDIA_ROOT 下）
 JUDGE_RUBRIC_DIR = os.path.join(MEDIA_ROOT, 'judge_rubrics')
 JUDGE_KB_DIR = os.path.join(MEDIA_ROOT, 'judge_kb')
-os.makedirs(JUDGE_RUBRIC_DIR, exist_ok=True)
-os.makedirs(JUDGE_KB_DIR, exist_ok=True)
 
 # ==================== 性能测试模块配置 ====================
 # 容量护栏：超过阈值时预检拦截，避免压力机自身成为瓶颈导致数据失真
@@ -583,6 +581,9 @@ PERF_MAX_CONCURRENT_EXECUTIONS = config('PERF_MAX_CONCURRENT_EXECUTIONS', defaul
 PERF_FORBIDDEN_HOSTS = [
     h.strip() for h in config('PERF_FORBIDDEN_HOSTS', default='').split(',') if h.strip()
 ]
+# Internal/loopback targets are denied by default. Test environments may opt in explicitly.
+PERF_ALLOW_PRIVATE_TARGETS = config('PERF_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
+MONITOR_ALLOW_PRIVATE_TARGETS = config('MONITOR_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
 
 # 数据保留策略
 PERF_RETENTION_DAYS = config('PERF_RETENTION_DAYS', default=90, cast=int)        # 执行记录

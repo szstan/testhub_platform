@@ -26,8 +26,8 @@ class ShareTokenAuthentication(BaseAuthentication):
             raise NotAuthenticated('分享链接无效')
         if execution.share_expires_at and execution.share_expires_at < timezone.now():
             raise NotAuthenticated('分享链接已过期')
-        # 标记分享通道，供权限类识别（即使 executed_by 为空也能放行）
         request._perf_share_authed = True
+        request._perf_share_execution_id = execution.id
         user = execution.executed_by
         if user is None:
             # 无执行人时回退到匿名，权限类靠 _perf_share_authed 标志放行
@@ -37,9 +37,12 @@ class ShareTokenAuthentication(BaseAuthentication):
 
 
 class HasPerfShareTokenOrAuthenticated(BasePermission):
-    """分享令牌有效 或 已正常登录 均可访问。"""
+    """分享令牌有效且绑定当前执行，或已正常登录均可访问。"""
 
     def has_permission(self, request, view):
-        if getattr(request, 'user', None) and request.user.is_authenticated:
-            return True
-        return bool(getattr(request, '_perf_share_authed', False))
+        if getattr(request, '_perf_share_authed', False):
+            parser_context = getattr(request, 'parser_context', {}) or {}
+            resource_id = (parser_context.get('kwargs') or {}).get('pk')
+            token_execution_id = getattr(request, '_perf_share_execution_id', None)
+            return resource_id is None or str(resource_id) == str(token_execution_id)
+        return bool(getattr(request, 'user', None) and request.user.is_authenticated)

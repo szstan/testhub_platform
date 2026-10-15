@@ -40,6 +40,10 @@ router.register(r'executions', AppTestExecutionViewSet, basename='app-execution'
 
 urlpatterns = [
     path('', include(router.urls)),
+    path('executions/<int:execution_id>/report/<str:access_token>/',
+         serve_report_file, name='app-execution-report-token'),
+    path('executions/<int:execution_id>/report/<str:access_token>/<path:file_path>',
+         serve_report_file, name='app-execution-report-token-file'),
     path('executions/<int:execution_id>/report/', serve_report_file, name='app-execution-report'),
     path('executions/<int:execution_id>/report/<path:file_path>', serve_report_file, name='app-execution-report-file'),
 ]

@@ -9,6 +9,7 @@ import logging
 
 from .test_case_views import AppPagination
 from ..models import AppProject
+from ..access import is_app_admin
 from ..serializers import (
     AppProjectSerializer,
     AppProjectCreateSerializer,
@@ -42,5 +43,14 @@ class AppProjectViewSet(viewsets.ModelViewSet):
             models.Q(owner=user) | models.Q(members=user)
         ).distinct()
 
-    def perform_create(self, serializer):
-        serializer.save(owner=self.request.user)
+    def perform_update(self, serializer):
+        if not is_app_admin(self.request.user) and serializer.instance.owner_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('只有项目负责人或管理员可以修改项目')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not is_app_admin(self.request.user) and instance.owner_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('只有项目负责人或管理员可以删除项目')
+        instance.delete()

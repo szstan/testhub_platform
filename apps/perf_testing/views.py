@@ -23,7 +23,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -31,6 +31,7 @@ from rest_framework.settings import api_settings
 from rest_framework.views import APIView
 
 from .auth import HasPerfShareTokenOrAuthenticated, ShareTokenAuthentication
+from .access import accessible_projects, can_access_project, can_manage_project, scope_by_project
 
 from .engines import engine_status
 from .models import (PerfBaseline, PerfComparisonReport, PerfDataFile, PerfExecution,
@@ -146,7 +147,8 @@ class PerfProjectViewSet(viewsets.ModelViewSet):
         # 注解场景/执行计数，避免序列化器逐项目 count() 的 N+1。
         # 两个 Count 必须 distinct，否则 JOIN 会产生笛卡尔积放大。
         from django.db.models import Count
-        return super().get_queryset().annotate(
+        return accessible_projects(self.request.user).select_related('owner').prefetch_related(
+            'members').annotate(
             scenario_count_anno=Count('scenarios', distinct=True),
             execution_count_anno=Count('executions', distinct=True),
         )
@@ -156,10 +158,14 @@ class PerfProjectViewSet(viewsets.ModelViewSet):
         log_operation('CREATE', 'PROJECT', project.id, project.name, self.request.user)
 
     def perform_update(self, serializer):
+        if not can_manage_project(self.request.user, serializer.instance):
+            raise PermissionDenied('只有项目负责人或管理员可以修改项目')
         project = serializer.save()
         log_operation('UPDATE', 'PROJECT', project.id, project.name, self.request.user)
 
     def perform_destroy(self, instance):
+        if not can_manage_project(self.request.user, instance):
+            raise PermissionDenied('只有项目负责人或管理员可以删除项目')
         # 有正在跑的压测时不允许删项目，否则子进程会写一张已经不存在的表记录
         running = PerfExecution.objects.filter(
             project=instance, status__in=PerfExecution.ACTIVE_STATUSES).count()
@@ -209,7 +215,7 @@ class PerfScenarioViewSet(viewsets.ModelViewSet):
         return PerfScenarioSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = scope_by_project(super().get_queryset(), self.request.user, 'project')
         if self.action == 'list':
             # 列表需要"最近一次执行"摘要。用关联子查询注解而非逐场景查询，
             # 把 PerfScenarioListSerializer.get_last_execution 的 N+1 收敛为单条 SQL。
@@ -569,6 +575,9 @@ class PerfScenarioStepViewSet(viewsets.ModelViewSet):
     filterset_fields = ['scenario', 'enabled', 'is_setup']
     ordering_fields = ['order', 'id']
 
+    def get_queryset(self):
+        return scope_by_project(super().get_queryset(), self.request.user, 'scenario__project')
+
 
 # ====================================================================== #
 # 执行
@@ -621,7 +630,11 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
         return PerfExecutionDetailSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        if (self.action in ('report', 'download_raw')
+                and getattr(self.request, '_perf_share_authed', False)):
+            return super().get_queryset().filter(
+                pk=getattr(self.request, '_perf_share_execution_id', None))
+        qs = scope_by_project(super().get_queryset(), self.request.user, 'project')
         if self.action == 'retrieve':
             return qs.prefetch_related('request_stats')
         return qs
@@ -805,7 +818,7 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
 
     @action(detail=True, methods=['post'], url_path='share-link')
     def share_link(self, request, pk=None):
-        """生成/重置报告分享直链。expires_in_days=None 表示永不过期。"""
+        """生成/重置报告分享直链，默认 7 天且最长 30 天。"""
         execution = self.get_object()
         if execution.is_active:
             return Response({'error': '压测尚未结束，请等待执行完成后再分享报告'},
@@ -823,7 +836,10 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
             except (TypeError, ValueError):
                 return Response({'error': 'expires_in_days 必须是整数(天)'},
                                 status=status.HTTP_400_BAD_REQUEST)
-        token = execution.generate_share_token(expires_in_days)
+        try:
+            token = execution.generate_share_token(expires_in_days)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         base = request.build_absolute_uri(
             f'/api/perf-testing/executions/{execution.id}/report/')
         raw_base = request.build_absolute_uri(
@@ -877,7 +893,9 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
             return Response({'error': '一次最多对比 5 次执行'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        executions = list(PerfExecution.objects.filter(id__in=ids).select_related('scenario'))
+        executions = list(scope_by_project(
+            PerfExecution.objects.filter(id__in=ids), request.user, 'project'
+        ).select_related('scenario'))
         if len(executions) < 2:
             return Response({'error': '所选执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
         # 保持用户传入的顺序，第一条作为对比基准
@@ -890,7 +908,8 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
     def dashboard(self, request):
         """压测总览：近 30 天概况 + 当前运行中列表。"""
         since = timezone.now() - timedelta(days=30)
-        qs = PerfExecution.objects.filter(created_at__gte=since)
+        qs = scope_by_project(
+            PerfExecution.objects.filter(created_at__gte=since), request.user, 'project')
         project_id = request.query_params.get('project')
         if project_id:
             qs = qs.filter(project_id=project_id)
@@ -899,8 +918,9 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
         evaluated = finished.exclude(sla_result='NOT_EVALUATED')
         passed = evaluated.filter(sla_result='PASSED').count()
 
-        running = PerfExecution.objects.filter(
-            status__in=PerfExecution.ACTIVE_STATUSES).select_related('scenario')
+        running = scope_by_project(
+            PerfExecution.objects.filter(status__in=PerfExecution.ACTIVE_STATUSES),
+            request.user, 'project').select_related('scenario')
         if project_id:
             running = running.filter(project_id=project_id)
 
@@ -919,6 +939,8 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
     @action(detail=False, methods=['post'], url_path='reap-stale')
     def reap_stale(self, request):
         """手动触发僵尸执行回收（运维入口）。"""
+        if not request.user.is_staff:
+            raise PermissionDenied('仅管理员可以回收所有压测僵尸任务')
         count = cleanup_service.reap_stale_executions()
         return Response({'reaped': count})
 
@@ -935,6 +957,9 @@ class PerfBaselineViewSet(viewsets.ModelViewSet):
     filterset_fields = ['scenario']
     ordering_fields = ['created_at', 'updated_at']
 
+    def get_queryset(self):
+        return scope_by_project(super().get_queryset(), self.request.user, 'scenario__project')
+
     def perform_create(self, serializer):
         serializer.save(set_by=self.request.user)
 
@@ -948,7 +973,9 @@ class PerfBaselineViewSet(viewsets.ModelViewSet):
         if not execution_id:
             return Response({'error': '缺少 execution_id'},
                             status=status.HTTP_400_BAD_REQUEST)
-        execution = PerfExecution.objects.filter(id=execution_id).first()
+        execution = scope_by_project(
+            PerfExecution.objects.filter(id=execution_id), request.user, 'project'
+        ).first()
         if not execution:
             return Response({'error': '执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
         if execution.status != 'COMPLETED':
@@ -974,8 +1001,9 @@ class PerfBaselineViewSet(viewsets.ModelViewSet):
     def compare(self, request):
         """执行 vs 基线：判断是否劣化。"""
         execution_id = request.query_params.get('execution_id')
-        execution = PerfExecution.objects.filter(id=execution_id).select_related(
-            'scenario').first()
+        execution = scope_by_project(
+            PerfExecution.objects.filter(id=execution_id), request.user, 'project'
+        ).select_related('scenario').first()
         if not execution:
             return Response({'error': '执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
         baseline = PerfBaseline.objects.filter(scenario=execution.scenario).first()
@@ -1038,10 +1066,18 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
 
     MAX_SIZE = 20 * 1024 * 1024  # 20MB：再大就该走数据库参数化了
 
+    def get_queryset(self):
+        return scope_by_project(super().get_queryset(), self.request.user, 'project')
+
     def create(self, request, *args, **kwargs):
         """上传文件。file_type=CSV(默认) 走参数化数据校验，JMX 走脚本校验，
         UPLOAD 为请求体上传文件（multipart/form-data 用），不限扩展名。"""
+        project = PerfProject.objects.filter(pk=request.data.get('project')).first()
+        if not can_access_project(request.user, project):
+            raise PermissionDenied('无权使用该性能项目')
         file_type = (request.data.get('file_type') or 'CSV').upper()
+        if file_type == 'JMX' and not request.user.is_staff:
+            raise PermissionDenied('仅管理员可以上传 JMeter 脚本')
         if file_type not in dict(PerfDataFile.FILE_TYPE_CHOICES):
             return Response({'error': f'不支持的文件类型：{file_type}'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -1269,7 +1305,7 @@ class PerfScheduledTaskViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'next_run_at']
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = scope_by_project(super().get_queryset(), self.request.user, 'scenario__project')
         project_id = self.request.query_params.get('project')
         if project_id:
             qs = qs.filter(scenario__project_id=project_id)
@@ -1418,7 +1454,9 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
 
     @extend_schema(operation_id='perf_comparison_reports_list')
     def list(self, request):
-        qs = PerfComparisonReport.objects.select_related('created_by')
+        qs = scope_by_project(
+            PerfComparisonReport.objects.select_related('created_by'),
+            request.user, 'project')
         project_id = request.query_params.get('project')
         if project_id:
             qs = qs.filter(project_id=project_id)
@@ -1428,7 +1466,9 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
 
     @extend_schema(operation_id='perf_comparison_reports_retrieve')
     def retrieve(self, request, pk=None):
-        report = PerfComparisonReport.objects.filter(id=pk).select_related('created_by').first()
+        report = scope_by_project(
+            PerfComparisonReport.objects.filter(id=pk).select_related('created_by'),
+            request.user, 'project').first()
         if not report:
             return Response({'error': '对照报告不存在'}, status=status.HTTP_404_NOT_FOUND)
         data = self._brief(report)
@@ -1438,9 +1478,11 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
 
     @extend_schema(operation_id='perf_comparison_reports_destroy')
     def destroy(self, request, pk=None):
-        deleted, _ = PerfComparisonReport.objects.filter(id=pk).delete()
-        if not deleted:
+        report = scope_by_project(
+            PerfComparisonReport.objects.filter(id=pk), request.user, 'project').first()
+        if not report:
             return Response({'error': '对照报告不存在'}, status=status.HTTP_404_NOT_FOUND)
+        report.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @extend_schema(operation_id='perf_comparison_reports_create')
@@ -1456,7 +1498,10 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
 
         project_id = request.data.get('project_id')
-        executions = list(PerfExecution.objects.filter(id__in=ids).select_related('scenario'))
+        executions = list(scope_by_project(
+            PerfExecution.objects.filter(id__in=ids), request.user, 'project'
+        ).select_related('scenario'))
+
         if len(executions) < len(ids):
             return Response({'error': '所选执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
         if project_id and any(str(e.project_id) != str(project_id) for e in executions):

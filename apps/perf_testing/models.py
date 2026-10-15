@@ -295,12 +295,11 @@ class PerfExecution(models.Model):
 
     @staticmethod
     def generate_execution_no():
-        """生成人可读的执行编号：PERF + 年月日时分秒 + 3 位序号。"""
+        """生成人可读且并发安全的执行编号。"""
+        import secrets
         now = timezone.localtime()
         prefix = f"PERF{now.strftime('%Y%m%d%H%M%S')}"
-        # 同秒内可能并发，用当日计数补足序号
-        seq = PerfExecution.objects.filter(execution_no__startswith=prefix).count() + 1
-        return f'{prefix}{seq:03d}'
+        return f'{prefix}-{secrets.token_hex(4).upper()}'
 
     @property
     def is_active(self):
@@ -315,18 +314,23 @@ class PerfExecution(models.Model):
             return False
         return True
 
+    DEFAULT_SHARE_DAYS = 7
+    MAX_SHARE_DAYS = 30
+
     def generate_share_token(self, expires_in_days=None):
-        """生成/重置分享令牌。expires_in_days=None 表示永不过期。"""
+        """生成/重置分享令牌，默认 7 天且最长 30 天。"""
         import secrets
-        self.share_token = secrets.token_urlsafe(32)
-        if expires_in_days:
+        if expires_in_days is None:
+            days = self.DEFAULT_SHARE_DAYS
+        else:
             try:
                 days = int(expires_in_days)
-            except (TypeError, ValueError):
-                days = 0
-            self.share_expires_at = timezone.now() + timedelta(days=days) if days > 0 else None
-        else:
-            self.share_expires_at = None
+            except (TypeError, ValueError) as exc:
+                raise ValueError('expires_in_days 必须是整数') from exc
+            if not 1 <= days <= self.MAX_SHARE_DAYS:
+                raise ValueError(f'expires_in_days 必须在 1~{self.MAX_SHARE_DAYS} 天之间')
+        self.share_token = secrets.token_urlsafe(32)
+        self.share_expires_at = timezone.now() + timedelta(days=days)
         self.save(update_fields=['share_token', 'share_expires_at'])
         return self.share_token
 

@@ -10,15 +10,26 @@ from unittest import mock
 
 import pytest
 
-from apps.monitor.utils.probes import _login, _jsonpath_extract, _run_assertions, probe_http, probe_online
-
-
+from apps.monitor.utils.probes import (
+    _login, _jsonpath_extract, _run_assertions, probe_http, probe_online, run_probe,
+)
 def _mk_resp(payload, status_code=200):
     resp = mock.Mock()
     resp.status_code = status_code
     resp.json.return_value = payload
     resp.text = str(payload)
     return resp
+
+
+def test_run_probe_rejects_private_target_by_default(monkeypatch):
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(type='HTTP', url='http://127.0.0.1:8000', method='GET', host='', port=None)
+    monkeypatch.setattr('apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS', False)
+    result = run_probe(target, {'url': target.url})
+    assert result.ok is False
+    assert '受限地址' in result.message
+
 
 
 BASE_CFG = {

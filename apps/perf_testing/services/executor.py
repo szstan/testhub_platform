@@ -10,10 +10,12 @@
 3. 独立进程可以被 SIGTERM 精确停止，并且进程崩溃不会带走整个 web 服务。
 """
 import asyncio
+import ipaddress
 import logging
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +45,29 @@ def _close_stale_connections():
 HEARTBEAT_TIMEOUT = 90
 #: 优雅停止后等待子进程退出的秒数，超时则 SIGKILL
 STOP_GRACE_SECONDS = 15
+
+
+def _target_network_error(host):
+    """Reject private and link-local targets unless explicitly enabled for tests/ops."""
+    if getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False):
+        return None
+    try:
+        resolved = {host}
+        try:
+            resolved = {
+                item[4][0]
+                for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            }
+        except socket.gaierror:
+            return f'目标主机 {host} 无法解析，已拒绝压测'
+        for address in resolved:
+            ip = ipaddress.ip_address(address)
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return f'目标主机 {host} 解析到受限地址 {ip}，已拒绝压测'
+    except ValueError:
+        return f'目标主机 {host} 地址格式非法，已拒绝压测'
+    return None
 
 
 # ====================================================================== #
@@ -234,6 +259,9 @@ def preflight(scenario, load_config=None, script_ref=None):
     for host in hosts:
         if any(host == f or host.endswith('.' + f) for f in forbidden):
             errors.append(f'目标主机 {host} 在平台禁止压测名单中')
+        network_error = _target_network_error(host)
+        if network_error:
+            errors.append(network_error)
     self_hosts = {h.lower() for h in (settings.ALLOWED_HOSTS or []) if h not in ('*', '')}
     hit_self = hosts & self_hosts
     if hit_self:
@@ -369,6 +397,9 @@ def _preflight_script(scenario, script_ref):
         for host in hosts:
             if any(host == f or host.endswith('.' + f) for f in forbidden):
                 errors.append(f'脚本目标主机 {host} 在平台禁止压测名单中')
+            network_error = _target_network_error(host)
+            if network_error:
+                errors.append(network_error)
         self_hosts = {h.lower() for h in (settings.ALLOWED_HOSTS or []) if h not in ('*', '')}
         hit_self = set(hosts) & self_hosts
         if hit_self:
@@ -509,6 +540,15 @@ def spawn_execution(execution):
 def start_execution(scenario, user=None, trigger_type='MANUAL', skip_preflight=False,
                     scheduled_task=None, script_ref=None):
     """一步到位：校验 → 建记录 → 起进程。返回 (execution, preflight_result)。"""
+    if user is not None and getattr(user, 'is_authenticated', False):
+        from ..access import can_access_project
+        if not can_access_project(user, scenario.project):
+            return None, {
+                'passed': False,
+                'errors': ['无权执行该性能项目'],
+                'warnings': [],
+                'estimated': {},
+            }
     # script_ref 必须一起带进 preflight，否则脚本模式会被按场景规则误判为"没有步骤"
     check = preflight(scenario, script_ref=script_ref)
     if not skip_preflight and not check['passed']:

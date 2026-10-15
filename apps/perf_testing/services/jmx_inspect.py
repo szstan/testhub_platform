@@ -13,7 +13,7 @@
   由上层降级为 warning 而不是 error——否则参数化脚本会被一刀切拒绝。
 """
 import os
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 
 # 单个 .jmx 的体积上限：正常脚本几十 KB，超过 10MB 基本是误传或塞了监听器结果
 MAX_JMX_SIZE = 10 * 1024 * 1024
@@ -33,6 +33,10 @@ THREAD_GROUP_TAGS = {
 NON_LOAD_THREAD_GROUP_TAGS = {'SetupThreadGroup', 'PostThreadGroup'}
 
 PROP_TAGS = ('stringProp', 'boolProp', 'intProp', 'longProp', 'doubleProp', 'floatProp')
+UNSAFE_SCRIPT_MARKERS = (
+    'jsr223', 'beanshell', 'bsh', 'osprocess', 'javasampler',
+    'systemsampler', 'commandsampler',
+)
 
 
 def _local(tag):
@@ -90,6 +94,7 @@ def inspect_jmx_text(text):
           'sampler_count': int, 'controller_count': int,
           'hosts': [str], 'csv_datasets': [{filename, variable_names}],
           'has_dynamic_props': bool,
+          'unsafe_elements': [str],
         }
     """
     result = {
@@ -105,6 +110,7 @@ def inspect_jmx_text(text):
         'hosts': [],
         'csv_datasets': [],
         'has_dynamic_props': False,
+        'unsafe_elements': [],
     }
 
     try:
@@ -128,6 +134,9 @@ def inspect_jmx_text(text):
 
     for elem in root.iter():
         tag = _local(elem.tag)
+        lowered_tag = tag.lower()
+        if any(marker in lowered_tag for marker in UNSAFE_SCRIPT_MARKERS):
+            result['unsafe_elements'].append(tag)
 
         if tag == 'TestPlan' and not result['test_plan_name']:
             result['test_plan_name'] = elem.attrib.get('testname', '')
@@ -200,6 +209,11 @@ def inspect_jmx_text(text):
         result['error'] = '.jmx 中没有找到任何线程组（ThreadGroup），无法执行压测'
         return result
 
+    if result['unsafe_elements']:
+        names = ', '.join(sorted(set(result['unsafe_elements'])))
+        result['error'] = f'.jmx 包含不允许的脚本组件：{names}'
+        return result
+
     result['total_threads'] = None if threads_dynamic else total_threads
     result['max_duration'] = None if duration_dynamic else max_duration
     result['hosts'] = sorted(hosts)
@@ -261,4 +275,5 @@ def summarize(meta):
         'hosts': (meta.get('hosts') or [])[:20],
         'csv_datasets': (meta.get('csv_datasets') or [])[:20],
         'has_dynamic_props': bool(meta.get('has_dynamic_props')),
+        'unsafe_elements': (meta.get('unsafe_elements') or [])[:20],
     }

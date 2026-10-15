@@ -34,7 +34,7 @@ import re
 import shutil
 import subprocess
 import time
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 
 from .base import BaseEngine, EngineError
 from .jmx_builder import build_jmx

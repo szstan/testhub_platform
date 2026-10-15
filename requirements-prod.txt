@@ -31,6 +31,7 @@ croniter==6.0.0
 cryptography==41.0.7
 distro==1.9.0
 Django==4.2.7
+defusedxml==0.7.1
 django-cors-headers==4.3.1
 django-filter==23.5
 django-simpleui==2025.6.24

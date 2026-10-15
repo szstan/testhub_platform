@@ -265,5 +265,15 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(summary['sampler_count'], 0)
 
 
+class TestUnsafeScripts(unittest.TestCase):
+
+    def test_script_components_are_rejected(self):
+        script = '<JSR223Sampler testname="run-code" enabled="true"/>'
+        meta = jmx_inspect.inspect_jmx_text(wrap(thread_group() + script))
+        self.assertFalse(meta['valid'])
+        self.assertIn('JSR223Sampler', meta['unsafe_elements'])
+        self.assertIn('脚本组件', meta['error'])
+
+
 if __name__ == '__main__':
     unittest.main()

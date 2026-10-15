@@ -11,19 +11,18 @@
 target 提供 url/method/host/port（通用字段），config 为解密后的 check_config（特异性配置）。
 """
 import base64
+import ipaddress
 import re
 import socket
 import time
-import urllib3
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
+from django.conf import settings
 from jsonpath_ng import parse as jsonpath_parse
 from jsonpath_ng.exceptions import JsonPathParserError
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # SL651 默认测试报文（与原脚本一致，已验证可收发）
@@ -47,6 +46,51 @@ class ProbeResult:
 def _clip(s, n=300):
     s = str(s)
     return s if len(s) <= n else s[:n] + "..."
+
+
+
+
+def _probe_hosts(target, cfg):
+    values = [getattr(target, 'url', None), getattr(target, 'host', None)]
+    values.extend((cfg or {}).get(key) for key in ('url', 'base_url', 'login_url', 'endpoint'))
+    login = (cfg or {}).get('login') or {}
+    if isinstance(login, dict):
+        values.extend(login.get(key) for key in ('url', 'login_url', 'base_url', 'host'))
+    statistics = (cfg or {}).get('statistics') or {}
+    if isinstance(statistics, dict):
+        values.append(statistics.get('url'))
+    db = (cfg or {}).get('db') or {}
+    if isinstance(db, dict):
+        values.append(db.get('host'))
+    hosts = set()
+    for value in values:
+        if not value:
+            continue
+        text = str(value).strip()
+        parsed = urlparse(text if '://' in text else f'//{text}')
+        if parsed.hostname:
+            hosts.add(parsed.hostname)
+    return hosts
+
+
+def _destination_error(host):
+    if getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False):
+        return None
+    try:
+        addresses = {host}
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(
+                host, None, type=socket.SOCK_STREAM)}
+        except socket.gaierror:
+            return f'目标主机 {host} 无法解析，已拒绝探测'
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return f'目标主机 {host} 解析到受限地址 {ip}，已拒绝探测'
+    except ValueError:
+        return f'目标主机 {host} 地址格式非法，已拒绝探测'
+    return None
 
 
 def _safe_json_dict(resp):
@@ -349,7 +393,8 @@ def _login(login_cfg, target_method=None, target_host=None, target_port=None, ta
 
     t0 = time.monotonic()
     try:
-        resp = requests.request(method, login_url, json=body, timeout=timeout, verify=False)
+        resp = requests.request(method, login_url, json=body, timeout=timeout,
+                                verify=True, allow_redirects=False)
         ms = int((time.monotonic() - t0) * 1000)
         data = _safe_json_dict(resp)
 
@@ -471,7 +516,7 @@ def probe_http(target, cfg):
     t0 = time.monotonic()
     try:
         resp = requests.request(method, url, headers=headers, params=params,
-                                timeout=timeout, verify=False, **req_kw)
+                                timeout=timeout, verify=True, allow_redirects=False, **req_kw)
         ms = int((time.monotonic() - t0) * 1000)
         if check_type == "json_code":
             expect = int(cfg.get("expect_code", 200))
@@ -544,7 +589,7 @@ def probe_online(target, cfg):
     t0 = time.monotonic()
     try:
         resp = requests.request(method, url, json=payload, headers=headers,
-                                timeout=timeout, verify=False)
+                                timeout=timeout, verify=True, allow_redirects=False)
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code != 200:
             return ProbeResult(False, f"HTTP {resp.status_code}", ms, resp.status_code,
@@ -586,7 +631,7 @@ def probe_docker(target, cfg):
 
     t0 = time.monotonic()
     try:
-        resp = requests.get(url, timeout=timeout, verify=False)
+        resp = requests.get(url, timeout=timeout, verify=True, allow_redirects=False)
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code != 200:
             return ProbeResult(False, f"Docker API HTTP {resp.status_code}", ms, resp.status_code,
@@ -641,10 +686,15 @@ def _sl651_db_check(db):
             connect_timeout=int(db.get("connect_timeout", 10)), charset="utf8mb4",
         )
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            where = db.get("where_clause")
-            where_sql = f"WHERE {where}" if where else ""
-            time_field = db["time_field"]
-            sql = f"SELECT * FROM {db['table']} {where_sql} ORDER BY {time_field} DESC LIMIT 1"
+            if db.get('where_clause'):
+                return False, '数据库 where_clause 不支持原始 SQL 条件', {}
+            table = str(db.get('table') or '')
+            time_field = str(db.get('time_field') or '')
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table):
+                return False, '数据库表名非法', {}
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', time_field):
+                return False, '数据库时间字段非法', {}
+            sql = f'SELECT * FROM `{table}` ORDER BY `{time_field}` DESC LIMIT 1'
             cursor.execute(sql)
             row = cursor.fetchone()
         conn.close()
@@ -754,8 +804,13 @@ DISPATCH = {
 
 
 def run_probe(target, cfg):
-    """按 target.type 分发到对应探针。"""
+    """按 target.type 分发到对应探针，并在所有入口统一执行出站安全校验。"""
+    cfg = cfg or {}
+    for host in _probe_hosts(target, cfg):
+        error = _destination_error(host)
+        if error:
+            return ProbeResult(False, error)
     fn = DISPATCH.get(target.type)
     if not fn:
         return ProbeResult(False, f"未知探测类型: {target.type}")
-    return fn(target, cfg or {})
+    return fn(target, cfg)

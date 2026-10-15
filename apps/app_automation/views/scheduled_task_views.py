@@ -15,6 +15,7 @@ from ..models import (
     AppScheduledTask, AppNotificationLog,
     AppTestSuite, AppTestCase, AppDevice,
 )
+from ..access import scope_project
 from ..serializers import (
     AppScheduledTaskSerializer,
     AppNotificationLogSerializer,
@@ -35,8 +36,9 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'next_run_time', 'last_run_time']
     ordering = ['-created_at']
 
-    @action(detail=True, methods=['post'])
-    def pause(self, request, pk=None):
+    def get_queryset(self):
+        return scope_project(super().get_queryset(), self.request.user, 'project')
+
         task = self.get_object()
         task.status = 'PAUSED'
         task.save(update_fields=['status'])

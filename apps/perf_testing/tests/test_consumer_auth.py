@@ -25,6 +25,7 @@ settings.CHANNEL_LAYERS = {
 from django.contrib.auth.models import AnonymousUser  # noqa: E402
 from unittest import IsolatedAsyncioTestCase  # noqa: E402
 from unittest.mock import AsyncMock  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 from apps.perf_testing.consumers import PerfExecutionConsumer  # noqa: E402
 
@@ -63,6 +64,7 @@ class TestPerfExecutionConsumerAuth(IsolatedAsyncioTestCase):
 
     async def test_authenticated_user_is_accepted(self):
         c = _make_consumer(user=_FakeAuthUser())
+        c._user_can_access_execution = AsyncMock(return_value=True)
         c._current_state = AsyncMock(return_value={'status': 'RUNNING'})
         await c.connect()
         c.accept.assert_awaited_once()
@@ -70,7 +72,7 @@ class TestPerfExecutionConsumerAuth(IsolatedAsyncioTestCase):
         c.close.assert_not_awaited()
 
     async def test_anonymous_with_valid_share_token_is_accepted(self):
-        fake_exec = object()
+        fake_exec = SimpleNamespace(id=1)
         c = _make_consumer(user=AnonymousUser(), query_string=b'token=abc123')
         c._lookup_by_token = AsyncMock(return_value=fake_exec)
         c._current_state = AsyncMock(return_value={'status': 'RUNNING'})
