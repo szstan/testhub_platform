@@ -62,7 +62,7 @@ jobs:
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: python -m pytest -q
 
-  backend-app-automation-collection:
+  backend-app-automation:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -78,11 +78,32 @@ jobs:
             requirements-app-optional.txt
             requirements-report-optional.txt
 
+      - name: Set up Java for Allure
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install APP worker system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y adb
+
       - name: Install APP automation test dependencies
         run: |
           python -m pip install -r requirements-prod.txt
           python -m pip install -r requirements-app-optional.txt
           python -m pip install -r requirements-report-optional.txt
+
+      - name: Verify APP worker runtime dependencies
+        run: |
+          python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+          export APP_ADB_PATH="$(command -v adb)"
+          test -n "$APP_ADB_PATH"
+          test -x "$APP_ADB_PATH"
+          "$APP_ADB_PATH" version
+          test -x allure/bin/allure
+          allure/bin/allure --version
 
       - name: Run APP automation security tests
         env:
@@ -91,12 +112,19 @@ jobs:
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: python -m pytest -q apps/app_automation/tests/test_security_boundaries.py
 
-      - name: Collect APP automation tests
+      - name: Run APP worker and WebSocket focused tests
         env:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
-        run: python -m pytest --collect-only -q apps/app_automation/tests
+        run: python -m pytest -q apps/app_automation/tests/test_executor.py apps/app_automation/tests/test_websocket_events.py
+
+      - name: Collect APP UI Flow entry without a test database
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python -m pytest -p no:django -o addopts= --collect-only -q apps/app_automation/tests/test_app_flow.py -m app_ui_flow
 
   frontend:
     runs-on: ubuntu-24.04

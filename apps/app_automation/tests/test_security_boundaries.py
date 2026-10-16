@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 from django.contrib.auth import get_user_model
 from django.core.signing import TimestampSigner
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from rest_framework.test import APIClient
 
 from apps.app_automation.consumers import AppExecutionConsumer
@@ -17,7 +17,7 @@ from apps.app_automation.views.execution_views import _valid_report_token
 User = get_user_model()
 
 
-class AppAuthorizationBoundaryTests(TestCase):
+class AppAuthorizationBoundaryTests(TransactionTestCase):
     def setUp(self):
         self.owner = User.objects.create_user(username='app-owner', password='pass')
         self.outsider = User.objects.create_user(username='app-outsider', password='pass')
@@ -55,6 +55,47 @@ class AppAuthorizationBoundaryTests(TestCase):
             self.assertEqual(bad.status_code, 403)
             good.close()
             bad.close()
+
+    def test_authenticated_websocket_sends_current_snapshot(self):
+        scope = {
+            'type': 'websocket',
+            'url_route': {'kwargs': {'execution_id': str(self.execution.id)}},
+            'user': self.owner,
+        }
+        consumer = AppExecutionConsumer(scope)
+        consumer.scope = scope
+        consumer.channel_layer = AsyncMock()
+        consumer.channel_name = 'snapshot-test'
+        consumer.accept = AsyncMock()
+        consumer.send_json = AsyncMock()
+        consumer.close = AsyncMock()
+
+        asyncio.run(consumer.connect())
+
+        consumer.accept.assert_awaited_once()
+        consumer.channel_layer.group_add.assert_awaited_once_with(
+            f'app_execution_{self.execution.id}', 'snapshot-test')
+        consumer.send_json.assert_awaited_once()
+        snapshot = consumer.send_json.await_args.args[0]
+        self.assertTrue(snapshot['snapshot'])
+        self.assertEqual(snapshot['execution_id'], self.execution.id)
+        self.assertEqual(snapshot['status'], 'pending')
+        self.assertEqual(snapshot['progress'], 0)
+        self.assertEqual(snapshot['total_steps'], 0)
+
+    def test_websocket_forwards_group_updates(self):
+        consumer = AppExecutionConsumer({})
+        consumer.send_json = AsyncMock()
+        event = {
+            'type': 'execution_update',
+            'execution_id': self.execution.id,
+            'status': 'running',
+            'progress': 10,
+        }
+
+        asyncio.run(consumer.execution_update(event))
+
+        consumer.send_json.assert_awaited_once_with(event)
 
     def test_app_websocket_rejects_anonymous_clients(self):
         consumer = AppExecutionConsumer({

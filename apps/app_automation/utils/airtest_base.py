@@ -30,7 +30,13 @@ class AirtestBase:
         'CLICK_DELAY': 0.5,
     }
     
-    def __init__(self, device_id: Optional[str] = None, screenshots_dir: Optional[str] = None, username: Optional[str] = None):
+    def __init__(
+        self,
+        device_id: Optional[str] = None,
+        screenshots_dir: Optional[str] = None,
+        username: Optional[str] = None,
+        adb_path: Optional[str] = None,
+    ):
         """
         初始化AirtestBase实例
         
@@ -38,8 +44,10 @@ class AirtestBase:
             device_id: 设备ID，例如Android设备的adb device ID
             screenshots_dir: 截图目录，如果未提供则使用默认目录
             username: 执行用户名，用于截图目录分组
+            adb_path: 已验证的 ADB 可执行文件路径；未提供时读取 APP_ADB_PATH
         """
         self.device_id = device_id
+        self.adb_path = adb_path or os.environ.get('APP_ADB_PATH') or None
         self.is_connected = False
         
         # 设置截图目录: media/app-automation/screenshots/{username}/
@@ -131,10 +139,13 @@ class AirtestBase:
         def call_init_device():
             try:
                 logger.info(f"线程中开始调用 init_device()...")
+                init_kwargs = {}
+                if self.adb_path:
+                    init_kwargs['adb_path'] = self.adb_path
                 if uuid:
-                    init_device(platform=platform, uuid=uuid)
+                    init_device(platform=platform, uuid=uuid, **init_kwargs)
                 else:
-                    init_device(platform=platform)
+                    init_device(platform=platform, **init_kwargs)
                 logger.info(f"线程中 init_device() 调用完成")
                 result_queue.put(True)
             except Exception as e:

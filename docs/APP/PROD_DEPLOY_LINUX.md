@@ -51,18 +51,29 @@ pip install -r requirements-prod.txt
 以下清单只用于独立自动化执行环境，当前 Web/Daphne 服务不安装、不启动这些能力：
 
 - `requirements-ui-optional.txt`：Playwright、Selenium、webdriver-manager、browser-use。
-- `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy。
-- `requirements-report-optional.txt`：Allure pytest 插件及运行时。
+- `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy（loguru、Pillow 已由 `requirements-prod.txt` 提供）。
+- `requirements-report-optional.txt`：Allure pytest 插件及 Python 运行时；仓库内 `allure/bin/allure` 提供报告命令。
 
-需要执行对应 UI、APP/OCR 或 Allure 任务时，创建独立环境并只安装所需清单；不要复用 `venv-prod`：
+APP worker 必须使用独立的 `venv-automation`，不要复用 `venv-prod`。安装后先执行与运行时相同的依赖和可执行文件检查：
 
 ```bash
 cd /opt/testhub_platform
 python3 -m venv venv-automation
 source venv-automation/bin/activate
-pip install -r requirements-ui-optional.txt
-# 按任务需要再选择 requirements-app-optional.txt 或 requirements-report-optional.txt
+pip install -r requirements-prod.txt
+pip install -r requirements-app-optional.txt
+pip install -r requirements-report-optional.txt
+python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+export APP_ADB_PATH="$(command -v adb)"
+test -n "$APP_ADB_PATH"
+test -x "$APP_ADB_PATH"
+"$APP_ADB_PATH" version
+sudo -u testhub -- "$APP_ADB_PATH" version
+test -x /opt/testhub_platform/allure/bin/allure
+/opt/testhub_platform/allure/bin/allure --version
 ```
+
+`APP_ADB_PATH` 必须指向运行 worker 的服务用户可执行的 ADB 文件；不要只在交互式管理员 shell 中验证。缺少 Airtest、Allure Python 插件/commons、仓库内 Allure 命令或 ADB 时，`AppTestExecutor` 会在启动 pytest 前失败并记录明确原因。
 
 API 测试管理页面和核心 API 服务随 Web 环境发布；需要浏览器、设备、OCR 或 Allure 的执行 worker 属于独立部署边界。未安装可选依赖时，Web 登录、项目/用例/套件管理、执行记录、报告统计和评审 API 仍应可用。
 
@@ -83,6 +94,7 @@ DB_USER=root
 DB_PASSWORD=your_db_password
 DB_HOST=127.0.0.1
 DB_PORT=3306
+APP_ADB_PATH=/usr/bin/adb
 
 REDIS_URL=redis://:1234@127.0.0.1:6379/0
 ```
@@ -92,7 +104,7 @@ REDIS_URL=redis://:1234@127.0.0.1:6379/0
 ## 4) 收集静态文件
 
 ```bash
-source /opt/testhub_platform/venv/bin/activate
+source /opt/testhub_platform/venv-prod/bin/activate
 cd /opt/testhub_platform
 python manage.py collectstatic --noinput
 ```
@@ -115,7 +127,7 @@ WorkingDirectory=/opt/testhub_platform
 Environment="DJANGO_SETTINGS_MODULE=backend.settings"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=/opt/testhub_platform/.env
-ExecStart=/opt/testhub_platform/venv/bin/daphne -b 0.0.0.0 -p 8000 backend.asgi:application
+ExecStart=/opt/testhub_platform/venv-prod/bin/daphne -b 0.0.0.0 -p 8000 backend.asgi:application
 Restart=always
 
 [Install]
@@ -136,7 +148,7 @@ WorkingDirectory=/opt/testhub_platform
 Environment="DJANGO_SETTINGS_MODULE=backend.settings"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=/opt/testhub_platform/.env
-ExecStart=/opt/testhub_platform/venv/bin/celery -A backend worker --loglevel=info --pool=solo --concurrency=1
+ExecStart=/opt/testhub_platform/venv-automation/bin/celery -A backend worker --loglevel=info --pool=solo --concurrency=1
 Restart=always
 
 [Install]
@@ -240,20 +252,38 @@ npm run build
 set -e
 
 APP_DIR="/opt/testhub_platform"
-VENV_DIR="$APP_DIR/venv"
+VENV_DIR="$APP_DIR/venv-prod"
+AUTOMATION_VENV_DIR="$APP_DIR/venv-automation"
 NGINX_CONF="/etc/nginx/conf.d/testhub.conf"
+
+APP_ADB_PATH="${APP_ADB_PATH:-$(command -v adb || true)}"
+test -n "$APP_ADB_PATH"
+test -x "$APP_ADB_PATH"
 
 echo "=== 1) 创建虚拟环境 ==="
 if [ ! -d "$VENV_DIR" ]; then
   python3 -m venv "$VENV_DIR"
 fi
+if [ ! -d "$AUTOMATION_VENV_DIR" ]; then
+  python3 -m venv "$AUTOMATION_VENV_DIR"
+fi
 
 source "$VENV_DIR/bin/activate"
 
-echo "=== 2) 安装依赖 ==="
+echo "=== 2) 安装 Web 依赖 ==="
 pip install -r "$APP_DIR/requirements-prod.txt"
 
-echo "=== 3) 写入 .env ==="
+echo "=== 3) 安装 APP worker 依赖并执行预检 ==="
+"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-prod.txt"
+"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-app-optional.txt"
+"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-report-optional.txt"
+"$AUTOMATION_VENV_DIR/bin/python" -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+"$APP_ADB_PATH" version
+sudo -u testhub -- "$APP_ADB_PATH" version
+test -x "$APP_DIR/allure/bin/allure"
+"$APP_DIR/allure/bin/allure" --version
+
+echo "=== 4) 写入 .env ==="
 cat > "$APP_DIR/.env" <<EOF
 DEBUG=False
 SECRET_KEY=your-secret-key
@@ -265,13 +295,14 @@ DB_PASSWORD=your_db_password
 DB_HOST=127.0.0.1
 DB_PORT=3306
 
+APP_ADB_PATH=$APP_ADB_PATH
 REDIS_URL=redis://:1234@127.0.0.1:6379/0
 EOF
 
-echo "=== 4) 收集静态文件 ==="
+echo "=== 5) 收集静态文件 ==="
 python "$APP_DIR/manage.py" collectstatic --noinput
 
-echo "=== 5) systemd 服务 ==="
+echo "=== 6) systemd 服务 ==="
 cat > /etc/systemd/system/testhub-asgi.service <<EOF
 [Unit]
 Description=TestHub ASGI (Daphne)
@@ -301,7 +332,7 @@ WorkingDirectory=$APP_DIR
 Environment="DJANGO_SETTINGS_MODULE=backend.settings"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=$APP_DIR/.env
-ExecStart=$VENV_DIR/bin/celery -A backend worker --loglevel=info --pool=solo --concurrency=1
+ExecStart=$AUTOMATION_VENV_DIR/bin/celery -A backend worker --loglevel=info --pool=solo --concurrency=1
 Restart=always
 
 [Install]
@@ -312,7 +343,7 @@ systemctl daemon-reload
 systemctl enable testhub-asgi testhub-celery
 systemctl restart testhub-asgi testhub-celery
 
-echo "=== 6) Nginx 配置 ==="
+echo "=== 7) Nginx 配置 ==="
 cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
