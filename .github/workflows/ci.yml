@@ -97,6 +97,7 @@ jobs:
 
       - name: Verify APP worker runtime dependencies
         run: |
+          python -m pip check
           python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
           export APP_ADB_PATH="$(command -v adb)"
           test -n "$APP_ADB_PATH"

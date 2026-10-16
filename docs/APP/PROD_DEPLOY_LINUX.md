@@ -44,13 +44,14 @@ cd /opt/testhub_platform
 python3 -m venv venv-prod
 source venv-prod/bin/activate
 pip install -r requirements-prod.txt
+python -m pip check
 ```
 
 ### 可选自动化依赖边界
 
 以下清单只用于独立自动化执行环境，当前 Web/Daphne 服务不安装、不启动这些能力：
 
-- `requirements-ui-optional.txt`：Playwright、Selenium、webdriver-manager、browser-use。
+- `requirements-ui-optional.txt`：Playwright、Selenium、webdriver-manager、browser-use 及其固定版本的 cdp-use、bubus 运行时依赖。
 - `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy（loguru、Pillow 已由 `requirements-prod.txt` 提供）。
 - `requirements-report-optional.txt`：Allure pytest 插件及 Python 运行时；仓库内 `allure/bin/allure` 提供报告命令。
 
@@ -277,6 +278,7 @@ echo "=== 3) 安装 APP worker 依赖并执行预检 ==="
 "$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-prod.txt"
 "$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-app-optional.txt"
 "$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-report-optional.txt"
+"$AUTOMATION_VENV_DIR/bin/python" -m pip check
 "$AUTOMATION_VENV_DIR/bin/python" -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
 "$APP_ADB_PATH" version
 sudo -u testhub -- "$APP_ADB_PATH" version

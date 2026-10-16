@@ -1,3 +1,4 @@
+# Core web, API, and worker dependencies. Browser-use, cdp-use, and bubus are optional UI dependencies.
 aiofiles==25.1.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.15
@@ -12,9 +13,7 @@ Authlib==1.6.6
 backoff==2.2.1
 beautifulsoup4==4.14.3
 billiard==4.2.1
-bubus==1.5.6
 cachetools==6.2.4
-cdp-use==1.4.4
 celery==5.3.4
 openpyxl==3.1.5
 certifi==2025.7.14

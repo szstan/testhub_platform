@@ -18,9 +18,16 @@ from ..models import AppTestExecution
 from ..access import scope_executions
 from ..serializers import AppTestExecutionSerializer
 from ..tasks import send_execution_update
-from .test_case_views import AppPagination
+from apps.app_automation.views.test_case_views import AppPagination
 
 logger = logging.getLogger(__name__)
+
+
+def _is_asgi_http_request(request):
+    """Return whether the Django request was created by the ASGI handler."""
+    django_request = getattr(request, '_request', request)
+    scope = getattr(django_request, 'scope', None)
+    return isinstance(scope, dict) and scope.get('type') == 'http'
 
 
 class AppTestExecutionViewSet(viewsets.ModelViewSet):
@@ -64,17 +71,14 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
     def ws_status(self, request):
         """检查 WebSocket 是否可用"""
         try:
-            import daphne
             from channels.layers import get_channel_layer
+
             channel_layer = get_channel_layer()
-            ws_available = channel_layer is not None and not isinstance(
-                channel_layer, type(None)
-            )
-            # 检查是否通过 ASGI 服务器运行（非 runserver）
-            server_type = request.META.get('SERVER_SOFTWARE', '')
-            is_asgi = 'daphne' in server_type.lower() or request.META.get('asgi', False)
-            return Response({'websocket': ws_available and is_asgi})
-        except (ImportError, Exception):
+            is_asgi = _is_asgi_http_request(request)
+            return Response({
+                'websocket': bool(channel_layer) and is_asgi,
+            })
+        except Exception:
             return Response({'websocket': False})
 
     @action(detail=True, methods=['post'])
