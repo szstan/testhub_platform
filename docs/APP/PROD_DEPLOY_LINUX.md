@@ -41,7 +41,9 @@ Web/Daphne 环境只安装仓库中的核心生产依赖清单 `requirements-pro
 
 ```bash
 cd /opt/testhub_platform
-python3 -m venv venv-prod
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+command -v "$PYTHON_BIN"
+"$PYTHON_BIN" -m venv venv-prod
 source venv-prod/bin/activate
 pip install -r requirements-prod.txt
 python -m pip check
@@ -59,11 +61,14 @@ APP worker 必须使用独立的 `venv-automation`，不要复用 `venv-prod`。
 
 ```bash
 cd /opt/testhub_platform
-python3 -m venv venv-automation
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+command -v "$PYTHON_BIN"
+"$PYTHON_BIN" -m venv venv-automation
 source venv-automation/bin/activate
 pip install -r requirements-prod.txt
 pip install -r requirements-app-optional.txt
 pip install -r requirements-report-optional.txt
+python -m pip check
 python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
 export APP_ADB_PATH="$(command -v adb)"
 test -n "$APP_ADB_PATH"
@@ -256,6 +261,13 @@ APP_DIR="/opt/testhub_platform"
 VENV_DIR="$APP_DIR/venv-prod"
 AUTOMATION_VENV_DIR="$APP_DIR/venv-automation"
 NGINX_CONF="/etc/nginx/conf.d/testhub.conf"
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python 3.12 interpreter is required: $PYTHON_BIN" >&2
+  exit 1
+fi
+"$PYTHON_BIN" --version
 
 APP_ADB_PATH="${APP_ADB_PATH:-$(command -v adb || true)}"
 test -n "$APP_ADB_PATH"
@@ -263,10 +275,10 @@ test -x "$APP_ADB_PATH"
 
 echo "=== 1) 创建虚拟环境 ==="
 if [ ! -d "$VENV_DIR" ]; then
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 if [ ! -d "$AUTOMATION_VENV_DIR" ]; then
-  python3 -m venv "$AUTOMATION_VENV_DIR"
+  "$PYTHON_BIN" -m venv "$AUTOMATION_VENV_DIR"
 fi
 
 source "$VENV_DIR/bin/activate"
