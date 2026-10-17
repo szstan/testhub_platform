@@ -7,6 +7,7 @@ import time
 from rest_framework import viewsets, status
 from django.conf import settings  # Added import
 from rest_framework.decorators import action, permission_classes
+from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer
 from rest_framework.permissions import AllowAny
@@ -1015,6 +1016,7 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @extend_schema(operation_id='requirement_ai_model_test_connection_preview')
     @action(detail=False, methods=['post'], url_path='test_connection')
     def test_connection_preview(self, request):
         """测试未保存的模型配置连接"""
@@ -1100,6 +1102,7 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @extend_schema(operation_id='requirement_ai_model_test_connection')
     @action(detail=True, methods=['post'])
     def test_connection(self, request, pk=None):
         """测试模型连接"""

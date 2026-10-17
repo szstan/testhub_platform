@@ -8,17 +8,26 @@ from rest_framework.filters import SearchFilter
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
-from django.http import FileResponse, Http404
+from django.http import FileResponse, Http404, HttpResponse
+from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
 from django.views.decorators.csrf import csrf_exempt
 import logging
 import os
 
 from ..models import AppTestExecution
+from ..access import scope_executions
 from ..serializers import AppTestExecutionSerializer
 from ..tasks import send_execution_update
-from .test_case_views import AppPagination
+from apps.app_automation.views.test_case_views import AppPagination
 
 logger = logging.getLogger(__name__)
+
+
+def _is_asgi_http_request(request):
+    """Return whether the Django request was created by the ASGI handler."""
+    django_request = getattr(request, '_request', request)
+    scope = getattr(django_request, 'scope', None)
+    return isinstance(scope, dict) and scope.get('type') == 'http'
 
 
 class AppTestExecutionViewSet(viewsets.ModelViewSet):
@@ -26,13 +35,13 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
     queryset = AppTestExecution.objects.all()
     serializer_class = AppTestExecutionSerializer
     permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter]
+    http_method_names = ['get', 'post', 'head', 'options']
     filterset_fields = ['status', 'test_case', 'device']
     search_fields = ['test_case__name', 'device__name', 'device__device_id', 'user__username']
     pagination_class = AppPagination
     
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = scope_executions(super().get_queryset(), self.request.user)
 
         # 支持 test_suite__isnull 过滤，用于区分单独执行和套件执行
         suite_isnull = self.request.query_params.get('test_suite__isnull')
@@ -54,21 +63,22 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
             Q(user__username__icontains=search_value)
         )
     
+    def create(self, request, *args, **kwargs):
+        return Response({'detail': '请通过测试用例执行入口创建执行记录'},
+                        status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
     @action(detail=False, methods=['get'])
     def ws_status(self, request):
         """检查 WebSocket 是否可用"""
         try:
-            import daphne
             from channels.layers import get_channel_layer
+
             channel_layer = get_channel_layer()
-            ws_available = channel_layer is not None and not isinstance(
-                channel_layer, type(None)
-            )
-            # 检查是否通过 ASGI 服务器运行（非 runserver）
-            server_type = request.META.get('SERVER_SOFTWARE', '')
-            is_asgi = 'daphne' in server_type.lower() or request.META.get('asgi', False)
-            return Response({'websocket': ws_available and is_asgi})
-        except (ImportError, Exception):
+            is_asgi = _is_asgi_http_request(request)
+            return Response({
+                'websocket': bool(channel_layer) and is_asgi,
+            })
+        except Exception:
             return Response({'websocket': False})
 
     @action(detail=True, methods=['post'])
@@ -115,9 +125,24 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+REPORT_TOKEN_MAX_AGE = 300
+
+
+def _valid_report_token(execution_id, access_token):
+    if not access_token:
+        return False
+    try:
+        value = TimestampSigner().unsign(access_token, max_age=REPORT_TOKEN_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    return str(value) == str(execution_id)
+
+
 @csrf_exempt
-def serve_report_file(request, execution_id, file_path=''):
-    """提供 Allure 报告文件访问"""
+def serve_report_file(request, execution_id, access_token='', file_path=''):
+    """提供带短时签名令牌的 Allure 报告文件访问。"""
+    if not _valid_report_token(execution_id, access_token):
+        return HttpResponse('报告访问令牌无效或已过期', status=403)
     try:
         execution = AppTestExecution.objects.get(id=execution_id)
         if not execution.report_path:
@@ -129,9 +154,9 @@ def serve_report_file(request, execution_id, file_path=''):
         report_dir = execution.report_path
         full_path = os.path.join(report_dir, file_path)
 
-        report_dir_abs = os.path.abspath(report_dir)
-        full_path_abs = os.path.abspath(full_path)
-        if not full_path_abs.startswith(report_dir_abs):
+        report_dir_abs = os.path.realpath(report_dir)
+        full_path_abs = os.path.realpath(full_path)
+        if os.path.commonpath([report_dir_abs, full_path_abs]) != report_dir_abs:
             raise Http404("无效的文件路径")
 
         if not os.path.exists(full_path_abs) or not os.path.isfile(full_path_abs):

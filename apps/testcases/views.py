@@ -38,26 +38,33 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = TestCasePagination
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['priority', 'test_type', 'project']
+    filterset_fields = ['priority', 'test_type']
     search_fields = ['title', 'description']
     ordering_fields = ['created_at', 'updated_at', 'priority']
     ordering = ['-created_at']
-    
+
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return TestCaseCreateSerializer
         return TestCaseListSerializer
-    
+
     def get_queryset(self):
         user = self.request.user
         accessible_projects = get_user_accessible_projects(user)
-        return TestCase.objects.filter(
+        queryset = TestCase.objects.filter(
             project__in=accessible_projects
         ).select_related(
             'author', 'assignee', 'project'
         ).prefetch_related(
             'versions'
         ).distinct()
+        # 支持多项目过滤：project=1,2,3（单值 project=1 同样兼容）
+        project_param = self.request.query_params.get('project')
+        if project_param:
+            project_ids = [int(pid) for pid in project_param.split(',') if pid.strip().isdigit()]
+            if project_ids:
+                queryset = queryset.filter(project_id__in=project_ids)
+        return queryset
     
     def get_user_accessible_projects(self, user):
         """获取用户有权限访问的项目"""

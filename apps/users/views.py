@@ -14,6 +14,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .captcha import create_captcha
 from .sms import send_register_verify_code, validate_verify_code
 from .redis_client import get_redis
+import redis
 import re
 import uuid
 
@@ -111,7 +112,13 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
 @permission_classes([permissions.AllowAny])
 def get_captcha(request):
     """获取图形验证码"""
-    result = create_captcha()
+    try:
+        result = create_captcha()
+    except (redis.RedisError, OSError):
+        return Response(
+            {'success': False, 'error': '验证码服务暂时不可用'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     return Response(result)
 
 

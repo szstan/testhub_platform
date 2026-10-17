@@ -34,6 +34,7 @@ croniter==6.0.0
 cryptography==41.0.7
 distro==1.9.0
 Django==4.2.7
+defusedxml==0.7.1
 django-cors-headers==4.3.1
 django-filter==23.5
 django-simpleui==2025.6.24
@@ -114,6 +115,7 @@ pypdf==6.5.0
 PyPDF2==3.0.1
 PySocks==1.7.1
 pytest==8.4.1
+pytest-django==4.11.1
 python-barcode==0.16.1
 python-dateutil==2.9.0.post0
 python-decouple==3.8
@@ -191,3 +193,4 @@ numpy==1.26.4
 daphne==4.2.1
 channels==4.3.2
 channels-redis==4.3.0
+cbor2==5.6.2

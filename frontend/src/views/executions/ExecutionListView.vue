@@ -78,7 +78,7 @@
           {{ formatDate(scope.row.created_at) }}
         </template>
       </el-table-column>
-      <el-table-column :label="$t('execution.actions')" width="200" fixed="right">
+      <el-table-column :label="$t('execution.actions')" width="220" fixed="right" class-name="action-col">
         <template #default="scope">
           <el-button size="small" type="primary" @click="viewPlan(scope.row.id)">
             {{ $t('execution.viewExecution') }}
@@ -967,5 +967,10 @@ onMounted(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* 操作列：固定右列，按钮强制单行不换行（列宽已留足空间） */
+:deep(.action-col .cell) {
+  white-space: nowrap;
 }
 </style>

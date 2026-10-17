@@ -11,10 +11,17 @@ import version from './version.js'
 import requirementModule from './requirement.js'
 import apiTestingModule from './api-testing.js'
 import uiAutomationModule from './ui-automation.js'
+import appAutomationModule from './app-automation.js'
 import configurationModule from './configuration.js'
 import assistantModule from './assistant.js'
 import dataFactoryModule from './data-factory.js'
 import notificationModule from './notification.js'
+import llmJudgeModule from './llm-judge.js'
+import monitorModule from './monitor.js'
+import performanceTestingModule from './performance-testing.js'
+import mcpModule from './mcp.js'
+import docsModule from './docs.js'
+import qualityIntelligence from './quality-intelligence.js'
 
 export default {
   // 模块化导出
@@ -58,6 +65,9 @@ export default {
   // UI Automation Module
   uiAutomation: uiAutomationModule,
 
+  // APP Automation Module
+  appAutomation: appAutomationModule,
+
   // Configuration Center Module
   configuration: configurationModule,
 
@@ -69,6 +79,24 @@ export default {
 
   // Notification Module
   notification: notificationModule,
+
+  // LLM Judge Module
+  llmJudge: llmJudgeModule,
+
+  // Monitor Module
+  monitor: monitorModule,
+
+  // Performance Testing Module
+  performanceTesting: performanceTestingModule,
+
+  // MCP Module
+  mcp: mcpModule,
+
+  // Docs Center
+  docs: docsModule.docs,
+
+  // Quality Intelligence module
+  qualityIntelligence,
 
   // Element Plus 语言包
   ...elementEn

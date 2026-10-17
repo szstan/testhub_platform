@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from datetime import datetime
+from typing import Optional
 
 
 class NullableDateField(serializers.DateField):
@@ -26,6 +27,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'first_name', 'last_name']
+        ref_name = 'ApiTestingUser'
 
 
 class ApiProjectSerializer(serializers.ModelSerializer):
@@ -243,7 +245,7 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
             'failed_runs', 'last_result', 'error_message', 'created_at', 'updated_at'
         ]
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示"""
         try:
             notification_setting = obj.notification_settings.first()
@@ -253,7 +255,7 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
             pass
         return "-"
 
-    def get_notification_type(self, obj):
+    def get_notification_type(self, obj) -> str:
         """获取通知类型原始值"""
         try:
             notification_setting = obj.notification_settings.first()
@@ -459,15 +461,15 @@ class NotificationLogSerializer(serializers.ModelSerializer):
                   'recipient_names', 'notification_target_display', 'status_display', 'created_at', 'sent_at', 'retry_status']
         read_only_fields = ['created_at', 'sent_at']
 
-    def get_recipient_names(self, obj):
+    def get_recipient_names(self, obj) -> str:
         """获取收件人姓名列表"""
         return obj.get_recipient_names()
 
-    def get_status_display(self, obj):
+    def get_status_display(self, obj) -> str:
         """获取状态显示"""
         return obj.get_status_display()
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示 - 从任务的通知设置中获取"""
         if obj.task:
             try:
@@ -479,7 +481,7 @@ class NotificationLogSerializer(serializers.ModelSerializer):
         # 回退到原始的通知类型显示
         return obj.get_notification_type_display()
 
-    def get_task_type_display(self, obj):
+    def get_task_type_display(self, obj) -> str:
         """获取任务类型显示 - 使用保存的快照值"""
         if obj.task_type:
             # 使用保存的任务类型快照
@@ -490,11 +492,11 @@ class NotificationLogSerializer(serializers.ModelSerializer):
         # 如果 task_type 为空，返回未记录，不要从 task 对象获取（避免显示修改后的值）
         return "未记录"
 
-    def get_retry_status(self, obj):
+    def get_retry_status(self, obj) -> str:
         """获取重试状态"""
         return obj.get_retry_status()
 
-    def get_notification_target_display(self, obj):
+    def get_notification_target_display(self, obj) -> str:
         """获取通知对象显示"""
         targets = []
 
@@ -538,16 +540,16 @@ class TaskNotificationSettingSerializer(serializers.ModelSerializer):
                   'notify_on_timeout', 'notify_on_error', 'active_types']
         read_only_fields = ['created_at', 'updated_at']
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示"""
         return obj.get_notification_type_display()
 
-    def get_notification_config_info(self, obj):
+    def get_notification_config_info(self, obj) -> str:
         """获取通知配置信息"""
         config = obj.get_notification_config()
         return f"{config.name}" if config else "未配置通知"
 
-    def get_active_types(self, obj):
+    def get_active_types(self, obj) -> str:
         """获取激活的通知类型"""
         types = obj.get_active_notification_types()
         type_names = []
@@ -575,7 +577,7 @@ class NotificationLogDetailSerializer(serializers.ModelSerializer):
                   'created_at', 'sent_at', 'retry_count', 'is_retried']
         read_only_fields = ['created_at', 'sent_at']
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示 - 从任务的通知设置中获取"""
         if obj.task:
             try:
@@ -587,11 +589,11 @@ class NotificationLogDetailSerializer(serializers.ModelSerializer):
         # 回退到原始的通知类型显示
         return obj.get_notification_type_display()
 
-    def get_status_display(self, obj):
+    def get_status_display(self, obj) -> str:
         """获取状态显示"""
         return obj.get_status_display()
 
-    def get_task_type_display(self, obj):
+    def get_task_type_display(self, obj) -> str:
         """获取任务类型显示 - 使用保存的快照值"""
         if obj.task_type:
             # 使用保存的任务类型快照
@@ -662,7 +664,7 @@ class NotificationLogDetailSerializer(serializers.ModelSerializer):
                 pass
         return None
 
-    def get_notification_target_display(self, obj):
+    def get_notification_target_display(self, obj) -> Optional[str]:
         """获取通知对象显示 - 返回详细信息"""
         targets = []
 
@@ -720,7 +722,7 @@ class TaskNotificationSettingDetailSerializer(serializers.ModelSerializer):
                   'custom_recipients', 'webhook_bots_display', 'recipients_detail', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示"""
         return obj.get_notification_type_display()
 

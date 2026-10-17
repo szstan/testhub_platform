@@ -11,7 +11,7 @@
               </div>
               <div class="stat-info">
                 <div class="stat-value">{{ statistics.devices.total }}</div>
-                <div class="stat-label">总设备数</div>
+                <div class="stat-label">{{ $t('appAutomation.dashboard.totalDevices') }}</div>
               </div>
             </div>
           </el-card>
@@ -25,7 +25,7 @@
               </div>
               <div class="stat-info">
                 <div class="stat-value">{{ statistics.devices.online }}</div>
-                <div class="stat-label">在线设备</div>
+                <div class="stat-label">{{ $t('appAutomation.dashboard.onlineDevices') }}</div>
               </div>
             </div>
           </el-card>
@@ -39,7 +39,7 @@
               </div>
               <div class="stat-info">
                 <div class="stat-value">{{ statistics.devices.locked }}</div>
-                <div class="stat-label">已锁定设备</div>
+                <div class="stat-label">{{ $t('appAutomation.dashboard.lockedDevices') }}</div>
               </div>
             </div>
           </el-card>
@@ -53,7 +53,7 @@
               </div>
               <div class="stat-info">
                 <div class="stat-value">{{ statistics.test_cases.total }}</div>
-                <div class="stat-label">测试用例</div>
+                <div class="stat-label">{{ $t('appAutomation.dashboard.testCases') }}</div>
               </div>
             </div>
           </el-card>
@@ -68,24 +68,24 @@
         <el-card class="stat-chart" shadow="hover">
           <template #header>
             <div class="card-header">
-              <span>执行统计</span>
+              <span>{{ $t('appAutomation.dashboard.executionStatistics') }}</span>
             </div>
           </template>
           <div class="chart-container">
             <div class="stat-item">
-              <div class="stat-label">总执行次数</div>
+              <div class="stat-label">{{ $t('appAutomation.dashboard.totalExecutions') }}</div>
               <div class="stat-value large">{{ statistics.executions.total }}</div>
             </div>
             <div class="stat-item">
-              <div class="stat-label">成功次数</div>
+              <div class="stat-label">{{ $t('appAutomation.dashboard.successCount') }}</div>
               <div class="stat-value success">{{ statistics.executions.success }}</div>
             </div>
             <div class="stat-item">
-              <div class="stat-label">失败次数</div>
+              <div class="stat-label">{{ $t('appAutomation.dashboard.failedCount') }}</div>
               <div class="stat-value danger">{{ statistics.executions.failed }}</div>
             </div>
             <div class="stat-item">
-              <div class="stat-label">通过率</div>
+              <div class="stat-label">{{ $t('appAutomation.dashboard.passRate') }}</div>
               <div class="stat-value" :class="getPassRateClass(statistics.executions.pass_rate)">
                 {{ statistics.executions.pass_rate }}%
               </div>
@@ -99,17 +99,17 @@
         <el-card class="recent-executions" shadow="hover">
           <template #header>
             <div class="card-header">
-              <span>最近执行记录</span>
+              <span>{{ $t('appAutomation.dashboard.recentExecutions') }}</span>
               <el-button type="primary" size="small" @click="$router.push('/app-automation/executions')">
-                查看全部
+                {{ $t('appAutomation.dashboard.viewAll') }}
               </el-button>
             </div>
           </template>
           <div v-if="loading" class="loading-container">
-            <el-empty description="加载中..." />
+            <el-empty :description="$t('appAutomation.common.loading')" />
           </div>
           <div v-else-if="statistics.recent_executions.length === 0" class="empty-container">
-            <el-empty description="暂无执行记录" />
+            <el-empty :description="$t('appAutomation.dashboard.noExecutionRecords')" />
           </div>
           <div v-else class="executions-list">
             <div v-for="execution in statistics.recent_executions" :key="execution.id" class="execution-item">
@@ -119,7 +119,7 @@
                   <el-tag :type="getStatusType(execution.status)" size="small">
                     {{ getStatusText(execution.status) }}
                   </el-tag>
-                  <span class="device-name">设备: {{ execution.device_name }}</span>
+                  <span class="device-name">{{ $t('appAutomation.dashboard.device') }}: {{ execution.device_name }}</span>
                   <span class="execution-time">{{ formatTime(execution.created_at) }}</span>
                 </div>
               </div>
@@ -130,7 +130,7 @@
                   text
                   @click="viewExecution(execution.id)"
                 >
-                  查看
+                  {{ $t('appAutomation.common.view') }}
                 </el-button>
               </div>
             </div>
@@ -145,7 +145,7 @@
         <el-card shadow="hover">
           <template #header>
             <div class="card-header">
-              <span>快速操作</span>
+              <span>{{ $t('appAutomation.dashboard.quickActions') }}</span>
             </div>
           </template>
           <div class="actions-grid">
@@ -153,25 +153,25 @@
               <div class="action-icon bg-blue">
                 <el-icon><Cellphone /></el-icon>
               </div>
-              <div class="action-label">设备管理</div>
+              <div class="action-label">{{ $t('appAutomation.dashboard.deviceManagement') }}</div>
             </div>
             <div class="action-item" @click="$router.push('/app-automation/elements')">
               <div class="action-icon bg-green">
                 <el-icon><Picture /></el-icon>
               </div>
-              <div class="action-label">元素管理</div>
+              <div class="action-label">{{ $t('appAutomation.dashboard.elementManagement') }}</div>
             </div>
             <div class="action-item" @click="$router.push('/app-automation/test-cases')">
               <div class="action-icon bg-purple">
                 <el-icon><Document /></el-icon>
               </div>
-              <div class="action-label">测试用例</div>
+              <div class="action-label">{{ $t('appAutomation.dashboard.testCases') }}</div>
             </div>
             <div class="action-item" @click="$router.push('/app-automation/executions')">
               <div class="action-icon bg-orange">
                 <el-icon><Aim /></el-icon>
               </div>
-              <div class="action-label">执行记录</div>
+              <div class="action-label">{{ $t('appAutomation.dashboard.executionRecords') }}</div>
             </div>
           </div>
         </el-card>
@@ -183,16 +183,19 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { getDashboardStatistics } from '@/api/app-automation'
 import { getExecutionStatusType, getExecutionStatusText, formatRelativeTime } from '@/utils/app-automation-helpers'
-import { 
-  Cellphone, 
-  CircleCheck, 
-  Lock, 
-  Document, 
+import {
+  Cellphone,
+  CircleCheck,
+  Lock,
+  Document,
   Picture,
   Aim
 } from '@element-plus/icons-vue'
+
+const { t } = useI18n()
 
 const loading = ref(false)
 const statistics = ref({
@@ -222,7 +225,7 @@ const loadStatistics = async () => {
       statistics.value = res.data.data
     }
   } catch (error) {
-    ElMessage.error('加载统计数据失败: ' + (error.message || '未知错误'))
+    ElMessage.error(t('appAutomation.dashboard.messages.loadFailed') + ': ' + (error.message || t('appAutomation.dashboard.messages.unknownError')))
   } finally {
     loading.value = false
   }
@@ -241,7 +244,7 @@ const getPassRateClass = (rate) => {
 const viewExecution = (id) => {
   // 跳转到执行详情页
   // TODO: 后续实现执行详情页
-  ElMessage.info('执行详情页待开发')
+  ElMessage.info(t('appAutomation.dashboard.messages.detailComingSoon'))
 }
 
 let refreshTimer = null

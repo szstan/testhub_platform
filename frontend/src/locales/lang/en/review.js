@@ -197,6 +197,7 @@ export default {
     priorityUrgent: 'Urgent',
     deadline: 'Deadline',
     deadlinePlaceholder: 'Select deadline',
+    deadlineRequired: 'Please select a deadline',
     description: 'Review Description',
     descriptionPlaceholder: 'Enter review description',
 
@@ -204,7 +205,9 @@ export default {
     selectTestcases: 'Select Test Cases',
     searchTestcases: 'Search test cases',
     selectTestcasesBtn: 'Select Test Cases',
-    emptyTestcasesTip: 'Please select test cases for review',
+    selectedTestcasesCount: '{count} test case(s) selected',
+    noTestcasesSelected: 'No test cases selected',
+    modifyTestcasesSelection: 'Modify',
 
     // Reviewers
     reviewers: 'Reviewers',

@@ -10,6 +10,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 import logging
 
 from ..models import AppPackage, AppTestCase, AppDevice, AppTestExecution
+from ..access import scope_test_cases
 from ..serializers import AppPackageSerializer, AppTestCaseSerializer, AppTestExecutionSerializer
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,12 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
     filterset_fields = ['project', 'app_package']
     search_fields = ['name']
     
+    def get_queryset(self):
+        return scope_test_cases(super().get_queryset(), self.request.user)
+
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
-    
+
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         """执行测试用例"""
@@ -68,6 +72,11 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
                     'success': False,
                     'message': '设备已被其他用户锁定'
                 }, status=status.HTTP_400_BAD_REQUEST)
+            if device.locked_by_id != request.user.id:
+                return Response({
+                    'success': False,
+                    'message': '请先锁定设备后再执行测试'
+                }, status=status.HTTP_403_FORBIDDEN)
             
             # 创建执行记录
             execution = AppTestExecution.objects.create(

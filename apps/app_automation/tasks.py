@@ -166,11 +166,16 @@ def _send_app_email_notification(task, detail_content, status_text):
 
 
 def send_execution_update(execution_id, status=None, progress=None, message=None, report_path=None, finished_at=None, result=None):
-    """通过 WebSocket 发送执行状态更新"""
+    """通过 WebSocket 发送执行状态更新，并报告通道不可用。"""
     try:
         channel_layer = get_channel_layer()
-        if not channel_layer:
-            return
+        if channel_layer is None:
+            logger.warning(
+                "APP execution WebSocket event skipped: channel layer unavailable "
+                "execution_id=%s",
+                execution_id,
+            )
+            return False
         payload = {
             "type": "execution_update",
             "execution_id": int(execution_id),
@@ -185,8 +190,14 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
             f"app_execution_{execution_id}",
             payload
         )
-    except Exception as e:
-        logger.debug(f"发送执行状态更新失败: {e}")
+        return True
+    except Exception as exc:
+        logger.warning(
+            "APP execution WebSocket event failed: execution_id=%s error_type=%s",
+            execution_id,
+            type(exc).__name__,
+        )
+        return False
 
 
 @shared_task

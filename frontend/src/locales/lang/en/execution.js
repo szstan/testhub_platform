@@ -9,12 +9,13 @@ export default {
   // Actions
   newPlan: 'New Test Plan',
   batchDelete: 'Batch Delete',
-  viewExecution: 'View Execution',
+  viewExecution: 'View',
   createPlan: 'Create',
   updatePlan: 'Save',
   closePlan: 'Close',
   activatePlan: 'Activate',
   viewHistory: 'History',
+  noRuns: 'No test runs yet',
 
   // Table columns
   serialNumber: 'No.',
@@ -120,6 +121,9 @@ export default {
   batchDeletePartialSuccess: 'Successfully deleted {successCount} test plans, {failCount} failed',
   batchDeleteCasesPartialSuccess: 'Successfully deleted {successCount} cases, {failCount} failed',
   batchDeleteFailed: 'Delete failed',
+  batchSaveAll: 'Save all changes',
+  batchSaveSuccess: 'Saved {count} cases',
+  batchSavePartialSuccess: '{successCount} saved, {failCount} failed',
   toggleStatusConfirm: 'Are you sure to {action} this test plan?',
   toggleStatusSuccess: '{action} successful',
   toggleStatusFailed: 'Operation failed',

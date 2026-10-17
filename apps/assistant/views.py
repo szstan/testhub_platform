@@ -14,6 +14,7 @@ from .serializers import (
 
 class AssistantSessionViewSet(viewsets.ModelViewSet):
     """智能助手会话视图集"""
+    queryset = AssistantSession.objects.none()
     permission_classes = [permissions.IsAuthenticated]
     
     def get_serializer_class(self):
@@ -22,6 +23,8 @@ class AssistantSessionViewSet(viewsets.ModelViewSet):
         return AssistantSessionSerializer
     
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return AssistantSession.objects.none()
         return AssistantSession.objects.filter(user=self.request.user)
     
     def perform_create(self, serializer):

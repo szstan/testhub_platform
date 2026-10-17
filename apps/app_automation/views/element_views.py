@@ -14,6 +14,7 @@ import re
 import logging
 
 from ..models import AppElement
+from ..access import scope_project
 from ..serializers import AppElementSerializer
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class AppElementViewSet(viewsets.ModelViewSet):
         - 名称：模糊匹配（LIKE）
         - 标签：精确匹配 JSONField 数组中的元素
         """
-        queryset = super().get_queryset()
+        queryset = scope_project(super().get_queryset(), self.request.user, 'project')
         
         # 获取搜索关键词
         search = self.request.query_params.get('search', '').strip()

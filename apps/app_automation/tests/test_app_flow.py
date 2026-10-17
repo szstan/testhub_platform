@@ -7,8 +7,17 @@ import logging
 import pytest
 import allure
 from apps.app_automation.models import AppTestCase, AppTestExecution
+from apps.app_automation.tasks import send_execution_update
 from apps.app_automation.utils.airtest_base import AirtestBase
 from apps.app_automation.runners.ui_flow_runner import UiFlowRunner
+
+
+# The production worker selects this marker explicitly; security boundary tests
+# stay outside the worker entry point and run in their own CI job. Keep this
+# module free of pytest-django's django_db marker so the worker never creates a
+# test database against the configured application database.
+pytestmark = pytest.mark.app_ui_flow
+
 
 logger = logging.getLogger(__name__)
 
@@ -21,28 +30,6 @@ def _make_progress_callback(execution_id):
     """
     if not execution_id:
         return None
-    
-    def _send_ws(eid, status, progress, message):
-        """发送 WebSocket 通知（失败不影响主流程）"""
-        try:
-            from asgiref.sync import async_to_sync
-            from channels.layers import get_channel_layer
-            channel_layer = get_channel_layer()
-            if channel_layer:
-                async_to_sync(channel_layer.group_send)(
-                    f"app_execution_{eid}",
-                    {
-                        "type": "execution_update",
-                        "execution_id": int(eid),
-                        "status": status,
-                        "progress": progress,
-                        "message": message,
-                        "report_path": None,
-                        "finished_at": None,
-                    }
-                )
-        except Exception as e:
-            logger.debug(f"WebSocket 通知失败: {e}")
     
     def callback(current_step, total_steps, step_name, status):
         """
@@ -68,7 +55,12 @@ def _make_progress_callback(execution_id):
         except Exception as e:
             logger.debug(f"更新执行进度失败: {e}")
         
-        _send_ws(execution_id, 'running', progress, message)
+        send_execution_update(
+            execution_id,
+            status='running',
+            progress=progress,
+            message=message,
+        )
     
     return callback
 
@@ -80,7 +72,11 @@ class TestAppFlow:
     @pytest.fixture(scope="class")
     def airtest(self, device_id, username):
         """Airtest 基础环境"""
-        airtest_base = AirtestBase(device_id=device_id, username=username)
+        airtest_base = AirtestBase(
+            device_id=device_id,
+            username=username,
+            adb_path=os.environ.get('APP_ADB_PATH'),
+        )
         
         # 设置环境
         if not airtest_base.setup_airtest():

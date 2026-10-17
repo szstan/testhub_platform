@@ -1,38 +1,16 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { trackPageView } from '@/utils/tracker'
+import api from '@/utils/api'
 
-// 静态导入常用组件来避免动态导入问题
-import Login from '@/views/auth/Login.vue'
-import Register from '@/views/auth/Register.vue'
-import Layout from '@/layout/index.vue'
-import ProjectList from '@/views/projects/ProjectList.vue'
-import Home from '@/views/Home.vue'
-import DataFactory from '@/views/data-factory/DataFactory.vue'
-import ApiDashboard from '@/views/api-testing/Dashboard.vue'
-import ApiProjectManagement from '@/views/api-testing/ProjectManagement.vue'
-import ApiInterfaceManagement from '@/views/api-testing/InterfaceManagement.vue'
-import ApiAutomationTesting from '@/views/api-testing/AutomationTesting.vue'
-import ApiRequestHistory from '@/views/api-testing/RequestHistory.vue'
-import ApiEnvironmentManagement from '@/views/api-testing/EnvironmentManagement.vue'
-import ApiReportView from '@/views/api-testing/ReportView.vue'
-import ApiScheduledTasks from '@/views/api-testing/ScheduledTasks.vue'
-import ApiAIServiceConfig from '@/views/api-testing/AIServiceConfig.vue'
-import NotificationLogs from '@/views/notification/NotificationLogs.vue'
-import UiDashboard from '@/views/ui-automation/dashboard/Dashboard.vue'
-import UiProjectList from '@/views/ui-automation/projects/ProjectList.vue'
-import UiElementManagerEnhanced from '@/views/ui-automation/elements/ElementManagerEnhanced.vue'
-import UiTestCaseManager from '@/views/ui-automation/test-cases/TestCaseManager.vue'
-import UiScriptEditorEnhanced from '@/views/ui-automation/scripts/ScriptEditorEnhanced.vue'
-import UiScriptList from '@/views/ui-automation/scripts/ScriptList.vue'
-import UiSuiteList from '@/views/ui-automation/suites/SuiteList.vue'
-import UiExecutionList from '@/views/ui-automation/executions/ExecutionList.vue'
-import UiReportList from '@/views/ui-automation/reports/ReportList.vue'
-import UiScheduledTasks from '@/views/ui-automation/scheduled-tasks/ScheduledTasks.vue'
-import UiNotificationLogs from '@/views/ui-automation/notification/NotificationLogs.vue'
-import UiAITesting from '@/views/ui-automation/ai/AITesting.vue'
-import UiAICaseList from '@/views/ui-automation/ai/AICaseList.vue'
-import UiAIExecutionRecords from '@/views/ui-automation/ai/AIExecutionRecords.vue'
+// Keep the shell and initial auth/home views eager; feature pages are lazy-loaded.
+const Login = () => import('@/views/auth/Login.vue')
+const Register = () => import('@/views/auth/Register.vue')
+const Layout = () => import('@/layout/index.vue')
+const ProjectList = () => import('@/views/projects/ProjectList.vue')
+const Home = () => import('@/views/Home.vue')
+
+const QUALITY_INTELLIGENCE_ENABLED = String(import.meta.env.VITE_QUALITY_INTELLIGENCE_ENABLED || '').toLowerCase() === 'true'
 
 /** @type {import('vue-router').RouteRecordRaw[]} */
 const routes = [
@@ -192,52 +170,52 @@ const routes = [
             {
                 path: 'dashboard',
                 name: 'ApiDashboard',
-                component: ApiDashboard
+                component: () => import('@/views/api-testing/Dashboard.vue')
             },
             {
                 path: 'projects',
                 name: 'ApiProjects',
-                component: ApiProjectManagement
+                component: () => import('@/views/api-testing/ProjectManagement.vue')
             },
             {
                 path: 'interfaces',
                 name: 'ApiInterfaces',
-                component: ApiInterfaceManagement
+                component: () => import('@/views/api-testing/InterfaceManagement.vue')
             },
             {
                 path: 'automation',
                 name: 'ApiAutomation',
-                component: ApiAutomationTesting
+                component: () => import('@/views/api-testing/AutomationTesting.vue')
             },
             {
                 path: 'history',
                 name: 'ApiHistory',
-                component: ApiRequestHistory
+                component: () => import('@/views/api-testing/RequestHistory.vue')
             },
             {
                 path: 'environments',
                 name: 'ApiEnvironments',
-                component: ApiEnvironmentManagement
+                component: () => import('@/views/api-testing/EnvironmentManagement.vue')
             },
             {
                 path: 'reports',
                 name: 'ApiReports',
-                component: ApiReportView
+                component: () => import('@/views/api-testing/ReportView.vue')
             },
             {
                 path: 'scheduled-tasks',
                 name: 'ApiScheduledTasks',
-                component: ApiScheduledTasks
+                component: () => import('@/views/api-testing/ScheduledTasks.vue')
             },
             {
                 path: 'ai-service-config',
                 name: 'ApiAIServiceConfig',
-                component: ApiAIServiceConfig
+                component: () => import('@/views/api-testing/AIServiceConfig.vue')
             },
             {
                 path: 'notification-logs',
                 name: 'ApiNotificationLogs',
-                component: NotificationLogs
+                component: () => import('@/views/notification/NotificationLogs.vue')
             }
         ]
     },
@@ -253,62 +231,62 @@ const routes = [
             {
                 path: 'dashboard',
                 name: 'UiDashboard',
-                component: UiDashboard
+                component: () => import('@/views/ui-automation/dashboard/Dashboard.vue')
             },
             {
                 path: 'projects',
                 name: 'UiProjects',
-                component: UiProjectList
+                component: () => import('@/views/ui-automation/projects/ProjectList.vue')
             },
             {
                 path: 'elements-enhanced',
                 name: 'UiElementsEnhanced',
-                component: UiElementManagerEnhanced
+                component: () => import('@/views/ui-automation/elements/ElementManagerEnhanced.vue')
             },
             {
                 path: 'test-cases',
                 name: 'UiTestCases',
-                component: UiTestCaseManager
+                component: () => import('@/views/ui-automation/test-cases/TestCaseManager.vue')
             },
             {
                 path: 'scripts-enhanced',
                 name: 'UiScriptsEnhanced',
-                component: UiScriptEditorEnhanced
+                component: () => import('@/views/ui-automation/scripts/ScriptEditorEnhanced.vue')
             },
             {
                 path: 'scripts/editor',
                 name: 'UiScriptEditor',
-                component: UiScriptEditorEnhanced
+                component: () => import('@/views/ui-automation/scripts/ScriptEditorEnhanced.vue')
             },
             {
                 path: 'scripts',
                 name: 'UiScripts',
-                component: UiScriptList
+                component: () => import('@/views/ui-automation/scripts/ScriptList.vue')
             },
             {
                 path: 'suites',
                 name: 'UiSuites',
-                component: UiSuiteList
+                component: () => import('@/views/ui-automation/suites/SuiteList.vue')
             },
             {
                 path: 'executions',
                 name: 'UiExecutions',
-                component: UiExecutionList
+                component: () => import('@/views/ui-automation/executions/ExecutionList.vue')
             },
             {
                 path: 'reports',
                 name: 'UiReports',
-                component: UiReportList
+                component: () => import('@/views/ui-automation/reports/ReportList.vue')
             },
             {
                 path: 'scheduled-tasks',
                 name: 'UiScheduledTasks',
-                component: UiScheduledTasks
+                component: () => import('@/views/ui-automation/scheduled-tasks/ScheduledTasks.vue')
             },
             {
                 path: 'notification-logs',
                 name: 'UiNotificationLogs',
-                component: UiNotificationLogs
+                component: () => import('@/views/ui-automation/notification/NotificationLogs.vue')
             }
         ]
     },
@@ -324,24 +302,65 @@ const routes = [
             {
                 path: 'testing',
                 name: 'AITesting',
-                component: UiAITesting
+                component: () => import('@/views/ui-automation/ai/AITesting.vue')
             },
             {
                 path: 'cases',
                 name: 'AICaseList',
-                component: UiAICaseList
+                component: () => import('@/views/ui-automation/ai/AICaseList.vue')
             },
             {
                 path: 'execution-records',
                 name: 'AIExecutionRecords',
-                component: UiAIExecutionRecords
+                component: () => import('@/views/ui-automation/ai/AIExecutionRecords.vue')
+            }
+        ]
+    },
+    {
+        path: '/defects',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'DefectDashboard',
+                component: () => import('@/views/defects/DefectDashboard.vue')
+            },
+            {
+                path: 'list',
+                name: 'DefectList',
+                component: () => import('@/views/defects/DefectList.vue')
+            },
+            {
+                path: 'create',
+                name: 'DefectCreate',
+                component: () => import('@/views/defects/DefectForm.vue')
+            },
+            {
+                path: 'reports',
+                name: 'DefectReport',
+                component: () => import('@/views/defects/DefectReport.vue')
+            },
+            {
+                path: ':id',
+                name: 'DefectDetail',
+                component: () => import('@/views/defects/DefectDetail.vue')
+            },
+            {
+                path: ':id/edit',
+                name: 'DefectEdit',
+                component: () => import('@/views/defects/DefectForm.vue')
             }
         ]
     },
     {
         path: '/data-factory',
         name: 'DataFactory',
-        component: DataFactory,
+        component: () => import('@/views/data-factory/DataFactory.vue'),
         meta: { requiresAuth: true }
     },
     {
@@ -398,6 +417,49 @@ const routes = [
                         component: () => import('@/views/configuration/DifyConfig.vue')
                     }
                 ]
+            }
+        ]
+    },
+    // 智能评分器路由
+    {
+        path: '/llm-judge',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'JudgeDashboard',
+                component: () => import('@/views/llm-judge/Dashboard.vue')
+            },
+            {
+                path: 'single',
+                name: 'JudgeSingle',
+                component: () => import('@/views/llm-judge/SingleJudge.vue')
+            },
+            {
+                path: 'batch',
+                name: 'JudgeBatch',
+                component: () => import('@/views/llm-judge/BatchJudge.vue')
+            },
+            {
+                path: 'history',
+                name: 'JudgeHistory',
+                component: () => import('@/views/llm-judge/HistoryList.vue')
+            },
+            {
+                path: 'rubrics',
+                name: 'JudgeRubrics',
+                component: () => import('@/views/llm-judge/RubricList.vue')
+            },
+            {
+                path: 'knowledge',
+                name: 'JudgeKnowledgeBase',
+                component: () => import('@/views/llm-judge/KnowledgeBase.vue')
+
             }
         ]
     },
@@ -473,6 +535,172 @@ const routes = [
                 component: () => import('@/views/app-automation/reports/ReportList.vue')
             }
         ]
+    },
+    {
+        path: '/monitor',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'MonitorDashboard',
+                component: () => import('@/views/monitor/Dashboard.vue')
+            },
+            {
+                path: 'checks',
+                name: 'MonitorCheckLogs',
+                component: () => import('@/views/monitor/CheckLogs.vue')
+            },
+            {
+                path: 'alerts',
+                name: 'MonitorAlerts',
+                component: () => import('@/views/monitor/Alerts.vue')
+            },
+            {
+                path: 'targets',
+                name: 'MonitorTargets',
+                component: () => import('@/views/monitor/MonitorTargets.vue')
+            },
+            {
+                path: 'channels',
+                name: 'NotificationChannels',
+                component: () => import('@/views/monitor/NotificationChannels.vue')
+            }
+        ]
+    },
+    {
+        path: '/performance-testing',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'PerfDashboard',
+                component: () => import('@/views/performance-testing/Dashboard.vue')
+            },
+            {
+                path: 'projects',
+                name: 'PerfProjects',
+                component: () => import('@/views/performance-testing/ProjectManagement.vue')
+            },
+            {
+                path: 'scenarios',
+                name: 'PerfScenarios',
+                component: () => import('@/views/performance-testing/ScenarioList.vue')
+            },
+            {
+                path: 'scenarios/:id',
+                name: 'PerfScenarioEditor',
+                component: () => import('@/views/performance-testing/ScenarioEditor.vue')
+            },
+            {
+                path: 'executions',
+                name: 'PerfExecutions',
+                component: () => import('@/views/performance-testing/ExecutionList.vue')
+            },
+            {
+                path: 'executions/:id',
+                name: 'PerfExecutionReport',
+                component: () => import('@/views/performance-testing/ExecutionReport.vue')
+            },
+            {
+                path: 'executions/:id/monitor',
+                name: 'PerfExecutionMonitor',
+                component: () => import('@/views/performance-testing/ExecutionMonitor.vue')
+            },
+            {
+                path: 'comparison',
+                name: 'PerfComparison',
+                component: () => import('@/views/performance-testing/Comparison.vue')
+            },
+            {
+                path: 'comparison-reports',
+                name: 'PerfComparisonReports',
+                component: () => import('@/views/performance-testing/ComparisonReports.vue')
+            },
+            {
+                path: 'scheduled',
+                name: 'PerfScheduled',
+                component: () => import('@/views/performance-testing/ScheduledTasks.vue')
+            }
+        ]
+    },
+    {
+        path: '/quality-intelligence',
+        component: Layout,
+        meta: { requiresAuth: true, featureFlag: 'quality-intelligence' },
+        children: [
+            {
+                path: '',
+                redirect: 'dashboard'
+            },
+            {
+                path: 'dashboard',
+                name: 'QualityDashboard',
+                component: () => import('@/views/quality-intelligence/QualityDashboard.vue')
+            },
+            {
+                path: 'runs',
+                name: 'QualityRuns',
+                component: () => import('@/views/quality-intelligence/QualityRunList.vue')
+            },
+            {
+                path: 'runs/:id',
+                name: 'QualityRunDetail',
+                component: () => import('@/views/quality-intelligence/QualityRunDetail.vue')
+            },
+            {
+                path: 'failures',
+                name: 'QualityFailures',
+                component: () => import('@/views/quality-intelligence/FailureExplorer.vue')
+            },
+            {
+                path: 'profiles',
+                name: 'QualityProfiles',
+                component: () => import('@/views/quality-intelligence/ProfileQuarantine.vue')
+            },
+            {
+                path: 'baselines',
+                name: 'QualityBaselines',
+                component: () => import('@/views/quality-intelligence/BaselineView.vue')
+            }
+        ]
+    },
+    {
+        path: '/mcp',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                redirect: 'console'
+            },
+            {
+                path: 'console',
+                name: 'McpConsole',
+                component: () => import('@/views/mcp/McpConsole.vue')
+            }
+        ]
+    },
+    {
+        path: '/docs-center',
+        component: Layout,
+        meta: { requiresAuth: true },
+        children: [
+            {
+                path: '',
+                name: 'DocsCenter',
+                component: () => import('@/views/docs-center/DocsCenter.vue')
+            }
+        ]
     }
 ]
 
@@ -488,7 +716,7 @@ router.beforeEach(async (to, _from, next) => {
     const code = to.query.code
     if (code && !userStore.accessToken) {
         try {
-            const api = (await import('@/utils/api')).default
+
             const response = await api.post('/auth/exchange-token/', {
                 action: 'redeem',
                 code: code,
@@ -522,7 +750,9 @@ router.beforeEach(async (to, _from, next) => {
         }
     }
 
-    if (to.meta.requiresAuth && !userStore.isAuthenticated) {
+    if (to.meta.featureFlag === 'quality-intelligence' && !QUALITY_INTELLIGENCE_ENABLED) {
+        next('/home')
+    } else if (to.meta.requiresAuth && !userStore.isAuthenticated) {
         next('/login')
     } else if (to.meta.requiresGuest && userStore.isAuthenticated) {
         next('/home')

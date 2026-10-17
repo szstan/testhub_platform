@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
+from typing import Optional
+
 from rest_framework import serializers
 from django.utils import timezone
+from django.core.signing import TimestampSigner
+from .access import accessible_projects, scope_test_cases
 from .models import (
     AppProject,
     AppTestConfig,
@@ -33,7 +37,7 @@ class AppProjectSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
-    def get_owner_name(self, obj):
+    def get_owner_name(self, obj) -> Optional[str]:
         return obj.owner.username if obj.owner else None
 
     def get_member_count(self, obj):
@@ -83,7 +87,7 @@ class AppDeviceSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_locked_by_name(self, obj):
+    def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None
 
 
@@ -98,10 +102,17 @@ class AppElementSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'usage_count', 'last_used_at')
     
-    def get_created_by_name(self, obj):
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
+
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
     
-    def get_preview_url(self, obj):
+    def get_preview_url(self, obj) -> Optional[str]:
         """获取图片预览 URL"""
         if obj.element_type == 'image' and obj.config:
             image_path = obj.config.get('image_path')
@@ -157,13 +168,13 @@ class AppElementSerializer(serializers.ModelSerializer):
 class AppPackageSerializer(serializers.ModelSerializer):
     """APP应用包名序列化器"""
     created_by_name = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = AppPackage
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
-    
-    def get_created_by_name(self, obj):
+
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -171,13 +182,20 @@ class AppTestCaseSerializer(serializers.ModelSerializer):
     """APP测试用例序列化器"""
     created_by_name = serializers.SerializerMethodField()
     app_package_name = serializers.CharField(source='app_package.name', read_only=True)
-    
+
     class Meta:
         model = AppTestCase
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
-    
-    def get_created_by_name(self, obj):
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
+
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -186,10 +204,16 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     case_name = serializers.CharField(read_only=True)
     device_name = serializers.CharField(read_only=True)
     user_name = serializers.CharField(read_only=True)
+    report_access_token = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     result_display = serializers.CharField(source='get_result_display', read_only=True, default=None)
-    
+
+    def get_report_access_token(self, obj) -> str:
+        if not obj.report_path:
+            return ''
+        return TimestampSigner().sign(str(obj.pk))
+
     class Meta:
         model = AppTestExecution
         fields = '__all__'
@@ -223,7 +247,7 @@ class AppComponentPackageSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
     
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
 
@@ -278,7 +302,7 @@ class AppTestSuiteSerializer(serializers.ModelSerializer):
             'passed_count', 'failed_count', 'last_run_at',
         )
 
-    def get_created_by_name(self, obj):
+    def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
 
     def get_test_case_count(self, obj):
@@ -299,8 +323,22 @@ class AppTestSuiteCreateSerializer(serializers.ModelSerializer):
         fields = ('id', 'name', 'description', 'project', 'test_case_ids')
         read_only_fields = ('id',)
 
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
+
     def create(self, validated_data):
         test_case_ids = validated_data.pop('test_case_ids', [])
+        project = validated_data.get('project')
+        user = getattr(self.context.get('request'), 'user', None)
+        allowed_ids = set(scope_test_cases(
+            AppTestCase.objects.filter(id__in=test_case_ids), user
+        ).filter(project=project).values_list('id', flat=True))
+        if set(test_case_ids) != allowed_ids:
+            raise serializers.ValidationError('测试用例列表包含无权使用的用例')
         suite = AppTestSuite.objects.create(**validated_data)
         for idx, tc_id in enumerate(test_case_ids):
             AppTestSuiteCase.objects.create(
@@ -313,6 +351,14 @@ class AppTestSuiteCreateSerializer(serializers.ModelSerializer):
 
 class AppTestSuiteUpdateSerializer(serializers.ModelSerializer):
     """测试套件更新序列化器"""
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
+
     class Meta:
         model = AppTestSuite
         fields = ('name', 'description', 'project')
@@ -331,6 +377,13 @@ class AppScheduledTaskSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     trigger_type_display = serializers.CharField(source='get_trigger_type_display', read_only=True)
     notification_type_display = serializers.SerializerMethodField()
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
 
     class Meta:
         model = AppScheduledTask
@@ -359,12 +412,12 @@ class AppScheduledTaskSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
 
-    def get_device_name(self, obj):
+    def get_device_name(self, obj) -> str:
         if obj.device:
             return obj.device.name or obj.device.device_id
         return ''
 
-    def get_notification_type_display(self, obj):
+    def get_notification_type_display(self, obj) -> str:
         return obj.get_notification_type_display() if obj.notification_type else '-'
 
     def validate(self, attrs):
@@ -426,19 +479,19 @@ class AppNotificationLogSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'sent_at']
 
-    def get_recipient_names(self, obj):
+    def get_recipient_names(self, obj) -> str:
         return obj.get_recipient_names()
 
-    def get_retry_status(self, obj):
+    def get_retry_status(self, obj) -> str:
         return obj.get_retry_status()
 
-    def get_task_type_display(self, obj):
+    def get_task_type_display(self, obj) -> str:
         if obj.task_type:
             choices = dict(AppScheduledTask.TASK_TYPE_CHOICES)
             return choices.get(obj.task_type, obj.task_type)
         return '未记录'
 
-    def get_actual_notification_type_display(self, obj):
+    def get_actual_notification_type_display(self, obj) -> str:
         if obj.webhook_bot_info:
             bot_type = obj.webhook_bot_info.get('type', '') or obj.webhook_bot_info.get('bot_type', '')
             type_map = {'wechat': '企微机器人', 'feishu': '飞书机器人', 'dingtalk': '钉钉机器人'}

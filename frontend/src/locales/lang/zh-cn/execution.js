@@ -9,12 +9,13 @@ export default {
   // Actions
   newPlan: '新建测试计划',
   batchDelete: '批量删除',
-  viewExecution: '查看执行',
+  viewExecution: '查看',
   createPlan: '创建',
   updatePlan: '保存',
   closePlan: '关闭',
   activatePlan: '激活',
   viewHistory: '历史',
+  noRuns: '暂无测试执行记录',
 
   // Table columns
   serialNumber: '序号',
@@ -120,6 +121,9 @@ export default {
   batchDeletePartialSuccess: '成功删除 {successCount} 个测试计划，{failCount} 个失败',
   batchDeleteCasesPartialSuccess: '成功删除 {successCount} 个用例，{failCount} 个失败',
   batchDeleteFailed: '删除失败',
+  batchSaveAll: '保存全部修改',
+  batchSaveSuccess: '成功保存 {count} 条用例',
+  batchSavePartialSuccess: '{successCount} 条保存成功，{failCount} 条失败',
   toggleStatusConfirm: '确定要{action}这个测试计划吗？',
   toggleStatusSuccess: '{action}成功',
   toggleStatusFailed: '操作失败',

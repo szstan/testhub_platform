@@ -1,14 +1,22 @@
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.utils import timezone
 from django.db import transaction
+from django.db.models import Q
 from .models import TestPlan, TestRun, TestRunCase, TestRunCaseHistory
 from apps.testcases.models import TestCase
 from apps.projects.models import Project
 from .serializers import (TestPlanSerializer, TestRunSerializer, TestRunCaseSerializer, 
                          TestPlanDetailSerializer, TestRunCaseDetailSerializer, 
                          TestRunCaseHistorySerializer)
+
+
+def get_accessible_projects(user):
+    return Project.objects.filter(
+        Q(owner=user) | Q(members=user)
+    ).distinct()
 
 class TestPlanViewSet(viewsets.ModelViewSet):
     """
@@ -17,10 +25,28 @@ class TestPlanViewSet(viewsets.ModelViewSet):
     queryset = TestPlan.objects.all().order_by('-created_at')
     serializer_class = TestPlanSerializer
 
+    def get_queryset(self):
+        return self.queryset.filter(
+            projects__in=get_accessible_projects(self.request.user)
+        ).distinct()
+
     def get_serializer_class(self):
         if self.action == 'retrieve':
             return TestPlanDetailSerializer
         return TestPlanSerializer
+
+    def _validate_project_ids(self, project_ids):
+        try:
+            requested_ids = {int(project_id) for project_id in project_ids}
+        except (TypeError, ValueError):
+            raise ValidationError({'projects': '项目 ID 格式错误'})
+
+        accessible_ids = set(
+            get_accessible_projects(self.request.user).values_list('id', flat=True)
+        )
+        if not requested_ids.issubset(accessible_ids):
+            raise PermissionDenied('没有权限访问部分项目')
+        return requested_ids
 
     def _sync_test_runs(self, test_plan, project_ids, testcase_ids):
         if not project_ids:
@@ -28,7 +54,11 @@ class TestPlanViewSet(viewsets.ModelViewSet):
             test_plan.test_runs.all().delete()
             return
 
-        valid_projects = list(Project.objects.filter(id__in=project_ids))
+        valid_projects = list(
+            Project.objects.filter(id__in=project_ids).filter(
+                id__in=get_accessible_projects(self.request.user).values('id')
+            )
+        )
         valid_project_ids = [project.id for project in valid_projects]
         test_plan.projects.set(valid_project_ids)
 
@@ -86,7 +116,10 @@ class TestPlanViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         # 在创建TestPlan时，设置creator并自动为每个项目创建TestRun和TestRunCase
-        # 获取版本信息
+        project_ids = self.request.data.get('projects', [])
+        testcase_ids = self.request.data.get('testcases', [])
+        self._validate_project_ids(project_ids)
+
         version_id = self.request.data.get('version')
         version = None
         if version_id:
@@ -95,11 +128,8 @@ class TestPlanViewSet(viewsets.ModelViewSet):
                 version = Version.objects.get(id=version_id)
             except Version.DoesNotExist:
                 pass
-        
-        test_plan = serializer.save(creator=self.request.user, version=version)
 
-        project_ids = self.request.data.get('projects', [])
-        testcase_ids = self.request.data.get('testcases', [])
+        test_plan = serializer.save(creator=self.request.user, version=version)
         self._sync_test_runs(test_plan, project_ids, testcase_ids)
 
     @action(detail=False, methods=['get'])
@@ -128,6 +158,8 @@ class TestPlanViewSet(viewsets.ModelViewSet):
             testcases = TestCase.objects.filter(
                 project_id__in=project_ids,
                 status__in=['draft', 'active']  # 包含草稿和激活状态的测试用例
+            ).filter(
+                project_id__in=get_accessible_projects(request.user).values('id')
             ).values('id', 'title', 'priority', 'test_type', 'project__name')
             
             return Response({
@@ -156,11 +188,12 @@ class TestPlanViewSet(viewsets.ModelViewSet):
             except Version.DoesNotExist:
                 pass
         
+        project_ids = self.request.data.get('projects', [])
+        testcase_ids = self.request.data.get('testcases', [])
+        self._validate_project_ids(project_ids)
+
         with transaction.atomic():
             test_plan = serializer.save(version=version)
-
-            project_ids = self.request.data.get('projects', [])
-            testcase_ids = self.request.data.get('testcases', [])
             self._sync_test_runs(test_plan, project_ids, testcase_ids)
 
             assignee_ids = self.request.data.get('assignees', [])
@@ -177,12 +210,22 @@ class TestRunViewSet(viewsets.ModelViewSet):
     queryset = TestRun.objects.all().order_by('-created_at')
     serializer_class = TestRunSerializer
 
+    def get_queryset(self):
+        return self.queryset.filter(
+            project__in=get_accessible_projects(self.request.user)
+        ).distinct()
+
 class TestRunCaseViewSet(viewsets.ModelViewSet):
     """
     测试执行用例视图集
     """
     queryset = TestRunCase.objects.all()
     serializer_class = TestRunCaseSerializer
+
+    def get_queryset(self):
+        return self.queryset.filter(
+            test_run__project__in=get_accessible_projects(self.request.user)
+        ).distinct()
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
@@ -238,3 +281,8 @@ class TestRunCaseHistoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
     queryset = TestRunCaseHistory.objects.all().order_by('-executed_at')
     serializer_class = TestRunCaseHistorySerializer
+
+    def get_queryset(self):
+        return self.queryset.filter(
+            run_case__test_run__project__in=get_accessible_projects(self.request.user)
+        ).distinct()

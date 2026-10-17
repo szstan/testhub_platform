@@ -51,7 +51,28 @@ REGISTRATION_STATS_VISIBLE_USERNAMES = config(
     cast=parse_csv,
 )
 APP_USE_HTTPS = config('APP_USE_HTTPS', default=not DEBUG, cast=bool)
+APP_DEVICE_ALLOWED_CIDRS = parse_csv(config('APP_DEVICE_ALLOWED_CIDRS', default=''))
 TRUST_PROXY_SSL_HEADER = config('TRUST_PROXY_SSL_HEADER', default=APP_USE_HTTPS, cast=bool)
+
+QUALITY_INTELLIGENCE_ENABLED = config(
+    'QUALITY_INTELLIGENCE_ENABLED', default=False, cast=bool
+)
+QUALITY_AI_ENABLED = config('QUALITY_AI_ENABLED', default=False, cast=bool)
+
+# MCP Server 总开关（协议端点 /api/mcp/，需 Daphne/ASGI 部署）
+MCP_ENABLED = config('MCP_ENABLED', default=True, cast=bool)
+# MCP 危险操作人工审批模式：开启后 confirm_* 不再直接执行，
+# 转为等待 MCP 控制台人工批准（Agent 轮询 get_approval_status 取结果）
+MCP_HUMAN_APPROVAL = config('MCP_HUMAN_APPROVAL', default=False, cast=bool)
+# MCP 协议端点 Host 白名单追加项（逗号分隔）：SDK 的 DNS Rebinding 防护
+MCP_ALLOWED_HOSTS = config('MCP_ALLOWED_HOSTS', default='')
+
+# ---------- 监控中心（monitor）全局默认 ----------
+# 自动监测持续 DOWN 时的重提醒周期、手动检测的冷却，均可在 .env 调整基线
+MONITOR_DEFAULT_ALERT_REPEAT_INTERVAL = config(
+    'MONITOR_DEFAULT_ALERT_REPEAT_INTERVAL', default=30, cast=int)
+MONITOR_DEFAULT_MANUAL_ALERT_COOLDOWN = config(
+    'MONITOR_DEFAULT_MANUAL_ALERT_COOLDOWN', default=5, cast=int)
 
 LOCAL_APPS = [
     'apps.users',
@@ -62,6 +83,7 @@ LOCAL_APPS = [
     'apps.reports',
     'apps.reviews',
     'apps.versions',
+    'apps.defects',
     'apps.assistant',
     'apps.requirement_analysis',
     'apps.api_testing',
@@ -69,6 +91,11 @@ LOCAL_APPS = [
     'apps.app_automation.apps.AppAutomationConfig',  # APP自动化测试
     'apps.core',
     'apps.data_factory',
+    'apps.llm_judge',
+    'apps.monitor',  # 监控中心
+    'apps.perf_testing.apps.PerfTestingConfig',  # 性能测试
+    'apps.mcp.apps.McpConfig',  # MCP Server（外部 Agent 驱动）
+    'apps.quality_intelligence.apps.QualityIntelligenceConfig',
 ]
 
 if ANALYTICS_ENABLED or REGISTRATION_STATS_ENABLED:
@@ -298,6 +325,38 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'Test Case Management Platform API',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
+    # Keep repeated model choices named by their domain instead of generated hashes.
+    'ENUM_NAME_OVERRIDES': {
+        'ApiRequestTypeEnum': 'apps.api_testing.models.ApiRequest.REQUEST_TYPE_CHOICES',
+        'AppExecutionResultEnum': 'apps.app_automation.models.AppTestSuite.EXECUTION_RESULT_CHOICES',
+        'AppScheduledTaskTypeEnum': 'apps.app_automation.models.AppScheduledTask.TASK_TYPE_CHOICES',
+        'AppScheduledTaskTriggerTypeEnum': 'apps.app_automation.models.AppScheduledTask.TRIGGER_TYPE_CHOICES',
+        'AppScheduledTaskStatusEnum': 'apps.app_automation.models.AppScheduledTask.STATUS_CHOICES',
+        'AppNotificationTypeEnum': 'apps.app_automation.models.AppScheduledTask.NOTIFICATION_TYPE_CHOICES',
+        'ApiNotificationTypeEnum': 'apps.api_testing.models.TaskNotificationSetting.NOTIFICATION_TYPES',
+        'ApiNotificationStatusEnum': 'apps.api_testing.models.NotificationLog.STATUS_CHOICES',
+        'DataFactoryToolScenarioEnum': 'apps.data_factory.models.DataFactoryRecord.TOOL_SCENARIOS',
+        'DefectSeverityEnum': 'apps.defects.models.Defect.SEVERITY_CHOICES',
+        'DefectPriorityEnum': 'apps.defects.models.Defect.PRIORITY_CHOICES',
+        'DefectStatusEnum': 'apps.defects.models.Defect.STATUS_CHOICES',
+        'DefectSourceEnum': 'apps.defects.models.Defect.SOURCE_CHOICES',
+        'ExecutionCaseStatusEnum': 'apps.executions.models.TestRunCase.STATUS_CHOICES',
+        'ExecutionCasePriorityEnum': 'apps.executions.models.TestRunCase.PRIORITY_CHOICES',
+        'PerfEngineEnum': 'apps.perf_testing.models.PerfScenario.ENGINE_CHOICES',
+        'PerfExecutionStatusEnum': 'apps.perf_testing.models.PerfExecution.STATUS_CHOICES',
+        'PerfExecutionTriggerTypeEnum': 'apps.perf_testing.models.PerfExecution.TRIGGER_TYPE_CHOICES',
+        'PerfSlaResultEnum': 'apps.perf_testing.models.PerfExecution.SLA_RESULT_CHOICES',
+        'ProjectStatusEnum': 'apps.projects.models.Project.STATUS_CHOICES',
+        'TestCaseImportStatusEnum': 'apps.testcases.models.TestCaseImportRecord.STATUS_CHOICES',
+        'TestCaseStatusEnum': 'apps.testcases.models.TestCase.STATUS_CHOICES',
+        'MonitorTargetStatusEnum': 'apps.monitor.models.TargetStatus.CHOICES',
+        'UiElementTypeEnum': 'apps.ui_automation.models.Element.ELEMENT_TYPE_CHOICES',
+        'UiEngineEnum': 'apps.ui_automation.models.TestCaseExecution.ENGINE_CHOICES',
+        'UiProjectStatusEnum': 'apps.ui_automation.models.UiProject.STATUS_CHOICES',
+        'UiTestCasePriorityEnum': 'apps.ui_automation.models.TestCase.PRIORITY_CHOICES',
+        'ReviewPriorityEnum': 'apps.reviews.models.TestCaseReview.PRIORITY_CHOICES',
+        'QualityTaxonomyCodeEnum': 'apps.quality_intelligence.models.QualityFailureCategory.choices',
+    },
 }
 
 # Redis URL (used across celery, channels, and SMS verification)
@@ -346,9 +405,8 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='webmaster@localhost')
 # For 163 email with SSL, you might need this setting
 EMAIL_TIMEOUT = 30
 
-# 确保日志目录存在
+# Logging directories are created by SafeFileHandler when logging is configured.
 log_dir = os.path.join(BASE_DIR, 'logs')
-os.makedirs(log_dir, exist_ok=True)
 
 # Logging
 LOGGING = {
@@ -367,13 +425,13 @@ LOGGING = {
     'handlers': {
         'file': {
             'level': 'INFO',
-            'class': 'logging.FileHandler',
+            'class': 'apps.core.logging_handlers.SafeFileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'app.log'),
             'formatter': 'verbose',
         },
         'error_file': {
             'level': 'ERROR',
-            'class': 'logging.FileHandler',
+            'class': 'apps.core.logging_handlers.SafeFileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'error.log'),
             'formatter': 'verbose',
         },
@@ -497,3 +555,39 @@ SIMPLEUI_ICON = {
 
 # 开发环境，暂时禁用迁移历史检查
 # SILENCED_SYSTEM_CHECKS = ['django.db.migrations.InconsistentMigrationHistory']
+
+# ==================== LLM 智能评分器配置 ====================
+# 评分器 OpenAI 兼容配置（与平台既有 LLM 配置共用）
+OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
+OPENAI_BASE_URL = config('OPENAI_BASE_URL', default=None)
+# Judge 评分模型
+JUDGE_MODEL = config('JUDGE_MODEL', default='deepseek-chat')
+JUDGE_MOCK = config('JUDGE_MOCK', default=False, cast=bool)
+JUDGE_N_RUNS = config('JUDGE_N_RUNS', default=3, cast=int)
+JUDGE_CACHE_TIMEOUT = config('JUDGE_CACHE_TIMEOUT', default=3600, cast=int)
+JUDGE_RULE_LLM_FALLBACK = config('JUDGE_RULE_LLM_FALLBACK', default=False, cast=bool)
+# Rubric / KB 目录（放 MEDIA_ROOT 下）
+JUDGE_RUBRIC_DIR = os.path.join(MEDIA_ROOT, 'judge_rubrics')
+JUDGE_KB_DIR = os.path.join(MEDIA_ROOT, 'judge_kb')
+
+# ==================== 性能测试模块配置 ====================
+# 容量护栏：超过阈值时预检拦截，避免压力机自身成为瓶颈导致数据失真
+PERF_MAX_CONCURRENCY = config('PERF_MAX_CONCURRENCY', default=1000, cast=int)
+PERF_MAX_TARGET_RPS = config('PERF_MAX_TARGET_RPS', default=5000, cast=int)
+PERF_MAX_DURATION = config('PERF_MAX_DURATION', default=7200, cast=int)  # 单次压测最长 2 小时
+PERF_MAX_CONCURRENT_EXECUTIONS = config('PERF_MAX_CONCURRENT_EXECUTIONS', default=2, cast=int)
+
+# 生产环境黑名单：base_url 命中则预检直接拦截，逗号分隔（支持后缀匹配）
+PERF_FORBIDDEN_HOSTS = [
+    h.strip() for h in config('PERF_FORBIDDEN_HOSTS', default='').split(',') if h.strip()
+]
+# Internal/loopback targets are denied by default. Test environments may opt in explicitly.
+PERF_ALLOW_PRIVATE_TARGETS = config('PERF_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
+MONITOR_ALLOW_PRIVATE_TARGETS = config('MONITOR_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
+
+# 数据保留策略
+PERF_RETENTION_DAYS = config('PERF_RETENTION_DAYS', default=90, cast=int)        # 执行记录
+PERF_ARTIFACT_RETENTION_DAYS = config('PERF_ARTIFACT_RETENTION_DAYS', default=30, cast=int)  # 产物文件
+
+# 压力机自监控告警阈值
+PERF_LOAD_GEN_CPU_WARN = config('PERF_LOAD_GEN_CPU_WARN', default=85.0, cast=float)

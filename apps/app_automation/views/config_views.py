@@ -7,6 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 import logging
 
 from ..models import AppTestConfig
+from ..access import is_app_admin
 from ..serializers import AppTestConfigSerializer
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,9 @@ class AppConfigViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'])
     def save(self, request):
         """保存配置"""
+        if not is_app_admin(request.user):
+            return Response({'success': False, 'message': '仅管理员可以修改 APP 配置'},
+                            status=status.HTTP_403_FORBIDDEN)
         try:
             # 获取或创建配置（单例模式）
             config, created = AppTestConfig.objects.get_or_create(

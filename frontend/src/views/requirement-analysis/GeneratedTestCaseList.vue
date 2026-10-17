@@ -1194,12 +1194,12 @@ export default {
 .testcases-table {
   border: 1px solid #ddd;
   border-radius: 8px;
-  overflow: hidden;
+  overflow-x: auto; /* 内容超宽时横向滚动，操作列固定在右侧 */
 }
 
 .table-header {
   display: grid;
-  grid-template-columns: 50px 60px 180px 320px 100px 100px 180px 200px;
+  grid-template-columns: 50px 60px 180px 320px 100px 100px 180px 260px;
   background: #f8f9fa;
   font-weight: bold;
   color: #2c3e50;
@@ -1207,7 +1207,7 @@ export default {
 
 .table-body .table-row {
   display: grid;
-  grid-template-columns: 50px 60px 180px 320px 100px 100px 180px 200px;
+  grid-template-columns: 50px 60px 180px 320px 100px 100px 180px 260px;
   border-bottom: 1px solid #eee;
   transition: background 0.2s ease;
 }
@@ -1317,21 +1317,41 @@ export default {
   justify-content: center;
 }
 
-/* 操作列 */
+/* 操作列：固定在右侧，横向滚动时始终可见 */
 .action-cell {
-  min-width: 200px;
+  min-width: 260px;
   flex-shrink: 0;
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  border-left: 1px solid #eee;
+}
+
+.header-cell.action-cell {
+  background: #f8f9fa;
 }
 
 .body-cell.action-cell {
-  justify-content: flex-start;
+  justify-content: center;
+  background: #fff;
+}
+
+/* 行 hover/选中时，固定操作列背景跟随行底色，避免透出滚动内容 */
+.table-row:hover .body-cell.action-cell {
+  background: #f8f9fa;
+}
+
+.table-row.selected .body-cell.action-cell,
+.table-row.selected:hover .body-cell.action-cell {
+  background: #e3f2fd;
 }
 
 .action-buttons {
   display: flex;
-  gap: 5px;
+  gap: 4px;
   flex-wrap: nowrap;
   align-items: center;
+  justify-content: center;
   margin: 0 auto;
 }
 
@@ -1419,12 +1439,11 @@ export default {
   background: #3498db;
   color: white;
   border: none;
-  padding: 6px 10px;
+  padding: 6px 8px;
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.8rem;
   transition: background 0.3s ease;
-  margin-right: 3px;
   white-space: nowrap;
 }
 
@@ -1436,12 +1455,11 @@ export default {
   background: #27ae60;
   color: white;
   border: none;
-  padding: 6px 10px;
+  padding: 6px 8px;
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.8rem;
   transition: background 0.3s ease;
-  margin-right: 3px;
   white-space: nowrap;
 }
 
@@ -1453,7 +1471,7 @@ export default {
   background: #e74c3c;
   color: white;
   border: none;
-  padding: 6px 10px;
+  padding: 6px 8px;
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.8rem;
@@ -1467,9 +1485,11 @@ export default {
 
 .action-buttons {
   display: flex;
-  gap: 5px;
+  gap: 4px;
   flex-wrap: nowrap;
   align-items: center;
+  justify-content: center;
+  margin: 0 auto;
 }
 
 .adopted-label {
@@ -1798,7 +1818,7 @@ export default {
     flex-direction: row;
     gap: 2px;
     align-items: center;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
   }
 
   .view-detail-btn,

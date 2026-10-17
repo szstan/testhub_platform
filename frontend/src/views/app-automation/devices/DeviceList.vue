@@ -2,7 +2,7 @@
   <div class="device-management">
     <!-- 页面标题和操作按钮 -->
     <div class="device-header">
-      <h3>设备管理</h3>
+      <h3>{{ $t('appAutomation.device.title') }}</h3>
       <div class="device-actions">
         <el-button
           type="primary"
@@ -10,14 +10,14 @@
           :loading="refreshing"
           @click="refreshDevices"
         >
-          刷新设备
+          {{ $t('appAutomation.device.refreshDevice') }}
         </el-button>
         <el-button
           type="success"
           :icon="Plus"
           @click="showAddRemoteDialog"
         >
-          添加远程设备
+          {{ $t('appAutomation.device.addRemoteDevice') }}
         </el-button>
       </div>
     </div>
@@ -29,15 +29,15 @@
       style="width: 100%; margin-top: 20px"
       :empty-text="emptyText"
     >
-      <el-table-column prop="name" label="设备名称" min-width="150">
+      <el-table-column prop="name" :label="$t('appAutomation.device.deviceName')" min-width="150">
         <template #default="{ row }">
           <span>{{ row.name || row.device_id }}</span>
         </template>
       </el-table-column>
 
-      <el-table-column prop="device_id" label="设备序列号" min-width="180" />
+      <el-table-column prop="device_id" :label="$t('appAutomation.device.serialNumber')" min-width="180" />
 
-      <el-table-column prop="status" label="状态" width="100">
+      <el-table-column prop="status" :label="$t('appAutomation.common.status')" width="100">
         <template #default="{ row }">
           <el-tag :type="getStatusType(row.status)" size="small">
             {{ getStatusText(row.status) }}
@@ -45,7 +45,7 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="locked_by" label="锁定用户" width="120">
+      <el-table-column prop="locked_by" :label="$t('appAutomation.device.lockedUser')" width="120">
         <template #default="{ row }">
           <span v-if="row.locked_by_name">
             {{ row.locked_by_name }}
@@ -54,7 +54,7 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="locked_at" label="锁定时间" width="180">
+      <el-table-column prop="locked_at" :label="$t('appAutomation.device.lockedTime')" width="180">
         <template #default="{ row }">
           <span v-if="row.locked_at">
             {{ formatDate(row.locked_at) }}
@@ -63,9 +63,9 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="android_version" label="Android版本" width="120" />
+      <el-table-column prop="android_version" :label="$t('appAutomation.device.androidVersion')" width="120" />
 
-      <el-table-column prop="connection_type" label="连接类型" width="120">
+      <el-table-column prop="connection_type" :label="$t('appAutomation.device.connectionType')" width="120">
         <template #default="{ row }">
           <el-tag
             :type="getConnectionType(row.connection_type) === 'local' ? 'primary' : 'warning'"
@@ -76,7 +76,7 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="ip_address" label="IP地址" width="150">
+      <el-table-column prop="ip_address" :label="$t('appAutomation.device.ipAddress')" width="150">
         <template #default="{ row }">
           <span v-if="row.ip_address">
             {{ row.ip_address }}
@@ -85,15 +85,15 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="usage_count" label="使用次数" width="100" />
+      <el-table-column prop="usage_count" :label="$t('appAutomation.device.usageCount')" width="100" />
 
-      <el-table-column prop="updated_at" label="更新时间" width="180">
+      <el-table-column prop="updated_at" :label="$t('appAutomation.common.updateTime')" width="180">
         <template #default="{ row }">
           {{ formatDate(row.updated_at) }}
         </template>
       </el-table-column>
 
-      <el-table-column label="操作" width="250" fixed="right">
+      <el-table-column :label="$t('appAutomation.common.operation')" width="250" fixed="right">
         <template #default="{ row }">
           <el-button
             v-if="row.status === 'available' || row.status === 'online'"
@@ -102,7 +102,7 @@
             type="primary"
             @click="lockDevice(row)"
           >
-            锁定
+            {{ $t('appAutomation.device.lock') }}
           </el-button>
           <el-button
             v-if="row.status === 'locked'"
@@ -111,7 +111,7 @@
             type="success"
             @click="unlockDevice(row)"
           >
-            解锁
+            {{ $t('appAutomation.device.unlock') }}
           </el-button>
           <el-button
             v-if="isRemoteDevice(row.connection_type) && row.status === 'offline'"
@@ -121,14 +121,14 @@
             :loading="reconnectingDevices[row.id]"
             @click="reconnectDevice(row)"
           >
-            重连
+            {{ $t('appAutomation.device.reconnect') }}
           </el-button>
           <el-button
             link
             size="small"
             @click="viewDeviceInfo(row)"
           >
-            详情
+            {{ $t('appAutomation.common.details') }}
           </el-button>
           <el-button
             v-if="isRemoteDevice(row.connection_type) && (row.status === 'online' || row.status === 'available')"
@@ -137,7 +137,7 @@
             type="warning"
             @click="disconnectDevice(row)"
           >
-            断开
+            {{ $t('appAutomation.common.disconnect') }}
           </el-button>
           <el-button
             link
@@ -145,7 +145,7 @@
             type="danger"
             @click="handleDeleteDevice(row)"
           >
-            删除
+            {{ $t('appAutomation.common.delete') }}
           </el-button>
         </template>
       </el-table-column>
@@ -154,7 +154,7 @@
     <!-- 添加远程设备对话框 -->
     <el-dialog
       v-model="addRemoteDialogVisible"
-      title="添加远程设备"
+      :title="$t('appAutomation.device.addRemoteDevice')"
       width="500px"
       :close-on-click-modal="false"
     >
@@ -164,45 +164,45 @@
         :rules="remoteDeviceRules"
         label-width="100px"
       >
-        <el-form-item label="IP地址" prop="ip_address">
+        <el-form-item :label="$t('appAutomation.device.ipAddress')" prop="ip_address">
           <el-input
             v-model="remoteDeviceForm.ip_address"
-            placeholder="请输入远程设备IP地址"
+            :placeholder="$t('appAutomation.device.ipAddressPlaceholder')"
           />
         </el-form-item>
 
-        <el-form-item label="端口" prop="port">
+        <el-form-item :label="$t('appAutomation.device.port')" prop="port">
           <el-input-number
             v-model="remoteDeviceForm.port"
             :min="1"
             :max="65535"
-            placeholder="默认5555"
+            :placeholder="$t('appAutomation.device.portPlaceholder')"
             style="width: 100%"
           />
         </el-form-item>
 
         <el-alert
-          title="提示"
+          :title="$t('appAutomation.device.tip')"
           type="info"
           :closable="false"
           style="margin-top: 10px"
         >
-          <div>请确保：</div>
-          <div>1. 远程设备已开启ADB调试</div>
-          <div>2. 远程设备已开启网络ADB（adb tcpip 5555）</div>
-          <div>3. 网络连接正常</div>
+          <div>{{ $t('appAutomation.device.remoteTipTitle') }}</div>
+          <div>{{ $t('appAutomation.device.remoteTip1') }}</div>
+          <div>{{ $t('appAutomation.device.remoteTip2') }}</div>
+          <div>{{ $t('appAutomation.device.remoteTip3') }}</div>
         </el-alert>
       </el-form>
 
       <template #footer>
         <div class="dialog-footer">
-          <el-button @click="addRemoteDialogVisible = false">取消</el-button>
+          <el-button @click="addRemoteDialogVisible = false">{{ $t('appAutomation.common.cancel') }}</el-button>
           <el-button
             type="primary"
             :loading="connecting"
             @click="connectRemoteDevice"
           >
-            连接
+            {{ $t('appAutomation.common.connect') }}
           </el-button>
         </div>
       </template>
@@ -211,31 +211,31 @@
     <!-- 设备详情对话框 -->
     <el-dialog
       v-model="deviceInfoDialogVisible"
-      title="设备详情"
+      :title="$t('appAutomation.device.deviceDetail')"
       width="600px"
     >
       <el-descriptions v-if="selectedDevice" :column="2" border>
-        <el-descriptions-item label="设备名称">
+        <el-descriptions-item :label="$t('appAutomation.device.deviceName')">
           {{ selectedDevice.name || selectedDevice.device_id }}
         </el-descriptions-item>
-        <el-descriptions-item label="设备序列号">
+        <el-descriptions-item :label="$t('appAutomation.device.serialNumber')">
           {{ selectedDevice.device_id }}
         </el-descriptions-item>
-        <el-descriptions-item label="状态">
+        <el-descriptions-item :label="$t('appAutomation.common.status')">
           <el-tag :type="getStatusType(selectedDevice.status)" size="small">
             {{ getStatusText(selectedDevice.status) }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="锁定用户">
+        <el-descriptions-item :label="$t('appAutomation.device.lockedUser')">
           {{ selectedDevice.locked_by_name || '-' }}
         </el-descriptions-item>
-        <el-descriptions-item label="锁定时间">
+        <el-descriptions-item :label="$t('appAutomation.device.lockedTime')">
           {{ selectedDevice.locked_at ? formatDate(selectedDevice.locked_at) : '-' }}
         </el-descriptions-item>
-        <el-descriptions-item label="Android版本">
+        <el-descriptions-item :label="$t('appAutomation.device.androidVersion')">
           {{ selectedDevice.android_version || '-' }}
         </el-descriptions-item>
-        <el-descriptions-item label="连接类型">
+        <el-descriptions-item :label="$t('appAutomation.device.connectionType')">
           <el-tag
             :type="getConnectionType(selectedDevice.connection_type) === 'local' ? 'primary' : 'warning'"
             size="small"
@@ -243,26 +243,26 @@
             {{ getConnectionTypeName(selectedDevice.connection_type) }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="IP地址">
+        <el-descriptions-item :label="$t('appAutomation.device.ipAddress')">
           {{ selectedDevice.ip_address || '-' }}
         </el-descriptions-item>
-        <el-descriptions-item label="端口">
+        <el-descriptions-item :label="$t('appAutomation.device.port')">
           {{ selectedDevice.port || '-' }}
         </el-descriptions-item>
-        <el-descriptions-item label="使用次数">
+        <el-descriptions-item :label="$t('appAutomation.device.usageCount')">
           {{ selectedDevice.usage_count || 0 }}
         </el-descriptions-item>
-        <el-descriptions-item label="创建时间">
+        <el-descriptions-item :label="$t('appAutomation.common.createTime')">
           {{ formatDate(selectedDevice.created_at) }}
         </el-descriptions-item>
-        <el-descriptions-item label="更新时间">
+        <el-descriptions-item :label="$t('appAutomation.common.updateTime')">
           {{ formatDate(selectedDevice.updated_at) }}
         </el-descriptions-item>
       </el-descriptions>
 
       <template #footer>
         <div class="dialog-footer">
-          <el-button @click="deviceInfoDialogVisible = false">关闭</el-button>
+          <el-button @click="deviceInfoDialogVisible = false">{{ $t('appAutomation.common.close') }}</el-button>
         </div>
       </template>
     </el-dialog>
@@ -270,7 +270,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Plus } from '@element-plus/icons-vue'
 import {
@@ -283,6 +283,9 @@ import {
   deleteDevice
 } from '@/api/app-automation'
 import { getDeviceStatusType, getDeviceStatusText, formatDateTime } from '@/utils/app-automation-helpers'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 // Refs
 const remoteDeviceFormRef = ref(null)
@@ -296,7 +299,7 @@ const reconnectingDevices = ref({})
 const addRemoteDialogVisible = ref(false)
 const deviceInfoDialogVisible = ref(false)
 const selectedDevice = ref(null)
-const emptyText = ref('暂无设备，请点击刷新设备或添加远程设备')
+const emptyText = ref(t('appAutomation.device.emptyText'))
 const refreshTimer = ref(null)
 
 const remoteDeviceForm = ref({
@@ -304,19 +307,19 @@ const remoteDeviceForm = ref({
   port: 5555
 })
 
-const remoteDeviceRules = {
+const remoteDeviceRules = computed(() => ({
   ip_address: [
-    { required: true, message: '请输入IP地址', trigger: 'blur' },
+    { required: true, message: t('appAutomation.device.rules.ipRequired'), trigger: 'blur' },
     {
       pattern: /^(\d{1,3}\.){3}\d{1,3}$/,
-      message: '请输入有效的IP地址',
+      message: t('appAutomation.device.rules.ipInvalid'),
       trigger: 'blur'
     }
   ],
   port: [
-    { required: true, message: '请输入端口号', trigger: 'blur' }
+    { required: true, message: t('appAutomation.device.rules.portRequired'), trigger: 'blur' }
   ]
-}
+}))
 
 // 方法
 const getDevices = async () => {
@@ -325,11 +328,11 @@ const getDevices = async () => {
     const res = await getDeviceList({ page: 1, page_size: 1000 })
     devices.value = res.data.results || []
     if (devices.value.length === 0) {
-      emptyText.value = '暂无设备，请点击刷新设备或添加远程设备'
+      emptyText.value = t('appAutomation.device.emptyText')
     }
   } catch (error) {
     console.error('获取设备列表失败:', error)
-    ElMessage.error('获取设备列表失败: ' + (error.message || '未知错误'))
+    ElMessage.error(t('appAutomation.device.messages.loadFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
     loading.value = false
   }
@@ -341,13 +344,13 @@ const refreshDevices = async () => {
     const res = await discoverDevices()
     if (res.data.success) {
       devices.value = res.data.devices || []
-      ElMessage.success(res.data.message || '设备列表已刷新')
+      ElMessage.success(res.data.message || t('appAutomation.device.messages.refreshedSuccess'))
     } else {
-      ElMessage.error(res.data.message || '刷新设备列表失败')
+      ElMessage.error(res.data.message || t('appAutomation.device.messages.refreshFailed'))
     }
   } catch (error) {
     console.error('刷新设备列表失败:', error)
-    ElMessage.error('刷新设备列表失败: ' + (error.message || '未知错误'))
+    ElMessage.error(t('appAutomation.device.messages.refreshFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
     refreshing.value = false
   }
@@ -378,15 +381,15 @@ const connectRemoteDevice = async () => {
       })
       
       if (res.data.success) {
-        ElMessage.success(res.data.message || '远程设备连接成功')
+        ElMessage.success(res.data.message || t('appAutomation.device.messages.connectSuccess'))
         addRemoteDialogVisible.value = false
         await getDevices()
       } else {
-        ElMessage.error(res.data.message || '连接远程设备失败')
+        ElMessage.error(res.data.message || t('appAutomation.device.messages.connectFailed'))
       }
     } catch (error) {
       console.error('连接远程设备失败:', error)
-      ElMessage.error('连接远程设备失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.device.messages.connectFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
     } finally {
       connecting.value = false
     }
@@ -395,12 +398,12 @@ const connectRemoteDevice = async () => {
 
 const reconnectDevice = async (device) => {
   if (!device.ip_address || !device.port) {
-    ElMessage.error('设备信息不完整，无法重连')
+    ElMessage.error(t('appAutomation.device.messages.incompleteInfo'))
     return
   }
 
   reconnectingDevices.value[device.id] = true
-  
+
   try {
     const res = await connectDevice({
       ip_address: device.ip_address,
@@ -408,14 +411,14 @@ const reconnectDevice = async (device) => {
     })
 
     if (res.data.success) {
-      ElMessage.success('设备重连成功')
+      ElMessage.success(t('appAutomation.device.messages.reconnectSuccess'))
       await getDevices()
     } else {
-      ElMessage.error(res.data.message || '设备重连失败，请检查设备网络连接')
+      ElMessage.error(res.data.message || t('appAutomation.device.messages.reconnectFailed'))
     }
   } catch (error) {
     console.error('设备重连失败:', error)
-    ElMessage.error('设备重连失败，请检查设备网络连接')
+    ElMessage.error(t('appAutomation.device.messages.reconnectFailed'))
   } finally {
     reconnectingDevices.value[device.id] = false
   }
@@ -424,11 +427,11 @@ const reconnectDevice = async (device) => {
 const disconnectDevice = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要断开设备 ${device.name || device.device_id} 的连接吗？`,
-      '提示',
+      t('appAutomation.device.messages.disconnectConfirm', { name: device.name || device.device_id }),
+      t('appAutomation.device.tip'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
@@ -436,15 +439,15 @@ const disconnectDevice = async (device) => {
     const res = await apiDisconnectDevice(device.id)
 
     if (res.data.success) {
-      ElMessage.success('设备已断开')
+      ElMessage.success(t('appAutomation.device.messages.disconnected'))
       await getDevices()
     } else {
-      ElMessage.error(res.data.message || '断开设备失败')
+      ElMessage.error(res.data.message || t('appAutomation.device.messages.disconnectFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
       console.error('断开设备失败:', error)
-      ElMessage.error('断开设备失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.device.messages.disconnectFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
     }
   }
 }
@@ -457,11 +460,11 @@ const viewDeviceInfo = (device) => {
 const lockDevice = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要锁定设备 ${device.name || device.device_id} 吗？`,
-      '提示',
+      t('appAutomation.device.messages.lockConfirm', { name: device.name || device.device_id }),
+      t('appAutomation.device.tip'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
@@ -469,15 +472,15 @@ const lockDevice = async (device) => {
     const res = await apiLockDevice(device.id)
 
     if (res.data.success) {
-      ElMessage.success('设备已锁定')
+      ElMessage.success(t('appAutomation.device.messages.locked'))
       await getDevices()
     } else {
-      ElMessage.error(res.data.message || '锁定设备失败')
+      ElMessage.error(res.data.message || t('appAutomation.device.messages.lockFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
       console.error('锁定设备失败:', error)
-      ElMessage.error('锁定设备失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.device.messages.lockFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
     }
   }
 }
@@ -485,11 +488,11 @@ const lockDevice = async (device) => {
 const unlockDevice = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要解锁设备 ${device.name || device.device_id} 吗？`,
-      '提示',
+      t('appAutomation.device.messages.unlockConfirm', { name: device.name || device.device_id }),
+      t('appAutomation.device.tip'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning'
       }
     )
@@ -497,15 +500,15 @@ const unlockDevice = async (device) => {
     const res = await apiUnlockDevice(device.id)
 
     if (res.data.success) {
-      ElMessage.success('设备已解锁')
+      ElMessage.success(t('appAutomation.device.messages.unlocked'))
       await getDevices()
     } else {
-      ElMessage.error(res.data.message || '解锁设备失败')
+      ElMessage.error(res.data.message || t('appAutomation.device.messages.unlockFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
       console.error('解锁设备失败:', error)
-      ElMessage.error('解锁设备失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.device.messages.unlockFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
     }
   }
 }
@@ -513,11 +516,11 @@ const unlockDevice = async (device) => {
 const handleDeleteDevice = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除设备 ${device.name || device.device_id} 吗？删除后将无法恢复。`,
-      '删除设备',
+      t('appAutomation.device.messages.deleteConfirm', { name: device.name || device.device_id }),
+      t('appAutomation.device.messages.deleteDeviceTitle'),
       {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
         type: 'warning',
         dangerouslyUseHTMLString: false
       }
@@ -526,15 +529,15 @@ const handleDeleteDevice = async (device) => {
     const res = await deleteDevice(device.id)
 
     if (res.status === 204 || res.status === 200) {
-      ElMessage.success('设备已删除')
+      ElMessage.success(t('appAutomation.device.messages.deleted'))
       await getDevices()
     } else {
-      ElMessage.error(res.data?.message || '删除设备失败')
+      ElMessage.error(res.data?.message || t('appAutomation.device.messages.deleteFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
       console.error('删除设备失败:', error)
-      ElMessage.error('删除设备失败: ' + (error.message || '未知错误'))
+      ElMessage.error(t('appAutomation.device.messages.deleteFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
     }
   }
 }
@@ -552,13 +555,13 @@ const getConnectionType = (type) => {
 }
 
 const getConnectionTypeName = (type) => {
-  const typeMap = {
-    'emulator': '本地模拟器',
-    'remote_emulator': '远程模拟器',
-    'remote': '远程设备',
-    'usb': 'USB连接'
-  }
-  return typeMap[type] || type
+  const typeKey = {
+    'emulator': 'emulator',
+    'remote_emulator': 'remoteEmulator',
+    'remote': 'remote',
+    'usb': 'usb'
+  }[type]
+  return typeKey ? t(`appAutomation.device.connectionTypes.${typeKey}`) : type
 }
 
 const isRemoteDevice = (type) => {

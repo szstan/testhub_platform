@@ -4,54 +4,54 @@
     <div class="filters">
       <el-row :gutter="20">
         <el-col :span="6">
-          <el-input v-model="searchForm.taskName" placeholder="搜索任务名称" clearable @clear="handleSearch" @keyup.enter="handleSearch">
+          <el-input v-model="searchForm.taskName" :placeholder="$t('appAutomation.notification.searchPlaceholder')" clearable @clear="handleSearch" @keyup.enter="handleSearch">
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
         </el-col>
         <el-col :span="6">
-          <el-date-picker v-model="searchForm.dateRange" type="daterange" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" value-format="YYYY-MM-DD" @change="handleSearch" />
+          <el-date-picker v-model="searchForm.dateRange" type="daterange" :range-separator="$t('appAutomation.notification.rangeSeparator')" :start-placeholder="$t('appAutomation.notification.startDate')" :end-placeholder="$t('appAutomation.notification.endDate')" value-format="YYYY-MM-DD" @change="handleSearch" />
         </el-col>
         <el-col :span="6">
-          <el-select v-model="searchForm.status" placeholder="发送状态" clearable @change="handleSearch">
-            <el-option label="全部" value="" />
-            <el-option label="发送成功" value="success" />
-            <el-option label="发送失败" value="failed" />
-            <el-option label="待发送" value="pending" />
+          <el-select v-model="searchForm.status" :placeholder="$t('appAutomation.notification.sendStatus')" clearable @change="handleSearch">
+            <el-option :label="$t('appAutomation.common.all')" value="" />
+            <el-option :label="$t('appAutomation.notification.sendSuccess')" value="success" />
+            <el-option :label="$t('appAutomation.notification.sendFailed')" value="failed" />
+            <el-option :label="$t('appAutomation.notification.pendingSend')" value="pending" />
           </el-select>
         </el-col>
         <el-col :span="6">
-          <el-button type="primary" @click="handleSearch"><el-icon><Search /></el-icon>查询</el-button>
-          <el-button @click="handleReset">重置</el-button>
+          <el-button type="primary" @click="handleSearch"><el-icon><Search /></el-icon>{{ $t('appAutomation.common.query') }}</el-button>
+          <el-button @click="handleReset">{{ $t('appAutomation.common.reset') }}</el-button>
         </el-col>
       </el-row>
     </div>
 
     <!-- 列表 -->
     <el-table :data="logsData" v-loading="loading" border stripe @sort-change="handleSortChange">
-      <el-table-column prop="task_name" label="任务名称" min-width="150" sortable="custom" />
-      <el-table-column label="任务类型" width="110">
+      <el-table-column prop="task_name" :label="$t('appAutomation.notification.taskName')" min-width="150" sortable="custom" />
+      <el-table-column :label="$t('appAutomation.notification.taskType')" width="110">
         <template #default="{ row }">
           <el-tag type="info" size="small">{{ row.task_type_display }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="通知类型" width="120">
+      <el-table-column :label="$t('appAutomation.notification.notificationType')" width="120">
         <template #default="{ row }">
           <el-tag :type="getNotificationTypeTag(row.actual_notification_type_display)" size="small">
             {{ row.actual_notification_type_display }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="created_at" label="通知时间" width="180" sortable="custom">
+      <el-table-column prop="created_at" :label="$t('appAutomation.notification.notificationTime')" width="180" sortable="custom">
         <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="状态" width="100" sortable="custom">
+      <el-table-column :label="$t('appAutomation.common.status')" width="100" sortable="custom">
         <template #default="{ row }">
           <el-tag :type="getStatusTag(row.status)" size="small">{{ row.status_display }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" fixed="right" width="100">
+      <el-table-column :label="$t('appAutomation.common.operation')" fixed="right" width="100">
         <template #default="{ row }">
-          <el-button type="primary" link size="small" @click="viewDetail(row)">详情</el-button>
+          <el-button type="primary" link size="small" @click="viewDetail(row)">{{ $t('appAutomation.common.details') }}</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -70,40 +70,40 @@
     </div>
 
     <!-- 详情弹窗 -->
-    <el-dialog v-model="detailVisible" title="通知详情" width="600px">
+    <el-dialog v-model="detailVisible" :title="$t('appAutomation.notification.notificationDetail')" width="600px">
       <el-form v-if="selectedLog" label-position="top">
         <el-row :gutter="20">
           <el-col :span="12">
-            <el-form-item label="任务名称"><span>{{ selectedLog.task_name }}</span></el-form-item>
+            <el-form-item :label="$t('appAutomation.notification.taskName')"><span>{{ selectedLog.task_name }}</span></el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="任务类型"><span>{{ selectedLog.task_type_display }}</span></el-form-item>
+            <el-form-item :label="$t('appAutomation.notification.taskType')"><span>{{ selectedLog.task_type_display }}</span></el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="通知类型">
+            <el-form-item :label="$t('appAutomation.notification.notificationType')">
               <el-tag :type="getNotificationTypeTag(selectedLog.actual_notification_type_display)">
                 {{ selectedLog.actual_notification_type_display }}
               </el-tag>
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="状态">
+            <el-form-item :label="$t('appAutomation.common.status')">
               <el-tag :type="getStatusTag(selectedLog.status)">{{ selectedLog.status_display }}</el-tag>
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="通知时间"><span>{{ formatDate(selectedLog.created_at) }}</span></el-form-item>
+            <el-form-item :label="$t('appAutomation.notification.notificationTime')"><span>{{ formatDate(selectedLog.created_at) }}</span></el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="发送时间"><span>{{ selectedLog.sent_at ? formatDate(selectedLog.sent_at) : '-' }}</span></el-form-item>
+            <el-form-item :label="$t('appAutomation.notification.sendTime')"><span>{{ selectedLog.sent_at ? formatDate(selectedLog.sent_at) : '-' }}</span></el-form-item>
           </el-col>
           <el-col :span="24" v-if="selectedLog.webhook_bot_info && (selectedLog.webhook_bot_info.type || selectedLog.webhook_bot_info.bot_type)">
-            <el-form-item label="Webhook机器人">
-              <el-tag size="small" type="info">{{ selectedLog.webhook_bot_info.name || '默认机器人' }}</el-tag>
+            <el-form-item :label="$t('appAutomation.notification.webhookBot')">
+              <el-tag size="small" type="info">{{ selectedLog.webhook_bot_info.name || $t('appAutomation.notification.defaultBot') }}</el-tag>
             </el-form-item>
           </el-col>
           <el-col :span="24">
-            <el-form-item label="通知内容">
+            <el-form-item :label="$t('appAutomation.notification.content')">
               <div class="content-box">
                 <div v-if="parsedContent" class="parsed-content">
                   <div v-for="(item, i) in parsedContent" :key="i" class="content-row">
@@ -116,14 +116,14 @@
             </el-form-item>
           </el-col>
           <el-col :span="24" v-if="selectedLog.error_message">
-            <el-form-item label="错误信息">
+            <el-form-item :label="$t('appAutomation.notification.errorInfo')">
               <el-alert :title="selectedLog.error_message" type="error" show-icon :closable="false" />
             </el-form-item>
           </el-col>
         </el-row>
       </el-form>
       <template #footer>
-        <el-button @click="detailVisible = false">关闭</el-button>
+        <el-button @click="detailVisible = false">{{ $t('appAutomation.common.close') }}</el-button>
       </template>
     </el-dialog>
   </div>
@@ -134,6 +134,9 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import { getAppNotificationLogs } from '@/api/app-automation.js'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 const loading = ref(false)
 const logsData = ref([])
@@ -163,7 +166,7 @@ async function fetchLogs() {
     const res = await getAppNotificationLogs(params)
     logsData.value = res.data.results || []
     pagination.total = res.data.count || 0
-  } catch { ElMessage.error('加载通知日志失败') }
+  } catch { ElMessage.error(t('appAutomation.notification.loadFailed')) }
   finally { loading.value = false }
 }
 

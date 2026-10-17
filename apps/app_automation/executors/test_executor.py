@@ -6,7 +6,9 @@ import os
 import sys
 import subprocess
 import glob
+import importlib
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -16,8 +18,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class AppTestWorkerError(RuntimeError):
+    """APP worker runtime is not safe to use for an execution."""
+
+
 class AppTestExecutor:
     """APP测试执行器，封装 pytest 执行逻辑"""
+
+    _REQUIRED_WORKER_MODULES = (
+        ('airtest.core.api', 'airtest'),
+        ('allure', 'allure-python-commons'),
+        ('allure_pytest', 'allure-pytest'),
+    )
     
     def __init__(self, base_path: Optional[str] = None):
         """
@@ -60,7 +72,10 @@ class AppTestExecutor:
             执行结果字典
         """
         logger.info(f"开始执行APP测试: test_case_id={test_case_id}, device={device_id}")
-        
+
+        # Fail before starting pytest so a broken worker is reported as an execution
+        # error instead of a misleading completed/skipped test run.
+        worker_runtime = self._preflight_worker()
         original_cwd = os.getcwd()
         
         try:
@@ -74,8 +89,11 @@ class AppTestExecutor:
             # 强制子进程使用 UTF-8，避免 Windows 下 gbk 解码错误
             env['PYTHONUTF8'] = '1'
             env['PYTHONIOENCODING'] = 'utf-8'
-            
-            # 传递执行参数到 pytest
+            env['APP_ADB_PATH'] = worker_runtime['adb_path']
+            adb_dir = str(Path(worker_runtime['adb_path']).parent)
+            env['PATH'] = os.pathsep.join(
+                part for part in (adb_dir, env.get('PATH', '')) if part
+            )
             env['APP_TEST_CASE_ID'] = str(test_case_id)
             env['APP_DEVICE_ID'] = device_id
             env['APP_PACKAGE_NAME'] = package_name
@@ -89,13 +107,7 @@ class AppTestExecutor:
             os.makedirs(allure_results_dir, exist_ok=True)
             
             # 构建 pytest 参数
-            pytest_args = [
-                sys.executable, '-m', 'pytest',
-                'apps/app_automation/tests/',  # 测试目录
-                '-s', '-v',
-                '--alluredir', allure_results_dir,
-                '--tb=short',
-            ]
+            pytest_args = self._build_pytest_args(allure_results_dir)
             
             logger.info(f"执行命令: {' '.join(pytest_args)}")
             logger.info(f"工作目录: {os.getcwd()}")
@@ -157,6 +169,10 @@ class AppTestExecutor:
             
             # 生成 Allure 报告
             report_path = self._generate_allure_report(execution_id)
+            if not report_path:
+                raise AppTestWorkerError(
+                    "Allure report generation failed after pytest completed"
+                )
             
             return {
                 'success': exit_code == 0,
@@ -166,6 +182,9 @@ class AppTestExecutor:
                 'output': '\n'.join(output_lines[-50:]),  # 保留最后50行输出
             }
             
+        except AppTestWorkerError:
+            logger.error("APP worker execution failed", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"执行测试失败: {str(e)}", exc_info=True)
             return {
@@ -175,6 +194,98 @@ class AppTestExecutor:
         finally:
             os.chdir(original_cwd)
     
+    def _build_pytest_args(self, allure_results_dir: str) -> list:
+        """构建只执行 APP UI Flow 的 pytest 参数。"""
+        return [
+            sys.executable, '-m', 'pytest',
+            'apps/app_automation/tests/test_app_flow.py',
+            '-m', 'app_ui_flow',
+            # UI Flow uses the configured application database. Do not let
+            # pytest-django create a production test database in the worker.
+            '-p', 'no:django',
+            '-o', 'addopts=',
+            '-s', '-v',
+            '--alluredir', allure_results_dir,
+            '--tb=short',
+        ]
+
+    def _preflight_worker(self) -> Dict[str, str]:
+        """校验 APP worker 的 Python、Allure 和 ADB 运行时依赖。"""
+        failures = []
+
+        for module_name, distribution_name in self._REQUIRED_WORKER_MODULES:
+            try:
+                importlib.import_module(module_name)
+            except Exception as exc:
+                failures.append(
+                    f"unable to import {distribution_name} (module {module_name}; "
+                    f"{type(exc).__name__})"
+                )
+
+        configured_adb = os.environ.get('APP_ADB_PATH', 'adb').strip() or 'adb'
+        adb_path = shutil.which(configured_adb)
+        if not adb_path:
+            failures.append(
+                f"ADB executable '{configured_adb}' was not found; "
+                "install android-tools or set APP_ADB_PATH"
+            )
+        else:
+            try:
+                adb_result = subprocess.run(
+                    [adb_path, 'version'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if adb_result.returncode != 0:
+                    failures.append(
+                        f"ADB executable '{configured_adb}' failed `adb version` "
+                        f"(exit {adb_result.returncode})"
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(
+                    f"ADB executable '{configured_adb}' could not run "
+                    f"({type(exc).__name__})"
+                )
+
+        allure_path = self._find_allure_command()
+        if not allure_path:
+            failures.append(
+                "Allure command is missing; provide the bundled "
+                "allure/bin/allure executable"
+            )
+        elif os.name != 'nt' and not os.access(allure_path, os.X_OK):
+            failures.append(f"Allure command is not executable: {allure_path}")
+        else:
+            try:
+                allure_result = subprocess.run(
+                    [allure_path, '--version'],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if allure_result.returncode != 0:
+                    failures.append(
+                        f"Allure command failed `allure --version` "
+                        f"(exit {allure_result.returncode})"
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(
+                    f"Allure command could not run ({type(exc).__name__})"
+                )
+
+        if failures:
+            raise AppTestWorkerError(
+                "APP automation worker preflight failed: " + '; '.join(failures)
+            )
+
+        logger.info(
+            "APP automation worker preflight passed: adb=%s, allure=%s",
+            adb_path,
+            allure_path,
+        )
+        return {'adb_path': adb_path, 'allure_path': allure_path}
+
     def _get_log_file_path(self, username: str) -> str:
         """生成日志文件路径: logs/app_automation/{username}/{日期}.log"""
         today = datetime.now().strftime('%Y-%m-%d')

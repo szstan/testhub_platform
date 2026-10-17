@@ -2,20 +2,32 @@
 """APP设备管理视图"""
 import subprocess
 import base64
+import ipaddress
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
+from django.conf import settings
 from django.utils import timezone
 import logging
 
 from .test_case_views import AppPagination
 from ..models import AppDevice
+from ..access import is_app_admin
 from ..serializers import AppDeviceSerializer
 from ..managers.device_manager import DeviceManager
 
 logger = logging.getLogger(__name__)
+
+
+def _remote_device_allowed(ip_address):
+    try:
+        address = ipaddress.ip_address(ip_address)
+    except ValueError:
+        return False
+    cidrs = getattr(settings, 'APP_DEVICE_ALLOWED_CIDRS', []) or []
+    return any(address in ipaddress.ip_network(cidr) for cidr in cidrs)
 
 
 def get_adb_path() -> str:
@@ -40,10 +52,36 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['status', 'connection_type']
     search_fields = ['device_id', 'name']
-    
+
+    def _require_admin(self, request):
+        if not is_app_admin(request.user):
+            return Response({'detail': '仅管理员可以执行设备管理操作'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def perform_create(self, serializer):
+        if not is_app_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('仅管理员可以创建设备')
+        serializer.save()
+
+    def perform_update(self, serializer):
+        if not is_app_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('仅管理员可以修改设备')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not is_app_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('仅管理员可以删除设备')
+        instance.delete()
+
     @action(detail=False, methods=['get'])
     def discover(self, request):
         """发现ADB设备"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         try:
             adb_path = get_adb_path()
             logger.info(f"使用 ADB 路径: {adb_path}")
@@ -137,7 +175,10 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     def disconnect(self, request, pk=None):
         """断开远程设备连接"""
         device = self.get_object()
-        
+        if not is_app_admin(request.user) and device.locked_by_id != request.user.id:
+            return Response({'success': False, 'message': '无权断开该设备'},
+                            status=status.HTTP_403_FORBIDDEN)
+
         # 只有远程设备可以断开
         if device.connection_type not in ['remote', 'remote_emulator']:
             return Response({
@@ -175,6 +216,9 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def connect(self, request):
         """连接远程设备"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         try:
             ip_address = request.data.get('ip_address')
             port = request.data.get('port', 5555)
@@ -185,10 +229,16 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                     'message': '请提供设备IP地址'
                 }, status=status.HTTP_400_BAD_REQUEST)
             
+            if not _remote_device_allowed(ip_address):
+                return Response({
+                    'success': False,
+                    'message': '目标设备地址不在允许的设备网段内'
+                }, status=status.HTTP_403_FORBIDDEN)
+
             adb_path = get_adb_path()
             manager = DeviceManager(adb_path=adb_path)
             device_info = manager.connect_device(ip_address, port)
-            
+
             # 创建或更新设备记录
             device, created = AppDevice.objects.update_or_create(
                 device_id=device_info['device_id'],
@@ -225,8 +275,12 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
         3. 返回 data URL 格式
         """
         device = self.get_object()
+        if not is_app_admin(request.user) and device.locked_by_id != request.user.id:
+            return Response({'code': 403, 'msg': '无权访问该设备', 'success': False},
+                            status=status.HTTP_403_FORBIDDEN)
         
         if device.status == 'offline':
+
             return Response({
                 'code': 400,
                 'msg': '设备离线，无法截图',

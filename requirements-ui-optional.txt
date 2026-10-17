@@ -1,0 +1,7 @@
+# Optional browser and UI automation dependencies. Not installed in venv-prod.
+playwright==1.57.0
+selenium==4.15.2
+webdriver-manager==4.0.1
+cdp-use==1.4.4
+bubus==1.5.6
+browser-use==0.10.1

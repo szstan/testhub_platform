@@ -43,10 +43,14 @@
             node-key="id"
             :expand-on-click-node="false"
             :default-expanded-keys="expandedKeys"
+            draggable
+            :allow-drag="allowDrag"
+            :allow-drop="allowDrop"
             @node-click="onNodeClick"
             @node-contextmenu="onNodeRightClick"
             @node-expand="onNodeExpand"
             @node-collapse="onNodeCollapse"
+            @node-drop="handleDrop"
           >
             <template #default="{ node, data }">
               <div class="tree-node">
@@ -70,11 +74,21 @@
                 </div>
 
                 <!-- 普通显示模式 -->
-                <span v-else class="node-label">{{ node.label }}</span>
+                <span v-else class="node-label" :title="node.label">{{ node.label }}</span>
 
                 <span v-if="data.type === 'request' && data.request_type !== 'WEBSOCKET'" class="method-tag" :class="(data.method || 'GET').toLowerCase()">
                   {{ data.method || 'GET' }}
                 </span>
+
+                <!-- 悬浮操作按钮：复制（仅接口）、删除 -->
+                <div class="node-actions" @click.stop>
+                  <el-tooltip v-if="data.type === 'request'" :content="$t('apiTesting.interface.contextMenu.copy')" placement="top">
+                    <el-button link size="small" :icon="CopyDocument" @click.stop="copyRequest(data)" />
+                  </el-tooltip>
+                  <el-tooltip :content="$t('apiTesting.interface.contextMenu.delete')" placement="top">
+                    <el-button link size="small" :icon="Delete" @click.stop="deleteNode(data)" />
+                  </el-tooltip>
+                </div>
               </div>
             </template>
           </el-tree>
@@ -669,78 +683,106 @@
               </div>
             </div>
 
-            <el-tabs v-model="responseActiveTab">
-              <el-tab-pane label="Body" name="body">
-                <div class="response-body">
-                  <div class="response-actions">
-                    <el-button-group>
-                      <el-button size="small" @click="formatResponse">{{ $t('apiTesting.interface.format') }}</el-button>
-                      <el-button size="small" @click="copyResponse">{{ $t('apiTesting.interface.copy') }}</el-button>
-                      <el-button size="small" @click="toggleJsonPathExtractor">
-                        {{ $t('apiTesting.interface.jsonPathExtract') }}
-                      </el-button>
-                    </el-button-group>
-                  </div>
-                  <div v-if="showJsonPathExtractor" class="jsonpath-extractor">
-                    <div class="jsonpath-input">
-                      <el-input
-                        v-model="jsonPathExpression"
-                        :placeholder="$t('apiTesting.interface.jsonPathExample')"
-                        size="small"
-                        @input="evaluateJsonPath"
+            <el-tabs v-model="resultActiveTab" class="result-tabs">
+              <!-- 一级 tab：响应信息 -->
+              <el-tab-pane :label="$t('apiTesting.interface.response')" name="response">
+                <el-tabs v-model="responseActiveTab" class="nested-tabs">
+                  <el-tab-pane label="Body" name="body">
+                    <div class="response-body">
+                      <div class="response-actions">
+                        <el-button-group>
+                          <el-button size="small" @click="formatResponse">{{ $t('apiTesting.interface.format') }}</el-button>
+                          <el-button size="small" @click="copyResponse">{{ $t('apiTesting.interface.copy') }}</el-button>
+                          <el-button size="small" @click="toggleJsonPathExtractor">
+                            {{ $t('apiTesting.interface.jsonPathExtract') }}
+                          </el-button>
+                        </el-button-group>
+                      </div>
+                      <div v-if="showJsonPathExtractor" class="jsonpath-extractor">
+                        <div class="jsonpath-input">
+                          <el-input
+                            v-model="jsonPathExpression"
+                            :placeholder="$t('apiTesting.interface.jsonPathExample')"
+                            size="small"
+                            @input="evaluateJsonPath"
+                          >
+                            <template #append>
+                              <el-button size="small" @click="copyJsonPathResult">{{ $t('apiTesting.interface.copyResult') }}</el-button>
+                            </template>
+                          </el-input>
+                        </div>
+                        <div v-if="jsonPathResult !== null" class="jsonpath-result">
+                          <strong>{{ $t('apiTesting.interface.extractResult') }}</strong>
+                          <pre>{{ jsonPathResult }}</pre>
+                        </div>
+                      </div>
+                      <div class="response-content" v-html="highlightedResponseBody"></div>
+                    </div>
+                  </el-tab-pane>
+
+                  <el-tab-pane label="Headers" name="headers">
+                    <div class="response-headers">
+                      <div v-for="(value, key) in (response.response_data?.headers || {})" :key="key" class="header-row">
+                        <strong>{{ key }}:</strong> {{ value }}
+                      </div>
+                    </div>
+                  </el-tab-pane>
+
+                  <el-tab-pane :label="$t('apiTesting.interface.assertionResults')" name="assertions" v-if="response.assertions_results && response.assertions_results.length > 0">
+                    <div class="assertions-results">
+                      <div
+                        v-for="(result, index) in response.assertions_results"
+                        :key="index"
+                        class="assertion-result-item"
+                        :class="{ 'passed': result.passed, 'failed': !result.passed }"
                       >
-                        <template #append>
-                          <el-button size="small" @click="copyJsonPathResult">{{ $t('apiTesting.interface.copyResult') }}</el-button>
-                        </template>
-                      </el-input>
+                        <div class="assertion-result-header">
+                          <el-tag :type="result.passed ? 'success' : 'danger'" size="small">
+                            {{ result.passed ? $t('apiTesting.interface.passed') : $t('apiTesting.interface.failed') }}
+                          </el-tag>
+                          <span class="assertion-name">{{ result.name }}</span>
+                        </div>
+                        <div class="assertion-result-details">
+                          <div class="result-row">
+                            <span class="label">{{ $t('apiTesting.interface.expected') }}</span>
+                            <span class="value">{{ formatAssertionValue(result.expected) }}</span>
+                          </div>
+                          <div class="result-row">
+                            <span class="label">{{ $t('apiTesting.interface.actual') }}</span>
+                            <span class="value">{{ formatAssertionValue(result.actual) }}</span>
+                          </div>
+                          <div class="result-row" v-if="result.error">
+                            <span class="label">{{ $t('apiTesting.interface.error') }}</span>
+                            <span class="value error">{{ result.error }}</span>
+                          </div>
+                        </div>
+                      </div>
                     </div>
-                    <div v-if="jsonPathResult !== null" class="jsonpath-result">
-                      <strong>{{ $t('apiTesting.interface.extractResult') }}</strong>
-                      <pre>{{ jsonPathResult }}</pre>
-                    </div>
-                  </div>
-                  <div class="response-content" v-html="highlightedResponseBody"></div>
-                </div>
+                  </el-tab-pane>
+                </el-tabs>
               </el-tab-pane>
 
-              <el-tab-pane label="Headers" name="headers">
-                <div class="response-headers">
-                  <div v-for="(value, key) in (response.response_data?.headers || {})" :key="key" class="header-row">
-                    <strong>{{ key }}:</strong> {{ value }}
-                  </div>
+              <!-- 一级 tab：请求信息 -->
+              <el-tab-pane :label="$t('apiTesting.interface.requestInfo')" name="request">
+                <div class="header-row request-line">
+                  <strong>{{ response.request_data?.method }}</strong>
+                  <span class="request-url">{{ response.request_data?.url }}</span>
                 </div>
-              </el-tab-pane>
+                <el-tabs v-model="requestActiveTab" class="nested-tabs">
+                  <el-tab-pane label="Body" name="body">
+                    <div v-if="hasRequestBodyData" class="response-content">{{ formattedRequestBody }}</div>
+                    <div v-else class="empty-tip">{{ $t('apiTesting.interface.noRequestBody') }}</div>
+                  </el-tab-pane>
 
-              <el-tab-pane :label="$t('apiTesting.interface.assertionResults')" name="assertions" v-if="response.assertions_results && response.assertions_results.length > 0">
-                <div class="assertions-results">
-                  <div
-                    v-for="(result, index) in response.assertions_results"
-                    :key="index"
-                    class="assertion-result-item"
-                    :class="{ 'passed': result.passed, 'failed': !result.passed }"
-                  >
-                    <div class="assertion-result-header">
-                      <el-tag :type="result.passed ? 'success' : 'danger'" size="small">
-                        {{ result.passed ? $t('apiTesting.interface.passed') : $t('apiTesting.interface.failed') }}
-                      </el-tag>
-                      <span class="assertion-name">{{ result.name }}</span>
-                    </div>
-                    <div class="assertion-result-details">
-                      <div class="result-row">
-                        <span class="label">{{ $t('apiTesting.interface.expected') }}</span>
-                        <span class="value">{{ formatAssertionValue(result.expected) }}</span>
-                      </div>
-                      <div class="result-row">
-                        <span class="label">{{ $t('apiTesting.interface.actual') }}</span>
-                        <span class="value">{{ formatAssertionValue(result.actual) }}</span>
-                      </div>
-                      <div class="result-row" v-if="result.error">
-                        <span class="label">{{ $t('apiTesting.interface.error') }}</span>
-                        <span class="value error">{{ result.error }}</span>
+                  <el-tab-pane label="Headers" name="headers">
+                    <div v-if="Object.keys(response.request_data?.headers || {}).length > 0" class="response-headers">
+                      <div v-for="(value, key) in (response.request_data?.headers || {})" :key="key" class="header-row">
+                        <strong>{{ key }}:</strong> {{ value }}
                       </div>
                     </div>
-                  </div>
-                </div>
+                    <div v-else class="empty-tip">{{ $t('apiTesting.interface.noRequestHeaders') }}</div>
+                  </el-tab-pane>
+                </el-tabs>
               </el-tab-pane>
             </el-tabs>
           </div>
@@ -932,7 +974,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Folder, Document, MagicStick, Search, Close } from '@element-plus/icons-vue'
+import { Plus, Folder, Document, MagicStick, Search, Close, CopyDocument, Delete } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import KeyValueEditor from './components/KeyValueEditor.vue'
 import DataFactorySelector from '@/components/DataFactorySelector.vue'
@@ -957,7 +999,9 @@ const response = ref(null)
 const sending = ref(false)
 const saving = ref(false)
 const activeTab = ref('params')
+const resultActiveTab = ref('response')
 const responseActiveTab = ref('body')
+const requestActiveTab = ref('body')
 const showCreateCollectionDialog = ref(false)
 const showEditCollectionDialog = ref(false)
 const showContextMenu = ref(false)
@@ -1105,13 +1149,16 @@ const loadCollections = async (projectId) => {
 
 const loadEnvironments = async (projectId) => {
   try {
-    const response = await api.get('/api-testing/environments/', {
-      params: {
-        project: projectId
-      }
-    })
+    // 不传递 project 参数，让后端返回所有可访问的环境（全局 + 当前用户项目），
+    // 否则 DjangoFilterBackend 的 project 过滤会把 project 为 null 的全局环境过滤掉。
+    const response = await api.get('/api-testing/environments/', {})
     // 后端可能返回分页格式 { results: [...] } 或直接返回数组
-    environments.value = response.data.results || response.data || []
+    const allEnvironments = response.data.results || response.data || []
+    // 过滤出全局环境 + 当前项目的局部环境
+    environments.value = allEnvironments.filter(env =>
+      env.scope === 'GLOBAL' ||
+      (env.scope === 'LOCAL' && (!projectId || env.project === projectId))
+    )
   } catch (error) {
     ElMessage.error('加载环境失败')
     console.error('加载环境失败:', error)
@@ -1427,10 +1474,7 @@ const editNode = () => {
   }
 }
 
-const deleteNode = () => {
-  if (!rightClickedNode.value) return
-
-  const node = rightClickedNode.value
+const deleteNode = (node = rightClickedNode.value) => {
   if (!node) {
     ElMessage.warning('无法删除此节点')
     return
@@ -1466,6 +1510,53 @@ const deleteNode = () => {
   })
 }
 
+const copyRequest = async (node) => {
+  if (!node || node.type !== 'request') return
+  try {
+    const { data } = await api.get(`/api-testing/requests/${node.id}/`)
+    const payload = { ...data }
+    delete payload.id
+    delete payload.created_at
+    delete payload.updated_at
+    delete payload.created_by
+    payload.name = `${data.name} (副本)`
+    // collection 保持原值 → 复制到同一集合下
+    await api.post('/api-testing/requests/', payload)
+    ElMessage.success('复制成功')
+    await loadCollections(selectedProject.value)
+  } catch (error) {
+    ElMessage.error('复制失败')
+    console.error('复制失败:', error)
+  }
+}
+
+// 仅接口节点可拖拽（集合不可拖，避免改动集合树结构）
+const allowDrag = (node) => node.data.type === 'request'
+
+// 仅允许把接口“放进”某个集合节点，不实现同集合内 prev/next 重排持久化
+const allowDrop = (draggingNode, dropNode, type) =>
+  type === 'inner' && dropNode?.data?.type === 'collection'
+
+const handleDrop = async (draggingNode, dropNode) => {
+  const requestId = draggingNode.data.id
+  const targetCollectionId = dropNode.data.id
+  // 同集合：el-tree 已乐观移动，统一 reload 回到服务端真实状态
+  if (draggingNode.data.collection === targetCollectionId) {
+    await loadCollections(selectedProject.value)
+    return
+  }
+  try {
+    await api.patch(`/api-testing/requests/${requestId}/`, { collection: targetCollectionId })
+    ElMessage.success('已移动到目标集合')
+  } catch (error) {
+    ElMessage.error('移动失败')
+    console.error('移动失败:', error)
+  } finally {
+    // el-tree 已乐观改了本地 collections，无论成败都用服务端状态覆盖，避免脏数据
+    await loadCollections(selectedProject.value)
+  }
+}
+
 const saveCollectionName = async () => {
   if (!editingNodeId.value || !editingNodeName.value.trim()) {
     cancelEdit()
@@ -1473,7 +1564,7 @@ const saveCollectionName = async () => {
   }
 
   try {
-    await api.put(`/api-testing/collections/${editingNodeId.value}/`, {
+    await api.patch(`/api-testing/collections/${editingNodeId.value}/`, {
       name: editingNodeName.value.trim()
     })
     ElMessage.success('保存成功')
@@ -1580,6 +1671,25 @@ const responseBody = computed(() => {
     }
   } catch (e) {
     return response.value.response_data?.body || ''
+  }
+})
+
+// 请求信息（执行后服务端返回的真实请求快照，已做变量解析）
+const hasRequestBodyData = computed(() => {
+  const body = response.value?.request_data?.body
+  if (body === null || body === undefined || body === '') return false
+  if (typeof body === 'object' && Object.keys(body).length === 0) return false
+  return true
+})
+
+const formattedRequestBody = computed(() => {
+  const body = response.value?.request_data?.body
+  if (body === null || body === undefined || body === '') return ''
+  if (typeof body === 'string') return body
+  try {
+    return JSON.stringify(body, null, 2)
+  } catch (e) {
+    return String(body)
   }
 })
 
@@ -1988,7 +2098,7 @@ const updateCollection = async () => {
   }
 
   try {
-    await api.put(`/api-testing/collections/${editCollectionForm.id}/`, editCollectionForm)
+    await api.patch(`/api-testing/collections/${editCollectionForm.id}/`, editCollectionForm)
     ElMessage.success('更新成功')
     await loadCollections(selectedProject.value)
     showEditCollectionDialog.value = false
@@ -2717,6 +2827,18 @@ const useLocalVariableCategories = () => {
   flex: 1;
   overflow: auto;
   padding: 10px;
+  min-width: 0;
+}
+
+/* el-tree 节点内容行：打断 min-content 宽度向上传播，
+   否则长接口名会让整行撑宽、把复制/删除按钮挤出可视区 */
+.collection-tree :deep(.el-tree-node__content) {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.collection-tree :deep(.el-tree-node__content > .el-tree-node__label) {
+  display: none;
 }
 
 /* 树节点样式 */
@@ -2725,22 +2847,51 @@ const useLocalVariableCategories = () => {
   align-items: center;
   gap: 8px;
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
   padding: 4px 0;
 }
 
 .tree-node .el-icon {
   font-size: 16px;
   color: #606266;
+  flex-shrink: 0;
 }
 
 .node-label {
   flex: 1;
+  min-width: 0;
   font-size: 14px;
   color: #303133;
   transition: color 0.2s;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tree-node:hover .node-label {
+  color: #409eff;
+}
+
+/* 悬浮操作按钮：默认隐藏，悬浮节点时显示 */
+.node-actions {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.tree-node:hover .node-actions {
+  display: flex;
+}
+
+.node-actions .el-button {
+  padding: 2px;
+  color: #909399;
+}
+
+.node-actions .el-button:hover {
   color: #409eff;
 }
 
@@ -2764,6 +2915,7 @@ const useLocalVariableCategories = () => {
   display: inline-block;
   min-width: 40px;
   text-align: center;
+  flex-shrink: 0;
 }
 
 .method-tag.get {
@@ -3286,6 +3438,57 @@ const useLocalVariableCategories = () => {
 
 .header-row:last-child {
   border-bottom: none;
+}
+
+/* 响应区域：一级 tab（响应信息 / 请求信息）切换，内部二级 tab 细分 */
+.result-tabs {
+  margin-top: 4px;
+  padding: 0 20px 20px;
+}
+
+.result-tabs :deep(.el-tabs__header) {
+  margin: 0 0 12px;
+}
+
+/* 嵌套的二级 tabs：去除默认大间距，紧贴上级 tab 内 */
+.nested-tabs :deep(.el-tabs__header) {
+  margin: 0 0 8px;
+}
+
+/* 请求行（方法 + URL） */
+.request-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #ecf5ff;
+  border-radius: 6px;
+  border: 1px solid #d9ecff;
+  margin-bottom: 8px;
+}
+
+.request-line strong {
+  color: #409eff;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  flex-shrink: 0;
+}
+
+.request-url {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 13px;
+  word-break: break-all;
+  color: #303133;
+  min-width: 0;
+}
+
+/* 空数据提示 */
+.empty-tip {
+  padding: 24px 16px;
+  color: #909399;
+  font-size: 13px;
+  text-align: center;
+  background: #f8f9fa;
+  border-radius: 6px;
 }
 
 /* 代码编辑器 */
@@ -4161,6 +4364,7 @@ const useLocalVariableCategories = () => {
   display: inline-block;
   min-width: 40px;
   text-align: center;
+  flex-shrink: 0;
 }
 
 .method-tag.get {

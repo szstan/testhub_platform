@@ -1,0 +1,6 @@
+# Optional APP automation and OCR dependencies. Not installed in venv-prod.
+# loguru and Pillow are supplied by requirements-prod.txt.
+airtest==1.4.3
+easyocr==1.7.2
+opencv-contrib-python==4.6.0.66
+numpy==1.26.4

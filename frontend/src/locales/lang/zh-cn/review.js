@@ -197,6 +197,7 @@ export default {
     priorityUrgent: '紧急',
     deadline: '截止日期',
     deadlinePlaceholder: '请选择截止日期',
+    deadlineRequired: '请选择截止日期',
     description: '评审描述',
     descriptionPlaceholder: '请输入评审描述',
 
@@ -204,7 +205,9 @@ export default {
     selectTestcases: '选择用例',
     searchTestcases: '搜索用例',
     selectTestcasesBtn: '选择用例',
-    emptyTestcasesTip: '请选择要评审的测试用例',
+    selectedTestcasesCount: '已选择{count}条测试用例',
+    noTestcasesSelected: '暂无已选用例',
+    modifyTestcasesSelection: '修改选择',
 
     // Reviewers
     reviewers: '评审人员',

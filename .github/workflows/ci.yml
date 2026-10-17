@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend-performance:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-prod.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements-prod.txt
+
+      - name: Run backend performance checks
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+          DB_HOST: 127.0.0.1
+          DB_NAME: testhub_ci
+          DB_USER: root
+          DB_PASSWORD: ''
+          PERF_MAX_CONCURRENCY: '1000'
+          PERF_MAX_TARGET_RPS: '5000'
+          PERF_MAX_DURATION: '7200'
+          PERF_MAX_CONCURRENT_EXECUTIONS: '2'
+          PERF_RETENTION_DAYS: '90'
+          PERF_ARTIFACT_RETENTION_DAYS: '30'
+          PERF_LOAD_GEN_CPU_WARN: '85'
+        run: python scripts/ci_perf_checks.py
+
+  backend-regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-prod.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements-prod.txt
+
+      - name: Run backend regression tests
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python -m pytest -q
+
+      - name: Validate Linux dependency artifact builder
+        run: |
+          python -m py_compile scripts/build_linux_wheelhouse.py
+          python scripts/build_linux_wheelhouse.py --help
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          touch "$tmp_dir/demo-1.0-py3-none-any.whl"
+          python scripts/build_linux_wheelhouse.py \
+            --output "$tmp_dir" \
+            --manifest-only \
+            --requirements requirements-prod.txt \
+            --requirements requirements-app-optional.txt \
+            --requirements requirements-report-optional.txt
+          test -s "$tmp_dir/manifest.json"
+          test -s "$tmp_dir/manifest.sha256"
+          test -s "$tmp_dir/SHA256SUMS"
+          touch "$tmp_dir/bad-1.0-py3-none-win_amd64.whl"
+          if python scripts/build_linux_wheelhouse.py \
+            --output "$tmp_dir" \
+            --manifest-only \
+            --requirements requirements-prod.txt \
+            --requirements requirements-app-optional.txt \
+            --requirements requirements-report-optional.txt; then
+            echo 'Windows artifact was not rejected' >&2
+            exit 1
+          fi
+
+  backend-app-automation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements-prod.txt
+            requirements-app-optional.txt
+            requirements-report-optional.txt
+
+      - name: Set up Java for Allure
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install APP worker system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y adb
+
+      - name: Install APP automation test dependencies
+        run: |
+          python -m pip install -r requirements-prod.txt
+          python -m pip install -r requirements-app-optional.txt
+          python -m pip install -r requirements-report-optional.txt
+
+      - name: Verify APP worker runtime dependencies
+        run: |
+          python -m pip check
+          python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+          export APP_ADB_PATH="$(command -v adb)"
+          test -n "$APP_ADB_PATH"
+          test -x "$APP_ADB_PATH"
+          "$APP_ADB_PATH" version
+          test -x allure/bin/allure
+          allure/bin/allure --version
+
+      - name: Run APP automation security tests
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python -m pytest -q apps/app_automation/tests/test_security_boundaries.py
+
+      - name: Run APP worker and WebSocket focused tests
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python -m pytest -q apps/app_automation/tests/test_executor.py apps/app_automation/tests/test_websocket_events.py
+
+      - name: Collect APP UI Flow entry without a test database
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python -m pytest -p no:django -o addopts= --collect-only -q apps/app_automation/tests/test_app_flow.py -m app_ui_flow
+
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build

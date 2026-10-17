@@ -1,33 +1,59 @@
 /**
  * APP自动化测试模块 - 公共工具函数
  */
+import i18n from '@/locales'
+
+const t = (key, params) => i18n.global.t(key, params)
 
 // ========== 执行状态映射（任务生命周期） ==========
 
-const EXECUTION_STATUS_MAP = {
-  'pending':   { type: 'info',    text: '等待中' },
-  'running':   { type: 'warning', text: '执行中' },
-  'completed': { type: 'success', text: '已完成' },
-  'error':     { type: 'danger',  text: '执行异常' },
-  'stopped':   { type: 'info',    text: '已停止' },
-  // 向后兼容旧值
-  'success':   { type: 'success', text: '已完成' },
-  'failed':    { type: 'danger',  text: '失败' },
+// 状态值 → i18n key / Element Plus Tag 类型
+const EXECUTION_STATUS_KEY = {
+  'pending':   'appAutomation.status.pending',
+  'running':   'appAutomation.status.running',
+  'completed': 'appAutomation.status.completed',
+  'error':     'appAutomation.status.error',
+  'stopped':   'appAutomation.status.stopped',
+  'success':   'appAutomation.status.success',
+  'failed':    'appAutomation.status.failed',
+}
+
+const EXECUTION_STATUS_TYPE = {
+  'pending':   'info',
+  'running':   'warning',
+  'completed': 'success',
+  'error':     'danger',
+  'stopped':   'info',
+  'success':   'success',
+  'failed':    'danger',
 }
 
 // ========== 测试结果映射（用例通过/失败） ==========
 
-const EXECUTION_RESULT_MAP = {
-  'passed':  { type: 'success', text: '通过' },
-  'failed':  { type: 'danger',  text: '失败' },
-  'skipped': { type: 'warning', text: '跳过' },
+const EXECUTION_RESULT_KEY = {
+  'passed':  'appAutomation.status.passed',
+  'failed':  'appAutomation.status.failed',
+  'skipped': 'appAutomation.status.skipped',
 }
 
-const DEVICE_STATUS_MAP = {
-  'available': { type: 'success', text: '可用' },
-  'locked':    { type: 'warning', text: '已锁定' },
-  'online':    { type: 'success', text: '在线' },
-  'offline':   { type: 'danger',  text: '离线' },
+const EXECUTION_RESULT_TYPE = {
+  'passed':  'success',
+  'failed':  'danger',
+  'skipped': 'warning',
+}
+
+const DEVICE_STATUS_KEY = {
+  'available': 'appAutomation.status.available',
+  'locked':    'appAutomation.status.locked',
+  'online':    'appAutomation.status.online',
+  'offline':   'appAutomation.status.offline',
+}
+
+const DEVICE_STATUS_TYPE = {
+  'available': 'success',
+  'locked':    'warning',
+  'online':    'success',
+  'offline':   'danger',
 }
 
 /**
@@ -36,16 +62,17 @@ const DEVICE_STATUS_MAP = {
  * @returns {string}
  */
 export function getExecutionStatusType(status) {
-  return EXECUTION_STATUS_MAP[status]?.type || 'info'
+  return EXECUTION_STATUS_TYPE[status] || 'info'
 }
 
 /**
- * 获取执行状态的中文文本
+ * 获取执行状态的显示文本
  * @param {string} status - 状态值
  * @returns {string}
  */
 export function getExecutionStatusText(status) {
-  return EXECUTION_STATUS_MAP[status]?.text || status
+  const key = EXECUTION_STATUS_KEY[status]
+  return key ? t(key) : status
 }
 
 /**
@@ -54,16 +81,17 @@ export function getExecutionStatusText(status) {
  * @returns {string}
  */
 export function getResultType(result) {
-  return EXECUTION_RESULT_MAP[result]?.type || 'info'
+  return EXECUTION_RESULT_TYPE[result] || 'info'
 }
 
 /**
- * 获取测试结果的中文文本
+ * 获取测试结果的显示文本
  * @param {string} result - 结果值
  * @returns {string}
  */
 export function getResultText(result) {
-  return EXECUTION_RESULT_MAP[result]?.text || '-'
+  const key = EXECUTION_RESULT_KEY[result]
+  return key ? t(key) : '-'
 }
 
 /**
@@ -76,22 +104,29 @@ export function getResultText(result) {
 export function getDisplayStatus(status, result) {
   // 任务还在进行中，显示任务状态
   if (status === 'pending' || status === 'running') {
-    return EXECUTION_STATUS_MAP[status]
+    const key = EXECUTION_STATUS_KEY[status]
+    return { type: EXECUTION_STATUS_TYPE[status], text: key ? t(key) : status }
   }
   // 任务异常，显示异常状态
   if (status === 'error') {
-    return { type: 'danger', text: '执行异常' }
+    return { type: 'danger', text: t('appAutomation.status.error') }
   }
   // 任务已停止
   if (status === 'stopped') {
-    return { type: 'info', text: '已停止' }
+    return { type: 'info', text: t('appAutomation.status.stopped') }
   }
   // 任务已完成，显示测试结果
   if (result) {
-    return EXECUTION_RESULT_MAP[result] || { type: 'info', text: result }
+    const key = EXECUTION_RESULT_KEY[result]
+    return key
+      ? { type: EXECUTION_RESULT_TYPE[result], text: t(key) }
+      : { type: 'info', text: result }
   }
   // 兜底
-  return EXECUTION_STATUS_MAP[status] || { type: 'info', text: status || '-' }
+  const key = EXECUTION_STATUS_KEY[status]
+  return key
+    ? { type: EXECUTION_STATUS_TYPE[status], text: t(key) }
+    : { type: 'info', text: status || '-' }
 }
 
 /**
@@ -100,16 +135,17 @@ export function getDisplayStatus(status, result) {
  * @returns {string}
  */
 export function getDeviceStatusType(status) {
-  return DEVICE_STATUS_MAP[status]?.type || 'info'
+  return DEVICE_STATUS_TYPE[status] || 'info'
 }
 
 /**
- * 获取设备状态的中文文本
+ * 获取设备状态的显示文本
  * @param {string} status - 状态值
  * @returns {string}
  */
 export function getDeviceStatusText(status) {
-  return DEVICE_STATUS_MAP[status]?.text || status
+  const key = DEVICE_STATUS_KEY[status]
+  return key ? t(key) : status
 }
 
 // ========== 日期格式化 ==========
@@ -142,8 +178,8 @@ export function formatRelativeTime(timeStr) {
   const now = new Date()
   const diff = now.getTime() - date.getTime()
 
-  if (diff < 60000) return '刚刚'
-  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前'
-  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前'
-  return Math.floor(diff / 86400000) + ' 天前'
+  if (diff < 60000) return t('appAutomation.common.justNow')
+  if (diff < 3600000) return t('appAutomation.common.minutesAgo', { n: Math.floor(diff / 60000) })
+  if (diff < 86400000) return t('appAutomation.common.hoursAgo', { n: Math.floor(diff / 3600000) })
+  return t('appAutomation.common.daysAgo', { n: Math.floor(diff / 86400000) })
 }

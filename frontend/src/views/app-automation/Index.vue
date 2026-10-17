@@ -2,8 +2,8 @@
   <div class="app-automation-index">
     <el-card shadow="never">
       <div class="welcome-section">
-        <h1>APP 自动化测试</h1>
-        <p>基于 Airtest 的 Android APP 自动化测试平台</p>
+        <h1>{{ $t('appAutomation.nav.title') }}</h1>
+        <p>{{ $t('appAutomation.nav.subtitle') }}</p>
       </div>
       
       <div class="features-grid">
@@ -12,39 +12,39 @@
             <el-icon><DataAnalysis /></el-icon>
           </div>
           <div class="feature-title">Dashboard</div>
-          <div class="feature-desc">查看统计数据和执行概览</div>
+          <div class="feature-desc">{{ $t('appAutomation.nav.dashboardDesc') }}</div>
         </el-card>
         
         <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/devices')">
           <div class="feature-icon bg-green">
             <el-icon><Cellphone /></el-icon>
           </div>
-          <div class="feature-title">设备管理</div>
-          <div class="feature-desc">管理 Android 设备和模拟器</div>
+          <div class="feature-title">{{ $t('appAutomation.nav.deviceManagement') }}</div>
+          <div class="feature-desc">{{ $t('appAutomation.nav.deviceManagementDesc') }}</div>
         </el-card>
         
         <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/elements')">
           <div class="feature-icon bg-purple">
             <el-icon><Picture /></el-icon>
           </div>
-          <div class="feature-title">元素管理</div>
-          <div class="feature-desc">管理UI元素（图片/坐标/区域）</div>
+          <div class="feature-title">{{ $t('appAutomation.nav.elementManagement') }}</div>
+          <div class="feature-desc">{{ $t('appAutomation.nav.elementManagementDesc') }}</div>
         </el-card>
         
         <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/test-cases')">
           <div class="feature-icon bg-orange">
             <el-icon><Document /></el-icon>
           </div>
-          <div class="feature-title">测试用例</div>
-          <div class="feature-desc">创建和管理测试用例</div>
+          <div class="feature-title">{{ $t('appAutomation.nav.testCases') }}</div>
+          <div class="feature-desc">{{ $t('appAutomation.nav.testCasesDesc') }}</div>
         </el-card>
         
         <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/executions')">
           <div class="feature-icon bg-red">
             <el-icon><Aim /></el-icon>
           </div>
-          <div class="feature-title">执行记录</div>
-          <div class="feature-desc">查看测试执行结果</div>
+          <div class="feature-title">{{ $t('appAutomation.nav.executionRecords') }}</div>
+          <div class="feature-desc">{{ $t('appAutomation.nav.executionRecordsDesc') }}</div>
         </el-card>
       </div>
     </el-card>

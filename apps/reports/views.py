@@ -1,19 +1,46 @@
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q, Sum, F, Avg
 from django.db.models.functions import TruncDate, Length
 from django.utils import timezone
 from datetime import timedelta, datetime
 from .models import TestReport, ReportTemplate
+from .serializers import TestReportSerializer
 from apps.executions.models import TestPlan, TestRun, TestRunCase
+from apps.projects.models import Project
 from apps.testcases.models import TestCase
 from apps.requirement_analysis.models import RequirementAnalysis, GeneratedTestCase, BusinessRequirement
 
+
+def get_accessible_projects(user):
+    return Project.objects.filter(
+        Q(owner=user) | Q(members=user)
+    ).distinct()
+
+@extend_schema_view(
+    list=extend_schema(operation_id='test_reports_list', responses=OpenApiTypes.OBJECT),
+    retrieve=extend_schema(operation_id='test_reports_retrieve', responses=OpenApiTypes.OBJECT),
+    create=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    partial_update=extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT),
+    destroy=extend_schema(responses=OpenApiTypes.OBJECT),
+)
 class TestReportViewSet(viewsets.ModelViewSet):
     """测试报告视图集"""
     queryset = TestReport.objects.all()
+    serializer_class = TestReportSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save(generated_by=self.request.user)
+
+    def get_queryset(self):
+        return self.queryset.filter(
+            project__in=get_accessible_projects(self.request.user)
+        ).distinct()
     
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
@@ -21,8 +48,13 @@ class TestReportViewSet(viewsets.ModelViewSet):
         project_id = request.query_params.get('project')
         
         # 基础查询集
-        plans_qs = TestPlan.objects.filter(is_active=True)
-        cases_qs = TestCase.objects.all()
+        plans_qs = TestPlan.objects.filter(
+            is_active=True,
+            projects__in=get_accessible_projects(request.user),
+        ).distinct()
+        cases_qs = TestCase.objects.filter(
+            project__in=get_accessible_projects(request.user),
+        )
         
         if project_id:
             plans_qs = plans_qs.filter(projects__id=project_id)
@@ -83,7 +115,9 @@ class TestReportViewSet(viewsets.ModelViewSet):
         project_id = request.query_params.get('project')
         version_id = request.query_params.get('version')
         
-        runs_qs = TestRun.objects.all()
+        runs_qs = TestRun.objects.filter(
+            project__in=get_accessible_projects(request.user),
+        ).distinct()
         if project_id:
             runs_qs = runs_qs.filter(project_id=project_id)
         if version_id:
@@ -104,7 +138,11 @@ class TestReportViewSet(viewsets.ModelViewSet):
     def defect_distribution(self, request):
         """获取缺陷分布 (按优先级)"""
         project_id = request.query_params.get('project')
-        qs = TestRunCase.objects.filter(status='failed')
+        qs = TestRunCase.objects.filter(
+            status='failed',
+            test_run__project__in=get_accessible_projects(request.user),
+        )
+
         
         if project_id:
             qs = qs.filter(test_run__project_id=project_id)
@@ -127,7 +165,11 @@ class TestReportViewSet(viewsets.ModelViewSet):
         """获取失败用例TOP榜"""
         project_id = request.query_params.get('project')
         
-        qs = TestRunCase.objects.filter(status='failed')
+        qs = TestRunCase.objects.filter(
+            status='failed',
+            test_run__project__in=get_accessible_projects(request.user),
+        )
+
         if project_id:
             qs = qs.filter(test_run__project_id=project_id)
             
@@ -159,9 +201,11 @@ class TestReportViewSet(viewsets.ModelViewSet):
         start_datetime = timezone.make_aware(start_datetime, current_tz)
         
         qs = TestRunCase.objects.filter(
+            test_run__project__in=get_accessible_projects(request.user),
             executed_at__gte=start_datetime,
             status__in=['passed', 'failed', 'blocked', 'retest']
         )
+
         
         if project_id:
             qs = qs.filter(test_run__project_id=project_id)
@@ -197,9 +241,15 @@ class TestReportViewSet(viewsets.ModelViewSet):
         """获取AI效能分析"""
         project_id = request.query_params.get('project')
         
-        cases_qs = TestCase.objects.all()
-        generated_qs = GeneratedTestCase.objects.all()
-        requirements_qs = BusinessRequirement.objects.all()
+        cases_qs = TestCase.objects.filter(
+            project__in=get_accessible_projects(request.user),
+        )
+        generated_qs = GeneratedTestCase.objects.filter(
+            requirement__analysis__document__project__in=get_accessible_projects(request.user),
+        )
+        requirements_qs = BusinessRequirement.objects.filter(
+            analysis__document__project__in=get_accessible_projects(request.user),
+        )
         
         if project_id:
             cases_qs = cases_qs.filter(project_id=project_id)
@@ -239,9 +289,11 @@ class TestReportViewSet(viewsets.ModelViewSet):
         project_id = request.query_params.get('project')
         
         qs = TestRunCase.objects.filter(
+            test_run__project__in=get_accessible_projects(request.user),
             status__in=['passed', 'failed', 'blocked', 'retest'],
             executed_by__isnull=False
         )
+
         
         if project_id:
             qs = qs.filter(test_run__project_id=project_id)
