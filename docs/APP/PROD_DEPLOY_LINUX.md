@@ -1,7 +1,7 @@
 # 生产部署（Linux）
 
-适用路径：`/opt/testhub_platform`  
-后端域名/IP：`172.13.6.230`  
+适用路径：`/opt/testhub_platform`
+后端域名/IP：`172.13.6.230`
 前端部署：独立部署在 `/opt/testhub_platform/frontend/dist`
 
 > 当前共享主机的 TestHub 发布边界：Daphne 使用 `8002`，前端 Nginx 容器使用 `8003`；既有 `80/8001` 服务不属于 TestHub 发布流程，不得停止或重配置。前端构建、Compose、健康检查和代理配置以 [frontend/README.Docker.md](../../frontend/README.Docker.md) 为准。当前 systemd 服务保持 `active` 但 `disabled`，不要在发布脚本中自动 `enable`。
@@ -45,8 +45,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 command -v "$PYTHON_BIN"
 "$PYTHON_BIN" -m venv venv-prod
 source venv-prod/bin/activate
-pip install -r requirements-prod.txt
-python -m pip check
+MIRROR="${TESTHUB_MIRROR:-/var/lib/testhub-mirror/testhub_platform/current}"
+test -d "$MIRROR"
+test -f "$MIRROR/manifest.json"
+python -m pip install --no-index --no-cache-dir --find-links "$MIRROR" -r requirements-prod.txt
+python scripts/validate_linux_runtime.py --profile web --repo-root "$PWD" --mirror "$MIRROR"
 ```
 
 ### 可选自动化依赖边界
@@ -65,18 +68,15 @@ PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 command -v "$PYTHON_BIN"
 "$PYTHON_BIN" -m venv venv-automation
 source venv-automation/bin/activate
-pip install -r requirements-prod.txt
-pip install -r requirements-app-optional.txt
-pip install -r requirements-report-optional.txt
-python -m pip check
-python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+MIRROR="${TESTHUB_MIRROR:-/var/lib/testhub-mirror/testhub_platform/current}"
+test -d "$MIRROR"
+python -m pip install --no-index --no-cache-dir --find-links "$MIRROR" -r requirements-prod.txt
+python -m pip install --no-index --no-cache-dir --find-links "$MIRROR" -r requirements-app-optional.txt
+python -m pip install --no-index --no-cache-dir --find-links "$MIRROR" -r requirements-report-optional.txt
+python scripts/validate_linux_runtime.py --profile automation --repo-root "$PWD" --mirror "$MIRROR"
 export APP_ADB_PATH="$(command -v adb)"
 test -n "$APP_ADB_PATH"
-test -x "$APP_ADB_PATH"
-"$APP_ADB_PATH" version
 sudo -u testhub -- "$APP_ADB_PATH" version
-test -x /opt/testhub_platform/allure/bin/allure
-/opt/testhub_platform/allure/bin/allure --version
 ```
 
 `APP_ADB_PATH` 必须指向运行 worker 的服务用户可执行的 ADB 文件；不要只在交互式管理员 shell 中验证。缺少 Airtest、Allure Python 插件/commons、仓库内 Allure 命令或 ADB 时，`AppTestExecutor` 会在启动 pytest 前失败并记录明确原因。
@@ -97,14 +97,20 @@ python3.12 scripts/build_linux_wheelhouse.py \
 候选环境必须使用 manifest 校验过的 wheelhouse，并保持与正式 venv 隔离：
 
 ```bash
+MIRROR="${TESTHUB_MIRROR:-/var/lib/testhub-mirror/testhub_platform/current}"
+test -d "$MIRROR"
+test -f "$MIRROR/manifest.json"
 CANDIDATE="/var/tmp/testhub-venv-${RELEASE}"
 python3.12 -m venv "$CANDIDATE"
-"$CANDIDATE/bin/python" -m pip install --no-index \
-  --find-links "$WHEELHOUSE" \
+"$CANDIDATE/bin/python" -m pip install --no-index --no-cache-dir \
+  --find-links "$MIRROR" \
   -r requirements-prod.txt \
   -r requirements-app-optional.txt \
   -r requirements-report-optional.txt
-"$CANDIDATE/bin/python" -m pip check
+"$CANDIDATE/bin/python" scripts/validate_linux_runtime.py \
+  --profile automation \
+  --repo-root "$PWD" \
+  --mirror "$MIRROR"
 ```
 
 不要把 wheelhouse、manifest 中的本地路径或任何内部访问凭据提交到 Git；内部制品的不可变版本、SHA-256、所有者和保留策略由发布平台管理。
@@ -290,12 +296,16 @@ VENV_DIR="$APP_DIR/venv-prod"
 AUTOMATION_VENV_DIR="$APP_DIR/venv-automation"
 NGINX_CONF="/etc/nginx/conf.d/testhub.conf"
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+MIRROR="${TESTHUB_MIRROR:-/var/lib/testhub-mirror/testhub_platform/current}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python 3.12 interpreter is required: $PYTHON_BIN" >&2
   exit 1
 fi
 "$PYTHON_BIN" --version
+
+test -d "$MIRROR"
+test -f "$MIRROR/manifest.json"
 
 APP_ADB_PATH="${APP_ADB_PATH:-$(command -v adb || true)}"
 test -n "$APP_ADB_PATH"
@@ -312,14 +322,16 @@ fi
 source "$VENV_DIR/bin/activate"
 
 echo "=== 2) 安装 Web 依赖 ==="
-pip install -r "$APP_DIR/requirements-prod.txt"
+pip install --no-index --no-cache-dir --find-links "$MIRROR" -r "$APP_DIR/requirements-prod.txt"
+"$VENV_DIR/bin/python" "$APP_DIR/scripts/validate_linux_runtime.py" \
+  --profile web --repo-root "$APP_DIR" --mirror "$MIRROR"
 
 echo "=== 3) 安装 APP worker 依赖并执行预检 ==="
-"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-prod.txt"
-"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-app-optional.txt"
-"$AUTOMATION_VENV_DIR/bin/pip" install -r "$APP_DIR/requirements-report-optional.txt"
-"$AUTOMATION_VENV_DIR/bin/python" -m pip check
-"$AUTOMATION_VENV_DIR/bin/python" -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+"$AUTOMATION_VENV_DIR/bin/pip" install --no-index --no-cache-dir --find-links "$MIRROR" -r "$APP_DIR/requirements-prod.txt"
+"$AUTOMATION_VENV_DIR/bin/pip" install --no-index --no-cache-dir --find-links "$MIRROR" -r "$APP_DIR/requirements-app-optional.txt"
+"$AUTOMATION_VENV_DIR/bin/pip" install --no-index --no-cache-dir --find-links "$MIRROR" -r "$APP_DIR/requirements-report-optional.txt"
+"$AUTOMATION_VENV_DIR/bin/python" "$APP_DIR/scripts/validate_linux_runtime.py" \
+  --profile automation --repo-root "$APP_DIR" --mirror "$MIRROR"
 "$APP_ADB_PATH" version
 sudo -u testhub -- "$APP_ADB_PATH" version
 test -x "$APP_DIR/allure/bin/allure"

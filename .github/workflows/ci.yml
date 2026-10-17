@@ -55,6 +55,9 @@ jobs:
       - name: Install backend dependencies
         run: python -m pip install -r requirements-prod.txt
 
+      - name: Validate web runtime boundary
+        run: python scripts/validate_linux_runtime.py --profile web --repo-root "$PWD"
+
       - name: Run backend regression tests
         env:
           SECRET_KEY: ci-only-not-for-production
@@ -124,6 +127,7 @@ jobs:
 
       - name: Verify APP worker runtime dependencies
         run: |
+          python scripts/validate_linux_runtime.py --profile automation --repo-root "$PWD"
           python -m pip check
           python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
           export APP_ADB_PATH="$(command -v adb)"
