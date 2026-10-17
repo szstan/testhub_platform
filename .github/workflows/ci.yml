@@ -62,6 +62,33 @@ jobs:
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: python -m pytest -q
 
+      - name: Validate Linux dependency artifact builder
+        run: |
+          python -m py_compile scripts/build_linux_wheelhouse.py
+          python scripts/build_linux_wheelhouse.py --help
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          touch "$tmp_dir/demo-1.0-py3-none-any.whl"
+          python scripts/build_linux_wheelhouse.py \
+            --output "$tmp_dir" \
+            --manifest-only \
+            --requirements requirements-prod.txt \
+            --requirements requirements-app-optional.txt \
+            --requirements requirements-report-optional.txt
+          test -s "$tmp_dir/manifest.json"
+          test -s "$tmp_dir/manifest.sha256"
+          test -s "$tmp_dir/SHA256SUMS"
+          touch "$tmp_dir/bad-1.0-py3-none-win_amd64.whl"
+          if python scripts/build_linux_wheelhouse.py \
+            --output "$tmp_dir" \
+            --manifest-only \
+            --requirements requirements-prod.txt \
+            --requirements requirements-app-optional.txt \
+            --requirements requirements-report-optional.txt; then
+            echo 'Windows artifact was not rejected' >&2
+            exit 1
+          fi
+
   backend-app-automation:
     runs-on: ubuntu-24.04
     steps:

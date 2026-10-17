@@ -81,6 +81,34 @@ test -x /opt/testhub_platform/allure/bin/allure
 
 `APP_ADB_PATH` 必须指向运行 worker 的服务用户可执行的 ADB 文件；不要只在交互式管理员 shell 中验证。缺少 Airtest、Allure Python 插件/commons、仓库内 Allure 命令或 ADB 时，`AppTestExecutor` 会在启动 pytest 前失败并记录明确原因。
 
+### 可重复依赖制品（Linux/Python 3.12）
+
+`scripts/build_linux_wheelhouse.py` 只能在原生 Linux/Python 3.12 x86_64 构建主机运行。输出目录必须位于仓库外；脚本会解析三份 requirements 的完整传递依赖，补充源码包构建依赖，拒绝 Windows/macOS/musllinux 文件，并生成 `manifest.json`、`manifest.sha256` 和 `SHA256SUMS`。脚本只构建本地制品，不负责上传；上传前必须使用已批准的内部 artifact 仓库或 package mirror。
+
+```bash
+cd /opt/testhub_platform
+RELEASE="$(sed -n '1p' RELEASE 2>/dev/null || date +%Y%m%d%H%M%S)"
+WHEELHOUSE="/var/tmp/testhub-wheelhouse-${RELEASE}"
+python3.12 scripts/build_linux_wheelhouse.py \
+  --output "$WHEELHOUSE" \
+  --index-url "${APP_INDEX_URL:-https://pypi.org/simple}"
+```
+
+候选环境必须使用 manifest 校验过的 wheelhouse，并保持与正式 venv 隔离：
+
+```bash
+CANDIDATE="/var/tmp/testhub-venv-${RELEASE}"
+python3.12 -m venv "$CANDIDATE"
+"$CANDIDATE/bin/python" -m pip install --no-index \
+  --find-links "$WHEELHOUSE" \
+  -r requirements-prod.txt \
+  -r requirements-app-optional.txt \
+  -r requirements-report-optional.txt
+"$CANDIDATE/bin/python" -m pip check
+```
+
+不要把 wheelhouse、manifest 中的本地路径或任何内部访问凭据提交到 Git；内部制品的不可变版本、SHA-256、所有者和保留策略由发布平台管理。
+
 API 测试管理页面和核心 API 服务随 Web 环境发布；需要浏览器、设备、OCR 或 Allure 的执行 worker 属于独立部署边界。未安装可选依赖时，Web 登录、项目/用例/套件管理、执行记录、报告统计和评审 API 仍应可用。
 
 
