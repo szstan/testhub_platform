@@ -11,7 +11,7 @@ class NotificationConfigApiTests(APITestCase):
 
     def setUp(self):
         self.client = APIClient()
-        self.user = User.objects.create_user(username='core_tester', password='pass123456')
+        self.user = User.objects.create_superuser(username='core_tester', password='pass123456', email='core@example.com')
         self.client.force_authenticate(self.user)
         self.list_url = reverse('unified-notification-config-list')
 

@@ -73,7 +73,7 @@ def test_register(request):
         from rest_framework_simplejwt.tokens import RefreshToken
         refresh = RefreshToken.for_user(user)
 
-        return JsonResponse({
+        response = JsonResponse({
             'success': True,
             'user': {
                 'id': user.id,
@@ -84,8 +84,10 @@ def test_register(request):
                 'last_name': user.last_name
             },
             'access': str(refresh.access_token),
-            'refresh': str(refresh),
         })
+        from .views import _set_refresh_cookie
+        _set_refresh_cookie(response, str(refresh))
+        return response
 
     except Exception as e:
         return JsonResponse({

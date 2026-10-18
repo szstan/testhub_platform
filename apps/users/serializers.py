@@ -15,6 +15,23 @@ class UserSerializer(serializers.ModelSerializer):
                  'date_joined', 'created_at', 'updated_at']
         read_only_fields = ['id', 'date_joined', 'created_at', 'updated_at']
 
+class UserDirectorySerializer(serializers.ModelSerializer):
+    """安全的用户目录表示，不暴露手机号或管理状态。"""
+
+    class Meta:
+        model = User
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'avatar')
+        read_only_fields = fields
+
+
+class UserSelfUpdateSerializer(serializers.ModelSerializer):
+    """允许用户修改的个人资料字段。"""
+
+    class Meta:
+        model = User
+        fields = ('email', 'first_name', 'last_name', 'avatar', 'department', 'position')
+
+
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=6)
     password_confirm = serializers.CharField(write_only=True)

@@ -149,7 +149,7 @@ jobs:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
-        run: python -m pytest -q apps/app_automation/tests/test_executor.py apps/app_automation/tests/test_websocket_events.py
+        run: python -m pytest -q apps/app_automation/tests/test_security_boundaries.py apps/app_automation/tests/test_execution_views.py apps/app_automation/tests/test_executor.py apps/app_automation/tests/test_websocket_events.py
 
       - name: Collect APP UI Flow entry without a test database
         env:

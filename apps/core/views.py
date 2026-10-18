@@ -3,7 +3,7 @@ Core 应用视图
 """
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
@@ -19,7 +19,7 @@ class UnifiedNotificationConfigViewSet(viewsets.ModelViewSet):
     """统一通知配置视图集"""
     queryset = UnifiedNotificationConfig.objects.all()
     serializer_class = UnifiedNotificationConfigSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['config_type', 'is_default', 'is_active']
     search_fields = ['name']

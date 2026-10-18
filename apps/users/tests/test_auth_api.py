@@ -129,7 +129,7 @@ def test_login_returns_jwt_tokens_for_valid_credentials(api_client, active_user)
     assert payload['user']['id'] == active_user.id
     assert payload['user']['username'] == active_user.username
     assert re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', payload['access'])
-    assert re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', payload['refresh'])
+    assert 'testhub_refresh=' in response.cookies['testhub_refresh'].OutputString()
 
 
 def test_login_rejects_invalid_password(api_client, active_user):
@@ -171,3 +171,89 @@ def test_login_rejects_inactive_user(api_client, active_user):
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert '用户已被禁用' in str(_response_error(response))
+
+
+def test_user_detail_is_scoped_to_self_for_regular_users(api_client, active_user):
+    other_user = User.objects.create_user(
+        username='other_user',
+        email='other@example.com',
+        password='StrongPass123',
+    )
+    api_client.force_authenticate(user=active_user)
+
+    response = api_client.get(f'/api/users/{other_user.id}/')
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_regular_users_cannot_create_or_delete_users(api_client, active_user):
+    api_client.force_authenticate(user=active_user)
+
+    create_response = api_client.post(
+        '/api/users/',
+        {'username': 'created_by_user', 'email': 'created@example.com'},
+        format='json',
+    )
+    assert create_response.status_code == status.HTTP_403_FORBIDDEN
+
+    other_user = User.objects.create_user(
+        username='delete_target',
+        email='delete@example.com',
+        password='StrongPass123',
+    )
+    delete_response = api_client.delete(f'/api/users/{other_user.id}/')
+    assert delete_response.status_code == status.HTTP_403_FORBIDDEN
+    assert User.objects.filter(pk=other_user.pk).exists()
+
+
+def test_session_authenticated_api_mutation_requires_csrf(active_user):
+    client = APIClient(enforce_csrf_checks=True)
+    client.force_login(active_user)
+
+    response = client.patch(
+        f'/api/users/{active_user.id}/',
+        {'first_name': 'blocked'},
+        format='json',
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_admin_can_manage_users(api_client):
+    admin = User.objects.create_superuser(
+        username='test-admin',
+        email='admin@example.com',
+        password='StrongPass123',
+    )
+    target = User.objects.create_user(
+        username='admin-target',
+        email='target@example.com',
+        password='StrongPass123',
+    )
+    api_client.force_authenticate(user=admin)
+
+    response = api_client.patch(
+        f'/api/users/{target.id}/',
+        {'is_active': False},
+        format='json',
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    target.refresh_from_db()
+    assert target.is_active is False
+
+
+def test_refresh_uses_httponly_cookie_without_returning_refresh_token(api_client, active_user):
+    login_response = api_client.post(
+        '/api/auth/login/',
+        {'username': active_user.username, 'password': 'StrongPass123'},
+        format='json',
+    )
+    api_client.cookies.update(login_response.cookies)
+
+    refresh_response = api_client.post('/api/auth/token/refresh/', {}, format='json')
+
+    assert refresh_response.status_code == status.HTTP_200_OK
+    assert 'access' in refresh_response.json()
+    assert 'refresh' not in refresh_response.json()
+    assert refresh_response.cookies['testhub_refresh']['httponly'] is True

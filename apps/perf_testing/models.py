@@ -634,7 +634,7 @@ class PerfEnvironment(models.Model):
                                db_comment='环境基础地址(如 https://api.example.com)')
     headers = models.JSONField(default=dict, blank=True, verbose_name='全局请求头',
                                db_comment='环境级全局请求头(JSON:{k:v})')
-    verify_ssl = models.BooleanField(default=False, verbose_name='校验 SSL 证书',
+    verify_ssl = models.BooleanField(default=True, verbose_name='校验 SSL 证书',
                                      db_comment='是否校验 SSL 证书')
     variables = models.JSONField(default=list, blank=True, verbose_name='环境变量',
                                  db_comment='环境变量列表(JSON:[{name,type,value}])')

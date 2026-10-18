@@ -1,7 +1,7 @@
 """Test settings shared by the core and upstream feature suites."""
 from backend.settings import *  # noqa: F401,F403
 
-SECRET_KEY = 'test-secret-key'
+SECRET_KEY = 'test-secret-key-for-unit-tests-32chars'
 DEBUG = True
 ROOT_URLCONF = 'backend.urls'
 
@@ -39,6 +39,8 @@ CELERY_TASK_EAGER_PROPAGATES = True
 
 PERF_ALLOW_PRIVATE_TARGETS = True
 MONITOR_ALLOW_PRIVATE_TARGETS = True
+MCP_ENABLED = True
+MCP_HUMAN_APPROVAL = False
 
 REDIS_URL = 'redis://localhost:6379/15'
 

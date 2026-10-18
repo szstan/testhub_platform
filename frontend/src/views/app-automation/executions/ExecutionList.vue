@@ -168,7 +168,7 @@ import {
   getAppProjects
 } from '@/api/app-automation'
 import { Search, Refresh } from '@element-plus/icons-vue'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -238,10 +238,12 @@ const viewReport = (execution) => {
     return
   }
   
-  const reportUrl = `/api/app-automation/executions/${execution.id}/report/`
-  
-  // 在新标签页打开报告
-  window.open(reportUrl, '_blank')
+  const reportUrl = getAppReportUrl(execution)
+  if (!reportUrl) {
+    ElMessage.warning(t('appAutomation.execution.reportNotExist'))
+    return
+  }
+  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 const viewError = (execution) => {

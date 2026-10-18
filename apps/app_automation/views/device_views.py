@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 import logging
 
@@ -136,16 +137,15 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def lock(self, request, pk=None):
         """锁定设备"""
-        device = self.get_object()
-        
-        if device.status == 'locked':
-            return Response({
-                'success': False,
-                'message': '设备已被锁定'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        device.lock(request.user)
-        
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=pk)
+            if device.status == 'locked':
+                return Response({
+                    'success': False,
+                    'message': '设备已被锁定'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            device.lock(request.user)
+
         return Response({
             'success': True,
             'message': '设备锁定成功',

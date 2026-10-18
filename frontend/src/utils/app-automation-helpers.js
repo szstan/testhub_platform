@@ -183,3 +183,8 @@ export function formatRelativeTime(timeStr) {
   if (diff < 86400000) return t('appAutomation.common.hoursAgo', { n: Math.floor(diff / 3600000) })
   return t('appAutomation.common.daysAgo', { n: Math.floor(diff / 86400000) })
 }
+
+export function getAppReportUrl(execution) {
+  if (!execution?.id || !execution.report_access_token) return ''
+  return `/api/app-automation/executions/${execution.id}/report/${encodeURIComponent(execution.report_access_token)}/`
+}

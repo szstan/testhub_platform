@@ -304,7 +304,7 @@ import {
   getPackageList,
   getAppProjects,
 } from '@/api/app-automation'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
 
 const { t } = useI18n()
 
@@ -624,7 +624,12 @@ const viewReport = (execution) => {
     ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
     return
   }
-  window.open(`/api/app-automation/executions/${execution.id}/report/`, '_blank')
+  const reportUrl = getAppReportUrl(execution)
+  if (!reportUrl) {
+    ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
+    return
+  }
+  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 // ===== 工具方法 =====

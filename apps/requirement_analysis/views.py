@@ -6,11 +6,11 @@ import json
 import time
 from rest_framework import viewsets, status
 from django.conf import settings  # Added import
-from rest_framework.decorators import action, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes
 from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 
 
 class PassThroughRenderer(BaseRenderer):
@@ -26,8 +26,6 @@ class PassThroughRenderer(BaseRenderer):
 
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.http import JsonResponse, StreamingHttpResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 from django.db import models
@@ -50,11 +48,41 @@ from .services import RequirementAnalysisService, DocumentProcessor
 logger = logging.getLogger(__name__)
 
 
+def _accessible_documents(user):
+    """Return requirement documents visible to the caller."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return RequirementDocument.objects.none()
+    if user.is_staff or user.is_superuser:
+        return RequirementDocument.objects.all()
+    return RequirementDocument.objects.filter(
+        models.Q(uploaded_by=user)
+        | models.Q(project__owner=user)
+        | models.Q(project__members=user)
+    ).distinct()
+
+
+def _project_for_user(user, project_id):
+    if not project_id:
+        return None
+    from apps.projects.models import Project
+
+    queryset = Project.objects.filter(pk=project_id)
+    if not (user.is_staff or user.is_superuser):
+        queryset = queryset.filter(
+            models.Q(owner=user) | models.Q(members=user)
+        )
+    return queryset.first()
+
+
 class RequirementDocumentViewSet(viewsets.ModelViewSet):
     """需求文档视图集"""
     queryset = RequirementDocument.objects.all()
     serializer_class = RequirementDocumentSerializer
     parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return _accessible_documents(self.request.user)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -147,13 +175,13 @@ class RequirementDocumentViewSet(viewsets.ModelViewSet):
                     document.save()
                     raise e
 
-            analysis = run_analysis()
-
+            from .tasks import process_requirement_document_task
+            task = process_requirement_document_task.delay(document.id)
             return Response({
-                'message': '分析完成',
-                'analysis_id': analysis.id,
-                'requirements_count': analysis.requirements_count
-            }, status=status.HTTP_200_OK)
+                'message': '分析任务已提交',
+                'document_id': document.id,
+                'task_id': task.id,
+            }, status=status.HTTP_202_ACCEPTED)
 
         except Exception as e:
             logger.error(f"分析文档时出错: {e}")
@@ -190,6 +218,12 @@ class RequirementAnalysisViewSet(viewsets.ReadOnlyModelViewSet):
     """需求分析视图集"""
     queryset = RequirementAnalysis.objects.all()
     serializer_class = RequirementAnalysisSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return super().get_queryset().filter(
+            document__in=_accessible_documents(self.request.user)
+        )
 
     @action(detail=True, methods=['get'])
     def requirements(self, request, pk=None):
@@ -204,13 +238,17 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
     """业务需求视图集"""
     queryset = BusinessRequirement.objects.all()
     serializer_class = BusinessRequirementSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            analysis__document__in=_accessible_documents(self.request.user)
+        )
         analysis_id = self.request.query_params.get('analysis_id')
         if analysis_id:
             queryset = queryset.filter(analysis_id=analysis_id)
         return queryset
+
 
     @classmethod
     def _generate_test_case_content(cls, requirement, case_number, test_level):
@@ -454,10 +492,13 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
     queryset = GeneratedTestCase.objects.all()
     serializer_class = GeneratedTestCaseSerializer
     pagination_class = GeneratedTestCasePagination
+    permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'patch']  # 只允许GET和PATCH方法
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            requirement__analysis__document__in=_accessible_documents(self.request.user)
+        )
 
         # 按需求ID过滤
         requirement_id = self.request.query_params.get('requirement_id')
@@ -491,7 +532,10 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
             def run_review():
                 try:
                     # 获取测试用例
-                    test_cases = GeneratedTestCase.objects.filter(id__in=test_case_ids)
+                    test_cases = GeneratedTestCase.objects.filter(
+                        id__in=test_case_ids,
+                        requirement__analysis__document__in=_accessible_documents(request.user),
+                    )
 
                     passed_count = 0
                     reviewed_cases = []
@@ -552,9 +596,12 @@ class AnalysisTaskViewSet(viewsets.ReadOnlyModelViewSet):
     """分析任务视图集"""
     queryset = AnalysisTask.objects.all()
     serializer_class = AnalysisTaskSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            document__in=_accessible_documents(self.request.user)
+        )
         document_id = self.request.query_params.get('document_id')
         if document_id:
             queryset = queryset.filter(document_id=document_id)
@@ -572,14 +619,8 @@ class AnalysisTaskViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
-from django.views.decorators.csrf import csrf_exempt
-
-
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def upload_and_analyze(request):
     """上传文档并立即开始分析"""
     try:
@@ -657,117 +698,21 @@ def upload_and_analyze(request):
                 document.save()
                 raise e
 
-        analysis = run_analysis()
-
+        from .tasks import process_requirement_document_task
+        task = process_requirement_document_task.delay(document.id)
         return Response({
-            'message': '上传并分析完成',
+            'message': '上传成功，分析任务已提交',
             'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
+            'task_id': task.id,
+        }, status=status.HTTP_202_ACCEPTED)
 
     except Exception as e:
         logger.error(f"上传并分析失败: {e}")
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
-def analyze_text(request):
-    """直接分析文本内容"""
-    try:
-        title = request.data.get('title', '')
-        description = request.data.get('description', '')
-        project_id = request.data.get('project')
-
-        if not title or not description:
-            return Response({'error': '标题和描述不能为空'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # 创建一个虚拟的需求文档记录
-        document = RequirementDocument.objects.create(
-            title=title,
-            document_type='txt',
-            status='analyzing',
-            uploaded_by_id=1,  # 使用默认用户ID，或者从request.user获取
-            project_id=project_id if project_id else None,
-            extracted_text=description
-        )
-
-        def run_analysis():
-            try:
-                # 创建模拟分析结果
-                analysis_result = {
-                    'analysis_report': f'对需求"{title}"的分析已完成。\n\n需求描述：{description[:200]}...\n\n识别到若干功能性需求。',
-                    'requirements_count': 2,
-                    'requirements': [
-                        {
-                            'requirement_id': 'REQ001',
-                            'requirement_name': '基础功能需求',
-                            'requirement_type': 'functional',
-                            'module': '核心模块',
-                            'requirement_level': 'high',
-                            'estimated_hours': 8,
-                            'description': f'基于需求描述识别的功能需求：{description[:100]}...',
-                            'acceptance_criteria': '功能正常运行，满足用户需求'
-                        },
-                        {
-                            'requirement_id': 'REQ002',
-                            'requirement_name': '用户交互需求',
-                            'requirement_type': 'usability',
-                            'module': '前端模块',
-                            'requirement_level': 'medium',
-                            'estimated_hours': 6,
-                            'description': '用户界面和交互相关需求',
-                            'acceptance_criteria': '界面友好，操作简单'
-                        }
-                    ]
-                }
-
-                # 创建分析记录
-                analysis = RequirementAnalysis.objects.create(
-                    document=document,
-                    analysis_report=analysis_result['analysis_report'],
-                    requirements_count=analysis_result['requirements_count'],
-                    analysis_time=1.5
-                )
-
-                # 保存需求数据
-                for req_data in analysis_result['requirements']:
-                    BusinessRequirement.objects.create(
-                        analysis=analysis,
-                        **req_data
-                    )
-
-                # 更新文档状态
-                document.status = 'analyzed'
-                document.save()
-
-                return analysis
-
-            except Exception as e:
-                logger.error(f"分析失败: {e}")
-                document.status = 'failed'
-                document.save()
-                raise e
-
-        analysis = run_analysis()
-
-        return Response({
-            'message': '文本分析完成',
-            'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
-
-    except Exception as e:
-        logger.error(f"文本分析失败: {e}")
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-@csrf_exempt
-@api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def analyze_text(request):
     """分析手动输入的需求文本"""
     try:
@@ -778,14 +723,18 @@ def analyze_text(request):
         if not title or not description:
             return Response({'error': '需求标题和描述不能为空'}, status=status.HTTP_400_BAD_REQUEST)
 
+        project = _project_for_user(request.user, project_id)
+        if project_id and project is None:
+            return Response({'error': '无权使用该项目'}, status=status.HTTP_403_FORBIDDEN)
+
         # 创建一个虚拟的需求文档记录
         document = RequirementDocument.objects.create(
             title=title,
-            file=None,  # 手动输入没有文件
+            file='',
             document_type='txt',
             status='analyzing',
-            uploaded_by_id=1,  # 使用默认用户ID，或者从request.user获取
-            project_id=project_id if project_id else None,
+            uploaded_by=request.user,
+            project=project,
             extracted_text=description
         )
 
@@ -888,14 +837,13 @@ def analyze_text(request):
                 document.save()
                 raise e
 
-        analysis = run_analysis()
-
+        from .tasks import process_requirement_document_task
+        task = process_requirement_document_task.delay(document.id)
         return Response({
-            'message': '文本分析完成',
+            'message': '文本分析任务已提交',
             'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
+            'task_id': task.id,
+        }, status=status.HTTP_202_ACCEPTED)
 
     except Exception as e:
         logger.error(f"文本分析失败: {e}")
@@ -906,6 +854,7 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
     """AI模型配置视图集"""
     queryset = AIModelConfig.objects.all()
     serializer_class = AIModelConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1113,8 +1062,6 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
             logger.info(f"模型类型: {config.model_type}")
             logger.info(f"模型名称: {config.model_name}")
             logger.info(f"API URL: {config.base_url}")
-            logger.info(
-                f"API Key前缀: {config.api_key[:10]}..." if len(config.api_key) > 10 else f"API Key: {config.api_key}")
 
             # 准备测试消息
             test_messages = [
@@ -1222,6 +1169,7 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
     """提示词配置视图集"""
     queryset = PromptConfig.objects.all()
     serializer_class = PromptConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1373,6 +1321,7 @@ class GenerationConfigViewSet(viewsets.ModelViewSet):
     """生成行为配置视图集"""
     queryset = GenerationConfig.objects.all()
     serializer_class = GenerationConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1443,6 +1392,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     """测试用例生成任务视图集"""
     queryset = TestCaseGenerationTask.objects.all()
     serializer_class = TestCaseGenerationTaskSerializer
+    permission_classes = [IsAuthenticated]
     pagination_class = TestCaseGenerationTaskPagination
     http_method_names = ['get', 'post', 'patch', 'delete']  # 允许GET、POST、PATCH和DELETE方法
     lookup_field = 'task_id'  # 使用task_id作为查找字段
@@ -1450,7 +1400,13 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        # 安全检查：确保request有query_params属性
+        if not (self.request.user.is_staff or self.request.user.is_superuser):
+            queryset = queryset.filter(
+                models.Q(created_by=self.request.user)
+                | models.Q(project__owner=self.request.user)
+                | models.Q(project__members=self.request.user)
+            ).distinct()
+
         if not hasattr(self.request, 'query_params'):
             return queryset.order_by('-created_at')
 

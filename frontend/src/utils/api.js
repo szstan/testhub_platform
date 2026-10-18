@@ -122,8 +122,8 @@ api.interceptors.response.use(
         return Promise.reject(error)
       }
 
-      // 如果有refresh token，尝试刷新
-      if (userStore.refreshToken && !isRefreshing) {
+      // 如果有内存中的 access token，尝试通过 HttpOnly refresh cookie 刷新
+      if (userStore.accessToken && !isRefreshing) {
         originalRequest._retry = true
         isRefreshing = true
 
@@ -147,8 +147,8 @@ api.interceptors.response.use(
           isRefreshing = false
         }
       } else {
-        // 没有refresh token，直接退出
-        console.error('没有refresh token，跳转登录页')
+        // 没有可用会话，直接退出
+        console.error('没有可用认证会话，跳转登录页')
         await userStore.logout()
       }
 

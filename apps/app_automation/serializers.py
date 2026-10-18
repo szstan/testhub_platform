@@ -2,6 +2,7 @@
 from typing import Optional
 
 from rest_framework import serializers
+from django.db import transaction
 from django.utils import timezone
 from django.core.signing import TimestampSigner
 from .access import accessible_projects, scope_test_cases
@@ -339,13 +340,16 @@ class AppTestSuiteCreateSerializer(serializers.ModelSerializer):
         ).filter(project=project).values_list('id', flat=True))
         if set(test_case_ids) != allowed_ids:
             raise serializers.ValidationError('测试用例列表包含无权使用的用例')
-        suite = AppTestSuite.objects.create(**validated_data)
-        for idx, tc_id in enumerate(test_case_ids):
-            AppTestSuiteCase.objects.create(
-                test_suite=suite,
-                test_case_id=tc_id,
-                order=idx
-            )
+        with transaction.atomic():
+            suite = AppTestSuite.objects.create(**validated_data)
+            AppTestSuiteCase.objects.bulk_create([
+                AppTestSuiteCase(
+                    test_suite=suite,
+                    test_case_id=tc_id,
+                    order=idx,
+                )
+                for idx, tc_id in enumerate(test_case_ids)
+            ])
         return suite
 
 

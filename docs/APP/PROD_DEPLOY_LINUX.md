@@ -125,8 +125,9 @@ API 测试管理页面和核心 API 服务随 Web 环境发布；需要浏览器
 创建 `/opt/testhub_platform/.env`：
 
 ```env
+APP_ENV=production
 DEBUG=False
-SECRET_KEY=your-secret-key
+SECRET_KEY=replace-with-a-random-secret
 ALLOWED_HOSTS=172.13.6.230
 
 DB_NAME=testhub
@@ -339,8 +340,9 @@ test -x "$APP_DIR/allure/bin/allure"
 
 echo "=== 4) 写入 .env ==="
 cat > "$APP_DIR/.env" <<EOF
+APP_ENV=production
 DEBUG=False
-SECRET_KEY=your-secret-key
+SECRET_KEY=replace-with-a-random-secret
 ALLOWED_HOSTS=172.13.6.230
 
 DB_NAME=testhub

@@ -16,7 +16,15 @@ from apps.app_automation.runners.ui_flow_runner import UiFlowRunner
 # stay outside the worker entry point and run in their own CI job. Keep this
 # module free of pytest-django's django_db marker so the worker never creates a
 # test database against the configured application database.
-pytestmark = pytest.mark.app_ui_flow
+pytestmark = [
+    pytest.mark.app_ui_flow,
+    pytest.mark.skipif(
+        not all(os.environ.get(name) for name in (
+            'APP_DEVICE_ID', 'APP_PACKAGE_NAME', 'APP_TEST_CASE_ID', 'APP_EXECUTION_ID'
+        )),
+        reason='APP UI flow requires an explicitly provisioned device and execution fixture',
+    ),
+]
 
 
 logger = logging.getLogger(__name__)

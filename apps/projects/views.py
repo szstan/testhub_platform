@@ -4,8 +4,18 @@ from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
+from django.shortcuts import get_object_or_404
+from rest_framework.exceptions import PermissionDenied
 from .models import Project, ProjectMember, ProjectEnvironment
 from .serializers import ProjectSerializer, ProjectCreateSerializer, ProjectMemberSerializer, ProjectEnvironmentSerializer
+
+
+def accessible_projects(user):
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
+    return Project.objects.filter(
+        models.Q(owner=user) | models.Q(members=user)
+    ).distinct()
 
 class ProjectListCreateView(generics.ListCreateAPIView):
     queryset = Project.objects.all()
@@ -32,13 +42,32 @@ class ProjectListCreateView(generics.ListCreateAPIView):
 @permission_classes([permissions.IsAuthenticated])
 def get_all_projects(request):
     """获取所有项目列表，用于下拉选择等场景"""
-    projects = Project.objects.all().values('id', 'name', 'description', 'status')
+    projects = accessible_projects(request.user).values('id', 'name', 'description', 'status')
     return Response(list(projects))
 
 class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Project.objects.all()
     serializer_class = ProjectSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return accessible_projects(self.request.user)
+
+    def _require_manage_permission(self, instance):
+        if not (
+            self.request.user.is_staff
+            or self.request.user.is_superuser
+            or instance.owner_id == self.request.user.id
+        ):
+            raise PermissionDenied('只有项目负责人或管理员可以修改项目')
+
+    def perform_update(self, serializer):
+        self._require_manage_permission(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_manage_permission(instance)
+        instance.delete()
 
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
@@ -115,9 +144,9 @@ class ProjectEnvironmentListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     
     def get_queryset(self):
-        project_id = self.kwargs['project_id']
-        return ProjectEnvironment.objects.filter(project_id=project_id)
+        project = get_object_or_404(accessible_projects(self.request.user), pk=self.kwargs['project_id'])
+        return ProjectEnvironment.objects.filter(project=project)
     
     def perform_create(self, serializer):
-        project_id = self.kwargs['project_id']
-        serializer.save(project_id=project_id)
+        project = get_object_or_404(accessible_projects(self.request.user), pk=self.kwargs['project_id'])
+        serializer.save(project=project)

@@ -10,7 +10,9 @@ from django.conf import settings
 from pathlib import Path
 from .test_case_views import AppPagination
 import hashlib
+import os
 import re
+import uuid
 import logging
 
 from ..models import AppElement
@@ -125,9 +127,20 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 'success': False
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        # 获取参数
-        category = request.data.get('category', 'common')
+        # 获取参数并限制目录/文件范围
+        category = str(request.data.get('category', 'common')).strip()
         element_id = request.data.get('element_id')  # 编辑模式时传递，用于排除自身
+        if not re.fullmatch(r'[a-zA-Z0-9_\-\u4e00-\u9fa5]+', category):
+            return Response({'code': 400, 'msg': '分类名称非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+        if file_obj.size > 10 * 1024 * 1024:
+            return Response({'code': 400, 'msg': '图片不能超过 10MB', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+
+        safe_name = Path(file_obj.name or '').name
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}:
+            return Response({'code': 400, 'msg': '只允许上传图片文件', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+        if not safe_name:
+            return Response({'code': 400, 'msg': '文件名不能为空', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
             # ✅ 业务逻辑内联：计算文件哈希
@@ -165,12 +178,15 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
             
             # ✅ 业务逻辑内联：保存图片到 Template 目录
-            template_base = self.get_template_base_path()
-            category_path = template_base / category
+            template_base = self.get_template_base_path().resolve()
+            category_path = (template_base / category).resolve()
+            if os.path.commonpath([str(template_base), str(category_path)]) != str(template_base):
+                return Response({'code': 400, 'msg': '非法的保存路径', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
             category_path.mkdir(parents=True, exist_ok=True)
-            
-            # 使用原始文件名
-            file_path = category_path / file_obj.name
+
+            # 使用随机文件名，避免覆盖已有元素或利用原始文件名写入路径
+            filename = f'{uuid.uuid4().hex}{suffix}'
+            file_path = category_path / filename
             
             # 保存文件
             with open(file_path, 'wb+') as destination:
@@ -178,7 +194,7 @@ class AppElementViewSet(viewsets.ModelViewSet):
                     destination.write(chunk)
             
             # 构建相对路径（直接返回 category/filename.png）
-            relative_path = f"{category}/{file_obj.name}"
+            relative_path = f"{category}/{filename}"
             
             logger.info(f"用户 {request.user.username} 上传图片: {relative_path}, 哈希: {file_hash}")
             

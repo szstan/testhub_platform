@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 import logging
 
 from ..models import AppTestSuite, AppTestSuiteCase, AppTestCase, AppDevice, AppTestExecution
@@ -173,51 +174,52 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
             return Response({'success': False, 'message': '请选择执行设备'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # 检查套件是否包含用例
         suite_cases = suite.suite_cases.select_related('test_case').all()
         if not suite_cases.exists():
             return Response({'success': False, 'message': '该套件未包含任何测试用例'},
                             status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            device = AppDevice.objects.get(device_id=device_id)
-            if device.status == 'locked' and device.locked_by != request.user:
-                return Response({'success': False, 'message': '设备已被其他用户锁定'},
-                                status=status.HTTP_400_BAD_REQUEST)
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(device_id=device_id)
+                if device.status == 'locked' and device.locked_by_id != request.user.id:
+                    return Response({'success': False, 'message': '设备已被其他用户锁定'},
+                                    status=status.HTTP_400_BAD_REQUEST)
 
-            # 为每个用例创建执行记录
-            executions = []
-            for sc in suite_cases:
-                execution = AppTestExecution.objects.create(
-                    test_case=sc.test_case,
-                    test_suite=suite,
-                    device=device,
-                    user=request.user,
-                    status='pending'
-                )
-                executions.append(execution)
+                executions = [
+                    AppTestExecution.objects.create(
+                        test_case=sc.test_case,
+                        test_suite=suite,
+                        device=device,
+                        user=request.user,
+                        status='pending'
+                    )
+                    for sc in suite_cases
+                ]
+                suite.execution_status = 'running'
+                suite.save(update_fields=['execution_status'])
 
-            # 更新套件状态
-            suite.execution_status = 'running'
-            suite.save(update_fields=['execution_status'])
-
-            # 触发 Celery 任务，顺序执行
             from ..tasks import execute_app_suite_task
             execution_ids = [e.id for e in executions]
-            task = execute_app_suite_task.delay(
-                suite_id=suite.id,
-                execution_ids=execution_ids,
-                package_name=package_name
-            )
+            try:
+                task = execute_app_suite_task.delay(
+                    suite_id=suite.id,
+                    execution_ids=execution_ids,
+                    package_name=package_name
+                )
+            except Exception:
+                AppTestExecution.objects.filter(id__in=execution_ids).update(
+                    status='error', error_message='无法提交 Celery 执行任务'
+                )
+                suite.execution_status = 'error'
+                suite.save(update_fields=['execution_status'])
+                raise
 
-            # 记录 task_id 到第一个执行
-            if executions:
-                executions[0].task_id = task.id
-                executions[0].save(update_fields=['task_id'])
+            executions[0].task_id = task.id
+            executions[0].save(update_fields=['task_id'])
 
             logger.info(f"测试套件已提交执行: suite={suite.name}, "
                         f"cases={len(executions)}, task_id={task.id}")
-
             return Response({
                 'success': True,
                 'message': f'测试套件已提交执行，共 {len(executions)} 个用例',
@@ -228,7 +230,6 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                     'test_case_count': len(executions),
                 }
             })
-
         except AppDevice.DoesNotExist:
             return Response({'success': False, 'message': '设备不存在'},
                             status=status.HTTP_404_NOT_FOUND)
