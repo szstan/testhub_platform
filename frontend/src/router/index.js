@@ -132,6 +132,26 @@ const routes = [
                 component: () => import('@/views/executions/ExecutionListView.vue')
             },
             {
+                path: 'task-center',
+                name: 'UnifiedTaskCenter',
+                component: () => import('@/views/executions/TaskCenter.vue')
+            },
+            {
+                path: 'traceability',
+                name: 'ExecutionTraceability',
+                component: () => import('@/views/executions/TraceabilityView.vue')
+            },
+            {
+                path: 'ci-profiles',
+                name: 'CIExecutionProfiles',
+                component: () => import('@/views/executions/CIProfiles.vue')
+            },
+            {
+                path: 'datasets-plugins',
+                name: 'ExecutionDatasetsPlugins',
+                component: () => import('@/views/executions/DatasetsPlugins.vue')
+            },
+            {
                 path: 'executions/:id',
                 name: 'ExecutionDetail',
                 component: () => import('@/views/executions/ExecutionDetailView.vue')

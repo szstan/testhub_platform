@@ -15,6 +15,8 @@ __pycache__/
 .pytest_cache
 .coverage
 .playwright-mcp/
+.workflow/
+/testhub-login-*.png
 wheels/
 备注笔记.txt
 # 忽略log文件，但保留.gitkeep和子目录
@@ -32,6 +34,16 @@ static_files/img/
 apps/*/migrations/*
 # 使用否定模式，例外地跟踪 __init__.py 文件
 !apps/*/migrations/__init__.py
+
+# Additive execution/device/report migrations are part of the reviewable change.
+!apps/executions/migrations/
+!apps/executions/migrations/*.py
+!apps/app_automation/migrations/
+!apps/app_automation/migrations/*.py
+!apps/reports/migrations/
+!apps/reports/migrations/*.py
+!apps/perf_testing/migrations/
+!apps/perf_testing/migrations/*.py
 
 # 质量智能 app 的迁移必须可追踪
 !apps/quality_intelligence/migrations/

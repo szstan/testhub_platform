@@ -596,3 +596,11 @@ def check_and_release_expired_devices():
         
     except Exception as e:
         logger.error(f"检查设备锁定失败: {str(e)}", exc_info=True)
+
+@shared_task
+def reap_expired_device_leases_task():
+    """Reclaim capability-pool leases whose heartbeat has expired."""
+    from .device_pool import reap_expired_device_leases
+    reclaimed = reap_expired_device_leases()
+    logger.info('回收过期设备租约: %s', reclaimed)
+    return reclaimed

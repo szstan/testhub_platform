@@ -16,6 +16,14 @@ class TestReport(models.Model):
     name = models.CharField(max_length=200, verbose_name='报告名称')
     report_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='execution', verbose_name='报告类型')
     execution = models.OneToOneField(TestRun, on_delete=models.CASCADE, null=True, blank=True, related_name='report', verbose_name='关联执行')
+    execution_job = models.ForeignKey(
+        'executions.ExecutionJob',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reports',
+        verbose_name='统一执行任务',
+    )
     summary = models.JSONField(default=dict, verbose_name='报告摘要')
     content = models.JSONField(default=dict, verbose_name='报告内容')
     generated_by = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='生成者')

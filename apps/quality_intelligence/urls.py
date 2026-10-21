@@ -6,11 +6,13 @@ from .views import (
     ComparisonViewSet,
     EvidenceViewSet,
     FailureViewSet,
+    FailureReviewAuditViewSet,
     IngestView,
     ItemViewSet,
     MetricViewSet,
     ProfileViewSet,
     QuarantineViewSet,
+    QuarantineAuditViewSet,
     RunViewSet,
     SummaryView,
     TrendView,
@@ -23,8 +25,10 @@ router.register(r"runs", RunViewSet, basename="quality-run")
 router.register(r"items", ItemViewSet, basename="quality-item")
 router.register(r"evidence", EvidenceViewSet, basename="quality-evidence")
 router.register(r"failures", FailureViewSet, basename="quality-failure")
+router.register(r"failure-review-audits", FailureReviewAuditViewSet, basename="quality-failure-review-audit")
 router.register(r"profiles", ProfileViewSet, basename="quality-profile")
 router.register(r"quarantines", QuarantineViewSet, basename="quality-quarantine")
+router.register(r"quarantine-audits", QuarantineAuditViewSet, basename="quality-quarantine-audit")
 router.register(r"metrics", MetricViewSet, basename="quality-metric")
 router.register(r"baselines", BaselineViewSet, basename="quality-baseline")
 router.register(r"comparisons", ComparisonViewSet, basename="quality-comparison")

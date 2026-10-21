@@ -380,7 +380,7 @@ def _persist_failures(run: QualityRun, raw_failures: Iterable[Any], item_map: Ma
             {"taxonomy": taxonomy_code, "message": message, "phase": _field(raw, "phase", "")}
         )
         dedupe_key = signature(
-            "quality-failure", source_type, execution_id, str(item_key or ""), signature_value, index
+            "quality-failure", source_type, execution_id, str(item_key or ""), signature_value
         )
         if dedupe_key in seen:
             continue

@@ -96,9 +96,17 @@ class AppDevice(models.Model):
     )
     locked_at = models.DateTimeField(null=True, blank=True, verbose_name='锁定时间')
     max_allocation_time = models.IntegerField(default=28800, verbose_name='最大分配时间(秒)', help_text='默认8小时')
-    
-    # 设备规格信息
+    lease_token_hash = models.CharField(max_length=128, blank=True, default='', verbose_name='租约令牌哈希')
+    lease_acquired_at = models.DateTimeField(null=True, blank=True, verbose_name='租约开始时间')
+    lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='租约过期时间')
+    last_heartbeat_at = models.DateTimeField(null=True, blank=True, verbose_name='最后心跳时间')
+
+    # 设备规格和资源池治理信息
     device_specs = models.JSONField(default=dict, verbose_name='设备规格', help_text='RAM, CPU, 分辨率等信息')
+    capabilities = models.JSONField(default=dict, blank=True, verbose_name='设备能力')
+    health_status = models.CharField(max_length=20, default='unknown', verbose_name='健康状态')
+    maintenance_mode = models.BooleanField(default=False, verbose_name='维护模式')
+    last_seen_at = models.DateTimeField(null=True, blank=True, verbose_name='最后在线时间')
     description = models.TextField(blank=True, default='', verbose_name='设备描述')
     location = models.CharField(max_length=200, blank=True, default='', verbose_name='设备位置')
     

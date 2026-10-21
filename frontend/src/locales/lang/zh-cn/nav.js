@@ -33,6 +33,10 @@ export default {
     reviewList: '评审列表',
     reviewTemplates: '评审模板',
     testPlan: '测试计划',
+    taskCenter: '统一任务中心',
+    traceability: '质量追踪',
+    ciProfiles: 'CI执行配置',
+    datasetsPlugins: '数据集与插件',
     testReport: '测试报告',
 
     // 接口测试

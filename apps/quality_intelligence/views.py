@@ -29,8 +29,11 @@ from apps.quality_intelligence.models import (
     QualityComparison,
     QualityEvidence,
     QualityFailure,
+    QualityFailureReviewAudit,
     QualityMetricObservation,
     QualityQuarantine,
+    QualityQuarantineApprovalStatus,
+    QualityQuarantineAudit,
     QualityRun,
     QualityRunItem,
     QualityTestProfile,
@@ -52,8 +55,10 @@ from apps.quality_intelligence.serializers import (
     QualityComparisonSerializer,
     QualityEvidenceSerializer,
     QualityFailureSerializer,
+    QualityFailureReviewAuditSerializer,
     QualityMetricObservationSerializer,
     QualityQuarantineSerializer,
+    QualityQuarantineAuditSerializer,
     QualityRunItemSerializer,
     QualityRunSerializer,
     QualityTestProfileSerializer,
@@ -61,6 +66,13 @@ from apps.quality_intelligence.serializers import (
 )
 from apps.quality_intelligence.services.baseline import compare_baseline
 from apps.quality_intelligence.services.ingestion import ingest_source
+from apps.quality_intelligence.services.governance import (
+    QuarantineGovernanceError,
+    approve_quarantine,
+    record_quarantine_audit,
+    reject_quarantine,
+    release_quarantine,
+)
 from apps.quality_intelligence.services.redaction import bound_text, redact_payload, redact_text
 
 logger = logging.getLogger(__name__)
@@ -331,6 +343,7 @@ class FailureViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         if not serializer.is_valid():
             return _error("INVALID_FAILURE_REVIEW", "invalid failure review", status.HTTP_400_BAD_REQUEST, fields=serializer.errors)
         values = serializer.validated_data
+        previous_taxonomy = failure.taxonomy_code
         failure.taxonomy_code = values["taxonomy_code"]
         if "subtype" in values:
             failure.subtype = values["subtype"]
@@ -339,7 +352,27 @@ class FailureViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         failure.reviewed_at = timezone.now()
         failure.review_note = bound_text(redact_text(values.get("review_note", ""), max_length=4096), 4096)
         failure.save(update_fields=["taxonomy_code", "subtype", "classifier", "reviewer", "reviewed_at", "review_note", "updated_at"])
+        QualityFailureReviewAudit.objects.create(
+            failure=failure,
+            source_failure_key=failure.dedupe_key,
+            actor=request.user,
+            previous_taxonomy=previous_taxonomy,
+            new_taxonomy=failure.taxonomy_code,
+            note=failure.review_note,
+        )
         return Response(QualityFailureSerializer(failure).data)
+
+
+class FailureReviewAuditViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
+    serializer_class = QualityFailureReviewAuditSerializer
+    pagination_class = QualityPagination
+    http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        return QualityFailureReviewAudit.objects.filter(
+            failure__run__in=_run_queryset(self.request.user)
+        ).select_related("failure", "actor").order_by("-created_at")
 
 
 class ProfileViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
@@ -376,15 +409,44 @@ class ProfileViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         expires_at = values.get("expires_at")
         if expires_at is not None and expires_at <= starts_at:
             return _error("INVALID_QUARANTINE", "expires_at must be after starts_at", status.HTTP_400_BAD_REQUEST)
+        requires_approval = bool(values.get("requires_approval"))
+        approval_status = (
+            QualityQuarantineApprovalStatus.PENDING
+            if requires_approval else QualityQuarantineApprovalStatus.APPROVED
+        )
+        now = timezone.now()
         quarantine = QualityQuarantine.objects.create(
             profile=profile,
             status=QualityQuarantineStatus.ACTIVE,
             reason=bound_text(redact_text(values["reason"], max_length=4096), 4096),
+            owner=request.user,
+            approval_status=approval_status,
+            approved_by=None if requires_approval else request.user,
+            approved_at=None if requires_approval else now,
+            approval_note="" if requires_approval else "created by authenticated operator",
             note=bound_text(redact_text(values.get("note", ""), max_length=4096), 4096),
             created_by=request.user,
             starts_at=starts_at,
             expires_at=expires_at,
         )
+        record_quarantine_audit(
+            quarantine,
+            action="CREATE",
+            actor=request.user,
+            reason=values["reason"],
+            previous_status="",
+            new_status=approval_status,
+            metadata={"requires_approval": requires_approval},
+        )
+        if not requires_approval:
+            record_quarantine_audit(
+                quarantine,
+                action="APPROVE",
+                actor=request.user,
+                reason="created by authenticated operator",
+                previous_status="PENDING",
+                new_status="APPROVED",
+            )
         return Response(QualityQuarantineSerializer(quarantine).data, status=status.HTTP_201_CREATED)
 
 
@@ -398,16 +460,45 @@ class QuarantineViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewse
         queryset = QualityQuarantine.objects.filter(profile__in=_profile_queryset(self.request.user)).select_related("profile").order_by("-created_at")
         return apply_quality_filters(queryset, self.request.query_params)
 
+    @action(detail=True, methods=["post"], url_path="approve")
+    def approve(self, request, pk=None):
+        quarantine = self.get_object()
+        try:
+            quarantine = approve_quarantine(quarantine, request.user, request.data.get("note", ""))
+        except QuarantineGovernanceError as exc:
+            return _error("QUARANTINE_APPROVAL_INVALID", str(exc), status.HTTP_409_CONFLICT)
+        return Response(QualityQuarantineSerializer(quarantine).data)
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    def reject(self, request, pk=None):
+        quarantine = self.get_object()
+        try:
+            quarantine = reject_quarantine(quarantine, request.user, request.data.get("note", ""))
+        except QuarantineGovernanceError as exc:
+            return _error("QUARANTINE_APPROVAL_INVALID", str(exc), status.HTTP_409_CONFLICT)
+        return Response(QualityQuarantineSerializer(quarantine).data)
+
     @action(detail=True, methods=["post"], url_path="release")
     def release(self, request, pk=None):
         quarantine = self.get_object()
-        if quarantine.status != QualityQuarantineStatus.ACTIVE:
-            return _error("QUARANTINE_TERMINAL", "quarantine is already released or expired", status.HTTP_400_BAD_REQUEST)
-        quarantine.status = QualityQuarantineStatus.RELEASED
-        quarantine.released_by = request.user
-        quarantine.released_at = timezone.now()
-        quarantine.save(update_fields=["status", "released_by", "released_at", "updated_at"])
+        try:
+            quarantine = release_quarantine(quarantine, request.user, request.data.get("reason", ""))
+        except QuarantineGovernanceError as exc:
+            return _error("QUARANTINE_TERMINAL", str(exc), status.HTTP_400_BAD_REQUEST)
         return Response(QualityQuarantineSerializer(quarantine).data)
+
+
+class QuarantineAuditViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
+    serializer_class = QualityQuarantineAuditSerializer
+    pagination_class = QualityPagination
+    http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        queryset = QualityQuarantineAudit.objects.filter(
+            profile__in=_profile_queryset(self.request.user)
+        ).select_related("quarantine", "profile", "execution_job", "actor").order_by("-created_at")
+        return apply_quality_filters(queryset, self.request.query_params, date_field="created_at")
 
 
 class MetricViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
@@ -576,11 +667,13 @@ __all__ = [
     "ComparisonViewSet",
     "EvidenceViewSet",
     "FailureViewSet",
+    "FailureReviewAuditViewSet",
     "IngestView",
     "ItemViewSet",
     "MetricViewSet",
     "ProfileViewSet",
     "QuarantineViewSet",
+    "QuarantineAuditViewSet",
     "RunViewSet",
     "SummaryView",
     "TrendView",

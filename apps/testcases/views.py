@@ -15,6 +15,7 @@ from .serializers import (
 from apps.projects.models import Project
 from .services import TestCaseImportTemplateService, TestCaseExcelImportService
 from .tasks import import_testcases_from_excel
+from apps.executions.models import TestCaseRevision
 
 class TestCasePagination(pagination.PageNumberPagination):
     page_size = 10
@@ -102,7 +103,34 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
                     description='系统自动创建的默认项目'
                 )
         
-        serializer.save(author=user, project=project)
+        testcase = serializer.save(author=user, project=project)
+        _record_test_case_revision(testcase, user)
+
+def _test_case_snapshot(test_case):
+    return {
+        'title': test_case.title,
+        'description': test_case.description,
+        'preconditions': test_case.preconditions,
+        'steps': test_case.steps,
+        'expected_result': test_case.expected_result,
+        'priority': test_case.priority,
+        'status': test_case.status,
+        'test_type': test_case.test_type,
+        'tags': test_case.tags,
+        'project_id': test_case.project_id,
+        'version_ids': list(test_case.versions.values_list('id', flat=True)),
+    }
+
+
+def _record_test_case_revision(test_case, user):
+    latest = TestCaseRevision.objects.filter(test_case=test_case).order_by('-revision').values_list('revision', flat=True).first() or 0
+    TestCaseRevision.objects.create(
+        test_case=test_case,
+        revision=latest + 1,
+        snapshot=_test_case_snapshot(test_case),
+        changed_by=user,
+    )
+
 
 class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = TestCase.objects.all()
@@ -131,19 +159,18 @@ class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         user = self.request.user
         project_id = self.request.data.get('project_id')
-        
+
         if project_id:
-            # 检查指定的项目是否存在且用户有权限
             accessible_projects = self.get_user_accessible_projects(user)
             try:
                 project = accessible_projects.get(id=project_id)
-                serializer.save(project=project)
             except Project.DoesNotExist:
-                # 如果指定项目不存在或无权限，保持原项目不变
-                serializer.save()
+                updated = serializer.save()
+            else:
+                updated = serializer.save(project=project)
         else:
-            # 没有指定项目，保持原项目不变
-            serializer.save()
+            updated = serializer.save()
+        _record_test_case_revision(updated, user)
 
 
 class TestCaseImportTemplateDownloadView(APIView):

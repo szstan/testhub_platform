@@ -85,8 +85,18 @@ class AppDeviceSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = AppDevice
-        fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at')
+        fields = [
+            'id', 'device_id', 'name', 'status', 'android_version', 'connection_type',
+            'ip_address', 'port', 'locked_by', 'locked_by_name', 'locked_at',
+            'max_allocation_time', 'lease_acquired_at', 'lease_expires_at',
+            'last_heartbeat_at', 'capabilities', 'health_status', 'maintenance_mode',
+            'last_seen_at', 'device_specs', 'description', 'location',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = (
+            'id', 'locked_by', 'locked_by_name', 'locked_at', 'lease_acquired_at',
+            'lease_expires_at', 'last_heartbeat_at', 'last_seen_at', 'created_at', 'updated_at',
+        )
     
     def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None

@@ -70,6 +70,9 @@ QUALITY_INTELLIGENCE_ENABLED = config(
     'QUALITY_INTELLIGENCE_ENABLED', default=False, cast=bool
 )
 QUALITY_AI_ENABLED = config('QUALITY_AI_ENABLED', default=False, cast=bool)
+EXECUTION_AI_SUGGESTIONS_ENABLED = config(
+    'EXECUTION_AI_SUGGESTIONS_ENABLED', default=False, cast=bool
+)
 
 # MCP Server 总开关（协议端点 /api/mcp/，需 Daphne/ASGI 部署）
 MCP_ENABLED = config('MCP_ENABLED', default=False, cast=bool)

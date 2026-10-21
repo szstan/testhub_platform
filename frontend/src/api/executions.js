@@ -1,0 +1,18 @@
+import api from '@/utils/api'
+
+export const listExecutionJobs = (params = {}) => api.get('/executions/jobs/', { params })
+export const getExecutionJobTimeline = (id) => api.get(`/executions/jobs/${id}/timeline/`)
+export const cancelExecutionJob = (id, reason = '') => api.post(`/executions/jobs/${id}/cancel/`, { reason })
+export const retryExecutionJob = (id, reason = '') => api.post(`/executions/jobs/${id}/retry/`, { reason })
+export const listExecutionRetryPolicies = (params = {}) => api.get('/executions/retry-policies/', { params })
+export const listExecutionGateEvaluations = (params = {}) => api.get('/executions/quality-gate-evaluations/', { params })
+export const listExecutionAISuggestions = (params = {}) => api.get('/executions/ai-suggestions/', { params })
+export const dispatchExecutionJob = (id, worker = '') => api.post(`/executions/jobs/${id}/dispatch/`, { worker })
+export const listExecutionBuilds = (params = {}) => api.get('/executions/builds/', { params })
+export const getExecutionCoverage = (project) => api.get('/executions/builds/coverage/', { params: { project } })
+export const listExecutionProfiles = (params = {}) => api.get('/executions/profiles/', { params })
+export const createExecutionProfile = (data) => api.post('/executions/profiles/', data)
+export const updateExecutionProfile = (id, data) => api.patch(`/executions/profiles/${id}/`, data)
+export const listExecutionDatasets = (params = {}) => api.get('/executions/datasets/', { params })
+export const createExecutionDataset = (data) => api.post('/executions/datasets/', data)
+export const listExecutionPlugins = (params = {}) => api.get('/executions/plugins/', { params })

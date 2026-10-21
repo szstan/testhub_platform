@@ -79,6 +79,12 @@ class QualityQuarantineStatus(models.TextChoices):
     EXPIRED = 'EXPIRED', 'Expired'
 
 
+class QualityQuarantineApprovalStatus(models.TextChoices):
+    PENDING = 'PENDING', 'Pending'
+    APPROVED = 'APPROVED', 'Approved'
+    REJECTED = 'REJECTED', 'Rejected'
+
+
 class QualityMetricAggregation(models.TextChoices):
     VALUE = 'VALUE', 'Value'
     AVG = 'AVG', 'Average'
@@ -278,6 +284,33 @@ class QualityFailure(models.Model):
         ]
 
 
+class QualityFailureReviewAudit(models.Model):
+    """Append-only human review history for a quality failure."""
+
+    failure = models.ForeignKey(QualityFailure, on_delete=models.SET_NULL, null=True, related_name='review_audits')
+    source_failure_key = models.CharField(max_length=512)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quality_failure_review_audits',
+    )
+    previous_taxonomy = models.CharField(max_length=32, blank=True, default='')
+    new_taxonomy = models.CharField(max_length=32, blank=True, default='')
+    note = models.TextField(blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'quality_failure_review_audits'
+        ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(fields=['source_failure_key', '-created_at'], name='qi_failure_review_key_idx'),
+            models.Index(fields=['failure', '-created_at'], name='qi_failure_review_idx'),
+        ]
+
+
 class QualityTestProfile(models.Model):
     source_type = models.CharField(max_length=16, choices=QualitySourceType.choices)
     project_type = models.CharField(max_length=64)
@@ -341,6 +374,27 @@ class QualityQuarantine(models.Model):
         default=QualityQuarantineStatus.ACTIVE,
     )
     reason = models.TextField()
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='owned_quality_quarantines',
+    )
+    approval_status = models.CharField(
+        max_length=16,
+        choices=QualityQuarantineApprovalStatus.choices,
+        default=QualityQuarantineApprovalStatus.APPROVED,
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='approved_quality_quarantines',
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approval_note = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -368,6 +422,51 @@ class QualityQuarantine(models.Model):
         indexes = [
             models.Index(fields=['status', '-created_at'], name='qi_quarantine_status_idx'),
             models.Index(fields=['profile', 'status'], name='qi_quarantine_profile_idx'),
+        ]
+
+
+class QualityQuarantineAudit(models.Model):
+    """Immutable audit trail for quarantine governance actions."""
+
+    ACTION_CHOICES = (
+        ('CREATE', 'Create'),
+        ('APPROVE', 'Approve'),
+        ('REJECT', 'Reject'),
+        ('RELEASE', 'Release'),
+        ('EXPIRE', 'Expire'),
+        ('OVERRIDE', 'Override'),
+    )
+
+    quarantine = models.ForeignKey(QualityQuarantine, on_delete=models.CASCADE, related_name='audit_entries')
+    profile = models.ForeignKey(QualityTestProfile, on_delete=models.CASCADE, related_name='quarantine_audits')
+    execution_job = models.ForeignKey(
+        'executions.ExecutionJob',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quarantine_audits',
+    )
+    action = models.CharField(max_length=16, choices=ACTION_CHOICES)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quality_quarantine_audits',
+    )
+    reason = models.TextField(blank=True, default='')
+    previous_status = models.CharField(max_length=16, blank=True, default='')
+    new_status = models.CharField(max_length=16, blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'quality_quarantine_audits'
+        ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(fields=['quarantine', '-created_at'], name='qi_quarantine_audit_idx'),
+            models.Index(fields=['execution_job', '-created_at'], name='qi_quarantine_job_audit_idx'),
+            models.Index(fields=['action', '-created_at'], name='qi_quarantine_action_idx'),
         ]
 
 

@@ -59,7 +59,12 @@ TestHub 是一个 AI 驱动的全栈测试管理平台，覆盖测试全流程�
 - 多项目管理、成员角色权限控制、版本规划
 - 统一通知：邮件 + 企业微信 / 钉钉 / 飞书 Webhook 机器人
 
-## 🏗️ 技术架构
+## 统一执行与治理
+
+统一任务中心把 API、UI、APP 和性能执行映射为 job、attempt、step、artifact、event 和 final result。CI profile 支持签名 webhook、重试策略、质量门禁和 quarantine 审计；数据集、fixture、插件 manifest 和 traceability API 均按项目权限隔离。
+
+Flaky profile、quarantine approval/override、retry outbox、质量门禁决策和 AI suggestion review 都保留可追踪记录。AI 建议默认关闭，输入输出会脱敏并生成确定性哈希，人工批准只改变建议状态，不自动修改生产代码。详细的迁移、feature flag、回滚和 staging/TLS 边界见 [统一执行与治理运行手册](docs/unified-execution-governance.md)。
+
 
 ### 后端
 - **框架**: Django 4.2 + Django REST Framework
