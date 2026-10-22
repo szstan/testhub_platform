@@ -157,6 +157,8 @@ DATABASES = {
         'PASSWORD': config('DB_PASSWORD', default=''),  # 移除硬编码默认密码
         'HOST': config('DB_HOST', default='127.0.0.1'),
         'PORT': config('DB_PORT', default='3306'),
+        'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=60, cast=int),
+        'CONN_HEALTH_CHECKS': True,
         'OPTIONS': {
             'charset': 'utf8mb4',
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
@@ -373,6 +375,8 @@ REDIS_URL = config('REDIS_URL', default='redis://:1234@127.0.0.1:6379/0')
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TASK_TRACK_STARTED = config('CELERY_TASK_TRACK_STARTED', default=True, cast=bool)
+CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
 
 # Channels Configuration
 CHANNEL_LAYERS = {
@@ -393,8 +397,11 @@ SMS_REGISTER_TEMPLATE_CODE = config('SMS_REGISTER_TEMPLATE_CODE', default='SMS_1
 # Cache Configuration
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake',
+        'BACKEND': config(
+            'CACHE_BACKEND',
+            default='django.core.cache.backends.redis.RedisCache',
+        ),
+        'LOCATION': config('CACHE_URL', default=REDIS_URL),
         'TIMEOUT': 300,  # 默认缓存超时5分钟
     }
 }

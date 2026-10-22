@@ -139,6 +139,35 @@ _TOOLS = [
         examples=({'execution_id': 42},),
     ),
 
+    ToolMeta(
+        name='get_ai_draft_summary', title='AI 草稿状态', category=CATEGORY_READ,
+        domain='requirement-analysis',
+        summary='查询 AI 测试用例草稿状态和审计元数据',
+        description='只返回当前用户可访问的 AI 生成任务状态、进度、contract metadata 和是否存在各阶段输出；不返回原始模型输出。',
+        examples=({'task_id': 42},),
+    ),
+    ToolMeta(
+        name='get_quality_risk_candidates', title='风险回归候选', category=CATEGORY_READ,
+        domain='quality-intelligence',
+        summary='根据历史结果和变更影响生成风险回归候选集',
+        description='纯只读计算：输入测试候选、历史 outcome 和 change impact，返回 risk score、level 和原因；跳过 quarantined 候选，不写数据库。',
+        examples=({'candidates': [{'test_key': 'login', 'priority': 'P0'}], 'limit': 20},),
+    ),
+    ToolMeta(
+        name='get_release_status', title='发布状态', category=CATEGORY_READ,
+        domain='platform',
+        summary='读取当前 release marker 和健康端点约定',
+        description='只读取当前代码目录 release marker、health/readiness 路径，不执行部署、重启或远程写操作。',
+        examples=({},),
+    ),
+    ToolMeta(
+        name='get_api_contract_status', title='API 契约状态', category=CATEGORY_READ,
+        domain='platform',
+        summary='读取 OpenAPI contract baseline 元数据',
+        description='只读取 OpenAPI baseline 的存在性、大小和 SHA-256，并返回本地 contract check 命令；不生成或修改 schema。',
+        examples=({},),
+    ),
+
     # ------------------- 危险工具：preview/confirm 两段（8） ------------------- #
     ToolMeta(
         name='preview_run_api_suite', title='预览执行 API 套件', category=CATEGORY_PREVIEW,

@@ -65,6 +65,14 @@ jobs:
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: python -m pytest -q
 
+      - name: Check OpenAPI contract compatibility
+        env:
+          APP_ENV: development
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+        run: python scripts/api_contract_check.py --baseline docs/openapi-contract-baseline.yaml
+
       - name: Validate Linux dependency artifact builder
         run: |
           python -m py_compile scripts/build_linux_wheelhouse.py
@@ -91,6 +99,51 @@ jobs:
             echo 'Windows artifact was not rejected' >&2
             exit 1
           fi
+
+  backend-migration-compatibility:
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-password
+          MYSQL_DATABASE: testhub_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-prod.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements-prod.txt
+
+      - name: Apply migrations on MySQL 8
+        env:
+          APP_ENV: development
+          DEBUG: 'False'
+          SECRET_KEY: ci-only-not-for-production
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+          DB_HOST: 127.0.0.1
+          DB_PORT: '3306'
+          DB_NAME: testhub_ci
+          DB_USER: root
+          DB_PASSWORD: ci-password
+        run: |
+          python manage.py check
+          python manage.py migrate --noinput
+          python manage.py showmigrations
 
   backend-app-automation:
     runs-on: ubuntu-24.04
