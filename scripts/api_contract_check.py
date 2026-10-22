@@ -62,7 +62,32 @@ def _operation_parameters(operation: Any, inherited: Any = None) -> dict[tuple[s
     return result
 
 
-def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[str], seen: set[tuple[int, int]]) -> None:
+def _resolve_ref(schema: Any, document: dict[str, Any] | None) -> Any:
+    if not isinstance(schema, dict) or not isinstance(document, dict):
+        return schema
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/"):
+        return schema
+    value: Any = document
+    try:
+        for part in reference[2:].split("/"):
+            value = value[part.replace("~1", "/").replace("~0", "~")]
+    except (KeyError, TypeError):
+        return schema
+    return value if isinstance(value, dict) else schema
+
+
+def _compare_schema(
+    old_schema: Any,
+    new_schema: Any,
+    label: str,
+    breaks: list[str],
+    seen: set[tuple[int, int]],
+    old_document: dict[str, Any] | None = None,
+    new_document: dict[str, Any] | None = None,
+) -> None:
+    old_schema = _resolve_ref(old_schema, old_document)
+    new_schema = _resolve_ref(new_schema, new_document)
     if not isinstance(old_schema, dict) or not isinstance(new_schema, dict):
         return
     pair = (id(old_schema), id(new_schema))
@@ -82,11 +107,11 @@ def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[s
     for field in sorted(set(old_properties) - set(new_properties)):
         breaks.append(f"property removed: {label}.{field}")
     for field in sorted(set(old_properties) & set(new_properties)):
-        _compare_schema(old_properties[field], new_properties[field], f"{label}.{field}", breaks, seen)
+        _compare_schema(old_properties[field], new_properties[field], f"{label}.{field}", breaks, seen, old_document, new_document)
     old_items = old_schema.get("items")
     new_items = new_schema.get("items")
     if old_items is not None and new_items is not None:
-        _compare_schema(old_items, new_items, f"{label}[]", breaks, seen)
+        _compare_schema(old_items, new_items, f"{label}[]", breaks, seen, old_document, new_document)
     old_enum = {
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")): value
         for value in (old_schema.get("enum") or [])
@@ -104,7 +129,7 @@ def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[s
         new_parts = new_schema.get(keyword) or []
         for index, old_part in enumerate(old_parts):
             if index < len(new_parts):
-                _compare_schema(old_part, new_parts[index], f"{label}.{keyword}[{index}]", breaks, seen)
+                _compare_schema(old_part, new_parts[index], f"{label}.{keyword}[{index}]", breaks, seen, old_document, new_document)
 
 
 def _component_breaks(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
@@ -115,7 +140,7 @@ def _component_breaks(previous: dict[str, Any], current: dict[str, Any]) -> list
         if name not in new_components:
             breaks.append(f"component schema removed: {name}")
             continue
-        _compare_schema(old_schema, new_components[name], f"component {name}", breaks, set())
+        _compare_schema(old_schema, new_components[name], f"component {name}", breaks, set(), previous, current)
     return breaks
 
 

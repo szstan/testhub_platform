@@ -106,3 +106,23 @@ def test_openapi_contract_accepts_structured_enum_and_ref_rename():
 
     assert 'schema reference changed' not in '\\n'.join(changes)
     assert "enum value removed: component Envelope.kind={'mode': 'b'}" in changes
+
+
+def test_openapi_contract_detects_inline_to_ref_type_change():
+    previous = {
+        'components': {'schemas': {'Envelope': {'type': 'object', 'properties': {
+            'value': {'type': 'string'},
+        }}}},
+    }
+    current = {
+        'components': {'schemas': {
+            'ValueObject': {'type': 'object', 'properties': {'value': {'type': 'string'}}},
+            'Envelope': {'type': 'object', 'properties': {
+                'value': {'$ref': '#/components/schemas/ValueObject'},
+            }},
+        }},
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'schema type changed: component Envelope.value string->object' in changes
