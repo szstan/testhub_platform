@@ -1,3 +1,4 @@
+import hashlib
 import pytest
 from datetime import timedelta
 from io import StringIO
@@ -98,6 +99,7 @@ def test_expired_artifact_cleanup_is_dry_run_by_default(result_job):
         uri='artifact://expired.log',
         retention_until=timezone.now() - timedelta(minutes=1),
     )
+    assert artifact.uri_hash == hashlib.sha256(artifact.uri.encode('utf-8')).hexdigest()
     output = StringIO()
     call_command('cleanup_execution_artifacts', stdout=output)
     assert 'DRY RUN' in output.getvalue()

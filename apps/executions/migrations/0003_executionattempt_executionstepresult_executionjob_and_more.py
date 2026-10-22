@@ -486,6 +486,15 @@ class Migration(migrations.Migration):
                 ),
                 ("uri", models.CharField(max_length=2048, verbose_name="产物 URI")),
                 (
+                    "uri_hash",
+                    models.CharField(
+                        default="",
+                        editable=False,
+                        max_length=64,
+                        verbose_name="产物 URI 哈希",
+                    ),
+                ),
+                (
                     "content_hash",
                     models.CharField(
                         blank=True, default="", max_length=128, verbose_name="内容哈希"
@@ -626,7 +635,7 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="executionartifact",
             constraint=models.UniqueConstraint(
-                fields=("attempt", "uri"), name="execution_artifact_attempt_uri_uniq"
+                fields=("attempt", "uri_hash"), name="execution_artifact_attempt_uri_uniq"
             ),
         ),
     ]

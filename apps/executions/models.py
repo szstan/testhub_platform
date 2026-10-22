@@ -131,6 +131,7 @@ class TestRunCaseHistory(models.Model):
 # Unified execution domain (additive to the legacy TestPlan/TestRun models)
 # ---------------------------------------------------------------------------
 
+import hashlib
 import uuid
 from uuid import uuid4
 
@@ -939,6 +940,12 @@ class ExecutionArtifact(models.Model):
         verbose_name='幂等键',
     )
     uri = models.CharField(max_length=2048, verbose_name='产物 URI')
+    uri_hash = models.CharField(
+        max_length=64,
+        editable=False,
+        default='',
+        verbose_name='产物 URI 哈希',
+    )
     content_hash = models.CharField(max_length=128, blank=True, default='', verbose_name='内容哈希')
     media_type = models.CharField(max_length=255, blank=True, default='', verbose_name='媒体类型')
     size_bytes = models.PositiveBigIntegerField(null=True, blank=True, verbose_name='大小字节')
@@ -958,7 +965,7 @@ class ExecutionArtifact(models.Model):
         ordering = ['-created_at']
         constraints = [
             models.UniqueConstraint(
-                fields=('attempt', 'uri'),
+                fields=('attempt', 'uri_hash'),
                 name='execution_artifact_attempt_uri_uniq',
             ),
         ]
@@ -976,6 +983,8 @@ class ExecutionArtifact(models.Model):
         return self.retention_policy
 
     def save(self, *args, **kwargs):
+        # Keep a fixed-width digest for the attempt/URI uniqueness constraint.
+        self.uri_hash = hashlib.sha256(self.uri.encode('utf-8')).hexdigest()
         # Adapters may attach an artifact at either job or attempt level.  Keep
         # the denormalized job link populated when an attempt is supplied.
         if self.attempt_id and not self.job_id:
