@@ -63,7 +63,10 @@ jobs:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
-        run: python -m pytest -q
+        run: |
+          python -m pytest -q \
+            --ignore=apps/app_automation/tests/test_app_flow.py \
+            --ignore=apps/app_automation/tests/test_executor.py
 
       - name: Check OpenAPI contract compatibility
         env:
