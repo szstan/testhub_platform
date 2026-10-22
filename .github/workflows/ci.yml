@@ -223,6 +223,10 @@ jobs:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
+          APP_DEVICE_ID: ${{ vars.APP_DEVICE_ID }}
+          APP_PACKAGE_NAME: ${{ vars.APP_PACKAGE_NAME }}
+          APP_TEST_CASE_ID: ${{ vars.APP_TEST_CASE_ID }}
+          APP_EXECUTION_ID: ${{ vars.APP_EXECUTION_ID }}
         run: |
           if [ -z "${APP_DEVICE_ID:-}" ] || [ -z "${APP_PACKAGE_NAME:-}" ] || [ -z "${APP_TEST_CASE_ID:-}" ] || [ -z "${APP_EXECUTION_ID:-}" ]; then
             echo 'APP UI Flow safety gate skipped: no approved device/execution fixture was provided.'

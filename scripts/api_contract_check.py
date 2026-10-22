@@ -29,8 +29,6 @@ def _load(path: Path) -> dict[str, Any]:
 def _schema_type(schema: Any) -> Any:
     if not isinstance(schema, dict):
         return None
-    if "$ref" in schema:
-        return schema["$ref"]
     return schema.get("type")
 
 
