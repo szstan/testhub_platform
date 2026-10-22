@@ -48,6 +48,7 @@ def _taxonomy_service() -> Any:
 
 ADAPTER_VERSION = "1.0"
 SCHEMA_VERSION = 1
+RESULT_CONTRACT_VERSION = "1.0"
 MAX_ITEMS = 1000
 MAX_EVIDENCE = 2000
 MAX_FAILURES = 1000
@@ -123,6 +124,20 @@ class NormalizedItem:
     def status(self) -> str:
         return self.outcome
 
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "test_key": self.test_key,
+            "outcome": self.outcome,
+            "source_item_type": self.source_item_type,
+            "source_item_id": self.source_item_id,
+            "name": self.name,
+            "source_status": self.source_status,
+            "attempt": self.attempt,
+            "duration_ms": self.duration_ms,
+            "environment_fingerprint": self.environment_fingerprint,
+            "details": payload(self.details),
+        }
+
 
 @dataclass
 class NormalizedEvidence:
@@ -143,6 +158,21 @@ class NormalizedEvidence:
     @property
     def source_item_key(self) -> str:
         return self.item_key
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "evidence_type": self.evidence_type,
+            "item_key": self.item_key,
+            "snippet": self.snippet,
+            "source_uri": self.source_uri,
+            "source_field": self.source_field,
+            "sha256": self.sha256,
+            "mime_type": self.mime_type,
+            "size_bytes": self.size_bytes,
+            "availability": self.availability,
+            "provenance": payload(self.provenance),
+            "captured_at": self.captured_at.isoformat() if self.captured_at else None,
+        }
 
 
 @dataclass
@@ -173,6 +203,25 @@ class NormalizedFailure:
     def code(self) -> str:
         return self.taxonomy_code
 
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "item_key": self.item_key,
+            "taxonomy_code": self.taxonomy_code,
+            "subtype": self.subtype,
+            "phase": self.phase,
+            "signature": self.signature,
+            "source_error_code": self.source_error_code,
+            "message": self.message,
+            "stack_excerpt": self.stack_excerpt,
+            "retryable": self.retryable,
+            "details": payload(self.details),
+            "initial_taxonomy_code": self.initial_taxonomy_code,
+            "classifier": self.classifier,
+            "confidence": self.confidence,
+            "rule_id": self.rule_id,
+            "model_category": self.model_category,
+        }
+
 
 @dataclass
 class NormalizedMetric:
@@ -194,6 +243,18 @@ class NormalizedMetric:
     @property
     def key(self) -> str:
         return self.metric_key
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "metric_key": self.metric_key,
+            "value": self.value,
+            "item_key": self.item_key,
+            "sample_key": self.sample_key,
+            "unit": self.unit,
+            "aggregation": self.aggregation,
+            "dimensions": payload(self.dimensions),
+            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
+        }
 
 
 @dataclass
@@ -250,6 +311,39 @@ class NormalizedRun:
     @property
     def partial(self) -> bool:
         return self.quality_status == "PARTIAL" or bool(self.warnings)
+
+    def to_contract(self) -> dict[str, Any]:
+        return {
+            "contract_version": RESULT_CONTRACT_VERSION,
+            "schema_version": self.schema_version,
+            "run": {
+                "source_type": self.source_type,
+                "source_scope": self.source_scope,
+                "source_execution_id": self.source_execution_id,
+                "project_type": self.project_type,
+                "project_id": self.project_id,
+                "source_asset_id": self.source_asset_id,
+                "source_asset_name": self.source_asset_name,
+                "source_status": self.source_status,
+                "started_at": self.started_at.isoformat() if self.started_at else None,
+                "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+                "duration_ms": self.duration_ms,
+                "environment_fingerprint": self.environment_fingerprint,
+                "source_fingerprint": self.source_fingerprint,
+                "adapter_version": self.adapter_version,
+                "redaction_version": self.redaction_version,
+                "outcome": self.outcome,
+                "quality_status": self.quality_status,
+                "summary": payload(self.summary),
+                "source_snapshot": payload(self.source_snapshot),
+                "provenance": payload(self.provenance),
+                "warnings": list(self.warnings),
+            },
+            "items": [item.to_contract() for item in self.items],
+            "evidence": [item.to_contract() for item in self.evidence],
+            "failures": [item.to_contract() for item in self.failures],
+            "metrics": [item.to_contract() for item in self.metrics],
+        }
 
 
 @runtime_checkable

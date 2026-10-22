@@ -768,7 +768,18 @@ class AIModelService:
             # 不再硬编码max_tokens，使用配置文件中的值（如32000）
         )
 
-        return response['choices'][0]['message']['content']
+        raw_output = response['choices'][0]['message']['content']
+        from .ai_contracts import normalize_generation_output
+
+        normalized_output, draft = normalize_generation_output(raw_output)
+        if draft:
+            logger.info(
+                "AI generation draft accepted contract=%s fingerprint=%s cases=%s",
+                draft['contract_version'],
+                draft['draft_fingerprint'],
+                len(draft['cases']),
+            )
+        return normalized_output
 
     @staticmethod
     async def review_test_cases(task: TestCaseGenerationTask, test_cases: str) -> str:
@@ -882,7 +893,17 @@ class AIModelService:
         case_count = full_content.count('TC-') + full_content.count('TEST-') + full_content.count('测试用例')
         logger.info(f"生成用例统计: 约检测到{case_count}个用例编号标记")
 
-        return full_content
+        from .ai_contracts import normalize_generation_output
+
+        normalized_output, draft = normalize_generation_output(full_content)
+        if draft:
+            logger.info(
+                "AI streaming draft accepted contract=%s fingerprint=%s cases=%s",
+                draft['contract_version'],
+                draft['draft_fingerprint'],
+                len(draft['cases']),
+            )
+        return normalized_output
 
     @staticmethod
     async def review_test_cases_stream(

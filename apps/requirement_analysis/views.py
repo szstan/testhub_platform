@@ -1576,6 +1576,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         generated_cases = loop.run_until_complete(
                                             AIModelService.generate_test_cases_stream(task, callback=stream_callback)
                                         )
+                                        from .ai_contracts import summarize_generation_output
+                                        task.generation_log = json.dumps(
+                                            summarize_generation_output(generated_cases),
+                                            ensure_ascii=False,
+                                        )
 
                                         # 生成完成后，确保最终的流式内容被保存
                                         if task.stream_buffer:
@@ -1742,6 +1747,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                         generated_cases = loop.run_until_complete(
                                             AIModelService.generate_test_cases(task)
+                                        )
+                                        from .ai_contracts import summarize_generation_output
+                                        task.generation_log = json.dumps(
+                                            summarize_generation_output(generated_cases),
+                                            ensure_ascii=False,
                                         )
 
                                         task.generated_test_cases = generated_cases

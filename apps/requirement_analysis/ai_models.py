@@ -233,7 +233,18 @@ class AIModelService:
         # 所有支持的模型都使用兼容OpenAI的接口
         response = await AIModelService.call_openai_compatible_api(task.writer_model_config, messages)
         
-        return response['choices'][0]['message']['content']
+        raw_output = response['choices'][0]['message']['content']
+        from .ai_contracts import normalize_generation_output
+
+        normalized_output, draft = normalize_generation_output(raw_output)
+        if draft:
+            logger.info(
+                "AI generation draft accepted contract=%s fingerprint=%s cases=%s",
+                draft['contract_version'],
+                draft['draft_fingerprint'],
+                len(draft['cases']),
+            )
+        return normalized_output
     
     @staticmethod
     async def review_test_cases(task: TestCaseGenerationTask, test_cases: str) -> str:
