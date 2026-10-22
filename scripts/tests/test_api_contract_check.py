@@ -79,3 +79,30 @@ def test_openapi_contract_detects_path_level_and_nested_changes():
 
     assert 'required parameter added: GET /api/items/{id}/ path:id' in changes
     assert 'enum value removed: component Envelope.items[].state=bad' in changes
+
+
+def test_openapi_contract_accepts_structured_enum_and_ref_rename():
+    previous = {
+        'components': {'schemas': {
+            'Old': {'type': 'object', 'properties': {'state': {'type': 'string'}}},
+            'Envelope': {'type': 'object', 'properties': {
+                'value': {'$ref': '#/components/schemas/Old'},
+                'kind': {'enum': [{'mode': 'a'}, {'mode': 'b'}]},
+            }},
+        }},
+    }
+    current = {
+        'components': {'schemas': {
+            'New': {'type': 'object', 'properties': {'state': {'type': 'string'}}},
+            'Old': {'type': 'object', 'properties': {'state': {'type': 'string'}}},
+            'Envelope': {'type': 'object', 'properties': {
+                'value': {'$ref': '#/components/schemas/New'},
+                'kind': {'enum': [{'mode': 'a'}]},
+            }},
+        }},
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'schema reference changed' not in '\\n'.join(changes)
+    assert "enum value removed: component Envelope.kind={'mode': 'b'}" in changes

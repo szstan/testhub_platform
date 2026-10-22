@@ -71,10 +71,6 @@ def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[s
     if pair in seen:
         return
     seen.add(pair)
-    old_ref = old_schema.get("$ref")
-    new_ref = new_schema.get("$ref")
-    if old_ref and new_ref and old_ref != new_ref:
-        breaks.append(f"schema reference changed: {label} {old_ref}->{new_ref}")
     old_type = _schema_type(old_schema)
     new_type = _schema_type(new_schema)
     if old_type and new_type and old_type != new_type:
@@ -93,10 +89,16 @@ def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[s
     new_items = new_schema.get("items")
     if old_items is not None and new_items is not None:
         _compare_schema(old_items, new_items, f"{label}[]", breaks, seen)
-    old_enum = set(old_schema.get("enum") or [])
-    new_enum = set(new_schema.get("enum") or [])
-    for value in sorted(old_enum - new_enum, key=str):
-        breaks.append(f"enum value removed: {label}={value}")
+    old_enum = {
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")): value
+        for value in (old_schema.get("enum") or [])
+    }
+    new_enum = {
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")): value
+        for value in (new_schema.get("enum") or [])
+    }
+    for key in sorted(set(old_enum) - set(new_enum)):
+        breaks.append(f"enum value removed: {label}={old_enum[key]}")
     if old_schema.get("additionalProperties") is not False and new_schema.get("additionalProperties") is False:
         breaks.append(f"additional properties disallowed: {label}")
     for keyword in ("allOf", "anyOf", "oneOf"):

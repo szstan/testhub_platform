@@ -8,6 +8,7 @@ instance.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,9 +71,15 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        pairs = [(str(key), _json_safe(item)) for key, item in value.items()]
+        keys = [key for key, _value in pairs]
+        if len(keys) != len(set(keys)):
+            return {"__mapping_pairs__": [{"key": key, "value": item} for key, item in pairs]}
+        return dict(pairs)
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return "[NON_FINITE]"
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)

@@ -48,3 +48,19 @@ def test_normalized_run_contract_is_versioned_and_json_safe():
     assert contract['failures'][0]['stack_excerpt'] == '[BINARY]'
     assert contract['metrics'][0]['unit'] == 'ms'
     assert 'do-not-persist' not in encoded
+
+
+def test_contract_normalizes_non_finite_and_colliding_mapping_values():
+    run = NormalizedRun(
+        source_type='API',
+        source_scope='SUITE',
+        source_execution_id='api-2',
+        summary={'metrics': {'bad': float('nan')}},
+        source_snapshot={1: 'first', '1': 'second'},
+    )
+
+    contract = run.to_contract()
+    encoded = json.dumps(contract, allow_nan=False)
+
+    assert '[NON_FINITE]' in encoded
+    assert '__mapping_pairs__' in encoded

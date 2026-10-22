@@ -223,7 +223,12 @@ jobs:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
-        run: python -m pytest -q apps/app_automation/tests/test_app_flow.py -m app_ui_flow
+        run: |
+          if [ -z "${APP_DEVICE_ID:-}" ] || [ -z "${APP_PACKAGE_NAME:-}" ] || [ -z "${APP_TEST_CASE_ID:-}" ] || [ -z "${APP_EXECUTION_ID:-}" ]; then
+            echo 'APP UI Flow safety gate skipped: no approved device/execution fixture was provided.'
+            exit 0
+          fi
+          python -m pytest -q apps/app_automation/tests/test_app_flow.py -m app_ui_flow
 
   frontend:
     runs-on: ubuntu-24.04
