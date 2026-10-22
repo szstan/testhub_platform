@@ -1,5 +1,7 @@
 """Small, dependency-aware health endpoints for deployment and monitoring."""
 
+import uuid
+
 from django.core.cache import cache
 from django.db import connection
 from django.http import JsonResponse
@@ -26,7 +28,7 @@ def readiness(request):
         checks['database'] = 'error'
 
     try:
-        cache_key = 'testhub:readiness'
+        cache_key = f'testhub:readiness:{uuid.uuid4().hex}'
         cache.set(cache_key, 'ok', timeout=5)
         checks['cache'] = 'ok' if cache.get(cache_key) == 'ok' else 'error'
         cache.delete(cache_key)

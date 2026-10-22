@@ -35,7 +35,6 @@ class DeviceHeartbeat:
             "capabilities": dict(self.capabilities),
             "agent_id": self.agent_id,
             "agent_version": self.agent_version,
-            "lease_token": self.lease_token,
         }
 
 
@@ -44,6 +43,8 @@ def parse_heartbeat(payload: Mapping[str, Any]) -> DeviceHeartbeat:
 
     if not isinstance(payload, Mapping):
         raise DeviceProtocolError("heartbeat must be an object")
+    if payload.get("protocol_version") != DEVICE_PROTOCOL_VERSION:
+        raise DeviceProtocolError("unsupported protocol version")
     device_id = str(payload.get("device_id") or "").strip()
     if not device_id or len(device_id) > 255:
         raise DeviceProtocolError("device_id is required")

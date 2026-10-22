@@ -39,6 +39,27 @@ def _steps(value: Any) -> list[str]:
     return rows[:100]
 
 
+def _string_list(value: Any, *, field: str, limit: int = 20, item_limit: int = 200) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, Mapping)):
+        values = list(value)
+    else:
+        raise AIContractError(f"{field} must be a string or array")
+    return [str(item).strip()[:item_limit] for item in values[:limit] if str(item).strip()]
+
+
+def _confidence(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError) as exc:
+        raise AIContractError("confidence must be a number") from exc
+
+
 def _extract_json(text: str) -> Any:
     candidate = text.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.IGNORECASE | re.DOTALL)
@@ -88,8 +109,8 @@ def parse_draft(raw: Any) -> dict[str, Any]:
                 "expected_result": _bounded_text(
                     raw_case.get("expected_result"), field="expected_result", limit=4000
                 ),
-                "source_refs": [str(item)[:200] for item in (raw_case.get("source_refs") or [])[:20]],
-                "confidence": max(0.0, min(1.0, float(raw_case.get("confidence", 0.0) or 0.0))),
+                "source_refs": _string_list(raw_case.get("source_refs"), field="source_refs"),
+                "confidence": _confidence(raw_case.get("confidence")),
             }
         )
 
@@ -135,21 +156,46 @@ def render_markdown(draft: Mapping[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def normalize_generation_output(raw: Any) -> tuple[str, dict[str, Any] | None]:
-    """Return a compatible text result and optional structured draft metadata."""
+class NormalizedGenerationOutput(str):
+    """String-compatible output carrying source and audit metadata."""
+
+    def __new__(cls, value: str, *, raw_output: str, metadata: dict[str, Any]):
+        instance = str.__new__(cls, value)
+        instance.raw_output = raw_output
+        instance.metadata = metadata
+        return instance
+
+
+def normalize_generation_output(raw: Any) -> tuple[NormalizedGenerationOutput, dict[str, Any] | None]:
+    """Return compatible text plus metadata without losing the raw model output."""
 
     if not isinstance(raw, str):
         raise AIContractError("generation output must be text")
     try:
         draft = parse_draft(raw)
     except AIContractError:
-        return raw, None
-    return render_markdown(draft), draft
+        metadata = {
+            "contract_version": "legacy",
+            "structured": False,
+            "output_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        }
+        return NormalizedGenerationOutput(raw, raw_output=raw, metadata=metadata), None
+    metadata = {
+        "contract_version": draft["contract_version"],
+        "structured": True,
+        "draft_fingerprint": draft["draft_fingerprint"],
+        "case_count": len(draft["cases"]),
+    }
+    return NormalizedGenerationOutput(
+        render_markdown(draft), raw_output=raw, metadata=metadata
+    ), draft
 
 
 def summarize_generation_output(raw: str) -> dict[str, Any]:
     """Return audit metadata without persisting model output or secrets."""
 
+    if isinstance(raw, NormalizedGenerationOutput):
+        return dict(raw.metadata)
     try:
         draft = parse_draft(raw)
     except AIContractError:

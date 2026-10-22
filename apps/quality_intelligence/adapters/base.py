@@ -62,6 +62,22 @@ INCONCLUSIVE = "INCONCLUSIVE"
 NOT_RUN = "NOT_RUN"
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert redacted contract values to deterministic JSON-safe primitives."""
+
+    if isinstance(value, bytes):
+        return "[BINARY]"
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 class AdapterError(Exception):
     """Base error raised when a source cannot be normalized safely."""
 
@@ -135,7 +151,7 @@ class NormalizedItem:
             "attempt": self.attempt,
             "duration_ms": self.duration_ms,
             "environment_fingerprint": self.environment_fingerprint,
-            "details": payload(self.details),
+            "details": _json_safe(payload(self.details)),
         }
 
 
@@ -170,7 +186,7 @@ class NormalizedEvidence:
             "mime_type": self.mime_type,
             "size_bytes": self.size_bytes,
             "availability": self.availability,
-            "provenance": payload(self.provenance),
+            "provenance": _json_safe(payload(self.provenance)),
             "captured_at": self.captured_at.isoformat() if self.captured_at else None,
         }
 
@@ -211,10 +227,10 @@ class NormalizedFailure:
             "phase": self.phase,
             "signature": self.signature,
             "source_error_code": self.source_error_code,
-            "message": self.message,
-            "stack_excerpt": self.stack_excerpt,
+            "message": _json_safe(payload(self.message)),
+            "stack_excerpt": _json_safe(payload(self.stack_excerpt)),
             "retryable": self.retryable,
-            "details": payload(self.details),
+            "details": _json_safe(payload(self.details)),
             "initial_taxonomy_code": self.initial_taxonomy_code,
             "classifier": self.classifier,
             "confidence": self.confidence,
@@ -252,7 +268,7 @@ class NormalizedMetric:
             "sample_key": self.sample_key,
             "unit": self.unit,
             "aggregation": self.aggregation,
-            "dimensions": payload(self.dimensions),
+            "dimensions": _json_safe(payload(self.dimensions)),
             "observed_at": self.observed_at.isoformat() if self.observed_at else None,
         }
 
@@ -334,9 +350,9 @@ class NormalizedRun:
                 "redaction_version": self.redaction_version,
                 "outcome": self.outcome,
                 "quality_status": self.quality_status,
-                "summary": payload(self.summary),
-                "source_snapshot": payload(self.source_snapshot),
-                "provenance": payload(self.provenance),
+                "summary": _json_safe(payload(self.summary)),
+                "source_snapshot": _json_safe(payload(self.source_snapshot)),
+                "provenance": _json_safe(payload(self.provenance)),
                 "warnings": list(self.warnings),
             },
             "items": [item.to_contract() for item in self.items],

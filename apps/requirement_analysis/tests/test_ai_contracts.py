@@ -52,3 +52,10 @@ def test_legacy_markdown_remains_compatible():
 def test_invalid_structured_draft_is_rejected():
     with pytest.raises(AIContractError):
         parse_draft('{"test_cases": [{"title": "missing steps"}]}')
+
+
+def test_malformed_optional_fields_raise_contract_error():
+    with pytest.raises(AIContractError):
+        parse_draft('{"test_cases": [{"title": "x", "steps": ["ok"], "expected_result": "ok", "source_refs": {}}]}')
+    with pytest.raises(AIContractError):
+        parse_draft('{"test_cases": [{"title": "x", "steps": ["ok"], "expected_result": "ok", "confidence": "bad"}]}')

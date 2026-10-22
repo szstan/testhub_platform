@@ -423,7 +423,7 @@ def get_release_status(ctx: Context) -> dict:
         release = ''
         if release_file.exists():
             release = release_file.read_text(encoding='utf-8').splitlines()[0].strip()
-        return {'release': release or 'unknown', 'release_file': str(release_file), 'health_path': '/health/', 'readiness_path': '/readiness/'}
+        return {'release': release or 'unknown', 'health_path': '/health/', 'readiness_path': '/readiness/'}
     return _run_tool(ctx, 'get_release_status', {}, run)
 
 
@@ -435,9 +435,9 @@ def get_api_contract_status(ctx: Context) -> dict:
         from django.conf import settings
         baseline = Path(getattr(settings, 'BASE_DIR', Path.cwd())) / 'docs' / 'openapi-contract-baseline.yaml'
         if not baseline.exists():
-            return {'available': False, 'baseline': str(baseline)}
+            return {'available': False, 'baseline_name': 'docs/openapi-contract-baseline.yaml'}
         digest = sha256(baseline.read_bytes()).hexdigest()
-        return {'available': True, 'baseline': str(baseline), 'sha256': digest, 'size_bytes': baseline.stat().st_size, 'check_command': 'python scripts/api_contract_check.py --baseline docs/openapi-contract-baseline.yaml'}
+        return {'available': True, 'baseline_name': 'docs/openapi-contract-baseline.yaml', 'sha256': digest, 'size_bytes': baseline.stat().st_size, 'check_command': 'python scripts/api_contract_check.py --baseline docs/openapi-contract-baseline.yaml'}
     return _run_tool(ctx, 'get_api_contract_status', {}, run)
 
 

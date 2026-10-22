@@ -26,17 +26,18 @@ def score_test_risk(
     candidate: Mapping[str, Any],
     history: Iterable[Any] | None = None,
     *,
-    change_impact: float = 0.0,
+    change_impact: float | None = None,
 ) -> dict[str, Any]:
     """Score one test using failure rate, flakiness, priority and change impact."""
 
-    attempts = list(history or candidate.get("history") or [])
+    attempts = list(candidate.get("history") or []) if history is None else list(history)
     reliability = calculate_flakiness(attempts, min_attempts=1)
     sample_count = int(reliability["sample_count"] or 0)
     failure_rate = (reliability["fail_count"] / sample_count) if sample_count else 0.0
     flaky_score = _number(reliability.get("flaky_score"))
     priority_score = _priority(candidate.get("priority"))
-    impact_score = _number(change_impact if change_impact else candidate.get("change_impact"))
+    impact_value = candidate.get("change_impact") if change_impact is None else change_impact
+    impact_score = _number(impact_value)
     score = round(
         100 * (
             0.40 * failure_rate
@@ -91,7 +92,7 @@ def select_regression_candidates(
             score_test_risk(
                 candidate,
                 histories.get(key),
-                change_impact=change_impacts.get(key, 0.0),
+                change_impact=(change_impacts[key] if key in change_impacts else None),
             )
         )
     scored.sort(key=lambda item: (-item["risk_score"], item["test_key"]))

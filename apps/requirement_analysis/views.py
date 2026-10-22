@@ -1582,11 +1582,12 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                             ensure_ascii=False,
                                         )
 
-                                        # 生成完成后，确保最终的流式内容被保存
-                                        if task.stream_buffer:
-                                            save_stream_buffer(task.stream_buffer)
+                                        # 生成完成后，使用最终 normalized 表示覆盖流式缓冲，避免
+                                        # 原始 JSON transcript 与最终 Markdown 字段不一致。
+                                        task.stream_buffer = str(generated_cases)
+                                        save_stream_buffer(task.stream_buffer)
 
-                                        task.generated_test_cases = generated_cases
+                                        task.generated_test_cases = str(generated_cases)
                                         task.progress = 60
                                         task.save()
 

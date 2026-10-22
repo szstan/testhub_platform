@@ -33,3 +33,11 @@ def test_regression_selection_is_deterministic_and_excludes_quarantine():
 
     assert [item['test_key'] for item in selected] == ['critical', 'stable']
     assert all(item['test_key'] != 'quarantined' for item in selected)
+
+
+def test_explicit_zero_impact_and_empty_history_are_honored():
+    candidate = {'test_key': 'case', 'priority': 'P2', 'change_impact': 1.0, 'history': ['FAIL']}
+    result = score_test_risk(candidate, history=[], change_impact=0.0)
+
+    assert result['change_impact'] == 0.0
+    assert result['failure_rate'] == 0.0

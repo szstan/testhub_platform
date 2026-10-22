@@ -28,9 +28,11 @@ def test_normalized_run_contract_is_versioned_and_json_safe():
         failures=[NormalizedFailure(
             item_key='request-1',
             taxonomy_code='ASSERTION',
-            message='expected response',
+            message='authorization: secret',
+            stack_excerpt=b'raw-binary',
+            details={'raw': b'bytes'},
         )],
-        metrics=[NormalizedMetric(metric_key='duration', value=12.5, unit='ms')],
+        metrics=[NormalizedMetric(metric_key='duration', value=12.5, unit='ms', dimensions={'raw': b'bytes'})],
     )
 
     contract = run.to_contract()
@@ -42,5 +44,7 @@ def test_normalized_run_contract_is_versioned_and_json_safe():
     assert contract['evidence'][0]['sha256'] == 'abc123'
     assert contract['evidence'][0]['captured_at'].startswith('2026-01-01T00:00:00')
     assert contract['failures'][0]['taxonomy_code'] == 'ASSERTION'
+    assert contract['failures'][0]['message'] == 'authorization: [REDACTED]'
+    assert contract['failures'][0]['stack_excerpt'] == '[BINARY]'
     assert contract['metrics'][0]['unit'] == 'ms'
     assert 'do-not-persist' not in encoded

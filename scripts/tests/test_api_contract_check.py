@@ -44,6 +44,38 @@ def test_openapi_contract_detects_required_and_removed_changes():
 
     assert 'required parameter added: GET /api/items/ query:tenant' in changes
     assert 'response status removed: GET /api/items/ 404' in changes
-    assert 'component required field added: Item.name' in changes
-    assert 'component property removed: Item.old' in changes
-    assert 'component property type changed: Item.name string->integer' in changes
+    assert 'required field added: component Item.name' in changes
+    assert 'property removed: component Item.old' in changes
+    assert 'schema type changed: component Item.name string->integer' in changes
+
+
+def test_openapi_contract_detects_path_level_and_nested_changes():
+    previous = {
+        'paths': {'/api/items/{id}/': {
+            'parameters': [{'in': 'path', 'name': 'id', 'required': False}],
+            'get': {'responses': {'200': {}}},
+        }},
+        'components': {'schemas': {'Envelope': {
+            'type': 'object',
+            'properties': {'items': {'type': 'array', 'items': {
+                'type': 'object', 'properties': {'state': {'type': 'string', 'enum': ['ok', 'bad']}}
+            }}},
+        }}},
+    }
+    current = {
+        'paths': {'/api/items/{id}/': {
+            'parameters': [{'in': 'path', 'name': 'id', 'required': True}],
+            'get': {'responses': {'200': {}}},
+        }},
+        'components': {'schemas': {'Envelope': {
+            'type': 'object',
+            'properties': {'items': {'type': 'array', 'items': {
+                'type': 'object', 'properties': {'state': {'type': 'string', 'enum': ['ok']}}
+            }}},
+        }}},
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'required parameter added: GET /api/items/{id}/ path:id' in changes
+    assert 'enum value removed: component Envelope.items[].state=bad' in changes

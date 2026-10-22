@@ -54,16 +54,57 @@ def _request_body_required(operation: Any) -> bool:
     return bool(body.get("required"))
 
 
-def _operation_parameters(operation: Any) -> dict[tuple[str, str], bool]:
-    if not isinstance(operation, dict):
-        return {}
+def _operation_parameters(operation: Any, inherited: Any = None) -> dict[tuple[str, str], bool]:
     result: dict[tuple[str, str], bool] = {}
-    for parameter in operation.get("parameters") or []:
+    for parameter in (inherited or []) + ((operation or {}).get("parameters") or []):
         if not isinstance(parameter, dict):
             continue
         key = (str(parameter.get("in", "")), str(parameter.get("name", "")))
         result[key] = bool(parameter.get("required"))
     return result
+
+
+def _compare_schema(old_schema: Any, new_schema: Any, label: str, breaks: list[str], seen: set[tuple[int, int]]) -> None:
+    if not isinstance(old_schema, dict) or not isinstance(new_schema, dict):
+        return
+    pair = (id(old_schema), id(new_schema))
+    if pair in seen:
+        return
+    seen.add(pair)
+    old_ref = old_schema.get("$ref")
+    new_ref = new_schema.get("$ref")
+    if old_ref and new_ref and old_ref != new_ref:
+        breaks.append(f"schema reference changed: {label} {old_ref}->{new_ref}")
+    old_type = _schema_type(old_schema)
+    new_type = _schema_type(new_schema)
+    if old_type and new_type and old_type != new_type:
+        breaks.append(f"schema type changed: {label} {old_type}->{new_type}")
+    old_required = _required_properties(old_schema)
+    new_required = _required_properties(new_schema)
+    for field in sorted(new_required - old_required):
+        breaks.append(f"required field added: {label}.{field}")
+    old_properties = old_schema.get("properties") or {}
+    new_properties = new_schema.get("properties") or {}
+    for field in sorted(set(old_properties) - set(new_properties)):
+        breaks.append(f"property removed: {label}.{field}")
+    for field in sorted(set(old_properties) & set(new_properties)):
+        _compare_schema(old_properties[field], new_properties[field], f"{label}.{field}", breaks, seen)
+    old_items = old_schema.get("items")
+    new_items = new_schema.get("items")
+    if old_items is not None and new_items is not None:
+        _compare_schema(old_items, new_items, f"{label}[]", breaks, seen)
+    old_enum = set(old_schema.get("enum") or [])
+    new_enum = set(new_schema.get("enum") or [])
+    for value in sorted(old_enum - new_enum, key=str):
+        breaks.append(f"enum value removed: {label}={value}")
+    if old_schema.get("additionalProperties") is not False and new_schema.get("additionalProperties") is False:
+        breaks.append(f"additional properties disallowed: {label}")
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        old_parts = old_schema.get(keyword) or []
+        new_parts = new_schema.get(keyword) or []
+        for index, old_part in enumerate(old_parts):
+            if index < len(new_parts):
+                _compare_schema(old_part, new_parts[index], f"{label}.{keyword}[{index}]", breaks, seen)
 
 
 def _component_breaks(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
@@ -74,28 +115,9 @@ def _component_breaks(previous: dict[str, Any], current: dict[str, Any]) -> list
         if name not in new_components:
             breaks.append(f"component schema removed: {name}")
             continue
-        new_schema = new_components[name]
-        old_type = _schema_type(old_schema)
-        new_type = _schema_type(new_schema)
-        if old_type and new_type and old_type != new_type:
-            breaks.append(f"component schema type changed: {name} {old_type}->{new_type}")
-        old_required = _required_properties(old_schema)
-        new_required = _required_properties(new_schema)
-        for field in sorted(new_required - old_required):
-            breaks.append(f"component required field added: {name}.{field}")
-        old_properties = (old_schema or {}).get("properties") or {}
-        new_properties = (new_schema or {}).get("properties") or {}
-        for field in sorted(set(old_properties) - set(new_properties)):
-            breaks.append(f"component property removed: {name}.{field}")
-        for field in sorted(set(old_properties) & set(new_properties)):
-            old_field_type = _schema_type(old_properties[field])
-            new_field_type = _schema_type(new_properties[field])
-            if old_field_type and new_field_type and old_field_type != new_field_type:
-                breaks.append(
-                    f"component property type changed: {name}.{field} "
-                    f"{old_field_type}->{new_field_type}"
-                )
+        _compare_schema(old_schema, new_components[name], f"component {name}", breaks, set())
     return breaks
+
 
 
 def find_breaking_changes(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
@@ -117,8 +139,8 @@ def find_breaking_changes(previous: dict[str, Any], current: dict[str, Any]) -> 
             old_operation = old_item[method]
             new_operation = new_item[method]
             label = f"{method.upper()} {path}"
-            old_params = _operation_parameters(old_operation)
-            new_params = _operation_parameters(new_operation)
+            old_params = _operation_parameters(old_operation, old_item.get("parameters"))
+            new_params = _operation_parameters(new_operation, new_item.get("parameters"))
             for parameter, required in sorted(new_params.items()):
                 if required and not old_params.get(parameter, False):
                     breaks.append(f"required parameter added: {label} {parameter[0]}:{parameter[1]}")
