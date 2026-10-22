@@ -126,3 +126,34 @@ def test_openapi_contract_detects_inline_to_ref_type_change():
     changes = find_breaking_changes(previous, current)
 
     assert 'schema type changed: component Envelope.value string->object' in changes
+
+
+def test_openapi_contract_resolves_reference_chains_and_encoded_keys():
+    previous = {
+        'components': {'schemas': {
+            'Final': {'type': 'object', 'properties': {'value': {'type': 'string'}}},
+            'Middle': {'$ref': '#/components/schemas/Final'},
+            'Encoded Name': {'type': 'string'},
+            'Envelope': {'type': 'object', 'properties': {
+                'value': {'$ref': '#/components/schemas/Middle'},
+                'encoded': {'$ref': '#/components/schemas/Encoded%20Name'},
+            }},
+        }},
+    }
+    current = {
+        'components': {'schemas': {
+            'Final': {'type': 'object', 'properties': {'value': {'type': 'integer'}}},
+            'Middle': {'$ref': '#/components/schemas/Final'},
+            'Encoded Name': {'type': 'object'},
+            'Envelope': {'type': 'object', 'properties': {
+                'value': {'$ref': '#/components/schemas/Middle'},
+                'encoded': {'$ref': '#/components/schemas/Encoded%20Name'},
+            }},
+
+        }},
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'schema type changed: component Final.value string->integer' in changes
+    assert 'schema type changed: component Envelope.encoded string->object' in changes

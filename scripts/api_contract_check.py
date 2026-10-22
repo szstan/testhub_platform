@@ -10,6 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import yaml
 
@@ -65,16 +66,26 @@ def _operation_parameters(operation: Any, inherited: Any = None) -> dict[tuple[s
 def _resolve_ref(schema: Any, document: dict[str, Any] | None) -> Any:
     if not isinstance(schema, dict) or not isinstance(document, dict):
         return schema
-    reference = schema.get("$ref")
-    if not isinstance(reference, str) or not reference.startswith("#/"):
-        return schema
-    value: Any = document
-    try:
-        for part in reference[2:].split("/"):
-            value = value[part.replace("~1", "/").replace("~0", "~")]
-    except (KeyError, TypeError):
-        return schema
-    return value if isinstance(value, dict) else schema
+    current = schema
+    seen_refs: set[str] = set()
+    while isinstance(current, dict):
+        reference = current.get("$ref")
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            return current
+        if reference in seen_refs:
+            return current
+        seen_refs.add(reference)
+        value: Any = document
+        try:
+            fragment = unquote(reference[2:])
+            for part in fragment.split("/"):
+                value = value[part.replace("~1", "/").replace("~0", "~")]
+        except (KeyError, TypeError):
+            return current
+        if not isinstance(value, dict):
+            return current
+        current = value
+    return current
 
 
 def _compare_schema(
