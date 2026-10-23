@@ -339,20 +339,23 @@ test -x "$APP_DIR/allure/bin/allure"
 "$APP_DIR/allure/bin/allure" --version
 
 echo "=== 4) 写入 .env ==="
+: "${SECRET_KEY:?请通过安全环境注入 SECRET_KEY}"
+: "${DB_PASSWORD:?请通过安全环境注入 DB_PASSWORD}"
+: "${REDIS_URL:?请通过安全环境注入 REDIS_URL}"
 cat > "$APP_DIR/.env" <<EOF
 APP_ENV=production
 DEBUG=False
-SECRET_KEY=replace-with-a-random-secret
-ALLOWED_HOSTS=172.13.6.230
+SECRET_KEY=$SECRET_KEY
+ALLOWED_HOSTS=${ALLOWED_HOSTS:?请设置 ALLOWED_HOSTS}
 
-DB_NAME=testhub
-DB_USER=root
-DB_PASSWORD=your_db_password
-DB_HOST=127.0.0.1
-DB_PORT=3306
+DB_NAME=${DB_NAME:-testhub}
+DB_USER=${DB_USER:-root}
+DB_PASSWORD=$DB_PASSWORD
+DB_HOST=${DB_HOST:-127.0.0.1}
+DB_PORT=${DB_PORT:-3306}
 
 APP_ADB_PATH=$APP_ADB_PATH
-REDIS_URL=redis://:1234@127.0.0.1:6379/0
+REDIS_URL=$REDIS_URL
 EOF
 
 echo "=== 5) 收集静态文件 ==="

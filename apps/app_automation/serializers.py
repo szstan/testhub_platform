@@ -493,6 +493,12 @@ class AppNotificationLogSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_at', 'sent_at']
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['webhook_bot_info'] = {'configured': bool(instance.webhook_bot_info)} if instance.webhook_bot_info else {}
+        data['response_info'] = {'available': bool(instance.response_info)} if instance.response_info else {}
+        return data
+
     def get_recipient_names(self, obj) -> str:
         return obj.get_recipient_names()
 

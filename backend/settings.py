@@ -149,12 +149,16 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 ASGI_APPLICATION = 'backend.asgi.application'
 
+_db_password = config('DB_PASSWORD', default='')
+if APP_ENV not in {'development', 'testing'} and not _db_password:
+    raise ImproperlyConfigured('DB_PASSWORD must be set in production/staging')
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': config('DB_NAME', default='testhub'),
         'USER': config('DB_USER', default='root'),
-        'PASSWORD': config('DB_PASSWORD', default=''),  # 移除硬编码默认密码
+        'PASSWORD': _db_password,  # 生产环境禁止空数据库密码
         'HOST': config('DB_HOST', default='127.0.0.1'),
         'PORT': config('DB_PORT', default='3306'),
         'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=60, cast=int),
@@ -369,7 +373,10 @@ SPECTACULAR_SETTINGS = {
 }
 
 # Redis URL (used across celery, channels, and SMS verification)
-REDIS_URL = config('REDIS_URL', default='redis://:1234@127.0.0.1:6379/0')
+_default_redis_url = 'redis://127.0.0.1:6379/0' if APP_ENV in {'development', 'testing'} else ''
+REDIS_URL = config('REDIS_URL', default=_default_redis_url)
+if APP_ENV not in {'development', 'testing'} and not REDIS_URL:
+    raise ImproperlyConfigured('REDIS_URL must be set in production/staging')
 
 # Celery Configuration
 CELERY_BROKER_URL = REDIS_URL

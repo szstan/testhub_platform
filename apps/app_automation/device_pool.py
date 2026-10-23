@@ -101,6 +101,15 @@ def _check_owner(device, user, token):
         raise DeviceLeaseError('设备租约令牌无效')
 
 
+def validate_device_lease(device_id, user, token):
+    """Validate an active lease before a worker mutates or executes a device."""
+    device = AppDevice.objects.select_for_update().get(pk=device_id)
+    _check_owner(device, user, token)
+    if device.lease_expires_at and device.lease_expires_at <= timezone.now():
+        raise DeviceLeaseError('设备租约已过期')
+    return device
+
+
 def heartbeat_device(device_id, user, token, *, lease_seconds=None):
     with transaction.atomic():
         device = AppDevice.objects.select_for_update().get(pk=device_id)

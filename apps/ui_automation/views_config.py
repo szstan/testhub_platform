@@ -21,7 +21,7 @@ _ALLOWED_PLAYWRIGHT_BROWSERS = {'chromium', 'firefox', 'webkit'}
 
 def _safe_ai_base_url(value):
     parsed = urlparse(str(value).strip())
-    if parsed.scheme != 'https' or not parsed.hostname:
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('AI Base URL 必须使用 HTTPS')
     try:
         addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
@@ -455,7 +455,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式预览 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(10, 60))
+            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
 
             logger.info(f"AI智能模式预览 - 收到响应: status_code={response.status_code}")
 
@@ -539,7 +539,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(10, 60))
+            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
 
             logger.info(f"AI智能模式 - 收到响应: status_code={response.status_code}")
 

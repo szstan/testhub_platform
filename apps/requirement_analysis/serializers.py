@@ -19,6 +19,25 @@ class RequirementDocumentSerializer(serializers.ModelSerializer):
                  'status', 'status_display', 'uploaded_by', 'uploaded_by_name', 'project', 
                  'project_name', 'created_at', 'updated_at', 'file_size', 'extracted_text']
         read_only_fields = ['uploaded_by', 'file_size', 'extracted_text']
+
+    def validate(self, attrs):
+        if self.instance is None and attrs.get('project') is None:
+            raise serializers.ValidationError({'project': '项目不能为空'})
+        immutable = {'project', 'document_type', 'status', 'uploaded_by', 'file_size', 'extracted_text'}
+        if self.instance is not None and immutable.intersection(attrs):
+            raise serializers.ValidationError('需求文档的项目、类型和状态不可直接修改')
+        return attrs
+
+    def validate_project(self, value):
+        if value is None:
+            raise serializers.ValidationError('项目不能为空')
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            raise serializers.ValidationError('必须登录后操作需求文档')
+        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+            return value
+        raise serializers.ValidationError('无权使用该项目')
     
     def get_file_url(self, obj):
         if obj.file:
@@ -60,8 +79,18 @@ class GeneratedTestCaseSerializer(serializers.ModelSerializer):
         model = GeneratedTestCase
         fields = ['id', 'case_id', 'title', 'priority', 'priority_display', 'precondition',
                  'test_steps', 'expected_result', 'status', 'status_display', 'generated_by_ai',
-                 'reviewed_by_ai', 'review_comments', 'requirement', 'requirement_name', 
+                 'reviewed_by_ai', 'review_comments', 'requirement', 'requirement_name',
                  'requirement_id_display', 'created_at', 'updated_at']
+        read_only_fields = []
+
+    def validate(self, attrs):
+        immutable = {
+            'status', 'generated_by_ai', 'reviewed_by_ai', 'review_comments',
+            'requirement', 'created_at', 'updated_at',
+        }
+        if self.instance is not None and immutable.intersection(attrs):
+            raise serializers.ValidationError('生成用例的状态、评审字段和关联需求不可直接修改')
+        return attrs
 
 
 class AnalysisTaskSerializer(serializers.ModelSerializer):
@@ -85,22 +114,28 @@ class AnalysisTaskSerializer(serializers.ModelSerializer):
 
 class DocumentUploadSerializer(serializers.ModelSerializer):
     """文档上传专用序列化器"""
+
     class Meta:
         model = RequirementDocument
         fields = ['id', 'title', 'file', 'project']
-    
-    def validate_project(self, value):
-        user = self.context['request'].user
-        if not user.is_authenticated:
-            raise serializers.ValidationError('必须登录后上传需求文档')
-        if not (
-            value.owner_id == user.id
-            or value.members.filter(pk=user.pk).exists()
-            or user.is_staff
-            or user.is_superuser
-        ):
-            raise serializers.ValidationError('无权使用该项目')
+        read_only_fields = ['id', 'uploaded_by', 'file_size', 'extracted_text']
+
+    def validate_file(self, value):
+        if getattr(value, 'size', 0) > 10 * 1024 * 1024:
+            raise serializers.ValidationError('文件大小不能超过 10MB')
+        name = (getattr(value, 'name', '') or '').lower()
+        if not name.endswith(('.pdf', '.docx', '.txt', '.md')):
+            raise serializers.ValidationError('仅支持 PDF、DOCX、TXT 或 Markdown 文件')
         return value
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            raise serializers.ValidationError('必须登录后上传需求文档')
+        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+            return value
+        raise serializers.ValidationError('无权使用该项目')
 
     def create(self, validated_data):
         user = self.context['request'].user
@@ -108,24 +143,20 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('必须登录后上传需求文档')
         validated_data['uploaded_by'] = user
 
-        # 根据文件扩展名设置文档类型
         file = validated_data['file']
         if file.name.lower().endswith('.pdf'):
             validated_data['document_type'] = 'pdf'
-        elif file.name.lower().endswith(('.doc', '.docx')):
+        elif file.name.lower().endswith('.docx'):
             validated_data['document_type'] = 'docx'
         elif file.name.lower().endswith('.txt'):
             validated_data['document_type'] = 'txt'
         elif file.name.lower().endswith('.md'):
             validated_data['document_type'] = 'md'
-        
-        # 设置文件大小
         validated_data['file_size'] = file.size
-        
         return super().create(validated_data)
 
 
-class TestCaseGenerationRequestSerializer(serializers.Serializer):
+class LegacyTestCaseGenerationRequestSerializer(serializers.Serializer):
     """测试用例生成请求序列化器"""
     requirement_ids = serializers.ListField(
         child=serializers.IntegerField(),
@@ -254,9 +285,25 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
                  'reviewer_prompt_config', 'reviewer_prompt_name', 'generated_test_cases',
                  'review_feedback', 'final_test_cases', 'generation_log', 'error_message',
                  'created_by', 'created_by_name', 'created_at', 'updated_at', 'completed_at']
-        read_only_fields = ['task_id', 'status', 'progress', 'generated_test_cases', 
-                          'review_feedback', 'final_test_cases', 'generation_log', 
+        read_only_fields = ['task_id', 'status', 'progress', 'generated_test_cases',
+                          'review_feedback', 'final_test_cases', 'generation_log',
                           'error_message', 'created_by', 'completed_at']
+
+    def validate_project(self, value):
+        if value is None:
+            raise serializers.ValidationError('项目不能为空')
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            raise serializers.ValidationError('必须登录后配置生成任务')
+        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+            return value
+        raise serializers.ValidationError('无权使用该项目')
+
+    def update(self, instance, validated_data):
+        if 'project' in validated_data and (validated_data['project'] is None or validated_data['project'].pk != instance.project_id):
+            raise serializers.ValidationError({'project': '已创建任务不能更换项目'})
+        return super().update(instance, validated_data)
     
     def create(self, validated_data):
         # 自动设置创建者和任务ID
@@ -274,7 +321,8 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
 class TestCaseGenerationRequestSerializer(serializers.Serializer):
     """新的测试用例生成请求序列化器"""
     title = serializers.CharField(max_length=200, help_text="任务标题")
-    requirement_text = serializers.CharField(help_text="需求描述")
+    requirement_text = serializers.CharField(max_length=100000, help_text="需求描述")
+    project = serializers.IntegerField(required=True, allow_null=False, help_text="项目 ID")
     use_writer_model = serializers.BooleanField(default=True, help_text="是否使用编写模型")
     use_reviewer_model = serializers.BooleanField(default=True, help_text="是否使用评审模型")
 

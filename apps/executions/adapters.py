@@ -607,7 +607,7 @@ class ExecutorAdapter:
                     message="late result retained as history",
                     details={"ignored": True, "final_attempt_id": locked_job.final_attempt_id},
                 )
-            locked_attempt.result = dict(payload.get("result") or payload.get("summary") or {})
+            locked_attempt.result = redact_result_payload(dict(payload.get("result") or payload.get("summary") or {}))
             locked_attempt.error_type = _error_type(payload.get("error_type")) if status_value in _TERMINAL_FAILURE else ""
             locked_attempt.error_message = str(payload.get("error_message") or "")[:4000]
             locked_attempt.save(update_fields=["result", "error_type", "error_message", "updated_at"])
@@ -626,8 +626,13 @@ class ExecutorAdapter:
                         "idempotency_key": str(item.get("idempotency_key") or "step-" + case_key + "-" + step_key),
                     },
                 )
-                step.status = _normalise_step_status(item.get("status", status_value))
-                step.result = dict(item.get("result") or {})
+                normalized_step_status = _normalise_step_status(item.get("status", status_value))
+                if normalized_step_status not in set(StepStatus.values):
+                    raise AdapterError(f"Unknown execution step status: {normalized_step_status}")
+                if step.status in set(StepStatus.values) - {StepStatus.PENDING, StepStatus.RUNNING} and normalized_step_status != step.status:
+                    raise AdapterConflict("Attempt step is already terminal")
+                step.status = normalized_step_status
+                step.result = redact_result_payload(dict(item.get("result") or {}))
                 step.error_type = _error_type(item.get("error_type"))
                 step.error_message = str(item.get("error_message") or "")[:4000]
                 step.duration_ms = item.get("duration_ms")
@@ -648,11 +653,11 @@ class ExecutorAdapter:
                         "media_type": str(item.get("media_type") or ""),
                         "size_bytes": item.get("size_bytes"),
                         "retention_policy": str(item.get("retention_policy") or "default"),
-                        "metadata": dict(item.get("metadata") or {}),
+                        "metadata": redact_result_payload(dict(item.get("metadata") or {})),
                     },
                 )
 
-            result_payload = dict(payload.get("result") or payload.get("summary") or {})
+            result_payload = redact_result_payload(dict(payload.get("result") or payload.get("summary") or {}))
             gate_result = apply_quality_gate(locked_job, result_payload, stage="result", attempt=locked_attempt)
             effective_status = status_value
             if status_value in _TERMINAL_SUCCESS and gate_result.get("configured") and not gate_result.get("passed"):

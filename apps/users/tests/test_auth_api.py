@@ -170,7 +170,7 @@ def test_login_rejects_inactive_user(api_client, active_user):
     )
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert '用户已被禁用' in str(_response_error(response))
+    assert '用户名或密码错误' in str(_response_error(response))
 
 
 def test_user_detail_is_scoped_to_self_for_regular_users(api_client, active_user):

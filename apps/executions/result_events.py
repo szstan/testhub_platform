@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,9 +69,24 @@ def redact_result_payload(value: Any, *, depth: int = 0) -> Any:
 
 
 def _event_key(job_id: int, event_type: str, payload: Mapping[str, Any], idempotency_key: str) -> str:
-    source = f"{job_id}|{idempotency_key}" if idempotency_key else '|'.join(
-        [str(job_id), event_type, str(payload.get('attempt', '')), str(payload.get('case_key', '')), str(payload.get('step_key', ''))]
-    )
+    if idempotency_key:
+        source = f"{job_id}|{idempotency_key}"
+    else:
+        identity = {
+            'attempt': payload.get('attempt', ''),
+            'case_key': payload.get('case_key', ''),
+            'step_key': payload.get('step_key', ''),
+            'status': payload.get('status', ''),
+        }
+        if event_type == 'artifact_uploaded':
+            identity.update({
+                'artifact_key': payload.get('artifact_idempotency_key', ''),
+                'uri': payload.get('uri', ''),
+                'content_hash': payload.get('content_hash', ''),
+            })
+        elif event_type == 'step_finished':
+            identity['step_idempotency_key'] = payload.get('step_idempotency_key', '')
+        source = f"{job_id}|{event_type}|{json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)}"
     return hashlib.sha256(source.encode('utf-8')).hexdigest()
 
 

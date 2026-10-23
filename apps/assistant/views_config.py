@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.db import transaction
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,6 +7,31 @@ from rest_framework.permissions import IsAdminUser
 from .models import DifyConfig
 from .serializers import DifyConfigSerializer
 import requests
+
+
+from urllib.parse import urlparse
+import ipaddress
+import socket
+
+
+def _validate_dify_url(value):
+    parsed = urlparse((value or '').strip())
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('Dify API URL 必须是无凭证的 http/https 地址')
+    allowed = {item.strip().lower() for item in (getattr(settings, 'DIFY_ALLOWED_HOSTS', '') or '').split(',') if item.strip()}
+    hostname = parsed.hostname.lower()
+    if allowed and hostname not in allowed:
+        raise ValueError('Dify API 主机不在允许列表中')
+    if not allowed:
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == 'https' else 80), type=socket.SOCK_STREAM)}
+        except OSError as exc:
+            raise ValueError('Dify API 主机无法解析') from exc
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                raise ValueError('Dify API URL 不允许访问内网或保留地址')
+    return parsed.geturl().rstrip('/')
 
 
 class DifyConfigViewSet(viewsets.ModelViewSet):
@@ -28,26 +55,32 @@ class DifyConfigViewSet(viewsets.ModelViewSet):
     
     def create(self, request):
         """创建新配置"""
-        # 如果设置为激活，先将其他配置设为不激活
-        if request.data.get('is_active', True):
-            DifyConfig.objects.update(is_active=False)
-        
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        try:
+            _validate_dify_url(serializer.validated_data['api_url'])
+        except ValueError as exc:
+            return Response({'api_url': [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            if serializer.validated_data.get('is_active', True):
+                DifyConfig.objects.update(is_active=False)
+            serializer.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
     def update(self, request, pk=None, partial=False):
         """更新配置"""
         instance = self.get_object()
         
-        # 如果设置为激活，先将其他配置设为不激活
-        if request.data.get('is_active', False):
-            DifyConfig.objects.exclude(pk=pk).update(is_active=False)
-        
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        try:
+            _validate_dify_url(serializer.validated_data.get('api_url', instance.api_url))
+        except ValueError as exc:
+            return Response({'api_url': [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            if serializer.validated_data.get('is_active', False):
+                DifyConfig.objects.exclude(pk=pk).update(is_active=False)
+            serializer.save()
         return Response(serializer.data)
     
     def partial_update(self, request, pk=None):
@@ -67,7 +100,7 @@ class DifyConfigViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            # 发送测试请求到Dify API
+            api_url = _validate_dify_url(api_url)
             headers = {
                 'Authorization': f'Bearer {api_key}',
                 'Content-Type': 'application/json'
@@ -87,7 +120,8 @@ class DifyConfigViewSet(viewsets.ModelViewSet):
                 f'{api_url}/chat-messages',
                 headers=headers,
                 json=test_data,
-                timeout=30
+                timeout=10,
+                allow_redirects=False,
             )
             
             if response.status_code == 200:
@@ -95,10 +129,11 @@ class DifyConfigViewSet(viewsets.ModelViewSet):
             else:
                 return Response({
                     'error': f'连接失败: {response.status_code}',
-                    'detail': response.text,
                     'success': False
                 }, status=status.HTTP_400_BAD_REQUEST)
                 
+        except ValueError as e:
+            return Response({'error': str(e), 'success': False}, status=status.HTTP_400_BAD_REQUEST)
         except requests.exceptions.Timeout:
             return Response({
                 'error': '连接超时，请检查API URL是否正确',

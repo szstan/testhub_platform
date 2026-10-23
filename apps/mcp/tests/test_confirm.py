@@ -18,6 +18,7 @@ from apps.mcp.confirm import (
     reject_pending,
     verify_pending,
 )
+from apps.mcp.actions import McpActionError
 from apps.mcp.models import McpPendingConfirm
 from apps.projects.models import Project
 from apps.testcases.models import TestCase as FunctionalTestCase
@@ -129,13 +130,11 @@ class ConfirmActionErrorTest(ConfirmFlowBase):
     def test_action_error_surfaces_as_confirm_error(self):
         # 项目不属于当前用户 → 动作执行失败
         foreign_project = Project.objects.create(name='别人项目', owner=self.other)
-        result = create_preview('confirm_create_testcase', {
-            'project_id': foreign_project.id,
-            'data': {'title': 'x', 'expected_result': 'y'},
-        }, self.user)
-        pending = verify_pending(result['confirm_token'], self.user)
-        with self.assertRaises(ConfirmError) as cm:
-            consume_pending(pending, self.user)
+        with self.assertRaises(McpActionError) as cm:
+            create_preview('confirm_create_testcase', {
+                'project_id': foreign_project.id,
+                'data': {'title': 'x', 'expected_result': 'y'},
+            }, self.user)
         self.assertIn('无权限', str(cm.exception))
 
 

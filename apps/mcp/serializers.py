@@ -20,3 +20,11 @@ class McpPendingConfirmSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'tool_name', 'preview', 'arguments',
                   'status', 'awaiting_human', 'result', 'expires_at',
                   'created_at', 'updated_at']
+
+    def to_representation(self, instance):
+        from .actions import _mask_value_tree
+
+        data = super().to_representation(instance)
+        data['arguments'] = _mask_value_tree(instance.arguments or {})
+        data['result'] = _mask_value_tree(instance.result or {})
+        return data

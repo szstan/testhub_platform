@@ -8,6 +8,7 @@
 """
 import logging
 from celery import shared_task
+from django.db import transaction
 from django.utils import timezone
 
 from .models import JudgeBatch
@@ -24,19 +25,26 @@ def score_batch_task(self, batch_id: int):
     """
     from .service import JudgeService
 
-    batch = JudgeBatch.objects.get(id=batch_id)
-
-    # ---- 1. 初始化（支持 resume 续跑） ----
-    if batch.started_at is None:
-        batch.started_at = timezone.now()
-    if batch.status != 'running':
-        batch.status = 'running'
-    batch.is_paused = False
+    request_id = ''
     try:
-        batch.celery_task_id = self.request.id or ''
+        request_id = self.request.id or f'sync-{batch_id}'
     except Exception:
-        pass
-    batch.save(update_fields=['status', 'celery_task_id', 'started_at', 'is_paused'])
+        request_id = f'sync-{batch_id}'
+
+    # Claim the batch atomically. A revoked/paused worker must not clear a newer pause.
+    with transaction.atomic():
+        batch = JudgeBatch.objects.select_for_update().get(id=batch_id)
+        if batch.is_paused or batch.status == 'paused':
+            return {'batch_id': batch.id, 'status': 'paused', 'scored': batch.scored, 'total': batch.total}
+        if batch.celery_task_id and batch.celery_task_id != request_id and batch.status == 'running':
+            logger.warning('[JudgeBatch#%s] duplicate worker rejected: %s', batch_id, request_id)
+            return {'batch_id': batch.id, 'status': 'already_running', 'scored': batch.scored, 'total': batch.total}
+        if batch.started_at is None:
+            batch.started_at = timezone.now()
+        batch.status = 'running'
+        batch.is_paused = False
+        batch.celery_task_id = request_id
+        batch.save(update_fields=['status', 'celery_task_id', 'started_at', 'is_paused'])
 
     try:
         service = JudgeService()
@@ -59,8 +67,11 @@ def score_batch_task(self, batch_id: int):
         # ---- 2. 循环评分（每条开始前检查暂停控制位） ----
         for global_i in range(start_i, total):
             # 暂停检查（每条都查一次；高并发下确保立即生效）
-            batch.refresh_from_db(fields=['is_paused'])
-            if batch.is_paused:
+            batch.refresh_from_db(fields=['is_paused', 'celery_task_id', 'status'])
+            if batch.celery_task_id != request_id:
+                logger.info(f'[JudgeBatch#{batch_id}] worker generation superseded, stopping')
+                return {'batch_id': batch.id, 'status': 'superseded', 'scored': batch.scored, 'total': batch.total}
+            if batch.is_paused or batch.status == 'paused':
                 logger.info(f'[JudgeBatch#{batch_id}] 暂停触发：位置 {global_i}/{total}，保存现场')
                 # 局部汇总（已评分的 results）+ 落盘
                 try:
@@ -114,18 +125,25 @@ def score_batch_task(self, batch_id: int):
                 results.append({'error': str(exc), 'case_index': global_i})
                 error_cnt += 1
 
-            # 进度 + results_buffer 持久化（确保 resume 可用；每 10 条或最后一条回写）
             scored_now = global_i + 1
             progress_now = int(scored_now / max(1, total) * 100)
-            flush = (scored_now == total) or (scored_now % 10 == 0)
-            update_fields = ['scored', 'progress']
+            rows = JudgeBatch.objects.filter(
+                pk=batch.id,
+                celery_task_id=request_id,
+                status='running',
+                is_paused=False,
+            ).update(
+                scored=scored_now,
+                progress=progress_now,
+                results_buffer=results,
+                error_count=error_cnt,
+            )
+            if rows != 1:
+                logger.info(f'[JudgeBatch#{batch_id}] stale worker result discarded')
+                return {'batch_id': batch.id, 'status': 'superseded', 'scored': scored_now, 'total': total}
             batch.scored = scored_now
             batch.progress = progress_now
-            if flush:
-                batch.results_buffer = results
-                batch.error_count = error_cnt
-                update_fields.extend(['results_buffer', 'error_count'])
-            batch.save(update_fields=update_fields)
+
             try:
                 self.update_state(state='PROGRESS', meta={
                     'current': scored_now, 'total': total, 'progress': progress_now,
@@ -165,7 +183,20 @@ def score_batch_task(self, batch_id: int):
         batch.error_count = error_cnt
         batch.is_paused = False
         batch.completed_at = timezone.now()
-        batch.save()
+        JudgeBatch.objects.filter(pk=batch.id, celery_task_id=request_id).update(
+            mean_score=batch.mean_score,
+            std_dev=batch.std_dev,
+            safety_pass_rate=batch.safety_pass_rate,
+            critical_success_rate=batch.critical_success_rate,
+            gate_zone=batch.gate_zone,
+            blocked=batch.blocked,
+            status=batch.status,
+            error_message=batch.error_message,
+            results_buffer=results,
+            error_count=error_cnt,
+            is_paused=False,
+            completed_at=batch.completed_at,
+        )
 
         return {
             'batch_id': batch.id,
@@ -177,7 +208,7 @@ def score_batch_task(self, batch_id: int):
         }
     except Exception as exc:
         logger.exception(f'[JudgeBatch#{batch_id}] 批量评分失败')
-        JudgeBatch.objects.filter(pk=batch.id).update(
+        JudgeBatch.objects.filter(pk=batch.id, celery_task_id=request_id).update(
             status='failed',
             error_message=str(exc),
             completed_at=timezone.now(),

@@ -16,8 +16,10 @@ class DatasetError(ValueError):
     pass
 
 
-def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return deterministic variants from rows or a cartesian matrix."""
+def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any], *, max_variants: int = 10000) -> list[dict[str, Any]]:
+    """Return deterministic variants with a hard expansion budget."""
+    if not isinstance(max_variants, int) or max_variants < 1:
+        raise DatasetError('max_variants must be a positive integer')
     if isinstance(dataset, ExecutionDataset):
         data = dataset.data or []
         matrix = dataset.matrix or {}
@@ -27,12 +29,21 @@ def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any]) -> list[dict[s
     if data:
         if not isinstance(data, list) or not all(isinstance(item, Mapping) for item in data):
             raise DatasetError('dataset.data must be a list of objects')
+        if len(data) > max_variants:
+            raise DatasetError(f'dataset.data exceeds {max_variants} variants')
         return [dict(item) for item in data]
     if not matrix:
         return [{}]
     if not isinstance(matrix, Mapping) or not all(isinstance(value, list) for value in matrix.values()):
         raise DatasetError('dataset.matrix must map column names to lists')
     columns = sorted(matrix)
+    if len(columns) > 50 or any(len(matrix[column]) > 1000 for column in columns):
+        raise DatasetError('dataset.matrix exceeds column/row limits')
+    variant_count = 1
+    for column in columns:
+        variant_count *= len(matrix[column])
+        if variant_count > max_variants:
+            raise DatasetError(f'dataset.matrix expansion exceeds {max_variants} variants')
     return [dict(zip(columns, values)) for values in itertools.product(*(matrix[column] for column in columns))]
 
 

@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from django.shortcuts import render
 import requests
 from .models import AssistantSession, AssistantMessage, ChatMessage, DifyConfig
+from .views_config import _validate_dify_url
 from .serializers import (
     AssistantSessionSerializer, 
     AssistantSessionCreateSerializer,
@@ -60,19 +61,19 @@ class ChatViewSet(viewsets.ViewSet):
         session_id = request.data.get('session_id')
         message = request.data.get('message')
         
-        if not session_id or not message:
+        if not isinstance(session_id, str) or not session_id.strip() or not isinstance(message, str) or not message.strip():
             return Response(
                 {'error': 'session_id和message都是必填项'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if len(session_id) > 200:
+            return Response({'error': 'session_id 长度不能超过 200'}, status=status.HTTP_400_BAD_REQUEST)
         
-        # 获取会话
-        try:
-            session = AssistantSession.objects.get(
-                session_id=session_id,
-                user=request.user
-            )
-        except AssistantSession.DoesNotExist:
+        session = AssistantSession.objects.filter(
+            session_id=session_id,
+            user=request.user
+        ).order_by('-updated_at').first()
+        if session is None:
             return Response(
                 {'error': '会话不存在'},
                 status=status.HTTP_404_NOT_FOUND
@@ -112,14 +113,13 @@ class ChatViewSet(viewsets.ViewSet):
             if session.conversation_id:
                 payload['conversation_id'] = session.conversation_id
             
-            # 去除URL末尾的斜杠
-            api_url = dify_config.api_url.rstrip('/')
-            
+            api_url = _validate_dify_url(dify_config.api_url)
             response = requests.post(
                 f'{api_url}/chat-messages',
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=30,
+                allow_redirects=False,
             )
             
             if response.status_code == 200:
@@ -146,18 +146,19 @@ class ChatViewSet(viewsets.ViewSet):
                 })
             else:
                 return Response({
-                    'error': f'Dify API错误: {response.status_code}',
-                    'detail': response.text
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    'error': f'Dify API错误: {response.status_code}'
+                }, status=status.HTTP_502_BAD_GATEWAY)
                 
+        except ValueError:
+            return Response({'error': 'Dify API 地址不可用'}, status=status.HTTP_400_BAD_REQUEST)
         except requests.exceptions.Timeout:
             return Response({
                 'error': 'API请求超时'
             }, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             return Response({
-                'error': f'API请求失败: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                'error': 'API请求失败'
+            }, status=status.HTTP_502_BAD_GATEWAY)
 
 
 def assistant_view(request):

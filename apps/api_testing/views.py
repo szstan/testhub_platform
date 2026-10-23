@@ -1,17 +1,21 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+from apps.quality_intelligence.services.redaction import redact_payload
 from django.utils import timezone
 from django.http import HttpResponse, FileResponse, Http404, HttpResponseNotFound
 from django.views.static import serve
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
+import html
 import requests
 import time
 import os
@@ -19,6 +23,7 @@ import json
 import logging
 import uuid
 import subprocess
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 
 from .models import (
@@ -90,7 +95,9 @@ class ApiProjectViewSet(viewsets.ModelViewSet):
         )
     
     def perform_update(self, serializer):
-        """更新项目时记录日志"""
+        """仅 owner/admin 可修改项目及成员关系。"""
+        if not (self.request.user.is_staff or self.request.user.is_superuser or serializer.instance.owner_id == self.request.user.id):
+            raise PermissionDenied('只有项目负责人或管理员可以修改项目')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -101,7 +108,9 @@ class ApiProjectViewSet(viewsets.ModelViewSet):
         )
     
     def perform_destroy(self, instance):
-        """删除项目时记录日志"""
+        """仅 owner/admin 可删除项目。"""
+        if not (self.request.user.is_staff or self.request.user.is_superuser or instance.owner_id == self.request.user.id):
+            raise PermissionDenied('只有项目负责人或管理员可以删除项目')
         log_operation(
             operation_type='delete',
             resource_type='project',
@@ -244,7 +253,14 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
         ).distinct()
 
     def perform_create(self, serializer):
-        """创建集合时记录日志"""
+        """创建集合时校验项目归属并记录日志。"""
+        project = serializer.validated_data.get('project')
+        user = self.request.user
+        if not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
+        parent = serializer.validated_data.get('parent')
+        if parent and parent.project_id != project.id:
+            raise PermissionDenied('父集合必须属于同一项目')
         instance = serializer.save()
         log_operation(
             operation_type='create',
@@ -255,7 +271,14 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新集合时记录日志"""
+        """更新集合时校验项目归属并记录日志。"""
+        project = serializer.validated_data.get('project', serializer.instance.project)
+        user = self.request.user
+        if not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
+        parent = serializer.validated_data.get('parent', serializer.instance.parent)
+        if parent and parent.project_id != project.id:
+            raise PermissionDenied('父集合必须属于同一项目')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -317,8 +340,12 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        """创建接口时记录日志"""
-        instance = serializer.save()
+        """创建接口时校验集合归属并记录日志。"""
+        collection = serializer.validated_data.get('collection')
+        user = self.request.user
+        if collection and not (user.is_staff or user.is_superuser or collection.project.owner_id == user.id or collection.project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
+        instance = serializer.save(created_by=user)
         log_operation(
             operation_type='create',
             resource_type='request',
@@ -328,7 +355,11 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新接口时记录日志"""
+        """更新接口时校验集合归属并记录日志。"""
+        collection = serializer.validated_data.get('collection', serializer.instance.collection)
+        user = self.request.user
+        if collection and not (user.is_staff or user.is_superuser or collection.project.owner_id == user.id or collection.project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -362,7 +393,13 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             # 解析环境变量
             variables = {}
             if environment_id:
-                env = Environment.objects.get(id=environment_id)
+                env = Environment.objects.filter(
+                    models.Q(project__in=ApiProject.objects.filter(models.Q(owner=request.user) | models.Q(members=request.user)))
+                    | models.Q(project__isnull=True, created_by=request.user),
+                    id=environment_id,
+                ).first()
+                if env is None:
+                    return Response({'error': '环境不存在或无权限'}, status=status.HTTP_403_FORBIDDEN)
                 variables.update(env.variables)
             
             # 使用前端发送的更新后的数据，如果没有则使用数据库中的数据
@@ -375,8 +412,13 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             # 替换URL中的变量（先解析动态函数，再替换环境变量）
             url = self._replace_variables(request_url or '', variables)
             url = resolver.resolve(url)
-            
-            # 准备请求头
+            try:
+                url = validate_outbound_url(
+                    url,
+                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+                )
+            except UnsafeOutboundURL as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
             headers = {}
             if isinstance(request_headers, list):
                 for header_item in request_headers:
@@ -437,7 +479,8 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                     headers=headers,
                     params=params,
                     data=body_data,
-                    timeout=30
+                    timeout=30,
+                    allow_redirects=False,
                 )
             else:
                 # json 类型使用 json 参数，自动序列化
@@ -447,7 +490,8 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                     headers=headers,
                     params=params,
                     json=body_data,
-                    timeout=30
+                    timeout=30,
+                    allow_redirects=False,
                 )
             end_time = time.time()
             
@@ -467,14 +511,14 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                 request_data={
                     'url': url,
                     'method': request_method,
-                    'headers': headers,
-                    'params': params,
-                    'body': body_data
+                    'headers': redact_payload(headers),
+                    'params': redact_payload(params),
+                    'body': redact_payload(body_data)
                 },
                 response_data={
-                    'headers': dict(response.headers),
-                    'body': response.text,
-                    'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+                    'headers': redact_payload(dict(response.headers)),
+                    'body': redact_payload(response.text),
+                    'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
                 },
                 status_code=response.status_code,
                 response_time=response_time,
@@ -561,9 +605,11 @@ class EnvironmentViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return Environment.objects.all().order_by('-created_at')
         return Environment.objects.filter(
-            models.Q(scope='GLOBAL') | 
-            models.Q(
+            models.Q(scope='GLOBAL', created_by=user)
+            | models.Q(
                 scope='LOCAL',
                 project__in=ApiProject.objects.filter(
                     models.Q(owner=user) | models.Q(members=user)
@@ -584,7 +630,10 @@ class EnvironmentViewSet(viewsets.ModelViewSet):
             ).update(is_active=False)
         # 如果是全局环境，取消其他全局环境的激活状态
         elif environment.scope == 'GLOBAL':
-            Environment.objects.filter(scope='GLOBAL').update(is_active=False)
+            global_qs = Environment.objects.filter(scope='GLOBAL')
+            if not (request.user.is_staff or request.user.is_superuser):
+                global_qs = global_qs.filter(created_by=environment.created_by)
+            global_qs.update(is_active=False)
         
         environment.is_active = True
         environment.save()
@@ -592,8 +641,13 @@ class EnvironmentViewSet(viewsets.ModelViewSet):
         return Response({'message': '环境已激活'})
 
     def perform_create(self, serializer):
-        """创建环境时记录日志"""
-        instance = serializer.save()
+        """创建环境时校验项目归属并记录日志。"""
+        user = self.request.user
+        scope = serializer.validated_data.get('scope', 'LOCAL')
+        project = serializer.validated_data.get('project')
+        if scope == 'LOCAL' and (not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists())):
+            raise PermissionDenied('无权使用该项目')
+        instance = serializer.save(created_by=user)
         log_operation(
             operation_type='create',
             resource_type='environment',
@@ -603,7 +657,14 @@ class EnvironmentViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新环境时记录日志"""
+        """更新环境时校验项目归属并记录日志。"""
+        user = self.request.user
+        scope = serializer.validated_data.get('scope', serializer.instance.scope)
+        project = serializer.validated_data.get('project', serializer.instance.project)
+        if scope == 'LOCAL' and (not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists())):
+            raise PermissionDenied('无权使用该项目')
+        if scope == 'GLOBAL' and not (user.is_staff or user.is_superuser or serializer.instance.created_by_id == user.id):
+            raise PermissionDenied('无权修改全局环境')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -669,7 +730,7 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['project']
-    
+
     def get_queryset(self):
         user = self.request.user
         return TestSuite.objects.filter(
@@ -721,8 +782,13 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                     # 替换URL中的变量（先解析动态函数，再替换环境变量）
                     url = self._replace_variables(api_request.url, variables)
                     url = resolver.resolve(url)
-
-                    # 准备请求头
+                    try:
+                        url = validate_outbound_url(
+                            url,
+                            allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+                        )
+                    except UnsafeOutboundURL as exc:
+                        raise ValueError(str(exc)) from exc
                     headers = {}
                     # 支持新的数组格式和旧的对象格式
                     if isinstance(api_request.headers, list):
@@ -760,7 +826,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                         headers=headers,
                         params=params,
                         json=body_data,
-                        timeout=30
+                        timeout=30,
+                        allow_redirects=False,
                     )
                     end_time = time.time()
                     response_time = (end_time - start_time) * 1000
@@ -820,14 +887,14 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                         request_data={
                             'url': url,
                             'method': api_request.method,
-                            'headers': headers,
-                            'params': params,
-                            'body': body_data
+                            'headers': redact_payload(headers),
+                            'params': redact_payload(params),
+                            'body': redact_payload(body_data)
                         },
                         response_data={
-                            'headers': dict(response.headers),
-                            'body': response.text,
-                            'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+                            'headers': redact_payload(dict(response.headers)),
+                            'body': redact_payload(response.text),
+                            'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
                         },
                         status_code=response.status_code,
                         response_time=response_time,
@@ -871,8 +938,15 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def perform_create(self, serializer):
-        """创建测试套件时记录日志"""
-        instance = serializer.save()
+        """创建测试套件时记录日志并校验项目/环境归属。"""
+        project = serializer.validated_data.get('project')
+        user = self.request.user
+        if not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
+        environment = serializer.validated_data.get('environment')
+        if environment and environment.scope == 'LOCAL' and environment.project_id != project.id:
+            raise PermissionDenied('环境必须属于同一项目')
+        instance = serializer.save(created_by=user)
         log_operation(
             operation_type='create',
             resource_type='suite',
@@ -882,7 +956,14 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新测试套件时记录日志"""
+        """更新测试套件时记录日志并校验项目/环境归属。"""
+        project = serializer.validated_data.get('project', serializer.instance.project)
+        user = self.request.user
+        if not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
+            raise PermissionDenied('无权使用该项目')
+        environment = serializer.validated_data.get('environment', serializer.instance.environment)
+        if environment and environment.scope == 'LOCAL' and environment.project_id != project.id:
+            raise PermissionDenied('环境必须属于同一项目')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -911,7 +992,15 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         
         try:
             for request_id in request_ids:
-                api_request = ApiRequest.objects.get(id=request_id)
+                api_request = ApiRequest.objects.filter(
+                    id=request_id,
+                    collection__project=test_suite.project,
+                ).filter(
+                    models.Q(collection__project__owner=request.user)
+                    | models.Q(collection__project__members=request.user)
+                ).first()
+                if api_request is None:
+                    raise ValueError('请求不存在、跨项目或无权限')
                 TestSuiteRequest.objects.get_or_create(
                     test_suite=test_suite,
                     request=api_request,
@@ -1001,6 +1090,10 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
     def generate_allure_report(self, request, pk=None):
         """生成Allure报告数据"""
         execution = self.get_object()
+        escape_html = html.escape
+        suite_name_html = escape_html(str(execution.test_suite.name))
+        project_name_html = escape_html(str(execution.test_suite.project.name))
+        status_html = escape_html(str(execution.get_status_display()))
         
         try:
             # 创建报告目录
@@ -1351,8 +1444,8 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
         <div class="header-content">
             <div class="header-info">
                 <h1>接口测试报告</h1>
-                <p>测试套件: {execution.test_suite.name}</p>
-                <p>项目: {execution.test_suite.project.name}</p>
+                <p>测试套件: {suite_name_html}</p>
+                <p>项目: {project_name_html}</p>
             </div>
             <div class="header-actions">
                 <a href="index.html" target="_blank" class="allure-report-btn">查看完整Allure报告</a>
@@ -1399,12 +1492,12 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
                     index_content += f"""
             <div class="test-result-item {result_class}">
                 <div class="test-header">
-                    <span class="test-method {method_class}">{result.get('method', 'GET')}</span>
-                    <span class="test-name">{result.get('name', f'测试请求 {i+1}')}</span>
+                    <span class="test-method {escape_html(method_class)}">{escape_html(result.get('method', 'GET'))}</span>
+                    <span class="test-name">{escape_html(result.get('name', f'测试请求 {i+1}'))}</span>
                 </div>
-                <div class="test-url">{result.get('url', '')}</div>
+                <div class="test-url">{escape_html(result.get('url', ''))}</div>
                 <div><strong>状态:</strong> {'通过' if result.get('passed', False) else '失败'}</div>
-                {f'<div class="test-error"><strong>错误:</strong> {result.get("error", "")}</div>' if result.get('error') else ""}
+                {f'<div class="test-error"><strong>错误:</strong> {escape_html(result.get("error", ""))}</div>' if result.get('error') else ""}
             </div>
 """
             
@@ -1556,7 +1649,10 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [filters.SearchFilter]
-    search_fields = ['username', 'email', 'first_name', 'last_name']
+    def get_queryset(self):
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return self.queryset
+        return self.queryset.filter(pk=self.request.user.pk)
 
 
 class ScheduledTaskViewSet(viewsets.ModelViewSet):
@@ -2082,6 +2178,14 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
 
                 bot_type = bot.get('type', 'unknown')
                 webhook_url = bot['webhook_url']
+                try:
+                    webhook_url = validate_outbound_url(
+                        webhook_url,
+                        allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+                    )
+                except UnsafeOutboundURL:
+                    logger.warning('拒绝向不安全 Webhook 地址发送 API 通知')
+                    continue
                 logger.info(f"发送通知到 {bot_type} 机器人: {bot.get('name', 'Unknown')}")
 
                 # 根据机器人类型构造消息格式
@@ -2159,10 +2263,7 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
                         else:
                             webhook_url += f'?timestamp={timestamp}&sign={sign}'
 
-                        logger.info(f"钉钉机器人签名验证 - 时间戳: {timestamp}")
-                        logger.info(f"签名字符串: {string_to_sign}")
-                        logger.info(f"生成的签名: {sign}")
-                        logger.info(f"最终URL: {webhook_url}")
+                        logger.info("钉钉机器人签名验证完成 timestamp=%s host=%s", timestamp, urlparse(webhook_url).hostname)
                     else:
                         logger.info("钉钉机器人未配置签名密钥，使用无签名模式")
                 else:  # 通用格式
@@ -2194,19 +2295,19 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
                         webhook_bot_info={
                             'bot_type': bot_type,
                             'bot_name': bot.get('name', 'Unknown'),
-                            'webhook_url': webhook_url[:50] + '...' if len(webhook_url) > 50 else webhook_url
+                            'configured': True
                         },
-                        notification_content=json.dumps(message_data, ensure_ascii=False),
+                        notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                         status='success',
                         sent_at=timezone.now(),
                         response_info={
                             'status_code': response.status_code,
-                            'response_text': response.text[:500]
+                            'response_text': redact_payload(response.text[:500])
                         }
                     )
 
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Webhook通知发送失败 - {bot_type}: {str(e)}")
+                except requests.exceptions.RequestException:
+                    logger.error("Webhook通知发送失败 - %s", bot_type)
 
                     # 记录失败的通知日志
                     try:
@@ -2222,11 +2323,11 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
                             webhook_bot_info={
                                 'bot_type': bot_type,
                                 'bot_name': bot.get('name', 'Unknown'),
-                                'webhook_url': webhook_url[:50] + '...' if len(webhook_url) > 50 else webhook_url
+                                'configured': True
                             },
-                            notification_content=json.dumps(message_data, ensure_ascii=False),
+                            notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                             status='failed',
-                            error_message=str(e),
+                            error_message='Webhook notification failed',
                             sent_at=timezone.now()
                         )
                     except:
@@ -2234,8 +2335,8 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
 
             logger.info("=== 结束发送Webhook通知 ===")
 
-        except Exception as e:
-            logger.error(f"发送Webhook通知失败: {str(e)}", exc_info=True)
+        except Exception:
+            logger.error("发送Webhook通知失败")
 
 
 class TaskExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
@@ -2346,8 +2447,9 @@ class OperationLogViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         """只返回当前用户相关的操作日志"""
         user = self.request.user
-        # 可以根据需要调整权限逻辑，这里返回所有日志
-        return OperationLog.objects.all().order_by('-created_at')
+        if user.is_staff or user.is_superuser:
+            return OperationLog.objects.all().order_by('-created_at')
+        return OperationLog.objects.filter(user=user).order_by('-created_at')
 
 
 class ApiDashboardViewSet(viewsets.ViewSet):
@@ -2430,11 +2532,16 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
                 'max_tokens': 10
             }
 
+            api_url = validate_outbound_url(
+                config.base_url,
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+            )
             response = requests.post(
-                f"{config.base_url}/chat/completions",
+                f"{api_url.rstrip('/')}/chat/completions",
                 headers=headers,
                 json=test_data,
-                timeout=10
+                timeout=10,
+                allow_redirects=False,
             )
 
             if response.status_code == 200:
@@ -2442,15 +2549,17 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
             else:
                 return Response({
                     'error': f'连接测试失败: {response.status_code}',
-                    'details': response.text
                 }, status=status.HTTP_400_BAD_REQUEST)
 
+        except UnsafeOutboundURL:
+            return Response({'error': 'AI endpoint is not allowed'}, status=status.HTTP_400_BAD_REQUEST)
         except requests.exceptions.Timeout:
             return Response({'error': '连接超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'连接失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except requests.exceptions.RequestException:
+            return Response({'error': '连接失败'}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            logger.exception('AI connection test failed')
+            return Response({'error': '连接测试失败'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
     def complete_parameter_descriptions(self, request):
@@ -2460,14 +2569,18 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
             return Response({'error': '请提供请求ID'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            api_request = ApiRequest.objects.get(id=request_id)
+            accessible = ApiProject.objects.filter(models.Q(owner=request.user) | models.Q(members=request.user))
+            api_request = ApiRequest.objects.filter(id=request_id, collection__project__in=accessible).first()
+            if api_request is None:
+                return Response({'error': '请求不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
         except ApiRequest.DoesNotExist:
             return Response({'error': '请求不存在'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
             config = AIServiceConfig.objects.filter(
                 role='description',
-                is_active=True
+                is_active=True,
+                created_by=request.user,
             ).first()
 
             if not config:
@@ -2532,10 +2645,11 @@ URL参数:
             }
 
             response = requests.post(
-                f"{config.base_url}/chat/completions",
+                f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
                 headers=headers,
                 json=ai_data,
-                timeout=30
+                timeout=30,
+                allow_redirects=False,
             )
 
             if response.status_code == 200:
@@ -2549,15 +2663,16 @@ URL参数:
             else:
                 return Response({
                     'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
+                    'details': 'upstream AI service error'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
         except requests.exceptions.Timeout:
             return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except requests.exceptions.RequestException:
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            logger.exception('AI service operation failed')
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
     def generate_mock_data(self, request):
@@ -2604,10 +2719,11 @@ URL参数:
             }
 
             response = requests.post(
-                f"{config.base_url}/chat/completions",
+                f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
                 headers=headers,
                 json=ai_data,
-                timeout=30
+                timeout=30,
+                allow_redirects=False,
             )
 
             if response.status_code == 200:
@@ -2621,15 +2737,16 @@ URL参数:
             else:
                 return Response({
                     'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
+                    'details': 'upstream AI service error'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
         except requests.exceptions.Timeout:
             return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except requests.exceptions.RequestException:
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            logger.exception('AI service operation failed')
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
     def normalize_parameter_names(self, request):
@@ -2680,10 +2797,11 @@ URL参数:
             }
 
             response = requests.post(
-                f"{config.base_url}/chat/completions",
+                f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
                 headers=headers,
                 json=ai_data,
-                timeout=30
+                timeout=30,
+                allow_redirects=False,
             )
 
             if response.status_code == 200:
@@ -2697,15 +2815,16 @@ URL参数:
             else:
                 return Response({
                     'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
+                    'details': 'upstream AI service error'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
         except requests.exceptions.Timeout:
             return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except requests.exceptions.RequestException:
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            logger.exception('AI service operation failed')
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
     def extract_documentation(self, request):
@@ -2715,14 +2834,18 @@ URL参数:
             return Response({'error': '请提供请求ID'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            api_request = ApiRequest.objects.get(id=request_id)
+            accessible = ApiProject.objects.filter(models.Q(owner=request.user) | models.Q(members=request.user))
+            api_request = ApiRequest.objects.filter(id=request_id, collection__project__in=accessible).first()
+            if api_request is None:
+                return Response({'error': '请求不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
         except ApiRequest.DoesNotExist:
             return Response({'error': '请求不存在'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
             config = AIServiceConfig.objects.filter(
                 role='doc_extractor',
-                is_active=True
+                is_active=True,
+                created_by=request.user,
             ).first()
 
             if not config:
@@ -2767,10 +2890,11 @@ URL参数: {json.dumps(request_data['params'], ensure_ascii=False)}
             }
 
             response = requests.post(
-                f"{config.base_url}/chat/completions",
+                f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
                 headers=headers,
                 json=ai_data,
-                timeout=30
+                timeout=30,
+                allow_redirects=False,
             )
 
             if response.status_code == 200:
@@ -2780,12 +2904,13 @@ URL参数: {json.dumps(request_data['params'], ensure_ascii=False)}
             else:
                 return Response({
                     'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
+                    'details': 'upstream AI service error'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
         except requests.exceptions.Timeout:
             return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except requests.exceptions.RequestException:
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception:
+            logger.exception('AI service operation failed')
+            return Response({'error': 'AI服务调用失败'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

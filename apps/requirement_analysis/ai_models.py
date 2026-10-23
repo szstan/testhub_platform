@@ -3,6 +3,8 @@
 AI模型配置和服务
 """
 
+from django.conf import settings
+from apps.core.network import validate_outbound_url
 from django.db import models
 from django.contrib.auth import get_user_model
 import json
@@ -158,7 +160,10 @@ class AIModelService:
         }
         
         # 确保base_url不以/结尾
-        base_url = config.base_url.rstrip('/')
+        base_url = validate_outbound_url(
+            config.base_url.rstrip('/'),
+            allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+        )
         # 如果用户没有输入完整的v1/chat/completions路径，尝试智能补全
         if not base_url.endswith('/chat/completions'):
             if base_url.endswith('/v1'):
@@ -172,7 +177,7 @@ class AIModelService:
             
         try:
             # Increase timeout to 120s for long generation tasks
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
                 response = await client.post(
                     url,
                     headers=headers,
@@ -180,14 +185,13 @@ class AIModelService:
                 )
                 
                 if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
+                    logger.error(f"API调用返回错误: Status={response.status_code}")
                     
                 response.raise_for_status()
                 return response.json()
         except httpx.HTTPStatusError as e:
             provider_name = config.get_model_type_display()
-            error_msg = f"{provider_name} API返回错误 {e.response.status_code}: {e.response.text}"
+            error_msg = f"{provider_name} API返回错误 {e.response.status_code}"
             logger.error(error_msg)
             raise Exception(error_msg)
         except httpx.TimeoutException as e:

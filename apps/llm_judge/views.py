@@ -19,7 +19,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters as drf_filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser, SAFE_METHODS, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -39,16 +39,31 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 200
 
 
+class IsStaffOrReadOnly(BasePermission):
+    """Allow authenticated reads; restrict shared judge/KB mutations to staff."""
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return request.method in SAFE_METHODS or request.user.is_staff or request.user.is_superuser
+
+
 class RubricViewSet(viewsets.ModelViewSet):
     """评分标准 CRUD + 预设模板克隆。"""
     queryset = Rubric.objects.filter(is_active=True).prefetch_related('dimensions', 'rules')
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_fields = ['domain', 'is_default', 'is_active']
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'updated_at']
     ordering = ['-is_default', '-created_at']
+
+    def get_queryset(self):
+        qs = Rubric.objects.filter(is_active=True).prefetch_related('dimensions', 'rules')
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return qs
+        return qs.filter(is_default=True)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -76,13 +91,19 @@ class JudgeRecordViewSet(viewsets.ReadOnlyModelViewSet):
     """评分记录（只读 + 过滤 + 分页）。"""
     queryset = JudgeRecord.objects.select_related('rubric', 'batch').all()
     serializer_class = JudgeRecordSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_class = JudgeRecordFilter
     search_fields = ['question', 'answer', 'request_id']
     ordering_fields = ['created_at', 'final_score', 'latency_ms']
     ordering = ['-created_at']
+
+    def get_queryset(self):
+        qs = JudgeRecord.objects.select_related('rubric', 'batch').all()
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return qs
+        return qs.filter(Q(created_by=self.request.user) | Q(batch__created_by=self.request.user)).distinct()
 
 
 class JudgeBatchViewSet(viewsets.ModelViewSet):
@@ -92,6 +113,12 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = StandardPagination
     http_method_names = ['get', 'post', 'head', 'options']
+
+    def get_queryset(self):
+        qs = JudgeBatch.objects.select_related('rubric').all()
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return qs
+        return qs.filter(created_by=self.request.user)
 
     def create(self, request, *args, **kwargs):
         serializer = JudgeBatchRequestSerializer(data=request.data)
@@ -113,9 +140,15 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                 return Response({'error': f'第 {i+1} 条用例缺少 answer（答案）'},
                                 status=status.HTTP_400_BAD_REQUEST)
 
+        active_batches = self.get_queryset().filter(status__in=('pending', 'running', 'paused')).count()
+        if active_batches >= 2:
+            return Response({'error': '同时运行的批量评分任务已达到上限'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         rubric_id = data.get('rubric')
         if rubric_id:
             rubric = Rubric.objects.filter(pk=rubric_id, is_active=True).first()
+            if rubric is None:
+                return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
         else:
             rubric = Rubric.objects.filter(is_default=True, is_active=True).first()
 
@@ -137,6 +170,12 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
         from celery import current_app as _celery_app
 
         sync_fallback_msg = None
+        import uuid
+        planned_task_id = f'judge-{uuid.uuid4().hex}'
+        JudgeBatch.objects.filter(pk=batch.id, celery_task_id='').update(
+            celery_task_id=planned_task_id, status='running')
+        batch.celery_task_id = planned_task_id
+        batch.status = 'running'
 
         def _broker_reachable(timeout: float = 2.0) -> bool:
             '''用 kombu 自带连接探测，2s 内失败即视为 Celery/Broker 不可用，避免用户 HTTP 阻塞 50s。
@@ -166,7 +205,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                 close_old_connections()
                 logger.warning(f'[JudgeBatch#{batch_id}] 后台线程执行批量评分: {delay_err}')
                 orig_fn = score_batch_task.__wrapped__.__func__
-                class R: id = f'SYNC{batch_id}'
+                class R: id = planned_task_id
                 class FakeS:
                     request = R()
                     def update_state(self, **kw): pass
@@ -190,9 +229,9 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
             # apply_async(retry=False)：不做 producer 级重试；立即失败就走 fallback
             try:
                 async_result = score_batch_task.apply_async(
-                    (batch.id,), retry=False, ignore_result=False,
+                    (batch.id,), retry=False, ignore_result=False, task_id=planned_task_id,
                 )
-                batch.celery_task_id = async_result.id or ''
+                batch.celery_task_id = async_result.id or planned_task_id
                 batch.status = 'running'
                 batch.save(update_fields=['celery_task_id', 'status'])
             except Exception as delay_exc:
@@ -235,7 +274,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
         '''
         from django.db import transaction
         with transaction.atomic():
-            batch = JudgeBatch.objects.select_for_update().filter(pk=pk).first()
+            batch = self.get_queryset().select_for_update().filter(pk=pk).first()
             if not batch:
                 return Response({'error': 'batch not found'}, status=status.HTTP_404_NOT_FOUND)
             if batch.status in ('completed', 'failed'):
@@ -253,7 +292,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                 pk=batch.id,
                 status__in=('pending', 'running', 'partial'),
                 is_paused=False,
-            ).update(is_paused=True, status='paused')
+            ).update(is_paused=True, status='paused', celery_task_id='')
             if rows == 1:
                 batch.refresh_from_db()
         if rows == 1:
@@ -268,7 +307,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
         '''
         from django.db import transaction
         with transaction.atomic():
-            batch = JudgeBatch.objects.select_for_update().filter(pk=pk).first()
+            batch = self.get_queryset().select_for_update().filter(pk=pk).first()
             if not batch:
                 return Response({'error': 'batch not found'}, status=status.HTTP_404_NOT_FOUND)
             if batch.total == 0:
@@ -301,7 +340,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                         _close_old_conn()
                         logger.warning(f'[JudgeBatch#{batch_id}] resume: 后台线程续跑: {delay_err}')
                         orig_fn = score_batch_task.__wrapped__.__func__
-                        class R: id = f'SYNC{batch_id}'
+                        class R: id = planned_resume_task_id
                         class FakeS:
                             request = R()
                             def update_state(self, **kw): pass
@@ -334,10 +373,18 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                     except Exception:
                         return False
 
+                import uuid
+                planned_resume_task_id = f'judge-resume-{uuid.uuid4().hex}'
+                JudgeBatch.objects.filter(pk=batch.id).update(
+                    celery_task_id=planned_resume_task_id, status='running')
+                batch.celery_task_id = planned_resume_task_id
                 if _broker_reachable(timeout=2.0):
                     try:
-                        async_result = score_batch_task.apply_async((batch.id,), retry=False)
-                        JudgeBatch.objects.filter(pk=batch.id).update(celery_task_id=async_result.id or '')
+                        async_result = score_batch_task.apply_async(
+                            (batch.id,), retry=False, task_id=planned_resume_task_id,
+                        )
+                        JudgeBatch.objects.filter(pk=batch.id, celery_task_id=planned_resume_task_id).update(
+                            celery_task_id=async_result.id or planned_resume_task_id)
                     except Exception as delay_exc:
                         JudgeBatch.objects.filter(pk=batch.id).update(error_message=f'resume: 投递失败已切换后台: {delay_exc}')
                         _resume_fallback_thread(batch.id, delay_err=str(delay_exc))
@@ -355,6 +402,8 @@ class JudgeSingleView(APIView):
         serializer = JudgeSingleRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        if data.get('rubric') and not Rubric.objects.filter(pk=data['rubric'], is_active=True).exists():
+            return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
 
         from .service import JudgeService
         service = JudgeService()
@@ -375,12 +424,18 @@ class DashboardStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        days = int(request.query_params.get('days', 7))
+        try:
+            days = int(request.query_params.get('days', 7))
+        except (TypeError, ValueError):
+            return Response({'error': 'days 必须是整数'}, status=status.HTTP_400_BAD_REQUEST)
+        days = max(1, min(days, 365))
         rubric_id = request.query_params.get('rubric')
         now = timezone.now()
         start = now - timedelta(days=days)
 
         qs = JudgeRecord.objects.filter(created_at__gte=start)
+        if not (request.user.is_staff or request.user.is_superuser):
+            qs = qs.filter(Q(created_by=request.user) | Q(batch__created_by=request.user)).distinct()
         if rubric_id:
             qs = qs.filter(rubric_id=rubric_id)
 
@@ -427,7 +482,7 @@ class DashboardStatsView(APIView):
 
 class JudgeServiceConfigView(APIView):
     """评分服务配置：连通性测试。"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
 
     def get(self, request):
         return Response({
@@ -436,7 +491,6 @@ class JudgeServiceConfigView(APIView):
             'n_runs': getattr(settings, 'JUDGE_N_RUNS', 3),
             'rule_llm_fallback': getattr(settings, 'JUDGE_RULE_LLM_FALLBACK', False),
             'cache_timeout': getattr(settings, 'JUDGE_CACHE_TIMEOUT', 3600),
-            'openai_base_url': getattr(settings, 'OPENAI_BASE_URL', None),
             'has_api_key': bool(getattr(settings, 'OPENAI_API_KEY', '')),
         })
 
@@ -473,7 +527,7 @@ from .file_parser import detect_and_parse, build_template_bytes
 class KnowledgeBaseViewSet(viewsets.ModelViewSet):
     """知识库 CRUD。"""
     serializer_class = KnowledgeBaseSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_fields = ['domain', 'is_default', 'is_active']
@@ -583,45 +637,45 @@ class KnowledgeBaseViewSet(viewsets.ModelViewSet):
 
 class KBCompanyViewSet(viewsets.ModelViewSet):
     serializer_class = KBCompanySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter]
     filterset_fields = ['kb']
     search_fields = ['name']
 
     def get_queryset(self):
-        return KBCompany.objects.annotate(
+        return KBCompany.objects.filter(kb__is_active=True).annotate(
             metric_count=Count('metric_values', distinct=True)
         ).all()
 
 
 class KBReportPeriodViewSet(viewsets.ModelViewSet):
     serializer_class = KBReportPeriodSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter]
     filterset_fields = ['kb']
     search_fields = ['name']
-    queryset = KBReportPeriod.objects.all()
+    queryset = KBReportPeriod.objects.filter(kb__is_active=True).all()
 
 
 class KBMetricViewSet(viewsets.ModelViewSet):
     serializer_class = KBMetricSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter]
     filterset_fields = ['kb']
     search_fields = ['name']
-    queryset = KBMetric.objects.all()
+    queryset = KBMetric.objects.filter(kb__is_active=True).all()
 
 
 class KBMetricValueViewSet(viewsets.ModelViewSet):
     serializer_class = KBMetricValueSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsStaffOrReadOnly]
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['company', 'period', 'metric', 'company__kb']
-    queryset = KBMetricValue.objects.select_related('company', 'period', 'metric').all()
+    queryset = KBMetricValue.objects.select_related('company', 'period', 'metric').filter(company__kb__is_active=True).all()
 
     def perform_create(self, serializer):
         user = self.request.user if not isinstance(self.request.user, AnonymousUser) else None

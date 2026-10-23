@@ -1445,7 +1445,6 @@ class BaseBrowserAgent:
             '--disable-renderer-backgrounding',
             '--disable-backgrounding-occluded-windows',
             '--disable-extensions',
-            '--disable-web-security',  # 允许跨域请求
         ]
 
         # 根据操作系统添加特定参数
@@ -1458,8 +1457,6 @@ class BaseBrowserAgent:
                 '--disable-gpu',  # 禁用 GPU 加速（服务器通常无 GPU）
                 '--headless=new',  # Linux 服务器使用无头模式
                 '--disable-software-rasterizer',  # 禁用软件光栅化器
-                '--remote-debugging-port=9222',  # 使用固定端口，避免随机端口导致连接失败
-                '--remote-debugging-address=0.0.0.0', # 允许远程连接，而不仅仅是 127.0.0.1
                 '--no-zygote',  # 减少进程数
                 '--single-process',  # 单进程模式，虽然不稳定但能解决某些 Docker 环境下的 PID 问题
             ])
@@ -1468,8 +1465,11 @@ class BaseBrowserAgent:
             extra_args.extend([
                 '--no-sandbox',  # 兼容性
                 '--disable-gpu',
-                '--remote-debugging-port=9222',
             ])
+
+        cdp_port = os.environ.get('BROWSER_CDP_PORT', '').strip()
+        if cdp_port.isdigit() and 1024 <= int(cdp_port) <= 65535:
+            extra_args.append(f'--remote-debugging-port={cdp_port}')
 
         return BrowserProfile(
             headless=(system == 'Linux'),  # Linux 使用无头模式，其他系统使用显示模式

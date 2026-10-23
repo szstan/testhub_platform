@@ -180,6 +180,9 @@ class AppNotificationLogViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['created_at', 'sent_at']
     ordering = ['-created_at']
 
+    def get_queryset(self):
+        return scope_project(AppNotificationLog.objects.select_related('task'), self.request.user, 'task__project').order_by('-created_at')
+
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
         log = self.get_object()

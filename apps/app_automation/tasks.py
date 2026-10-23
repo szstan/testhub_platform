@@ -59,6 +59,9 @@ def _send_app_webhook_notification(task, detail_content, status_text):
     """发送 Webhook 通知"""
     import requests
     import json
+    from django.conf import settings
+    from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+    from apps.quality_intelligence.services.redaction import redact_payload
     from .models import AppNotificationLog
 
     try:
@@ -83,6 +86,15 @@ def _send_app_webhook_notification(task, detail_content, status_text):
     for bot in all_bots:
         webhook_url = bot.get('webhook_url')
         if not webhook_url:
+            continue
+
+        try:
+            webhook_url = validate_outbound_url(
+                webhook_url,
+                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+            )
+        except UnsafeOutboundURL:
+            logger.warning('拒绝向不安全 Webhook 地址发送 APP 通知')
             continue
 
         bot_type = bot.get('type', 'unknown')
@@ -110,24 +122,24 @@ def _send_app_webhook_notification(task, detail_content, status_text):
                 task=task, task_name=task.name, task_type=task.task_type,
                 notification_type='task_execution', sender_name='系统Webhook通知',
                 sender_email='system@notification.com',
-                recipient_info=[{'name': bot.get('name', 'Unknown'), 'webhook_url': webhook_url}],
-                webhook_bot_info=bot,
-                notification_content=json.dumps(message_data, ensure_ascii=False),
+                recipient_info=[{'name': bot.get('name', 'Unknown')}],
+                webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                 status=log_status,
-                error_message='' if log_status == 'success' else f'HTTP {resp.status_code}: {resp.text}',
-                response_info={'status_code': resp.status_code, 'response': resp.text[:500]},
+                error_message='' if log_status == 'success' else f'HTTP {resp.status_code}',
+                response_info=redact_payload({'status_code': resp.status_code, 'response': resp.text[:500]}),
                 sent_at=timezone.now()
             )
-        except Exception as e:
-            logger.error(f"发送Webhook失败: {e}")
+        except Exception:
+            logger.error('发送Webhook失败')
             AppNotificationLog.objects.create(
                 task=task, task_name=task.name, task_type=task.task_type,
                 notification_type='task_execution', sender_name='系统Webhook通知',
                 sender_email='system@notification.com',
                 recipient_info=[{'name': bot.get('name', 'Unknown')}],
-                webhook_bot_info=bot,
-                notification_content=json.dumps(message_data, ensure_ascii=False),
-                status='failed', error_message=str(e)
+                webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
+                status='failed', error_message='Webhook notification failed'
             )
 
 

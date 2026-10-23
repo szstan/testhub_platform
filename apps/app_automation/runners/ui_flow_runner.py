@@ -10,6 +10,7 @@ import re
 import copy
 from typing import Any, Dict, List, Optional
 from django.conf import settings
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 from airtest.core.api import (
     Template,
@@ -1148,6 +1149,10 @@ class UiFlowRunner:
         
         if not url:
             raise ValueError("api_request 缺少 url 参数")
+        try:
+            url = validate_outbound_url(url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+        except UnsafeOutboundURL as exc:
+            raise ValueError(str(exc)) from exc
         
         # 渲染 headers/params 中的变量
         if isinstance(headers, dict):
@@ -1167,7 +1172,8 @@ class UiFlowRunner:
                 params=params,
                 json=json_data if json_data else None,
                 data=data if data else None,
-                timeout=timeout
+                timeout=timeout,
+                allow_redirects=False,
             )
         except Exception as e:
             logger.error(f"HTTP请求失败: {str(e)}")

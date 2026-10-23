@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from django.conf import settings
 from jsonpath_ng import parse as jsonpath_parse
 from jsonpath_ng.exceptions import JsonPathParserError
@@ -359,6 +360,14 @@ def _login(login_cfg, target_method=None, target_host=None, target_port=None, ta
     if not login_url:
         return ProbeResult(False, "登录配置缺少 URL：请在基础信息中填写 URL/主机/端口，或在探测配置中填写 endpoint")
 
+    try:
+        login_url = validate_outbound_url(
+            login_url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return ProbeResult(False, '登录目标地址不允许访问')
+
     # ---------- 凭证 ----------
     username_field = login_cfg.get("username_field", "username")
     username = login_cfg.get(username_field) or login_cfg.get("username")
@@ -487,6 +496,14 @@ def probe_http(target, cfg):
     if not url:
         return ProbeResult(False, "缺少请求 url")
 
+    try:
+        url = validate_outbound_url(
+            url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return ProbeResult(False, 'HTTP 探测目标地址不允许访问')
+
     headers = dict(cfg.get("headers") or {})
     if token:
         if cfg.get("token_header") == "X-Token":
@@ -578,6 +595,14 @@ def probe_online(target, cfg):
         return ProbeResult(False, "缺少 statistics.endpoint")
     url = urljoin(base_url, endpoint)
 
+    try:
+        url = validate_outbound_url(
+            url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return ProbeResult(False, '在线率探测目标地址不允许访问')
+
     labelname = cfg.get("labelname")
     method = (stat_cfg.get("method") or "POST").upper()
     token_header = cfg.get("token_header", "X-Token")
@@ -628,6 +653,14 @@ def probe_docker(target, cfg):
     timeout = int(cfg.get("timeout", 10))
     scheme = "https" if tls else "http"
     url = f"{scheme}://{host}:{port}/containers/json?all=1"
+
+    try:
+        url = validate_outbound_url(
+            url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return ProbeResult(False, 'Docker 目标地址不允许访问')
 
     t0 = time.monotonic()
     try:

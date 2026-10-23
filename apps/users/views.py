@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from django.conf import settings
 from django.contrib.auth import logout
 from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from .models import User
 from .serializers import (
@@ -86,8 +87,17 @@ class RegisterView(generics.CreateAPIView):
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
 def login_view(request):
+    username = str(request.data.get('username') or '')[:150]
+    ip = request.META.get('REMOTE_ADDR', 'unknown')
+    throttle_key = f'auth:login-fail:{ip}:{username.lower()}'
+    attempts = cache.get(throttle_key, 0)
+    if attempts >= 10:
+        return Response({'error': '登录尝试过于频繁，请稍后再试'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
     serializer = LoginSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
+    if not serializer.is_valid():
+        cache.set(throttle_key, attempts + 1, timeout=300)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    cache.delete(throttle_key)
     user = serializer.validated_data['user']
 
     # JWT authentication is the sole browser API session; do not create a Django session cookie.
@@ -141,7 +151,9 @@ class UserListView(generics.ListCreateAPIView):
         return UserCreateSerializer if self.request.method == 'POST' else UserDirectorySerializer
 
     def get_queryset(self):
-        return self.queryset.filter(is_active=True)
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return self.queryset.filter(is_active=True)
+        return self.queryset.filter(pk=self.request.user.pk, is_active=True)
 
 
 class UserDetailView(generics.RetrieveUpdateDestroyAPIView):

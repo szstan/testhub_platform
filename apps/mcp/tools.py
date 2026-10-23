@@ -130,7 +130,9 @@ def _run_tool(ctx: Context, tool_name: str, arguments: dict, fn):
         result = fn(user)
         _log_call(user, tool_name, arguments, started, client_name=client_name)
         return result
-    except ToolError:
+    except ToolError as e:
+        _log_call(user, tool_name, arguments, started, error=str(e),
+                  status='denied', client_name=client_name)
         raise
     except ConfirmError as e:
         _log_call(user, tool_name, arguments, started, error=str(e),
@@ -144,7 +146,7 @@ def _run_tool(ctx: Context, tool_name: str, arguments: dict, fn):
         logger.exception('MCP 工具 %s 执行异常', tool_name)
         _log_call(user, tool_name, arguments, started, error=str(e),
                   status='error', client_name=client_name)
-        raise ToolError(f'{tool_name} 执行失败: {e}') from e
+        raise ToolError(f'{tool_name} 执行失败，请查看审计日志') from e
     finally:
         if not connection.in_atomic_block:
             close_old_connections()

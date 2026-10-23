@@ -30,7 +30,7 @@ class RuleReport(BaseModel):
 
 class DimensionScore(BaseModel):
     id: str
-    score: Optional[float] = None
+    score: Optional[float] = Field(default=None, ge=1, le=5)
     passed: Optional[bool] = None
     reasoning: str = ""
 

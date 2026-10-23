@@ -8,8 +8,10 @@ from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db import transaction
 import logging
+import re
 
 from ..models import AppTestSuite, AppTestSuiteCase, AppTestCase, AppDevice, AppTestExecution
+from ..device_pool import DeviceLeaseError, validate_device_lease
 from ..access import scope_project, scope_test_cases
 from .test_case_views import AppPagination
 from ..serializers import (
@@ -168,11 +170,16 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
         """执行测试套件（顺序执行所有用例）"""
         suite = self.get_object()
         device_id = request.data.get('device_id')
-        package_name = request.data.get('package_name')
+        package_name = request.data.get('package_name') or ''
+        lease_token = request.data.get('lease_token') or ''
 
         if not device_id:
             return Response({'success': False, 'message': '请选择执行设备'},
                             status=status.HTTP_400_BAD_REQUEST)
+        if package_name and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', str(package_name)):
+            return Response({'success': False, 'message': '非法 Android package name'}, status=status.HTTP_400_BAD_REQUEST)
+        if not lease_token:
+            return Response({'success': False, 'message': '执行设备必须先取得有效 lease'}, status=status.HTTP_403_FORBIDDEN)
 
         suite_cases = suite.suite_cases.select_related('test_case').all()
         if not suite_cases.exists():
@@ -182,9 +189,10 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 device = AppDevice.objects.select_for_update().get(device_id=device_id)
-                if device.status == 'locked' and device.locked_by_id != request.user.id:
-                    return Response({'success': False, 'message': '设备已被其他用户锁定'},
-                                    status=status.HTTP_400_BAD_REQUEST)
+                try:
+                    validate_device_lease(device.id, request.user, lease_token)
+                except DeviceLeaseError as exc:
+                    return Response({'success': False, 'message': str(exc)}, status=status.HTTP_403_FORBIDDEN)
 
                 executions = [
                     AppTestExecution.objects.create(
