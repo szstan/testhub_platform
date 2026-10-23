@@ -72,6 +72,11 @@ const routes = [
                 component: () => import('@/views/testcases/TestCaseList.vue')
             },
             {
+                path: 'testcases/sync',
+                name: 'TestCaseSync',
+                component: () => import('@/views/testcases/TestCaseSync.vue')
+            },
+            {
                 path: 'testcases/import-records',
                 name: 'TestCaseImportRecords',
                 component: () => import('@/views/testcases/TestCaseImportRecordList.vue')
