@@ -162,6 +162,10 @@ class TestCaseImportRecordDetailSerializer(TestCaseImportRecordListSerializer):
             'failure_details', 'failure_report_file', 'failure_report_url'
         ]
 
+    def get_failure_report_url(self, obj):
+        if obj.failure_report_file:
+            return obj.failure_report_file.url
+        return None
 
 
 class TestCaseSyncProfileSerializer(serializers.ModelSerializer):
