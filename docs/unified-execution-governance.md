@@ -21,6 +21,7 @@ AI suggestion 的输入、输出、prompt version、model、token/cost、target 
 - `apps/executions/migrations/0008_executionattempt_is_final_and_more.py`
 - `apps/executions/migrations/0009_executionaisuggestionaudit_executionretryrequest_and_more.py`
 - `apps/executions/migrations/0010_executionjob_dataset_executionjob_dataset_snapshot_and_more.py`
+- `apps/testcases/migrations/0003_testcase_external_ref_and_more.py`
 - `apps/executions/migrations/0011_alter_executionjob_source_type_and_more.py`
 - `apps/executions/migrations/0012_alter_executionqualitygateevaluation_stage.py`
 - `apps/quality_intelligence/migrations/0002_qualityquarantine_approval_note_and_more.py`
@@ -31,13 +32,13 @@ AI suggestion 的输入、输出、prompt version、model、token/cost、target 
 
 ```bash
 python manage.py check
-python manage.py makemigrations executions quality_intelligence --check --dry-run
+python manage.py makemigrations executions testcases quality_intelligence --check --dry-run
 python manage.py migrate --plan
 python manage.py migrate
 python scripts/ci_schema_check.py
 ```
 
-本地默认 MySQL 连接如果返回 `Access denied for user 'root'@'localhost'`，只表示目标数据库的已应用迁移历史没有在本机凭证下核对。当前工作区已确认 executions、quality_intelligence 和 perf_testing 没有待生成迁移；`perf_testing` 的 `verify_ssl` 默认值已由 0011 迁移与模型对齐。部署前仍应使用目标数据库凭证复跑迁移计划和 applied history 检查。
+当前 P0 迁移包含 testcases 0003、executions 0011/0012；目标 staging 已应用这些迁移并通过 `migrate --plan`。本地默认 MySQL 连接如果返回 `Access denied for user 'root'@'localhost'`，只表示目标数据库的已应用迁移历史没有在本机凭证下核对。
 
 ## 重试、终态和质量门禁
 
@@ -110,4 +111,4 @@ Failure Review、quarantine transition、AI suggestion review 都使用 append-o
 4. staging APP authenticated smoke 仍需要 approved application session、fixture IDs 和 disposable fixture authorization。缺少这些输入时保持 staging 写操作关闭。
 5. TLS/WSS 仍需要 approved domain/DNS、证书链、私钥交付、443/firewall 变更和独立审批；当前实现不执行 TLS/WSS rollout，也不把 HTTP/WS staging 改写成 HTTPS/WSS。
 
-本地证据：全量 pytest `478 passed, 3 skipped`；`python -m compileall -q backend apps scripts` 通过；Django check 通过；OpenAPI warning baseline 通过；frontend lint/build 通过。
+本地证据：全量 pytest `542 passed, 3 skipped`；`python -m compileall -q backend apps scripts` 通过；Django check 通过；OpenAPI contract check 通过；frontend lint/build 通过。
