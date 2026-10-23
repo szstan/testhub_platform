@@ -168,7 +168,7 @@ sha256sum "/var/tmp/testhub-platform-${RELEASE}.tar.gz"
 
 ```bash
 cd /opt/testhub_platform
-./scripts/validate_staging_release.sh
+bash scripts/validate_staging_release.sh
 ```
 
 该检查会验证 `frontend/dist/index.html`、Django system check、迁移计划、SELinux 上下文、Nginx 用户可读性、后端 health/readiness、前端 health/index 和 API docs。SELinux enforcing 时如果没有 `restorecon`，检查会失败。发布同步应排除 `.env`、`media/`、`static_files/`、虚拟环境、依赖 wheelhouse、日志、备份和 `frontend/node_modules/`，并保留独立 rollback 目录。
@@ -304,7 +304,7 @@ npm run build
 
 ```bash
 cd /opt/testhub_platform
-./scripts/validate_staging_release.sh
+bash scripts/validate_staging_release.sh
 ```
 
 APP authenticated smoke 和 TLS/WSS 必须分别按照 `docs/staging-release-gates.md` 的授权边界执行。
