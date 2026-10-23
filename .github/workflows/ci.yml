@@ -32,6 +32,7 @@ jobs:
       - name: Run backend performance checks
         env:
           APP_ENV: development
+          DJANGO_SETTINGS_MODULE: backend.test_settings
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
