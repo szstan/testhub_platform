@@ -99,6 +99,28 @@ POST /api/executions/jobs/<job_id>/release-gate/
 
 前端入口位于统一任务中心的“CI 质量闭环”页面，支持导入结果、运行对比和门禁评估。
 
+CI pipeline 可以使用仓库内的 `scripts/testhub_ci.py`，其 exit code 可直接作为发布步骤结果：
+
+```bash
+export TESTHUB_TOKEN="..."
+python scripts/testhub_ci.py import-results \
+  --base-url "https://testhub.example.com" \
+  --project-id 7 \
+  --format junit \
+  --external-run-id "${GITHUB_RUN_ID}" \
+  --build-reference "${GITHUB_SHA}" \
+  --file test-results.xml
+
+python scripts/testhub_ci.py release-gate \
+  --base-url "https://testhub.example.com" \
+  --job-id "${TESTHUB_JOB_ID}" \
+  --baseline-job-id "${TESTHUB_BASELINE_JOB_ID:-}" \
+  --max-failed 0 \
+  --max-unmatched 0
+```
+
+`trigger` 可以幂等创建 CI job，`wait` 可以轮询 job 的终态和质量门禁；CLI 不会打印 token 或原始测试结果。
+
 quarantine 包含 owner、expiry、approval status 和 approval note。需要审批的 quarantine 必须由独立的 privileged reviewer 批准，owner 不能自审；release 可以由 owner 或 privileged reviewer 执行。统一 dispatch 和 adapter 两个边界都会检查有效 quarantine，override 必须由 privileged actor 提供原因，并写入 project-scoped audit。
 
 Failure Review、quarantine transition、AI suggestion review 都使用 append-only audit rows。强制重建 QI 派生 failure 时使用稳定 source/item/signature key；review audit 通过 durable source key 保留，不依赖被重建的 failure row。

@@ -1,5 +1,7 @@
 from rest_framework import serializers
-from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord
+from django.db.models import Q
+from apps.projects.models import Project
+from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from apps.users.serializers import UserSerializer
 from apps.versions.serializers import VersionSimpleSerializer
 
@@ -160,7 +162,27 @@ class TestCaseImportRecordDetailSerializer(TestCaseImportRecordListSerializer):
             'failure_details', 'failure_report_file', 'failure_report_url'
         ]
 
-    def get_failure_report_url(self, obj):
-        if obj.failure_report_file:
-            return obj.failure_report_file.url
-        return None
+
+
+class TestCaseSyncProfileSerializer(serializers.ModelSerializer):
+    created_by = UserSerializer(read_only=True)
+    secret_configured = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TestCaseSyncProfile
+        fields = '__all__'
+        read_only_fields = ('id', 'created_by', 'last_commit_sha', 'last_sync_at', 'created_at', 'updated_at', 'secret_configured')
+        extra_kwargs = {'token_env_ref': {'write_only': True}}
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated or not Project.objects.filter(
+            pk=value.pk,
+        ).filter(Q(owner=user) | Q(members=user)).exists():
+            raise serializers.ValidationError('项目不存在或无权限')
+        return value
+
+    def get_secret_configured(self, obj):
+        import os
+        return bool(obj.token_env_ref and os.environ.get(obj.token_env_ref))

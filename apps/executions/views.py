@@ -74,6 +74,7 @@ from .state_machine import InvalidExecutionTransition
 from .adapters import AdapterConflict, get_executor_adapter
 from .result_events import ResultEventError, ResultEventIngestor
 from .run_comparison import compare_jobs, evaluate_release_gate
+from .failure_intelligence import analyze_job_failures
 from .ci import WebhookVerificationError, process_webhook, verify_webhook_request
 from .result_import import ResultImportError, import_results
 from .policies import (
@@ -581,6 +582,31 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+    @action(detail=True, methods=['get'], url_path='failure-analysis')
+    def failure_analysis(self, request, pk=None):
+        return Response(analyze_job_failures(self.get_object()))
+
+    @action(detail=True, methods=['get'], url_path='ci-status')
+    def ci_status(self, request, pk=None):
+        job = self.get_object()
+        status_value = job.final_status or job.status
+        gate = job.quality_gate_result or {}
+        terminal = status_value in {
+            'cancelled', 'passed', 'succeeded', 'completed', 'failed', 'blocked', 'unsupported',
+        }
+        exit_code = None
+        if terminal:
+            exit_code = 0 if status_value in {'passed', 'succeeded', 'completed'} and gate.get('passed', True) else 1
+        return Response({
+            'job_id': job.pk,
+            'status': status_value,
+            'terminal': terminal,
+            'exit_code': exit_code,
+            'quality_gate': gate,
+            'final_result': job.final_result or {},
+            'error_message': job.error_message or '',
+        })
+
     @action(detail=True, methods=['post'], url_path='compare')
     def compare(self, request, pk=None):
         job = self.get_object()

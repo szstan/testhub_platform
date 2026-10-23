@@ -8,15 +8,16 @@ from django.db import models
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.views import APIView
 
-from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord
+from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from .serializers import (
     TestCaseSerializer, TestCaseListSerializer, TestCaseCreateSerializer, TestCaseUpdateSerializer,
-    TestCaseImportRecordListSerializer, TestCaseImportRecordDetailSerializer
+    TestCaseImportRecordListSerializer, TestCaseImportRecordDetailSerializer, TestCaseSyncProfileSerializer
 )
 from apps.projects.models import Project
 from .services import TestCaseImportTemplateService, TestCaseExcelImportService
 from .tasks import import_testcases_from_excel
 from apps.executions.models import TestCaseRevision
+from .sync import TestCaseSyncError, sync_profile
 
 class TestCasePagination(pagination.PageNumberPagination):
     page_size = 10
@@ -44,6 +45,62 @@ def get_user_accessible_projects(user):
     return Project.objects.filter(
         models.Q(owner=user) | models.Q(members=user)
     ).distinct()
+
+class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TestCaseSyncProfileSerializer
+
+    def get_queryset(self):
+        return TestCaseSyncProfile.objects.filter(
+            project__in=get_user_accessible_projects(self.request.user)
+        ).select_related('project', 'created_by')
+
+    def perform_create(self, serializer):
+        project = serializer.validated_data.get('project')
+        if not get_user_accessible_projects(self.request.user).filter(pk=project.pk).exists():
+            raise ValidationError({'project': '项目不存在或无权限'})
+        serializer.save(created_by=self.request.user)
+
+
+class TestCaseSyncProfileDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TestCaseSyncProfileSerializer
+
+    def get_queryset(self):
+        return TestCaseSyncProfile.objects.filter(
+            project__in=get_user_accessible_projects(self.request.user)
+        ).select_related('project', 'created_by')
+
+    def perform_update(self, serializer):
+        serializer.save(project=serializer.instance.project)
+
+
+class TestCaseSyncProfileSyncView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        profile = TestCaseSyncProfile.objects.filter(
+            pk=pk,
+            project__in=get_user_accessible_projects(request.user),
+        ).first()
+        if profile is None:
+            return Response({'error': '同步配置不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            summary = sync_profile(profile)
+        except TestCaseSyncError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'profile_id': summary.profile_id,
+            'provider': summary.provider,
+            'commit': summary.commit,
+            'files': summary.files,
+            'created': summary.created,
+            'updated': summary.updated,
+            'skipped': summary.skipped,
+            'conflicts': summary.conflicts,
+            'warnings': summary.warnings,
+        })
+
 
 class TestCaseListCreateView(generics.ListCreateAPIView):
     queryset = TestCase.objects.all()

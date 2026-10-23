@@ -97,3 +97,7 @@ def test_result_import_api_requires_project_and_file(execution_fixture):
     assert response.status_code == 201, response.data
     assert response.data['total'] == 1
     assert response.data['created'] is True
+    status_response = client.get(f"/api/executions/jobs/{response.data['job_id']}/ci-status/")
+    assert status_response.status_code == 200
+    assert status_response.data['terminal'] is True
+    assert status_response.data['exit_code'] == 0
