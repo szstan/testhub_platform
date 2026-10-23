@@ -152,9 +152,32 @@ python manage.py collectstatic --noinput
 
 ---
 
-## 5) systemd 服务
+## 5) 发布制品与 staging 发布后检查
 
-### 5.1 ASGI 服务（Daphne）
+源码发布包必须由仓库脚本生成，脚本会拒绝缺少前端生产构建产物的工作树：
+
+```bash
+cd /opt/testhub_platform
+python scripts/build_release_archive.py \
+  --output "/var/tmp/testhub-platform-${RELEASE}.tar.gz" \
+  --release "${RELEASE}"
+sha256sum "/var/tmp/testhub-platform-${RELEASE}.tar.gz"
+```
+
+发布候选切换完成后，在目标机执行：
+
+```bash
+cd /opt/testhub_platform
+./scripts/validate_staging_release.sh
+```
+
+该检查会验证 `frontend/dist/index.html`、Django system check、迁移计划、SELinux 上下文、Nginx 用户可读性、后端 health/readiness、前端 health/index 和 API docs。SELinux enforcing 时如果没有 `restorecon`，检查会失败。发布同步应排除 `.env`、`media/`、`static_files/`、虚拟环境、依赖 wheelhouse、日志、备份和 `frontend/node_modules/`，并保留独立 rollback 目录。
+
+---
+
+## 6) systemd 服务
+
+### 6.1 ASGI 服务（Daphne）
 `/etc/systemd/system/testhub-asgi.service`
 
 ```ini
@@ -175,7 +198,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### 5.2 Celery Worker 服务
+### 6.2 Celery Worker 服务
 `/etc/systemd/system/testhub-celery.service`
 
 ```ini
@@ -196,14 +219,14 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### 5.3 启动服务
+### 6.3 启动服务
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable testhub-asgi testhub-celery
 sudo systemctl start testhub-asgi testhub-celery
 ```
 
-### 5.4 状态与日志
+### 6.4 状态与日志
 ```bash
 sudo systemctl status testhub-asgi
 sudo systemctl status testhub-celery
@@ -214,7 +237,7 @@ journalctl -u testhub-celery -f
 
 ---
 
-## 6) Nginx 配置（含 WebSocket）
+## 7) Nginx 配置（含 WebSocket）
 
 `/etc/nginx/conf.d/testhub.conf`
 
@@ -265,7 +288,7 @@ sudo systemctl restart nginx
 
 ---
 
-## 7) 前端构建（独立部署）
+## 8) 前端构建（独立部署）
 
 ```bash
 cd /opt/testhub_platform/frontend
@@ -275,14 +298,20 @@ npm run build
 
 ---
 
-## 8) 验证
+## 9) 验证
 
-- API：`http://172.13.6.230/api/`
-- WebSocket：`ws://172.13.6.230/ws/app-automation/executions/<id>/`
+推荐直接执行仓库内检查脚本：
+
+```bash
+cd /opt/testhub_platform
+./scripts/validate_staging_release.sh
+```
+
+APP authenticated smoke 和 TLS/WSS 必须分别按照 `docs/staging-release-gates.md` 的授权边界执行。
 
 ---
 
-## 9) 一键部署脚本（可选）
+## 10) 一键部署脚本（可选）
 
 > 脚本会写入 `.env`、systemd 与 Nginx 配置，请先确认变量值（如 DB/Redis 密码）。
 
