@@ -1379,6 +1379,39 @@ class ExecutionQualityGateEvaluation(models.Model):
         ]
 
 
+class ExecutionFailureReview(models.Model):
+    """Human classification feedback for one unified execution failure cluster."""
+
+    CATEGORY_CHOICES = (
+        ('PRODUCT', 'Product'),
+        ('TEST', 'Test'),
+        ('ENVIRONMENT', 'Environment'),
+        ('INFRASTRUCTURE', 'Infrastructure'),
+        ('DATA', 'Data'),
+        ('PERFORMANCE', 'Performance'),
+        ('TIMEOUT', 'Timeout'),
+        ('UNKNOWN', 'Unknown'),
+    )
+
+    job = models.ForeignKey(ExecutionJob, on_delete=models.CASCADE, related_name='failure_reviews')
+    case_key = models.CharField(max_length=255)
+    signature = models.CharField(max_length=128)
+    category = models.CharField(max_length=32, choices=CATEGORY_CHOICES)
+    note = models.TextField(blank=True, default='')
+    reviewed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='execution_failure_reviews')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    history = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'execution_failure_reviews'
+        constraints = [
+            models.UniqueConstraint(fields=('job', 'case_key', 'signature'), name='execution_failure_review_key_uniq'),
+        ]
+        indexes = [models.Index(fields=('job', 'category'), name='exec_failure_job_cat_idx')]
+
+
 class ExecutionAISuggestion(models.Model):
     """Redacted, deterministic AI suggestion record requiring human review."""
 

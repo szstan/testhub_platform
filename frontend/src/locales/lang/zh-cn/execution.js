@@ -200,6 +200,23 @@ export default {
     gateAction: '执行发布门禁'
   },
 
+  failureReview: {
+    nav: '失败分析',
+    title: '失败分析与反馈',
+    subtitle: '按规则聚类失败并记录人工分类',
+    jobId: 'Job ID',
+    category: '分类',
+    subtype: '子类型',
+    count: '数量',
+    signature: '签名',
+    message: '示例错误',
+    actions: '操作',
+    review: '人工复核',
+    empty: '暂无失败聚类',
+    dialogTitle: '记录失败反馈',
+    caseKey: 'Case key',
+    note: '备注'
+  },
   traceability: {
     title: '质量追踪',
     subtitle: '查看需求、用例、构建和执行覆盖关系',

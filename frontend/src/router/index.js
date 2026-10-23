@@ -142,6 +142,11 @@ const routes = [
                 component: () => import('@/views/executions/TaskCenter.vue')
             },
             {
+                path: 'failure-review',
+                name: 'ExecutionFailureReview',
+                component: () => import('@/views/executions/FailureReview.vue')
+            },
+            {
                 path: 'quality-loop',
                 name: 'ExecutionQualityLoop',
                 component: () => import('@/views/executions/QualityLoop.vue')

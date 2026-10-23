@@ -19,6 +19,7 @@ from .views import (
     ExecutionQualityGateEvaluationViewSet,
     ExecutionAISuggestionViewSet,
     ExecutionAISuggestionAuditViewSet,
+    ExecutionFailureReviewViewSet,
     ExecutionStepResultViewSet,
     WebhookEventViewSet,
     RequirementTestCaseLinkViewSet,
@@ -52,6 +53,7 @@ router.register(r'retry-policies', ExecutionRetryPolicyViewSet, basename='execut
 router.register(r'quality-gate-evaluations', ExecutionQualityGateEvaluationViewSet, basename='execution-quality-gate-evaluation')
 router.register(r'ai-suggestions', ExecutionAISuggestionViewSet, basename='execution-ai-suggestion')
 router.register(r'ai-suggestion-audits', ExecutionAISuggestionAuditViewSet, basename='execution-ai-suggestion-audit')
+router.register(r'failure-reviews', ExecutionFailureReviewViewSet, basename='execution-failure-review')
 router.register(r'datasets', ExecutionDatasetViewSet, basename='execution-dataset')
 router.register(r'data-matrices', ExecutionDataMatrixViewSet, basename='execution-data-matrix')
 router.register(r'fixtures', ExecutionFixtureViewSet, basename='execution-fixture')

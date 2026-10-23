@@ -18,6 +18,7 @@ from .models import (
     ExecutionProfile,
     ExecutionQualityGateEvaluation,
     ExecutionRetryPolicy,
+    ExecutionFailureReview,
     ExecutionAISuggestion,
     ExecutionAISuggestionAudit,
     WebhookEvent,
@@ -157,6 +158,14 @@ class ExecutionQualityGateEvaluationSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+
+class ExecutionFailureReviewSerializer(serializers.ModelSerializer):
+    reviewed_by = UserSimpleSerializer(read_only=True)
+
+    class Meta:
+        model = ExecutionFailureReview
+        fields = '__all__'
+        read_only_fields = ('id', 'reviewed_by', 'reviewed_at', 'history', 'created_at', 'updated_at')
 
 class ExecutionAISuggestionSerializer(serializers.ModelSerializer):
     requested_by = UserSimpleSerializer(read_only=True)

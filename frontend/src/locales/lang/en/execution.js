@@ -200,6 +200,23 @@ export default {
     gateAction: 'Evaluate release gate'
   },
 
+  failureReview: {
+    nav: 'Failure analysis',
+    title: 'Failure Analysis & Feedback',
+    subtitle: 'Cluster failures deterministically and record human classification',
+    jobId: 'Job ID',
+    category: 'Category',
+    subtype: 'Subtype',
+    count: 'Count',
+    signature: 'Signature',
+    message: 'Sample error',
+    actions: 'Actions',
+    review: 'Review',
+    empty: 'No failure clusters',
+    dialogTitle: 'Record failure feedback',
+    caseKey: 'Case key',
+    note: 'Note'
+  },
   traceability: {
     title: 'Quality Traceability',
     subtitle: 'Track requirement, case, build and execution coverage',

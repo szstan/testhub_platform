@@ -5,6 +5,9 @@
         <h1>{{ $t('execution.taskCenter.title') }}</h1>
         <p class="page-subtitle">{{ $t('execution.taskCenter.subtitle') }}</p>
       </div>
+      <el-button @click="router.push({ name: 'ExecutionFailureReview' })">
+        {{ $t('execution.failureReview.nav') }}
+      </el-button>
       <el-button type="primary" @click="router.push({ name: 'ExecutionQualityLoop' })">
         {{ $t('execution.qualityLoop.nav') }}
       </el-button>

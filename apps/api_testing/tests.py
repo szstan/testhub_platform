@@ -75,3 +75,7 @@ def test_openapi_contract_api_is_project_scoped():
     coverage = client.get(f'/api/api-testing/openapi-contracts/{spec_id}/coverage/')
     assert coverage.status_code == 200
     assert coverage.data['total'] == 1
+    materialized = client.post(f'/api/api-testing/openapi-contracts/{spec_id}/materialize-cases/', {'kinds': ['positive']}, format='json')
+    assert materialized.status_code == 200
+    assert materialized.data['total'] == 1
+    assert materialized.data['created'][0]['external_ref'] == 'openapi:listUsers:positive'

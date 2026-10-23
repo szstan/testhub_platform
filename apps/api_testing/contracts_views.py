@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from django.db import models
 
 from apps.projects.models import Project
+from apps.testcases.models import TestCase
 
 from .contracts import coverage_for_spec, diff_contracts, generate_contract_cases
 from .models import OpenApiContractSpec
@@ -75,6 +76,58 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def coverage(self, request, pk=None):
         return Response(coverage_for_spec(self.get_object()))
+
+    @action(detail=True, methods=['post'], url_path='materialize-cases')
+    def materialize_cases(self, request, pk=None):
+        spec = self.get_object()
+        limit = min(max(int(request.data.get('limit', 500)), 1), 500)
+        selected_kinds = request.data.get('kinds')
+        if selected_kinds and not isinstance(selected_kinds, list):
+            return Response({'detail': 'kinds 必须是数组'}, status=status.HTTP_400_BAD_REQUEST)
+        cases = generate_contract_cases(spec)
+        if selected_kinds:
+            cases = [case for case in cases if case.get('kind') in selected_kinds]
+        cases = cases[:limit]
+        created = []
+        updated = []
+        for case in cases:
+            external_ref = case['external_ref']
+            values = {
+                'title': f"{case['method']} {case['path']} [{case['kind']}]"[:500],
+                'description': json.dumps({
+                    'operation_id': case.get('operation_id'),
+                    'summary': case.get('summary'),
+                    'strategy': case.get('strategy', 'schema-driven'),
+                    'source_spec': spec.pk,
+                }, ensure_ascii=False),
+                'preconditions': 'OpenAPI contract generated case',
+                'steps': f"{case['method']} {case['path']}",
+                'expected_result': '响应符合 OpenAPI contract 且满足测试场景',
+                'priority': 'high' if case['kind'] == 'security' else 'medium',
+                'test_type': 'security' if case['kind'] == 'security' else 'api',
+                'status': 'draft',
+                'author': request.user,
+            }
+            testcase, was_created = TestCase.objects.get_or_create(
+                project=spec.project,
+                external_ref=external_ref,
+                defaults=values,
+            )
+            if not was_created:
+                for key, value in values.items():
+                    if key not in {'author'}:
+                        setattr(testcase, key, value)
+                testcase.save(update_fields=[key for key in values if key != 'author'] + ['updated_at'])
+                updated.append({'id': testcase.id, 'external_ref': external_ref})
+            else:
+                created.append({'id': testcase.id, 'external_ref': external_ref})
+        return Response({
+            'spec_id': spec.pk,
+            'created': created,
+            'updated': updated,
+            'total': len(created) + len(updated),
+            'next_step': '使用这些 TestCase.external_ref 组织测试套件并通过 CI/ExecutionJob 执行',
+        })
 
     @action(detail=True, methods=['get'], url_path='generate-cases')
     def generate_cases(self, request, pk=None):

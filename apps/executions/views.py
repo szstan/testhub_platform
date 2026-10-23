@@ -25,6 +25,7 @@ from .models import (
     ExecutionProfile,
     ExecutionQualityGateEvaluation,
     ExecutionRetryPolicy,
+    ExecutionFailureReview,
     ExecutionAISuggestion,
     ExecutionAISuggestionAudit,
     ExecutionRequirementLink,
@@ -55,6 +56,7 @@ from .serializers import (
     ExecutionQualityGateEvaluationSerializer,
     ExecutionRetryPolicySerializer,
     ExecutionAISuggestionSerializer,
+    ExecutionFailureReviewSerializer,
     ExecutionAISuggestionAuditSerializer,
     ExecutionRequirementLinkSerializer,
     ExecutionStepResultSerializer,
@@ -582,6 +584,36 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+    @action(detail=True, methods=['post'], url_path='failure-review')
+    def failure_review(self, request, pk=None):
+        job = self.get_object()
+        case_key = str(request.data.get('case_key') or '').strip()[:255]
+        signature = str(request.data.get('signature') or '').strip()[:128]
+        category = str(request.data.get('category') or 'UNKNOWN').upper()
+        note = str(request.data.get('note') or '')[:4000]
+        valid = {choice[0] for choice in ExecutionFailureReview.CATEGORY_CHOICES}
+        if not case_key or not signature or category not in valid:
+            return Response({'detail': 'case_key、signature 和有效 category 均为必填项'}, status=status.HTTP_400_BAD_REQUEST)
+        review, created = ExecutionFailureReview.objects.get_or_create(
+            job=job,
+            case_key=case_key,
+            signature=signature,
+            defaults={'category': category, 'note': note, 'reviewed_by': request.user, 'reviewed_at': timezone.now()},
+        )
+        if not created:
+            review.history = [*(review.history or []), {
+                'category': review.category,
+                'note': review.note,
+                'reviewed_by': review.reviewed_by_id,
+                'reviewed_at': review.reviewed_at.isoformat() if review.reviewed_at else None,
+            }][-20:]
+            review.category = category
+            review.note = note
+            review.reviewed_by = request.user
+            review.reviewed_at = timezone.now()
+            review.save(update_fields=['category', 'note', 'reviewed_by', 'reviewed_at', 'history', 'updated_at'])
+        return Response(ExecutionFailureReviewSerializer(review).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
     @action(detail=True, methods=['get'], url_path='failure-analysis')
     def failure_analysis(self, request, pk=None):
         return Response(analyze_job_failures(self.get_object()))
@@ -1092,6 +1124,19 @@ class ExecutionAISuggestionAuditViewSet(viewsets.ReadOnlyModelViewSet):
         return self.queryset.filter(
             suggestion__project__in=accessible_execution_projects(self.request.user)
         ).distinct()
+
+
+class ExecutionFailureReviewViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = ExecutionFailureReview.objects.select_related('job', 'job__project', 'reviewed_by')
+    serializer_class = ExecutionFailureReviewSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = ExecutionPagination
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['job', 'category', 'case_key']
+    ordering = ['-updated_at']
+
+    def get_queryset(self):
+        return self.queryset.filter(job__project__in=accessible_execution_projects(self.request.user)).distinct()
 
 
 class WebhookEventViewSet(viewsets.ReadOnlyModelViewSet):
