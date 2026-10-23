@@ -197,7 +197,9 @@ export default {
     maxFailed: '允许失败数',
     maxUnmatched: '允许未匹配数',
     compareAction: '运行对比',
-    gateAction: '执行发布门禁'
+    gateAction: '执行发布门禁',
+    metricsTitle: '质量指标',
+    noMetrics: '暂无质量指标'
   },
 
   failureReview: {

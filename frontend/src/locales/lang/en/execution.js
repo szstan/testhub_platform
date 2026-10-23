@@ -197,7 +197,9 @@ export default {
     maxFailed: 'Allowed failures',
     maxUnmatched: 'Allowed unmatched',
     compareAction: 'Compare runs',
-    gateAction: 'Evaluate release gate'
+    gateAction: 'Evaluate release gate',
+    metricsTitle: 'Quality metrics',
+    noMetrics: 'No quality metrics'
   },
 
   failureReview: {

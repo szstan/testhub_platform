@@ -7,6 +7,16 @@
       </div>
     </div>
 
+    <el-card shadow="never" class="metrics-card">
+      <template #header>{{ $t('execution.qualityLoop.metricsTitle') }}</template>
+      <el-row v-if="metrics" :gutter="12">
+        <el-col v-for="item in metricCards" :key="item.key" :xs="12" :md="4">
+          <el-statistic :title="item.label" :value="item.value" :suffix="item.suffix || ''" />
+        </el-col>
+      </el-row>
+      <el-empty v-else :description="$t('execution.qualityLoop.noMetrics')" />
+    </el-card>
+
     <el-row :gutter="16">
       <el-col :xs="24" :lg="12">
         <el-card shadow="never">
@@ -72,8 +82,9 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import api from '@/utils/api'
 import {
   compareExecutionJobs,
   evaluateExecutionReleaseGate,
@@ -86,8 +97,23 @@ const gating = ref(false)
 const importFile = ref(null)
 const importResultData = ref(null)
 const gateResult = ref(null)
+const metrics = ref(null)
+const metricCards = computed(() => metrics.value ? [
+  { key: 'ci', label: 'CI jobs', value: metrics.value.ci_jobs },
+  { key: 'association', label: '关联率', value: metrics.value.ci_association_rate, suffix: '%' },
+  { key: 'unmatched', label: '未匹配', value: metrics.value.unmatched_results },
+  { key: 'gate', label: '门禁通过率', value: metrics.value.gate_pass_rate, suffix: '%' },
+  { key: 'flaky', label: 'Flaky', value: metrics.value.flaky_profiles },
+] : [])
 const importForm = ref({ project_id: null, format: 'junit', external_run_id: '', build_reference: '' })
 const gateForm = ref({ jobId: null, baselineJobId: null, maxFailed: 0, maxUnmatched: 0 })
+
+const loadMetrics = async () => {
+  try {
+    const response = await api.get('/executions/metrics/')
+    metrics.value = response.data
+  } catch (error) { ElMessage.error(error.response?.data?.detail || '指标加载失败') }
+}
 
 const selectFile = event => {
   importFile.value = event.target.files?.[0] || null
@@ -152,6 +178,8 @@ const evaluateGate = async () => {
     gating.value = false
   }
 }
+
+onMounted(loadMetrics)
 </script>
 
 <style scoped>

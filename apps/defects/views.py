@@ -20,7 +20,8 @@ from rest_framework.response import Response
 from apps.projects.models import Project, ProjectMember
 from apps.users.models import User
 from apps.versions.models import Version
-from .models import Defect, DefectAttachment, DefectComment, DefectTransition
+from .models import Defect, DefectAttachment, DefectComment, DefectTransition, GitHubIssueIntegration
+from .integrations import ExternalIssueError, push_defect_to_github
 from .serializers import (
     DefectActionSerializer,
     DefectAttachmentSerializer,
@@ -437,6 +438,20 @@ class DefectViewSet(viewsets.ModelViewSet):
                 results.append({'id': defect_id, **result})
 
         return Response({'results': results})
+
+    @action(detail=True, methods=['post'], url_path='push-github')
+    def push_github(self, request, pk=None):
+        defect = self.get_object()
+        if not (request.user.is_staff or request.user.is_superuser or defect.project.owner_id == request.user.id or defect.project.members.filter(pk=request.user.pk).exists()):
+            return Response({'detail': '无权操作该项目'}, status=status.HTTP_403_FORBIDDEN)
+        integration = GitHubIssueIntegration.objects.filter(project=defect.project, enabled=True).first()
+        if integration is None:
+            return Response({'detail': '项目未配置 GitHub Issues 集成'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = push_defect_to_github(defect, integration)
+        except ExternalIssueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK if not result.get('created') else status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):

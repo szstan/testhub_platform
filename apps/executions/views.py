@@ -8,6 +8,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
+from datetime import timedelta
 from django.db import transaction
 from django.db.models import Q
 from .models import (
@@ -152,6 +153,43 @@ class ResultImportView(APIView):
             },
             status=status.HTTP_201_CREATED if summary.created else status.HTTP_200_OK,
         )
+
+
+class ExecutionMetricsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        days = max(1, min(int(request.query_params.get('days', 30)), 365))
+        since = timezone.now() - timedelta(days=days)
+        projects = accessible_execution_projects(request.user)
+        project_id = request.query_params.get('project')
+        if project_id:
+            projects = projects.filter(pk=project_id)
+        jobs = list(ExecutionJob.objects.filter(project__in=projects, created_at__gte=since))
+        ci_jobs = [job for job in jobs if job.source_type == 'ci']
+        summaries = [job.result or {} for job in ci_jobs if isinstance(job.result, dict)]
+        evaluations = list(ExecutionQualityGateEvaluation.objects.filter(job__in=jobs, stage='release'))
+        from collections import Counter
+        failure_reviews = ExecutionFailureReview.objects.filter(job__in=jobs)
+        try:
+            from apps.quality_intelligence.models import QualityTestProfile
+            flaky_count = QualityTestProfile.objects.filter(
+                project_id__in=[str(project.pk) for project in projects],
+                reliability_status='FLAKY',
+            ).count()
+        except Exception:
+            flaky_count = 0
+        return Response({
+            'window_days': days,
+            'total_jobs': len(jobs),
+            'ci_jobs': len(ci_jobs),
+            'ci_association_rate': round(sum(1 for item in summaries if not int(item.get('unmatched', 0) or 0)) / len(summaries) * 100, 2) if summaries else 0,
+            'unmatched_results': sum(int(item.get('unmatched', 0) or 0) for item in summaries),
+            'gate_evaluations': len(evaluations),
+            'gate_pass_rate': round(sum(1 for item in evaluations if item.passed) / len(evaluations) * 100, 2) if evaluations else 0,
+            'failure_categories': dict(Counter(failure_reviews.values_list('category', flat=True))),
+            'flaky_profiles': flaky_count,
+        })
 
 
 class TestPlanViewSet(viewsets.ModelViewSet):
