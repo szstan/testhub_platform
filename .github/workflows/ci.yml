@@ -31,6 +31,7 @@ jobs:
 
       - name: Run backend performance checks
         env:
+          APP_ENV: development
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
@@ -38,6 +39,7 @@ jobs:
           DB_NAME: testhub_ci
           DB_USER: root
           DB_PASSWORD: ci-password
+          REDIS_URL: redis://127.0.0.1:6379/0
           PERF_MAX_CONCURRENCY: '1000'
           PERF_MAX_TARGET_RPS: '5000'
           PERF_MAX_DURATION: '7200'
