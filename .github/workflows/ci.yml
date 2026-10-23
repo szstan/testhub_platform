@@ -37,7 +37,7 @@ jobs:
           DB_HOST: 127.0.0.1
           DB_NAME: testhub_ci
           DB_USER: root
-          DB_PASSWORD: ''
+          DB_PASSWORD: ci-password
           PERF_MAX_CONCURRENCY: '1000'
           PERF_MAX_TARGET_RPS: '5000'
           PERF_MAX_DURATION: '7200'
