@@ -66,6 +66,14 @@ def should_include(path: Path) -> bool:
     return not any(part in EXCLUDED_PARTS for part in relative.parts)
 
 
+def archive_mode(relative: Path) -> int:
+    if relative == Path("frontend/deploy.sh"):
+        return 0o755
+    if relative.parts and relative.parts[0] == "scripts" and relative.suffix in {".py", ".sh"}:
+        return 0o755
+    return 0o644
+
+
 def build_archive(output: Path, release: str) -> None:
     frontend_index = REPO_ROOT / "frontend" / "dist" / "index.html"
     if not frontend_index.is_file():
@@ -85,7 +93,11 @@ def build_archive(output: Path, release: str) -> None:
         for path in sorted(REPO_ROOT.rglob("*")):
             if not path.is_file() or not should_include(path):
                 continue
-            archive.add(path, arcname=Path(archive_root) / path.relative_to(REPO_ROOT))
+            relative = path.relative_to(REPO_ROOT)
+            info = archive.gettarinfo(str(path), arcname=Path(archive_root) / relative)
+            info.mode = archive_mode(relative)
+            with path.open("rb") as handle:
+                archive.addfile(info, handle)
 
     print(f"archive={output}")
     print(f"release={release}")
