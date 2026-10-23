@@ -49,7 +49,7 @@ const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
 const providers = ['github', 'gitlab', 'jenkins', 'generic']
-const sources = ['api', 'ui', 'app', 'performance', 'manual']
+const sources = ['api', 'ui', 'app', 'performance', 'ci', 'manual']
 const form = ref({ name: '', project: null, provider: 'generic', source_type: 'manual', webhook_secret_ref: '', webhook_enabled: false, quality_gate_text: '{}' })
 
 const load = async () => {

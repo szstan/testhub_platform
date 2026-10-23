@@ -1,6 +1,9 @@
 import api from '@/utils/api'
 
 export const listExecutionJobs = (params = {}) => api.get('/executions/jobs/', { params })
+export const importExecutionResults = (formData) => api.post('/executions/import-results/', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+export const compareExecutionJobs = (jobId, baselineJobId) => api.post(`/executions/jobs/${jobId}/compare/`, { baseline_job_id: baselineJobId })
+export const evaluateExecutionReleaseGate = (jobId, data = {}) => api.post(`/executions/jobs/${jobId}/release-gate/`, data)
 export const getExecutionJobTimeline = (id) => api.get(`/executions/jobs/${id}/timeline/`)
 export const cancelExecutionJob = (id, reason = '') => api.post(`/executions/jobs/${id}/cancel/`, { reason })
 export const retryExecutionJob = (id, reason = '') => api.post(`/executions/jobs/${id}/retry/`, { reason })

@@ -21,6 +21,8 @@ AI suggestion 的输入、输出、prompt version、model、token/cost、target 
 - `apps/executions/migrations/0008_executionattempt_is_final_and_more.py`
 - `apps/executions/migrations/0009_executionaisuggestionaudit_executionretryrequest_and_more.py`
 - `apps/executions/migrations/0010_executionjob_dataset_executionjob_dataset_snapshot_and_more.py`
+- `apps/executions/migrations/0011_alter_executionjob_source_type_and_more.py`
+- `apps/executions/migrations/0012_alter_executionqualitygateevaluation_stage.py`
 - `apps/quality_intelligence/migrations/0002_qualityquarantine_approval_note_and_more.py`
 - `apps/quality_intelligence/migrations/0003_qualityfailurereviewaudit.py`
 - `apps/perf_testing/migrations/0011_alter_perfenvironment_verify_ssl.py`
@@ -45,7 +47,56 @@ python scripts/ci_schema_check.py
 
 profile 的质量门禁在 result stage 进行确定性检查；缺失指标、非法规则和非法值 fail closed，并保存 `ExecutionQualityGateEvaluation`。CI webhook 如果携带 preflight summary 会保存 webhook stage evaluation，失败时拒绝 webhook 记录而不伪造一个已执行的 terminal attempt；真实执行结果仍需经过 result stage gate。
 
-## Quarantine 与 AI 审计
+## Release Quality Loop（P0）
+
+P0 将 CI 结果导入、稳定测试身份、运行对比和发布质量门禁接入统一执行模型。
+
+### 稳定测试身份
+
+普通测试用例使用项目内唯一的 `external_ref` 作为 Git、CI 和自动化结果的稳定关联标识。创建用例时如果没有提供该字段，系统自动生成 `TC-<随机标识>`。测试标题可以修改而不影响结果关联；同一项目内重复 `external_ref` 会被拒绝。Excel 模板支持可选的“外部引用标识”列，旧模板仍可导入。
+
+### JUnit/Allure 结果导入
+
+结果导入接口：
+
+```http
+POST /api/executions/import-results/
+Content-Type: multipart/form-data
+```
+
+必填字段：
+
+- `project_id`：目标项目；
+- `format`：`junit` 或 `allure`；
+- `external_run_id`：外部运行的稳定 ID；
+- `file`：JUnit XML 或 Allure JSON 文件。
+
+可选字段：
+
+- `build_reference`：构建号或发布引用。
+
+结果会创建或复用一个 `ExecutionJob`，并写入 attempt、step result 和 artifact。重复使用相同的 `format + external_run_id + project` 会返回已有任务，不会重复写入。单个文件最大 20MB，最多 5000 条测试结果；未匹配 `external_ref` 的结果保留在执行历史中，并返回 `unmatched` 数量。
+
+### 运行对比与发布门禁
+
+当前执行任务支持：
+
+```http
+POST /api/executions/jobs/<job_id>/compare/
+POST /api/executions/jobs/<job_id>/release-gate/
+```
+
+请求可以携带 `baseline_job_id`。运行对比返回新增失败、修复失败、持续失败、新增用例、移除用例和未执行用例。
+
+发布门禁支持：
+
+- `max_failed`：允许的失败数量；
+- `max_unmatched`：允许的未匹配数量；
+- baseline 与当前运行之间的新增失败默认阻断发布。
+
+门禁结果写入 `ExecutionJob.quality_gate_result`，并以 `ExecutionQualityGateEvaluation(stage=release)` 保存审计记录。门禁通过返回 HTTP 200 和 `exit_code=0`；门禁失败返回 HTTP 409 和 `exit_code=1`。CI CLI 或 pipeline 可以据此决定发布是否继续。
+
+前端入口位于统一任务中心的“CI 质量闭环”页面，支持导入结果、运行对比和门禁评估。
 
 quarantine 包含 owner、expiry、approval status 和 approval note。需要审批的 quarantine 必须由独立的 privileged reviewer 批准，owner 不能自审；release 可以由 owner 或 privileged reviewer 执行。统一 dispatch 和 adapter 两个边界都会检查有效 quarantine，override 必须由 privileged actor 提供原因，并写入 project-scoped audit。
 

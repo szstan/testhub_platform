@@ -1,6 +1,7 @@
 from django.http import FileResponse
 from rest_framework import generics, permissions, status, pagination
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
@@ -29,6 +30,16 @@ class TestCaseImportRecordPagination(pagination.PageNumberPagination):
     max_page_size = 100
 
 
+def _ensure_external_ref_available(project, external_ref, *, exclude_id=None):
+    if not external_ref:
+        return
+    queryset = TestCase.objects.filter(project=project, external_ref=external_ref)
+    if exclude_id is not None:
+        queryset = queryset.exclude(pk=exclude_id)
+    if queryset.exists():
+        raise ValidationError({'external_ref': '该项目中已存在相同的 external_ref'})
+
+
 def get_user_accessible_projects(user):
     return Project.objects.filter(
         models.Q(owner=user) | models.Q(members=user)
@@ -40,7 +51,7 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
     pagination_class = TestCasePagination
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['priority', 'test_type']
-    search_fields = ['title', 'description']
+    search_fields = ['title', 'description', 'external_ref']
     ordering_fields = ['created_at', 'updated_at', 'priority']
     ordering = ['-created_at']
 
@@ -103,12 +114,15 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
                     description='系统自动创建的默认项目'
                 )
         
+        external_ref = serializer.validated_data.get('external_ref')
+        _ensure_external_ref_available(project, external_ref)
         testcase = serializer.save(author=user, project=project)
         _record_test_case_revision(testcase, user)
 
 def _test_case_snapshot(test_case):
     return {
         'title': test_case.title,
+        'external_ref': test_case.external_ref,
         'description': test_case.description,
         'preconditions': test_case.preconditions,
         'steps': test_case.steps,
@@ -159,17 +173,18 @@ class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         user = self.request.user
         project_id = self.request.data.get('project_id')
+        project = serializer.instance.project
 
         if project_id:
             accessible_projects = self.get_user_accessible_projects(user)
             try:
                 project = accessible_projects.get(id=project_id)
             except Project.DoesNotExist:
-                updated = serializer.save()
-            else:
-                updated = serializer.save(project=project)
-        else:
-            updated = serializer.save()
+                project = serializer.instance.project
+
+        external_ref = serializer.validated_data.get('external_ref', serializer.instance.external_ref)
+        _ensure_external_ref_available(project, external_ref, exclude_id=serializer.instance.pk)
+        updated = serializer.save(project=project)
         _record_test_case_revision(updated, user)
 
 

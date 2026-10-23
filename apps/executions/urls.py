@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import CIWebhookView
+from .views import CIWebhookView, ResultImportView
 from .views import (
     ExecutionArtifactViewSet,
     ExecutionAttemptViewSet,
@@ -60,5 +60,6 @@ router.register(r'webhook-events', WebhookEventViewSet, basename='webhook-event'
 
 urlpatterns = [
     path('webhooks/<str:provider>/', CIWebhookView.as_view(), name='ci-webhook'),
+    path('import-results/', ResultImportView.as_view(), name='result-import'),
     path('', include(router.urls)),
 ]

@@ -49,7 +49,7 @@ class TestCaseListSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'id', 'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'id', 'external_ref', 'title', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type',
             'author', 'assignee', 'project', 'versions', 'tags', 'created_at', 'updated_at'
         ]
@@ -79,10 +79,16 @@ class TestCaseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type', 'tags', 'project_id', 'version_ids'
         ]
     
+    def validate_external_ref(self, value):
+        value = str(value or '').strip()
+        if not value:
+            raise serializers.ValidationError('external_ref 不能为空')
+        return value
+
     def create(self, validated_data):
         version_ids = validated_data.pop('version_ids', [])
         # project_id会在视图的perform_create中处理
@@ -108,10 +114,16 @@ class TestCaseUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type', 'tags', 'project_id', 'version_ids'
         ]
     
+    def validate_external_ref(self, value):
+        value = str(value or '').strip()
+        if not value:
+            raise serializers.ValidationError('external_ref 不能为空')
+        return value
+
     def update(self, instance, validated_data):
         version_ids = validated_data.pop('version_ids', None)
         # project_id会在视图中处理

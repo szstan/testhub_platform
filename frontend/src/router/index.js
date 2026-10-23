@@ -137,6 +137,11 @@ const routes = [
                 component: () => import('@/views/executions/TaskCenter.vue')
             },
             {
+                path: 'quality-loop',
+                name: 'ExecutionQualityLoop',
+                component: () => import('@/views/executions/QualityLoop.vue')
+            },
+            {
                 path: 'traceability',
                 name: 'ExecutionTraceability',
                 component: () => import('@/views/executions/TraceabilityView.vue')

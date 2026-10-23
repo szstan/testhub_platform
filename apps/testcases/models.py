@@ -1,8 +1,13 @@
 from django.db import models
 from django.utils import timezone
+import uuid
 from apps.users.models import User
 from apps.projects.models import Project
 from apps.versions.models import Version
+
+def _new_external_ref():
+    return f'TC-{uuid.uuid4().hex[:12].upper()}'
+
 
 class TestCase(models.Model):
     """测试用例模型"""
@@ -29,6 +34,7 @@ class TestCase(models.Model):
     ]
     
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='testcases')
+    external_ref = models.CharField(max_length=255, default=_new_external_ref, verbose_name='外部引用标识')
     versions = models.ManyToManyField(Version, blank=True, related_name='testcases', verbose_name='关联版本')
     title = models.CharField(max_length=500, verbose_name='用例标题')
     description = models.TextField(blank=True, verbose_name='用例描述')
@@ -52,6 +58,12 @@ class TestCase(models.Model):
         verbose_name = '测试用例'
         verbose_name_plural = '测试用例'
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project', 'external_ref'],
+                name='testcase_project_external_ref_uniq',
+            ),
+        ]
 
 class TestCaseStep(models.Model):
     """测试用例步骤"""

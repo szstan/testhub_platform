@@ -165,6 +165,7 @@ EXECUTION_SOURCE_CHOICES = (
     ('ui', 'UI'),
     ('app', 'APP'),
     ('performance', 'Performance'),
+    ('ci', 'CI'),
     ('manual', 'Manual'),
     ('other', 'Other'),
 )
@@ -1332,6 +1333,7 @@ class ExecutionQualityGateEvaluation(models.Model):
     STAGE_CHOICES = (
         ('dispatch', 'Dispatch'),
         ('result', 'Result'),
+        ('release', 'Release'),
         ('webhook', 'Webhook'),
     )
 

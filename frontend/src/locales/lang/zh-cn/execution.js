@@ -180,6 +180,26 @@ export default {
     empty: '暂无统一执行任务'
   },
 
+  qualityLoop: {
+    nav: 'CI 质量闭环',
+    title: 'CI 质量闭环',
+    subtitle: '导入自动化结果、比较运行并执行发布质量门禁',
+    importTitle: '导入测试结果',
+    gateTitle: '运行对比与发布门禁',
+    projectId: '项目 ID',
+    format: '结果格式',
+    externalRunId: '外部运行 ID',
+    buildReference: '构建引用',
+    resultFile: '结果文件',
+    importAction: '导入结果',
+    currentJobId: '当前运行 ID',
+    baselineJobId: '基线运行 ID',
+    maxFailed: '允许失败数',
+    maxUnmatched: '允许未匹配数',
+    compareAction: '运行对比',
+    gateAction: '执行发布门禁'
+  },
+
   traceability: {
     title: '质量追踪',
     subtitle: '查看需求、用例、构建和执行覆盖关系',

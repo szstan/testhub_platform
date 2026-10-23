@@ -5,6 +5,9 @@
         <h1>{{ $t('execution.taskCenter.title') }}</h1>
         <p class="page-subtitle">{{ $t('execution.taskCenter.subtitle') }}</p>
       </div>
+      <el-button type="primary" @click="router.push({ name: 'ExecutionQualityLoop' })">
+        {{ $t('execution.qualityLoop.nav') }}
+      </el-button>
       <el-button :icon="Refresh" :loading="loading" @click="loadJobs">
         {{ $t('common.refresh') }}
       </el-button>
@@ -170,6 +173,7 @@
 
 <script setup>
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import api from '@/utils/api'
@@ -180,6 +184,7 @@ import {
   retryExecutionJob,
 } from '@/api/executions'
 
+const router = useRouter()
 const jobs = ref([])
 const loading = ref(false)
 const timeline = ref(null)
@@ -208,6 +213,7 @@ const sourceOptions = [
   { value: 'ui', label: 'UI' },
   { value: 'app', label: 'APP' },
   { value: 'performance', label: 'Performance' },
+  { value: 'ci', label: 'CI' },
   { value: 'manual', label: 'Manual' },
 ]
 const sourceLabels = Object.fromEntries(sourceOptions.map(item => [item.value, item.label]))

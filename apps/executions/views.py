@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
@@ -72,7 +73,9 @@ from .serializers import (
 from .state_machine import InvalidExecutionTransition
 from .adapters import AdapterConflict, get_executor_adapter
 from .result_events import ResultEventError, ResultEventIngestor
+from .run_comparison import compare_jobs, evaluate_release_gate
 from .ci import WebhookVerificationError, process_webhook, verify_webhook_request
+from .result_import import ResultImportError, import_results
 from .policies import (
     AISuggestionDisabled,
     GovernanceConflict,
@@ -96,6 +99,57 @@ def get_accessible_projects(user):
     return Project.objects.filter(
         Q(owner=user) | Q(members=user)
     ).distinct()
+
+class ResultImportView(APIView):
+    """Import JUnit or Allure results into one idempotent CI execution job."""
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        result_format = request.data.get('format')
+        external_run_id = request.data.get('external_run_id')
+        build_reference = request.data.get('build_reference', '')
+        uploaded = request.FILES.get('file')
+        if not project_id or not result_format or not external_run_id or uploaded is None:
+            return Response(
+                {'detail': 'project_id、format、external_run_id 和 file 均为必填项'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        project = accessible_execution_projects(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': '项目不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+        payload = uploaded.read(20 * 1024 * 1024 + 1)
+        try:
+            summary = import_results(
+                project=project,
+                payload=payload,
+                result_format=result_format,
+                external_run_id=external_run_id,
+                requested_by=request.user,
+                build_reference=build_reference,
+                filename=uploaded.name,
+            )
+        except ResultImportError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                'job_id': summary.job.id,
+                'created': summary.created,
+                'format': summary.format,
+                'external_run_id': summary.external_run_id,
+                'total': summary.total,
+                'passed': summary.passed,
+                'failed': summary.failed,
+                'skipped': summary.skipped,
+                'matched': summary.matched,
+                'unmatched': summary.unmatched,
+                'status': summary.job.final_status or summary.job.status,
+            },
+            status=status.HTTP_201_CREATED if summary.created else status.HTTP_200_OK,
+        )
+
 
 class TestPlanViewSet(viewsets.ModelViewSet):
     """
@@ -527,6 +581,42 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+    @action(detail=True, methods=['post'], url_path='compare')
+    def compare(self, request, pk=None):
+        job = self.get_object()
+        baseline_id = request.data.get('baseline_job_id')
+        baseline = self.get_queryset().filter(pk=baseline_id).first()
+        if baseline is None:
+            return Response({'detail': 'baseline_job_id 不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            result = compare_jobs(job, baseline)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
+
+    @action(detail=True, methods=['post'], url_path='release-gate')
+    def release_gate(self, request, pk=None):
+        job = self.get_object()
+        baseline_id = request.data.get('baseline_job_id')
+        baseline = None
+        if baseline_id:
+            baseline = self.get_queryset().filter(pk=baseline_id).first()
+            if baseline is None:
+                return Response({'detail': 'baseline_job_id 不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            max_failed = int(request.data.get('max_failed', 0))
+            max_unmatched = int(request.data.get('max_unmatched', 0))
+            result = evaluate_release_gate(
+                job,
+                baseline=baseline,
+                max_failed=max_failed,
+                max_unmatched=max_unmatched,
+                evaluated_by=request.user,
+            )
+        except (TypeError, ValueError) as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK if result['passed'] else status.HTTP_409_CONFLICT)
+
     @action(detail=True, methods=['post'], url_path='events')
     def events(self, request, pk=None):
         job = self.get_object()

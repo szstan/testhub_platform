@@ -180,6 +180,26 @@ export default {
     empty: 'No unified execution jobs'
   },
 
+  qualityLoop: {
+    nav: 'CI Quality Loop',
+    title: 'CI Quality Loop',
+    subtitle: 'Import results, compare runs and enforce release quality gates',
+    importTitle: 'Import Test Results',
+    gateTitle: 'Run Comparison & Release Gate',
+    projectId: 'Project ID',
+    format: 'Result format',
+    externalRunId: 'External run ID',
+    buildReference: 'Build reference',
+    resultFile: 'Result file',
+    importAction: 'Import results',
+    currentJobId: 'Current job ID',
+    baselineJobId: 'Baseline job ID',
+    maxFailed: 'Allowed failures',
+    maxUnmatched: 'Allowed unmatched',
+    compareAction: 'Compare runs',
+    gateAction: 'Evaluate release gate'
+  },
+
   traceability: {
     title: 'Quality Traceability',
     subtitle: 'Track requirement, case, build and execution coverage',
