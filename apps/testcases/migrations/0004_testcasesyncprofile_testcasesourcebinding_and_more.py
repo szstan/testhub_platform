@@ -91,7 +91,7 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 ("external_ref", models.CharField(max_length=255)),
-                ("source_path", models.CharField(max_length=1024)),
+                ("source_path", models.CharField(max_length=512)),
                 (
                     "source_commit",
                     models.CharField(blank=True, default="", max_length=128),

@@ -194,7 +194,7 @@ class TestCaseSourceBinding(models.Model):
     testcase = models.OneToOneField(TestCase, on_delete=models.CASCADE, related_name='source_binding')
     profile = models.ForeignKey(TestCaseSyncProfile, on_delete=models.CASCADE, related_name='bindings')
     external_ref = models.CharField(max_length=255)
-    source_path = models.CharField(max_length=1024)
+    source_path = models.CharField(max_length=512)
     source_commit = models.CharField(max_length=128, blank=True, default='')
     source_hash = models.CharField(max_length=64, blank=True, default='')
     last_synced_at = models.DateTimeField(default=timezone.now)
