@@ -28,9 +28,18 @@ user.profile.update
 
 测试标题可以修改，`external_ref` 应长期保持不变。结果中的 JUnit property 或 Allure `testCaseId` 应使用同一个值。
 
+## 仓库内 workflow
+
+仓库已经包含可手动触发的 `.github/workflows/testhub-quality-loop.yml`。它要求 self-hosted runner 标签为 `self-hosted, linux, x64, testhub-staging`，并使用以下仓库配置：
+
+- Repository Variable：`TESTHUB_BASE_URL`；
+- Repository Secret：`TESTHUB_TOKEN`；
+- 手动运行时输入：`project_id`、可选 `baseline_job_id` 和测试命令。
+
+该 workflow 默认不会随每次 push 自动运行，先用 `workflow_dispatch` 做试点，确认关联率和门禁规则后再接入 push/pull_request。
 ## GitHub Actions
 
-将以下变量配置到仓库 Secrets/Variables：
+如果暂时不使用仓库内的手动 workflow，也可以把以下步骤嵌入现有 workflow。配置项如下：
 
 - `TESTHUB_BASE_URL`：例如 `https://testhub.example.com`；
 - `TESTHUB_TOKEN`：项目级 JWT；

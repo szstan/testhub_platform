@@ -1,0 +1,89 @@
+name: TestHub quality loop pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: TestHub project ID
+        required: true
+        type: string
+      baseline_job_id:
+        description: Optional baseline TestHub job ID
+        required: false
+        type: string
+      test_command:
+        description: Test command that writes JUnit XML to test-results.xml
+        required: true
+        default: python -m pytest -q --junitxml=test-results.xml
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  quality-loop:
+    runs-on: [self-hosted, linux, x64, testhub-staging]
+    timeout-minutes: 45
+    env:
+      TESTHUB_BASE_URL: ${{ vars.TESTHUB_BASE_URL }}
+      TESTHUB_TOKEN: ${{ secrets.TESTHUB_TOKEN }}
+      TESTHUB_PROJECT_ID: ${{ inputs.project_id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate TestHub configuration
+        shell: bash
+        run: |
+          test -n "$TESTHUB_BASE_URL"
+          test -n "$TESTHUB_TOKEN"
+          test -n "$TESTHUB_PROJECT_ID"
+          python scripts/testhub_ci.py --help >/dev/null
+
+      - name: Run project tests
+        shell: bash
+        run: ${{ inputs.test_command }}
+
+      - name: Import JUnit results
+        id: import
+        shell: bash
+        run: |
+          test -s test-results.xml
+          python scripts/testhub_ci.py import-results \
+            --base-url "$TESTHUB_BASE_URL" \
+            --project-id "$TESTHUB_PROJECT_ID" \
+            --format junit \
+            --external-run-id "github-${{ github.run_id }}" \
+            --build-reference "${{ github.sha }}" \
+            --file test-results.xml > testhub-import.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open('testhub-import.json', encoding='utf-8') as handle:
+              print(f"job_id={json.load(handle)['job_id']}")
+          PY
+
+      - name: Evaluate TestHub release gate
+        shell: bash
+        env:
+          BASELINE_JOB_ID: ${{ inputs.baseline_job_id }}
+        run: |
+          args=(
+            --base-url "$TESTHUB_BASE_URL"
+            --job-id "${{ steps.import.outputs.job_id }}"
+            --max-failed 0
+            --max-unmatched 0
+          )
+          if test -n "$BASELINE_JOB_ID"; then
+            args+=(--baseline-job-id "$BASELINE_JOB_ID")
+          fi
+          python scripts/testhub_ci.py release-gate "${args[@]}"
+
+      - name: Upload JUnit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testhub-quality-loop-${{ github.run_id }}
+          path: |
+            test-results.xml
+            testhub-import.json
+          if-no-files-found: ignore
