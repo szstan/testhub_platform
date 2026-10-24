@@ -91,6 +91,7 @@ from apps.testcases.models import TestCase
 from apps.projects.models import Project
 from apps.requirement_analysis.models import BusinessRequirement
 from apps.defects.models import Defect
+from apps.users.permissions import CIServiceTokenPermission
 
 
 class ExecutionPagination(PageNumberPagination):
@@ -107,7 +108,7 @@ def get_accessible_projects(user):
 class ResultImportView(APIView):
     """Import JUnit or Allure results into one idempotent CI execution job."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CIServiceTokenPermission]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):

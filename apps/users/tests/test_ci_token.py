@@ -75,6 +75,18 @@ def test_ci_token_rejects_another_project_and_updates_last_used():
 
 
 @pytest.mark.django_db
+def test_ci_token_cannot_access_non_ci_api():
+    user = User.objects.create_user(username='restricted-ci-user', password='pass')
+    project = Project.objects.create(name='Restricted CI Project', owner=user)
+    raw = 'th_ci_restricted_token'
+    _token(user, project, raw)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Bearer {raw}')
+    response = client.get('/api/projects/')
+    assert response.status_code in {401, 403}
+
+
+@pytest.mark.django_db
 def test_revoked_ci_token_is_rejected():
     user = User.objects.create_user(username='revoked-ci-user', password='pass')
     project = Project.objects.create(name='Revoked CI Project', owner=user)
