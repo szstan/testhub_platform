@@ -84,6 +84,27 @@ def test_result_import_is_idempotent_and_links_external_ref(execution_fixture):
 
 
 @pytest.mark.django_db
+def test_result_import_hashes_long_idempotency_keys(execution_fixture):
+    user, project, _ = execution_fixture
+    classname = 'C' * 180
+    name = 'N' * 180
+    payload = f'<testsuite><testcase classname="{classname}" name="{name}" /></testsuite>'.encode()
+
+    summary = import_results(
+        project=project,
+        payload=payload,
+        result_format='junit',
+        external_run_id='github-' + ('r' * 180),
+        requested_by=user,
+    )
+
+    assert summary.created is True
+    step = ExecutionStepResult.objects.get(attempt__job_id=summary.job.id)
+    assert len(step.idempotency_key) <= 128
+    assert step.idempotency_key.startswith('result-step:')
+
+
+@pytest.mark.django_db
 @pytest.mark.django_db
 def test_execution_metrics_reports_ci_association_and_gate_rate(execution_fixture):
     user, project, _ = execution_fixture
