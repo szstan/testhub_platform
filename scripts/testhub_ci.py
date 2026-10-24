@@ -27,7 +27,7 @@ TERMINAL = {"cancelled", "passed", "succeeded", "completed", "failed", "blocked"
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--base-url", required=True, help="TestHub API origin, e.g. https://testhub.example.com")
-    root.add_argument("--token", default=os.environ.get("TESTHUB_TOKEN", ""), help="JWT; defaults to TESTHUB_TOKEN")
+    root.add_argument('--token', default=os.environ.get('TESTHUB_TOKEN', ''), help='TestHub bearer token (th_ci service token or JWT); defaults to TESTHUB_TOKEN')
     root.add_argument("--timeout", type=float, default=15.0)
     sub = root.add_subparsers(dest="command", required=True)
 

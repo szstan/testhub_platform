@@ -48,6 +48,19 @@ python manage.py create_ci_token \
 Authorization: Bearer th_ci_...
 ```
 
+查看 token 元数据（不会显示明文或哈希）：
+
+```bash
+python manage.py list_ci_tokens --project-id 1
+python manage.py list_ci_tokens --project-id 1 --all
+```
+
+撤销 token：
+
+```bash
+python manage.py revoke_ci_token --project-id 1 --name github-pilot
+```
+
 
 仓库已经包含可手动触发的 `.github/workflows/testhub-quality-loop.yml`。它要求 self-hosted runner 标签为 `self-hosted, linux, x64, testhub-staging`，并使用以下仓库配置：
 
@@ -61,7 +74,7 @@ Authorization: Bearer th_ci_...
 如果暂时不使用仓库内的手动 workflow，也可以把以下步骤嵌入现有 workflow。配置项如下：
 
 - `TESTHUB_BASE_URL`：例如 `https://testhub.example.com`；
-- `TESTHUB_TOKEN`：项目级 JWT；
+- `TESTHUB_TOKEN`：项目级 `th_ci_...` service token；
 - `TESTHUB_PROJECT_ID`：TestHub 项目 ID；
 - `TESTHUB_BASELINE_JOB_ID`：可选的基线 job ID。
 
