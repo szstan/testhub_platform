@@ -105,3 +105,23 @@ def test_ci_token_commands_never_list_plaintext_or_hash():
     call_command('revoke_ci_token', project_id=project.id, name='test-token', stdout=io.StringIO())
     token.refresh_from_db()
     assert token.revoked_at is not None
+
+
+@pytest.mark.django_db
+def test_create_ci_token_prints_secret_once_and_stores_only_hash():
+    user = User.objects.create_user(username='create-command-user', password='pass')
+    project = Project.objects.create(name='Create Command Project', owner=user)
+    output = io.StringIO()
+    call_command(
+        'create_ci_token',
+        project_id=project.id,
+        username=user.username,
+        name='github-pilot',
+        expires_days=90,
+        stdout=output,
+    )
+    raw = output.getvalue().strip()
+    created = CIToken.objects.get(project=project, name='github-pilot')
+    assert raw.startswith('th_ci_')
+    assert created.token_hash == hashlib.sha256(raw.encode()).hexdigest()
+    assert raw != created.token_hash
