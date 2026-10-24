@@ -61,8 +61,9 @@ jobs:
         shell: bash
         run: |
           test -s test-results.xml
-          python scripts/testhub_ci.py import-results \
+          python scripts/testhub_ci.py \
             --base-url "$TESTHUB_BASE_URL" \
+            import-results \
             --project-id "$TESTHUB_PROJECT_ID" \
             --format junit \
             --external-run-id "github-${{ github.run_id }}" \
@@ -80,7 +81,6 @@ jobs:
           BASELINE_JOB_ID: ${{ inputs.baseline_job_id }}
         run: |
           args=(
-            --base-url "$TESTHUB_BASE_URL"
             --job-id "${{ steps.import.outputs.job_id }}"
             --max-failed 0
             --max-unmatched 0
@@ -88,7 +88,10 @@ jobs:
           if test -n "$BASELINE_JOB_ID"; then
             args+=(--baseline-job-id "$BASELINE_JOB_ID")
           fi
-          python scripts/testhub_ci.py release-gate "${args[@]}"
+          python scripts/testhub_ci.py \
+            --base-url "$TESTHUB_BASE_URL" \
+            release-gate \
+            "${args[@]}"
 
       - name: Upload JUnit artifact
         if: always()
