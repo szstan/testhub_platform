@@ -121,6 +121,8 @@ class ResultImportView(APIView):
                 {'detail': 'project_id、format、external_run_id 和 file 均为必填项'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if getattr(request.auth, 'project_id', None) and int(project_id) != request.auth.project_id:
+            return Response({'detail': 'CI token 无权访问该项目'}, status=status.HTTP_403_FORBIDDEN)
         project = accessible_execution_projects(request.user).filter(pk=project_id).first()
         if project is None:
             return Response({'detail': '项目不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
@@ -482,9 +484,12 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'head', 'options']
 
     def get_queryset(self):
-        return self.queryset.filter(
+        queryset = self.queryset.filter(
             project__in=accessible_execution_projects(self.request.user)
         ).distinct()
+        if getattr(self.request.auth, 'project_id', None):
+            queryset = queryset.filter(project_id=self.request.auth.project_id)
+        return queryset
 
     def create(self, request, *args, **kwargs):
         header_key = request.headers.get('Idempotency-Key') or request.META.get(
@@ -496,6 +501,9 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
                 {'detail': 'Idempotency-Key header does not match request body'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        project_id = request.data.get('project')
+        if getattr(request.auth, 'project_id', None) and project_id and int(project_id) != request.auth.project_id:
+            return Response({'detail': 'CI token 无权访问该项目'}, status=status.HTTP_403_FORBIDDEN)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:

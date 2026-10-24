@@ -212,6 +212,7 @@ AUTH_USER_MODEL = 'users.User'
 # DRF Settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
+        'apps.users.authentication.CITokenAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',  # JWT认证（优先）
         'rest_framework.authentication.TokenAuthentication',  # 保留Token认证（兼容）
         'rest_framework.authentication.SessionAuthentication',

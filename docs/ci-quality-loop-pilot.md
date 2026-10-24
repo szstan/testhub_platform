@@ -28,7 +28,26 @@ user.profile.update
 
 测试标题可以修改，`external_ref` 应长期保持不变。结果中的 JUnit property 或 Allure `testCaseId` 应使用同一个值。
 
-## 仓库内 workflow
+## 长期 CI token
+
+普通 JWT access token 有效期有限，不适合作为长期 GitHub Secret。建议在 staging 上使用项目级 CI token：
+
+```bash
+cd /opt/testhub_platform
+source venv-prod/bin/activate
+python manage.py create_ci_token \
+  --project-id 1 \
+  --username staging_admin \
+  --name github-pilot \
+  --expires-days 90
+```
+
+命令只输出一次明文 token；不要把输出写入仓库、`.env`、日志或聊天。将输出直接保存为 GitHub Repository Secret `TESTHUB_TOKEN`。Token 只保存哈希，绑定项目，支持过期和撤销；CI 请求使用：
+
+```text
+Authorization: Bearer th_ci_...
+```
+
 
 仓库已经包含可手动触发的 `.github/workflows/testhub-quality-loop.yml`。它要求 self-hosted runner 标签为 `self-hosted, linux, x64, testhub-staging`，并使用以下仓库配置：
 

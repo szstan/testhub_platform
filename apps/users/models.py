@@ -26,6 +26,27 @@ class RegistrationStatsProxy(User):
         verbose_name = '注册统计'
         verbose_name_plural = '注册统计'
 
+class CIToken(models.Model):
+    """Project-scoped long-lived CI credential; only a hash is persisted."""
+
+    project = models.ForeignKey('projects.Project', on_delete=models.CASCADE, related_name='ci_tokens')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='ci_tokens')
+    name = models.CharField(max_length=160)
+    token_prefix = models.CharField(max_length=24)
+    token_hash = models.CharField(max_length=64, unique=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'user_ci_tokens'
+        constraints = [
+            models.UniqueConstraint(fields=('project', 'name'), name='ci_token_project_name_uniq'),
+        ]
+        indexes = [models.Index(fields=('project', 'revoked_at'), name='ci_token_project_active_idx')]
+
+
 class UserProfile(models.Model):
     """用户配置"""
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
