@@ -213,6 +213,16 @@ def _job_status(cases: list[ImportedCase]) -> str:
     return ExecutionStatus.PASSED
 
 
+def _import_idempotency_key(result_format: str, external_run_id: str) -> str:
+    digest = hashlib.sha256(f'{result_format}:{external_run_id}'.encode('utf-8')).hexdigest()
+    return f'result-import:{digest}'
+
+
+def _step_idempotency_key(import_key: str, case_key: str) -> str:
+    digest = hashlib.sha256(f'{import_key}:{case_key}'.encode('utf-8')).hexdigest()
+    return f'result-step:{digest}'
+
+
 def import_results(*, project, payload: bytes, result_format: str, external_run_id: str,
                    requested_by=None, build_reference: str = "", filename: str = "results") -> ImportSummary:
     external_run_id = _text(external_run_id, 255)
@@ -220,7 +230,7 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
         raise ResultImportError("external_run_id 不能为空")
     cases = parse_results(payload, result_format)
     result_format = str(result_format).strip().lower()
-    idempotency_key = f"result-import:{result_format}:{external_run_id}"
+    idempotency_key = _import_idempotency_key(result_format, external_run_id)
 
     with transaction.atomic():
         build = None
@@ -279,7 +289,7 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
                 attempt=attempt,
                 case_key=item.case_key,
                 step_key="test",
-                idempotency_key=f"{idempotency_key}:{item.case_key}",
+                idempotency_key=_step_idempotency_key(idempotency_key, item.case_key),
                 result=redact_result_payload({
                     "name": item.name,
                     "matched_testcase": testcase_exists,
