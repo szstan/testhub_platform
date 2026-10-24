@@ -66,7 +66,7 @@ python manage.py revoke_ci_token --project-id 1 --name github-pilot
 
 - Repository Variable：`TESTHUB_BASE_URL`；
 - Repository Secret：`TESTHUB_TOKEN`；
-- 手动运行时输入：`project_id`、可选 `baseline_job_id` 和测试命令。
+- 手动运行时输入：`project_id`、可选 `baseline_job_id`、`max_unmatched` 和测试命令；初始 pilot 默认允许 unmatched，完成 TestHub 用例物化后将 `max_unmatched` 设为 `0`。
 
 该 workflow 默认不会随每次 push 自动运行，先用 `workflow_dispatch` 做试点，确认关联率和门禁规则后再接入 push/pull_request。
 ## GitHub Actions

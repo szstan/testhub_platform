@@ -11,6 +11,11 @@ on:
         description: Optional baseline TestHub job ID
         required: false
         type: string
+      max_unmatched:
+        description: Maximum unmatched imported tests for this pilot; set to 0 after TestHub cases are materialized
+        required: false
+        default: '1000'
+        type: string
       test_command:
         description: Test command that writes JUnit XML to test-results.xml
         required: true
@@ -28,6 +33,7 @@ jobs:
       TESTHUB_BASE_URL: ${{ vars.TESTHUB_BASE_URL }}
       TESTHUB_TOKEN: ${{ secrets.TESTHUB_TOKEN }}
       TESTHUB_PROJECT_ID: ${{ inputs.project_id }}
+      TESTHUB_MAX_UNMATCHED: ${{ inputs.max_unmatched }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -83,7 +89,7 @@ jobs:
           args=(
             --job-id "${{ steps.import.outputs.job_id }}"
             --max-failed 0
-            --max-unmatched 0
+            --max-unmatched "$TESTHUB_MAX_UNMATCHED"
           )
           if test -n "$BASELINE_JOB_ID"; then
             args+=(--baseline-job-id "$BASELINE_JOB_ID")
