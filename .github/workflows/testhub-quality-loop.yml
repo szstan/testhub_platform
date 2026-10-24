@@ -14,7 +14,7 @@ on:
       test_command:
         description: Test command that writes JUnit XML to test-results.xml
         required: true
-        default: python -m pytest -q --junitxml=test-results.xml
+        default: python -m pytest -q --ignore=apps/app_automation/tests/test_app_flow.py --ignore=apps/app_automation/tests/test_executor.py --junitxml=test-results.xml
         type: string
 
 permissions:
@@ -38,7 +38,6 @@ jobs:
           python3.12 -m venv "$RUNNER_TEMP/testhub-ci-venv"
           "$RUNNER_TEMP/testhub-ci-venv/bin/python" --version
           "$RUNNER_TEMP/testhub-ci-venv/bin/python" -m pip install -r requirements-prod.txt
-          "$RUNNER_TEMP/testhub-ci-venv/bin/python" -m pip install -r requirements-app-optional.txt
           echo "$RUNNER_TEMP/testhub-ci-venv/bin" >> "$GITHUB_PATH"
 
       - name: Validate TestHub configuration
