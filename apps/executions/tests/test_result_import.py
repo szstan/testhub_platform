@@ -84,6 +84,27 @@ def test_result_import_is_idempotent_and_links_external_ref(execution_fixture):
 
 
 @pytest.mark.django_db
+@pytest.mark.django_db
+def test_execution_metrics_reports_ci_association_and_gate_rate(execution_fixture):
+    user, project, _ = execution_fixture
+    payload = b'<testsuite><testcase name="one"/></testsuite>'
+    import_results(
+        project=project,
+        payload=payload,
+        result_format='junit',
+        external_run_id='metrics-run',
+        requested_by=user,
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    response = client.get('/api/executions/metrics/', {'project': project.id})
+    assert response.status_code == 200
+    assert response.data['ci_jobs'] == 1
+    assert response.data['ci_association_rate'] == 0
+    assert response.data['unmatched_results'] == 1
+    assert response.data['total_jobs'] == 1
+
+
 def test_result_import_api_requires_project_and_file(execution_fixture):
     user, project, _ = execution_fixture
     client = APIClient()
