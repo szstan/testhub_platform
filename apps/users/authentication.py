@@ -13,6 +13,9 @@ class CITokenAuthentication(BaseAuthentication):
 
     keyword = 'Bearer'
 
+    def authenticate_header(self, request):
+        return self.keyword
+
     def authenticate(self, request):
         header = request.headers.get('Authorization', '')
         prefix = f'{self.keyword} '
