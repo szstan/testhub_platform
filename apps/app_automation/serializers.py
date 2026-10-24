@@ -2,6 +2,7 @@
 from typing import Optional
 
 from rest_framework import serializers
+from django.db import transaction
 from django.utils import timezone
 from django.core.signing import TimestampSigner
 from .access import accessible_projects, scope_test_cases
@@ -84,8 +85,18 @@ class AppDeviceSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = AppDevice
-        fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at')
+        fields = [
+            'id', 'device_id', 'name', 'status', 'android_version', 'connection_type',
+            'ip_address', 'port', 'locked_by', 'locked_by_name', 'locked_at',
+            'max_allocation_time', 'lease_acquired_at', 'lease_expires_at',
+            'last_heartbeat_at', 'capabilities', 'health_status', 'maintenance_mode',
+            'last_seen_at', 'device_specs', 'description', 'location',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = (
+            'id', 'locked_by', 'locked_by_name', 'locked_at', 'lease_acquired_at',
+            'lease_expires_at', 'last_heartbeat_at', 'last_seen_at', 'created_at', 'updated_at',
+        )
     
     def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None
@@ -339,13 +350,16 @@ class AppTestSuiteCreateSerializer(serializers.ModelSerializer):
         ).filter(project=project).values_list('id', flat=True))
         if set(test_case_ids) != allowed_ids:
             raise serializers.ValidationError('测试用例列表包含无权使用的用例')
-        suite = AppTestSuite.objects.create(**validated_data)
-        for idx, tc_id in enumerate(test_case_ids):
-            AppTestSuiteCase.objects.create(
-                test_suite=suite,
-                test_case_id=tc_id,
-                order=idx
-            )
+        with transaction.atomic():
+            suite = AppTestSuite.objects.create(**validated_data)
+            AppTestSuiteCase.objects.bulk_create([
+                AppTestSuiteCase(
+                    test_suite=suite,
+                    test_case_id=tc_id,
+                    order=idx,
+                )
+                for idx, tc_id in enumerate(test_case_ids)
+            ])
         return suite
 
 
@@ -478,6 +492,12 @@ class AppNotificationLogSerializer(serializers.ModelSerializer):
             'created_at', 'sent_at', 'retry_count', 'retry_status',
         ]
         read_only_fields = ['created_at', 'sent_at']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['webhook_bot_info'] = {'configured': bool(instance.webhook_bot_info)} if instance.webhook_bot_info else {}
+        data['response_info'] = {'available': bool(instance.response_info)} if instance.response_info else {}
+        return data
 
     def get_recipient_names(self, obj) -> str:
         return obj.get_recipient_names()

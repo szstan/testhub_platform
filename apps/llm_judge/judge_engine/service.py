@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import statistics
 import time
@@ -116,10 +117,18 @@ class JudgeService:
 
         # 4. 缓存检查
         cfg = get_config()
-        gt_values = req.ground_truth.values if req.ground_truth else []
+        gt_values = [{
+            'text': req.ground_truth.text if req.ground_truth else None,
+            'values': req.ground_truth.values if req.ground_truth else [],
+        }]
+
+        rubric_fingerprint = hashlib.sha256(
+            json.dumps(getattr(self.rubric, 'raw', {}), ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')
+        ).hexdigest()[:16]
         cache_key = build_cache_key(
             req.question, req.answer, gt_values,
-            str(self.rubric.version), cfg.judge_model,
+            f"{self._rubric_orm_id or 'yaml'}:{self.rubric.version}:{rubric_fingerprint}",
+            cfg.judge_model,
         )
         cached_verdict = get_cached(cache_key)
         cache_hit = cached_verdict is not None
@@ -185,8 +194,8 @@ class JudgeService:
             )
             return record
         except Exception as e:
-            logger.warning(f'[JudgeService] JudgeRecord 落库失败: {e}')
-            return None
+            logger.exception('[JudgeService] JudgeRecord 落库失败')
+            raise RuntimeError('评分结果审计落库失败') from e
 
     # ---------- 批量汇总 ----------
 

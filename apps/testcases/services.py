@@ -41,6 +41,7 @@ class TestCaseImportTemplateService:
         '优先级',
         '测试类型',
         '关联版本',
+        '外部引用标识',
     ]
 
     SAMPLE_ROW = [
@@ -51,6 +52,7 @@ class TestCaseImportTemplateService:
         '高',
         '功能测试',
         'V1.0,V1.1',
+        'checkout.login',
     ]
 
     INSTRUCTIONS = [
@@ -65,6 +67,7 @@ class TestCaseImportTemplateService:
         ['测试类型', '可选，支持中文或英文：功能测试/集成测试/API测试/UI测试/性能测试/安全测试 或 functional/integration/api/ui/performance/security；默认 functional(功能测试)'],
         ['中英文示例', '优先级示例：高 或 high；测试类型示例：功能测试 或 functional'],
         ['关联版本', '可选，填写当前项目下的版本名称，多个版本用英文逗号分隔'],
+        ['外部引用标识', '可选，供 Git/CI/自动化结果稳定关联；同一项目内必须唯一'],
         ['关联项目', '上传时由页面选择，不需要在 Excel 中填写'],
     ]
 
@@ -90,7 +93,7 @@ class TestCaseImportTemplateService:
             for cell in row:
                 cell.alignment = Alignment(vertical='top', wrap_text=True)
 
-        column_widths = [24, 24, 40, 34, 14, 18, 22]
+        column_widths = [24, 24, 40, 34, 14, 18, 22, 24]
         for idx, width in enumerate(column_widths, start=1):
             worksheet.column_dimensions[chr(64 + idx)].width = width
 
@@ -142,6 +145,7 @@ class TestCaseExcelImportService:
         '优先级': 'priority',
         '测试类型': 'test_type',
         '关联版本': 'versions',
+        '外部引用标识': 'external_ref',
     }
     EXPECTED_HEADER_FIELDS = [
         'title',
@@ -164,7 +168,14 @@ class TestCaseExcelImportService:
         effective_headers = [header for header in raw_headers if header]
         header_fields = [cls.HEADER_ALIASES.get(header) for header in effective_headers]
 
-        if None in header_fields or header_fields != cls.EXPECTED_HEADER_FIELDS:
+        allowed_fields = set(cls.EXPECTED_HEADER_FIELDS) | {'external_ref'}
+        required_fields = [field for field in header_fields if field in cls.EXPECTED_HEADER_FIELDS]
+        if (
+            None in header_fields
+            or any(field not in allowed_fields for field in header_fields)
+            or required_fields != cls.EXPECTED_HEADER_FIELDS
+            or len(header_fields) != len(set(header_fields))
+        ):
             raise ValueError('导入模板表头不匹配，请先下载最新模板后再导入')
 
         rows = list(worksheet.iter_rows(min_row=2, values_only=True))
@@ -199,21 +210,25 @@ class TestCaseExcelImportService:
 
             version_names = cls._split_csv(row_data.get('versions'))
 
+            create_values = {
+                'project': record.project,
+                'title': row_data['title'],
+                'description': '',
+                'preconditions': row_data.get('preconditions', ''),
+                'steps': row_data['steps'],
+                'expected_result': row_data['expected_result'],
+                'priority': cls.PRIORITY_MAP.get(row_data.get('priority', '').lower(), 'medium'),
+                'status': 'draft',
+                'test_type': cls.TEST_TYPE_MAP.get(row_data.get('test_type', '').lower(), 'functional'),
+                'tags': [],
+                'author': record.created_by,
+                'assignee': None,
+            }
+            if row_data.get('external_ref'):
+                create_values['external_ref'] = row_data['external_ref']
+
             with transaction.atomic():
-                testcase = TestCase.objects.create(
-                    project=record.project,
-                    title=row_data['title'],
-                    description='',
-                    preconditions=row_data.get('preconditions', ''),
-                    steps=row_data['steps'],
-                    expected_result=row_data['expected_result'],
-                    priority=cls.PRIORITY_MAP.get(row_data.get('priority', '').lower(), 'medium'),
-                    status='draft',
-                    test_type=cls.TEST_TYPE_MAP.get(row_data.get('test_type', '').lower(), 'functional'),
-                    tags=[],
-                    author=record.created_by,
-                    assignee=None,
-                )
+                testcase = TestCase.objects.create(**create_values)
                 if version_names:
                     testcase.versions.set([version_map[name].id for name in version_names])
 

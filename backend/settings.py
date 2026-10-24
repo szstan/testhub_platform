@@ -2,24 +2,36 @@
 
 from pathlib import Path
 from decouple import config
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.utils import get_random_secret_key
 import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+TESTING = os.environ.get('DJANGO_SETTINGS_MODULE') == 'backend.test_settings'
+APP_ENV = config('APP_ENV', default='testing' if TESTING else 'production').strip().lower()
 
 
 def parse_csv(value):
     return [item.strip() for item in value.split(',') if item.strip()]
 
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-your-secret-key-here')
 
-DEBUG = config('DEBUG', default=True, cast=bool)
-
-# 根据DEBUG模式设置ALLOWED_HOSTS，生产环境不应使用通配符
-if DEBUG:
-    ALLOWED_HOSTS = ['*']
+DEBUG = config('DEBUG', default=TESTING, cast=bool)
+_secret_key = config('SECRET_KEY', default='')
+if _secret_key:
+    SECRET_KEY = _secret_key
+elif DEBUG and APP_ENV in {'development', 'testing'}:
+    # Development/test processes get an ephemeral key instead of a shared default.
+    SECRET_KEY = get_random_secret_key()
 else:
-    ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1',
-                           cast=parse_csv)
+    raise ImproperlyConfigured('SECRET_KEY must be set in production/staging')
+
+_allowed_hosts_raw = config('ALLOWED_HOSTS', default='')
+ALLOWED_HOSTS = parse_csv(_allowed_hosts_raw)
+if not ALLOWED_HOSTS:
+    if DEBUG and APP_ENV in {'development', 'testing'}:
+        ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
+    else:
+        raise ImproperlyConfigured('ALLOWED_HOSTS must be set in production/staging')
 
 DJANGO_APPS = [
     'simpleui',
@@ -58,12 +70,14 @@ QUALITY_INTELLIGENCE_ENABLED = config(
     'QUALITY_INTELLIGENCE_ENABLED', default=False, cast=bool
 )
 QUALITY_AI_ENABLED = config('QUALITY_AI_ENABLED', default=False, cast=bool)
+EXECUTION_AI_SUGGESTIONS_ENABLED = config(
+    'EXECUTION_AI_SUGGESTIONS_ENABLED', default=False, cast=bool
+)
 
 # MCP Server 总开关（协议端点 /api/mcp/，需 Daphne/ASGI 部署）
-MCP_ENABLED = config('MCP_ENABLED', default=True, cast=bool)
-# MCP 危险操作人工审批模式：开启后 confirm_* 不再直接执行，
-# 转为等待 MCP 控制台人工批准（Agent 轮询 get_approval_status 取结果）
-MCP_HUMAN_APPROVAL = config('MCP_HUMAN_APPROVAL', default=False, cast=bool)
+MCP_ENABLED = config('MCP_ENABLED', default=False, cast=bool)
+# MCP 危险操作人工审批模式：默认要求控制台人工批准
+MCP_HUMAN_APPROVAL = config('MCP_HUMAN_APPROVAL', default=True, cast=bool)
 # MCP 协议端点 Host 白名单追加项（逗号分隔）：SDK 的 DNS Rebinding 防护
 MCP_ALLOWED_HOSTS = config('MCP_ALLOWED_HOSTS', default='')
 
@@ -108,7 +122,6 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'backend.middleware.DisableCSRFMiddleware',  # 添加CSRF禁用中间件
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -136,14 +149,20 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 ASGI_APPLICATION = 'backend.asgi.application'
 
+_db_password = config('DB_PASSWORD', default='')
+if APP_ENV not in {'development', 'testing'} and not _db_password:
+    raise ImproperlyConfigured('DB_PASSWORD must be set in production/staging')
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': config('DB_NAME', default='testhub'),
         'USER': config('DB_USER', default='root'),
-        'PASSWORD': config('DB_PASSWORD', default=''),  # 移除硬编码默认密码
+        'PASSWORD': _db_password,  # 生产环境禁止空数据库密码
         'HOST': config('DB_HOST', default='127.0.0.1'),
         'PORT': config('DB_PORT', default='3306'),
+        'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=60, cast=int),
+        'CONN_HEALTH_CHECKS': True,
         'OPTIONS': {
             'charset': 'utf8mb4',
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
@@ -193,12 +212,14 @@ AUTH_USER_MODEL = 'users.User'
 # DRF Settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
+        'apps.users.authentication.CITokenAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',  # JWT认证（优先）
         'rest_framework.authentication.TokenAuthentication',  # 保留Token认证（兼容）
         'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
+        'apps.users.permissions.CIServiceTokenPermission',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
@@ -288,14 +309,8 @@ if DEBUG:
         'cache-control',  # 添加 SSE 需要的头部
     ]
 else:
-    # 生产环境 CORS 配置
-    if parsed_cors_origins:
-        # 如果配置了 CORS_ALLOWED_ORIGINS，使用配置的值
-        CORS_ALLOWED_ORIGINS = parsed_cors_origins
-    else:
-        # 如果未配置，允许所有来源（可根据需求调整）
-        CORS_ALLOW_ALL_ORIGINS = True
-
+    # 生产环境只允许显式配置的来源；同源部署无需 CORS_ALLOW_ALL_ORIGINS。
+    CORS_ALLOWED_ORIGINS = parsed_cors_origins
     CORS_ALLOW_CREDENTIALS = True
     CORS_ALLOW_HEADERS = [
         'accept',
@@ -342,6 +357,8 @@ SPECTACULAR_SETTINGS = {
         'DefectSourceEnum': 'apps.defects.models.Defect.SOURCE_CHOICES',
         'ExecutionCaseStatusEnum': 'apps.executions.models.TestRunCase.STATUS_CHOICES',
         'ExecutionCasePriorityEnum': 'apps.executions.models.TestRunCase.PRIORITY_CHOICES',
+        'ProviderEnum': 'apps.executions.models.ExecutionProfile.PROVIDER_CHOICES',
+        'SourceType588Enum': 'apps.executions.models.EXECUTION_SOURCE_CHOICES',
         'PerfEngineEnum': 'apps.perf_testing.models.PerfScenario.ENGINE_CHOICES',
         'PerfExecutionStatusEnum': 'apps.perf_testing.models.PerfExecution.STATUS_CHOICES',
         'PerfExecutionTriggerTypeEnum': 'apps.perf_testing.models.PerfExecution.TRIGGER_TYPE_CHOICES',
@@ -360,12 +377,17 @@ SPECTACULAR_SETTINGS = {
 }
 
 # Redis URL (used across celery, channels, and SMS verification)
-REDIS_URL = config('REDIS_URL', default='redis://:1234@127.0.0.1:6379/0')
+_default_redis_url = 'redis://127.0.0.1:6379/0' if APP_ENV in {'development', 'testing'} else ''
+REDIS_URL = config('REDIS_URL', default=_default_redis_url)
+if APP_ENV not in {'development', 'testing'} and not REDIS_URL:
+    raise ImproperlyConfigured('REDIS_URL must be set in production/staging')
 
 # Celery Configuration
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TASK_TRACK_STARTED = config('CELERY_TASK_TRACK_STARTED', default=True, cast=bool)
+CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
 
 # Channels Configuration
 CHANNEL_LAYERS = {
@@ -386,8 +408,11 @@ SMS_REGISTER_TEMPLATE_CODE = config('SMS_REGISTER_TEMPLATE_CODE', default='SMS_1
 # Cache Configuration
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake',
+        'BACKEND': config(
+            'CACHE_BACKEND',
+            default='django.core.cache.backends.redis.RedisCache',
+        ),
+        'LOCATION': config('CACHE_URL', default=REDIS_URL),
         'TIMEOUT': 300,  # 默认缓存超时5分钟
     }
 }

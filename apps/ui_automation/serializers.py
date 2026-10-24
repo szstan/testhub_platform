@@ -686,10 +686,27 @@ class UiScheduledTaskSerializer(serializers.ModelSerializer):
         task_type = attrs.get('task_type')
         if task_type == 'TEST_SUITE' and not attrs.get('test_suite'):
             raise serializers.ValidationError("测试套件不能为空")
-        elif task_type == 'TEST_CASE':
-            test_cases = attrs.get('test_cases', [])
-            if not test_cases or len(test_cases) == 0:
+        if task_type == 'TEST_CASE':
+            test_cases = attrs.get('test_cases')
+            if test_cases is None and self.instance is not None:
+                test_cases = list(self.instance.test_cases.all())
+            if not test_cases:
                 raise serializers.ValidationError("至少选择一个测试用例")
+        project = attrs.get('project') or getattr(self.instance, 'project', None)
+        suite = attrs.get('test_suite') or getattr(self.instance, 'test_suite', None)
+        if suite and project and suite.project_id != project.id:
+            raise serializers.ValidationError('测试套件必须属于同一项目')
+        test_cases = attrs.get('test_cases')
+        if test_cases is None and self.instance is not None:
+            test_cases = list(self.instance.test_cases.all())
+        case_ids = [case for case in (test_cases or []) if isinstance(case, int)]
+        if project and case_ids:
+            valid_count = TestCase.objects.filter(pk__in=case_ids, project_id=project.id).values('pk').distinct().count()
+            if valid_count != len(set(case_ids)):
+                raise serializers.ValidationError('所有测试用例必须属于同一项目')
+        for case in test_cases or []:
+            if project and getattr(case, 'project_id', project.id) != project.id:
+                raise serializers.ValidationError('所有测试用例必须属于同一项目')
 
         return attrs
 
@@ -856,6 +873,12 @@ class UiNotificationLogSerializer(serializers.ModelSerializer):
             'created_at', 'sent_at', 'retry_count', 'retry_status'
         ]
         read_only_fields = ['created_at', 'sent_at']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['webhook_bot_info'] = {'configured': bool(instance.webhook_bot_info)} if instance.webhook_bot_info else {}
+        data['response_info'] = {'available': bool(instance.response_info)} if instance.response_info else {}
+        return data
 
     def get_recipient_names(self, obj):
         """获取收件人姓名列表"""

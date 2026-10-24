@@ -258,7 +258,7 @@ import {
   getWsStatus
 } from '@/api/app-automation'
 import { getDeviceList } from '@/api/app-automation'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -421,8 +421,12 @@ const viewReport = (execution) => {
     ElMessage.info(t('appAutomation.testCase.reportNotExist'))
     return
   }
-  const reportUrl = `/api/app-automation/executions/${execution.id}/report/`
-  window.open(reportUrl, '_blank')
+  const reportUrl = getAppReportUrl(execution)
+  if (!reportUrl) {
+    ElMessage.info(t('appAutomation.testCase.reportNotExist'))
+    return
+  }
+  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 // 停止测试

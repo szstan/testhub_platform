@@ -228,7 +228,8 @@ class BuiltinEngine(BaseEngine):
         timeout = float(self.runtime.get('timeout') or 30)
         keep_alive = bool(self.runtime.get('keep_alive', True))
         follow_redirects = bool(self.runtime.get('follow_redirects', False))
-        verify_ssl = bool(self.env.get('verify_ssl', False))
+        verify_ssl = self.env.get('verify_ssl')
+        verify_ssl = True if verify_ssl is None else bool(verify_ssl)
 
         peak = self._estimate_peak_concurrency()
         limits = httpx.Limits(
@@ -696,7 +697,7 @@ async def debug_run(snapshot, max_steps=50):
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(float(runtime.get('timeout') or 30)),
-        verify=bool(env.get('verify_ssl', False)),
+        verify=bool(env.get('verify_ssl', True)),
         follow_redirects=bool(runtime.get('follow_redirects', False)),
         headers=headers_global,
         **build_proxy_kwargs(runtime),

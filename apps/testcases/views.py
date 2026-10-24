@@ -1,20 +1,23 @@
 from django.http import FileResponse
 from rest_framework import generics, permissions, status, pagination
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.views import APIView
 
-from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord
+from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from .serializers import (
     TestCaseSerializer, TestCaseListSerializer, TestCaseCreateSerializer, TestCaseUpdateSerializer,
-    TestCaseImportRecordListSerializer, TestCaseImportRecordDetailSerializer
+    TestCaseImportRecordListSerializer, TestCaseImportRecordDetailSerializer, TestCaseSyncProfileSerializer
 )
 from apps.projects.models import Project
 from .services import TestCaseImportTemplateService, TestCaseExcelImportService
 from .tasks import import_testcases_from_excel
+from apps.executions.models import TestCaseRevision
+from .sync import TestCaseSyncError, sync_profile
 
 class TestCasePagination(pagination.PageNumberPagination):
     page_size = 10
@@ -28,10 +31,76 @@ class TestCaseImportRecordPagination(pagination.PageNumberPagination):
     max_page_size = 100
 
 
+def _ensure_external_ref_available(project, external_ref, *, exclude_id=None):
+    if not external_ref:
+        return
+    queryset = TestCase.objects.filter(project=project, external_ref=external_ref)
+    if exclude_id is not None:
+        queryset = queryset.exclude(pk=exclude_id)
+    if queryset.exists():
+        raise ValidationError({'external_ref': '该项目中已存在相同的 external_ref'})
+
+
 def get_user_accessible_projects(user):
     return Project.objects.filter(
         models.Q(owner=user) | models.Q(members=user)
     ).distinct()
+
+class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TestCaseSyncProfileSerializer
+
+    def get_queryset(self):
+        return TestCaseSyncProfile.objects.filter(
+            project__in=get_user_accessible_projects(self.request.user)
+        ).select_related('project', 'created_by')
+
+    def perform_create(self, serializer):
+        project = serializer.validated_data.get('project')
+        if not get_user_accessible_projects(self.request.user).filter(pk=project.pk).exists():
+            raise ValidationError({'project': '项目不存在或无权限'})
+        serializer.save(created_by=self.request.user)
+
+
+class TestCaseSyncProfileDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TestCaseSyncProfileSerializer
+
+    def get_queryset(self):
+        return TestCaseSyncProfile.objects.filter(
+            project__in=get_user_accessible_projects(self.request.user)
+        ).select_related('project', 'created_by')
+
+    def perform_update(self, serializer):
+        serializer.save(project=serializer.instance.project)
+
+
+class TestCaseSyncProfileSyncView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        profile = TestCaseSyncProfile.objects.filter(
+            pk=pk,
+            project__in=get_user_accessible_projects(request.user),
+        ).first()
+        if profile is None:
+            return Response({'error': '同步配置不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            summary = sync_profile(profile)
+        except TestCaseSyncError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'profile_id': summary.profile_id,
+            'provider': summary.provider,
+            'commit': summary.commit,
+            'files': summary.files,
+            'created': summary.created,
+            'updated': summary.updated,
+            'skipped': summary.skipped,
+            'conflicts': summary.conflicts,
+            'warnings': summary.warnings,
+        })
+
 
 class TestCaseListCreateView(generics.ListCreateAPIView):
     queryset = TestCase.objects.all()
@@ -39,7 +108,7 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
     pagination_class = TestCasePagination
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['priority', 'test_type']
-    search_fields = ['title', 'description']
+    search_fields = ['title', 'description', 'external_ref']
     ordering_fields = ['created_at', 'updated_at', 'priority']
     ordering = ['-created_at']
 
@@ -102,7 +171,37 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
                     description='系统自动创建的默认项目'
                 )
         
-        serializer.save(author=user, project=project)
+        external_ref = serializer.validated_data.get('external_ref')
+        _ensure_external_ref_available(project, external_ref)
+        testcase = serializer.save(author=user, project=project)
+        _record_test_case_revision(testcase, user)
+
+def _test_case_snapshot(test_case):
+    return {
+        'title': test_case.title,
+        'external_ref': test_case.external_ref,
+        'description': test_case.description,
+        'preconditions': test_case.preconditions,
+        'steps': test_case.steps,
+        'expected_result': test_case.expected_result,
+        'priority': test_case.priority,
+        'status': test_case.status,
+        'test_type': test_case.test_type,
+        'tags': test_case.tags,
+        'project_id': test_case.project_id,
+        'version_ids': list(test_case.versions.values_list('id', flat=True)),
+    }
+
+
+def _record_test_case_revision(test_case, user):
+    latest = TestCaseRevision.objects.filter(test_case=test_case).order_by('-revision').values_list('revision', flat=True).first() or 0
+    TestCaseRevision.objects.create(
+        test_case=test_case,
+        revision=latest + 1,
+        snapshot=_test_case_snapshot(test_case),
+        changed_by=user,
+    )
+
 
 class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = TestCase.objects.all()
@@ -131,19 +230,19 @@ class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         user = self.request.user
         project_id = self.request.data.get('project_id')
-        
+        project = serializer.instance.project
+
         if project_id:
-            # 检查指定的项目是否存在且用户有权限
             accessible_projects = self.get_user_accessible_projects(user)
             try:
                 project = accessible_projects.get(id=project_id)
-                serializer.save(project=project)
             except Project.DoesNotExist:
-                # 如果指定项目不存在或无权限，保持原项目不变
-                serializer.save()
-        else:
-            # 没有指定项目，保持原项目不变
-            serializer.save()
+                project = serializer.instance.project
+
+        external_ref = serializer.validated_data.get('external_ref', serializer.instance.external_ref)
+        _ensure_external_ref_available(project, external_ref, exclude_id=serializer.instance.pk)
+        updated = serializer.save(project=project)
+        _record_test_case_revision(updated, user)
 
 
 class TestCaseImportTemplateDownloadView(APIView):

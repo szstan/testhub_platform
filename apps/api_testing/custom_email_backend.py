@@ -10,8 +10,8 @@ class CustomEmailBackend(EmailBackend):
         if self.connection:
             return False
         
-        # 创建SSL上下文，禁用证书验证
-        ssl_context = ssl._create_unverified_context()
+        # Use the platform trust store; never disable SMTP certificate validation.
+        ssl_context = ssl.create_default_context()
         
         try:
             if self.use_ssl:

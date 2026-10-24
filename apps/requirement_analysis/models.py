@@ -1,5 +1,7 @@
 from django.db import models
 from django.utils import timezone
+from django.conf import settings
+from apps.core.network import validate_outbound_url
 from apps.users.models import User
 from apps.projects.models import Project
 import json
@@ -451,6 +453,13 @@ class AIModelService:
         return f"{normalized_base_url}/v1{endpoint}"
 
     @staticmethod
+    def _validate_request_url(url: str) -> str:
+        return validate_outbound_url(
+            url,
+            allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+        )
+
+    @staticmethod
     async def call_openai_compatible_api(
             config: AIModelConfig,
             messages: List[Dict[str, str]],
@@ -481,7 +490,9 @@ class AIModelService:
             'stream': False
         }
 
-        url = AIModelService.build_openai_compatible_url(config.base_url, '/chat/completions')
+        url = AIModelService._validate_request_url(
+            AIModelService.build_openai_compatible_url(config.base_url, '/chat/completions')
+        )
 
         logger.info(f"=== API调用详情 ===")
         logger.info(f"原始base_url: {config.base_url}")
@@ -499,7 +510,7 @@ class AIModelService:
                 write=60.0,  # 写入超时：60秒
                 pool=60.0  # 连接池超时：60秒
             )
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
+            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
                 logger.info(f"发送POST请求到: {url}")
                 response = await client.post(
                     url,
@@ -510,8 +521,7 @@ class AIModelService:
                 logger.info(f"收到响应: status_code={response.status_code}")
 
                 if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
+                    logger.error(f"API调用返回错误: Status={response.status_code}")
 
                 response.raise_for_status()
                 result = response.json()
@@ -519,7 +529,7 @@ class AIModelService:
                 return result
         except httpx.HTTPStatusError as e:
             provider_name = config.get_model_type_display()
-            error_msg = f"{provider_name} API返回错误 {e.response.status_code}: {e.response.text}"
+            error_msg = f"{provider_name} API返回错误 {e.response.status_code}"
             logger.error(error_msg)
             raise Exception(error_msg)
         except httpx.TimeoutException as e:
@@ -536,7 +546,9 @@ class AIModelService:
     async def list_available_models(config: AIModelConfig) -> List[str]:
         """获取当前配置下可用的模型列表。"""
         headers = AIModelService.get_openai_compatible_headers(config.api_key)
-        url = AIModelService.build_openai_compatible_url(config.base_url, '/models')
+        url = AIModelService._validate_request_url(
+            AIModelService.build_openai_compatible_url(config.base_url, '/models')
+        )
 
         timeout_config = httpx.Timeout(
             connect=30.0,
@@ -546,7 +558,7 @@ class AIModelService:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
+            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
                 logger.info(f"获取模型列表，URL: {url}")
                 response = await client.get(url, headers=headers)
 
@@ -573,7 +585,7 @@ class AIModelService:
                 return unique_model_ids
         except httpx.HTTPStatusError as e:
             provider_name = config.get_model_type_display()
-            raise Exception(f"{provider_name} 获取模型列表失败 {e.response.status_code}: {e.response.text}")
+            raise Exception(f"{provider_name} 获取模型列表失败 {e.response.status_code}")
         except httpx.TimeoutException as e:
             provider_name = config.get_model_type_display()
             logger.error(f"{provider_name} 获取模型列表超时: {repr(e)}")
@@ -626,6 +638,8 @@ class AIModelService:
         else:
             url = base_url
 
+        url = AIModelService._validate_request_url(url)
+
         # 续写控制
         current_messages = list(messages)  # 浅拷贝
         continuation_count = 0
@@ -654,7 +668,7 @@ class AIModelService:
                     write=60.0,  # 写入超时：60秒
                     pool=60.0  # 连接池超时：60秒
                 )
-                async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
+                async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
                     async with client.stream('POST', url, headers=headers, json=data) as response:
                         if response.status_code != 200:
                             error_detail = await response.aread()
@@ -768,7 +782,18 @@ class AIModelService:
             # 不再硬编码max_tokens，使用配置文件中的值（如32000）
         )
 
-        return response['choices'][0]['message']['content']
+        raw_output = response['choices'][0]['message']['content']
+        from .ai_contracts import normalize_generation_output
+
+        normalized_output, draft = normalize_generation_output(raw_output)
+        if draft:
+            logger.info(
+                "AI generation draft accepted contract=%s fingerprint=%s cases=%s",
+                draft['contract_version'],
+                draft['draft_fingerprint'],
+                len(draft['cases']),
+            )
+        return normalized_output
 
     @staticmethod
     async def review_test_cases(task: TestCaseGenerationTask, test_cases: str) -> str:
@@ -882,7 +907,17 @@ class AIModelService:
         case_count = full_content.count('TC-') + full_content.count('TEST-') + full_content.count('测试用例')
         logger.info(f"生成用例统计: 约检测到{case_count}个用例编号标记")
 
-        return full_content
+        from .ai_contracts import normalize_generation_output
+
+        normalized_output, draft = normalize_generation_output(full_content)
+        if draft:
+            logger.info(
+                "AI streaming draft accepted contract=%s fingerprint=%s cases=%s",
+                draft['contract_version'],
+                draft['draft_fingerprint'],
+                len(draft['cases']),
+            )
+        return normalized_output
 
     @staticmethod
     async def review_test_cases_stream(

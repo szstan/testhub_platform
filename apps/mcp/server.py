@@ -12,6 +12,7 @@ import asyncio
 import contextvars
 import functools
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ _starlette_app = None
 #: 而工具内含 Django ORM 调用（@async_unsafe），会抛 SynchronousOnlyOperation
 #: 导致工具执行失败（表现为「未认证」错误且无调用日志），必须投递到线程执行
 _TOOL_THREADS = ThreadPoolExecutor(max_workers=8, thread_name_prefix='mcp-tool')
+_TOOL_SLOTS = threading.BoundedSemaphore(8)
 
 
 def _async_safe_tool(fn):
@@ -38,13 +40,20 @@ def _async_safe_tool(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
+        if not _TOOL_SLOTS.acquire(blocking=False):
+            raise RuntimeError('MCP tool concurrency limit reached; retry later')
         ctx = contextvars.copy_context()
-        future = _TOOL_THREADS.submit(ctx.run, functools.partial(fn, *args, **kwargs))
+        try:
+            future = _TOOL_THREADS.submit(ctx.run, functools.partial(fn, *args, **kwargs))
+        except Exception:
+            _TOOL_SLOTS.release()
+            raise
         try:
             return await asyncio.wrap_future(future)
         except RuntimeError:
-            # 事件循环已关闭等异常场景：同步阻塞等待结果，避免丢失异常
             return future.result()
+        finally:
+            _TOOL_SLOTS.release()
 
     return wrapper
 

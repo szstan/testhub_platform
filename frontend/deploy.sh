@@ -59,6 +59,18 @@ compose() {
     docker compose --project-directory "${SCRIPT_DIR}" -f "${COMPOSE_FILE}" "$@"
 }
 
+check_dist() {
+    [[ -f "${SCRIPT_DIR}/dist/index.html" ]] || die "找不到 frontend/dist/index.html，请先完成生产构建"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R "${SCRIPT_DIR}/dist" || die "无法恢复 frontend/dist 的 SELinux 上下文"
+    fi
+    [[ -r "${SCRIPT_DIR}/dist/index.html" ]] || die "frontend/dist/index.html 不可读"
+    if id nginx >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        runuser -u nginx -- test -r "${SCRIPT_DIR}/dist/index.html" \
+            || die "nginx 用户无法读取 frontend/dist/index.html"
+    fi
+}
+
 # Compose 仅挂载 dist，因此生产构建必须在宿主机完成。
 build_frontend() {
     check_node
@@ -70,7 +82,7 @@ build_frontend() {
         npm run build
     )
 
-    [[ -f "${SCRIPT_DIR}/dist/index.html" ]] || die "前端构建完成但未找到 dist/index.html"
+    check_dist
     print_info "✓ 前端静态资源构建完成"
 }
 
@@ -87,6 +99,8 @@ health_request() {
 wait_for_health() {
     local attempts="${1:-${HEALTH_ATTEMPTS}}"
     local attempt
+
+    check_dist
 
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         print_error "未找到 curl 或 wget，无法执行前端健康检查"

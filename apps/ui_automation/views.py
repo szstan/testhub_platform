@@ -1,14 +1,19 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
 from django.utils import timezone
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+from apps.quality_intelligence.services.redaction import redact_payload
+from urllib.parse import urlparse
 import logging
 import json
 import re
@@ -151,12 +156,17 @@ class UiProjectViewSet(viewsets.ModelViewSet):
         log_operation('create', 'project', instance.id, instance.name, self.request.user)
 
     def perform_update(self, serializer):
+        """仅 owner/admin 可修改项目及成员关系。"""
+        if not (self.request.user.is_staff or self.request.user.is_superuser or serializer.instance.owner_id == self.request.user.id):
+            raise PermissionDenied('只有项目负责人或管理员可以修改项目')
         instance = serializer.save()
         # 记录操作
         log_operation('edit', 'project', instance.id, instance.name, self.request.user)
 
     def perform_destroy(self, instance):
-        # 记录操作（在删除前记录）
+        """仅 owner/admin 可删除项目。"""
+        if not (self.request.user.is_staff or self.request.user.is_superuser or instance.owner_id == self.request.user.id):
+            raise PermissionDenied('只有项目负责人或管理员可以删除项目')
         log_operation('delete', 'project', instance.id, instance.name, self.request.user)
         instance.delete()
 
@@ -2017,6 +2027,8 @@ class OperationRecordViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = OperationRecord.objects.exclude(
             resource_type__in=['ai_case', 'ai_execution']
         ).order_by('-created_at')
+        if not (self.request.user.is_staff or self.request.user.is_superuser):
+            queryset = queryset.filter(user=self.request.user)
 
         # 支持通过查询参数限制返回数量
         limit = self.request.query_params.get('limit', None)
@@ -2715,20 +2727,26 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                     logger.warning(f"未知的机器人类型: {bot_type}")
                     continue
 
+                try:
+                    webhook_url = validate_outbound_url(
+                        webhook_url,
+                        allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+                    )
+                except UnsafeOutboundURL:
+                    logger.warning('拒绝向不安全 Webhook 地址发送 UI 通知')
+                    continue
+
                 # 发送webhook请求
                 try:
-                    logger.info(f"发送请求到: {webhook_url}")
-                    logger.info(f"消息数据: {json.dumps(message_data, ensure_ascii=False, indent=2)}")
-
+                    logger.info("发送通知到 %s webhook host=%s", bot_type, urlparse(webhook_url).hostname)
                     response = requests.post(
                         webhook_url,
                         json=message_data,
                         headers={'Content-Type': 'application/json'},
-                        timeout=10
+                        timeout=10,
                     )
 
-                    logger.info(f"响应状态码: {response.status_code}")
-                    logger.info(f"响应内容: {response.text}")
+                    logger.info("响应状态码: %s", response.status_code)
 
                     if response.status_code == 200:
                         logger.info(f"成功发送通知到 {bot.get('name', 'Unknown')}")
@@ -2741,11 +2759,11 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                             notification_type='task_execution',
                             sender_name='系统Webhook通知',
                             sender_email='system@notification.com',
-                            recipient_info=[{'name': bot.get('name', 'Unknown'), 'webhook_url': webhook_url}],
-                            webhook_bot_info=bot,
-                            notification_content=json.dumps(message_data, ensure_ascii=False),
+                            recipient_info=[{'name': bot.get('name', 'Unknown')}],
+                            webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                            notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                             status='success',
-                            response_info={'status_code': response.status_code, 'response': response.text},
+                            response_info=redact_payload({'status_code': response.status_code, 'response': response.text}),
                             sent_at=timezone.now()
                         )
                     else:
@@ -2759,16 +2777,16 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                             notification_type='task_execution',
                             sender_name='系统Webhook通知',
                             sender_email='system@notification.com',
-                            recipient_info=[{'name': bot.get('name', 'Unknown'), 'webhook_url': webhook_url}],
-                            webhook_bot_info=bot,
-                            notification_content=json.dumps(message_data, ensure_ascii=False),
+                            recipient_info=[{'name': bot.get('name', 'Unknown')}],
+                            webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                            notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                             status='failed',
-                            error_message=f'HTTP {response.status_code}: {response.text}',
-                            response_info={'status_code': response.status_code, 'response': response.text}
+                            error_message=f'HTTP {response.status_code}',
+                            response_info=redact_payload({'status_code': response.status_code, 'response': response.text})
                         )
 
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"发送webhook请求失败: {str(e)}")
+                except requests.exceptions.RequestException:
+                    logger.error("发送webhook请求失败")
 
                     # 记录失败日志
                     UiNotificationLog.objects.create(
@@ -2778,15 +2796,15 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                         notification_type='task_execution',
                         sender_name='系统Webhook通知',
                         sender_email='system@notification.com',
-                        recipient_info=[{'name': bot.get('name', 'Unknown'), 'webhook_url': webhook_url}],
-                        webhook_bot_info=bot,
-                        notification_content=json.dumps(message_data, ensure_ascii=False),
+                        recipient_info=[{'name': bot.get('name', 'Unknown')}],
+                        webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                        notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                         status='failed',
-                        error_message=str(e)
+                        error_message='Webhook notification failed'
                     )
 
-        except Exception as e:
-            logger.error(f"发送Webhook通知失败: {str(e)}", exc_info=True)
+        except Exception:
+            logger.error('发送Webhook通知失败')
 
     def _send_email_notification(self, task, success):
         """发送邮件通知"""
@@ -2895,9 +2913,13 @@ class UiNotificationLogViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['created_at', 'sent_at']
     ordering = ['-created_at']
 
+    def get_queryset(self):
+        user = self.request.user
+        projects = UiProject.objects.filter(models.Q(owner=user) | models.Q(members=user)).distinct()
+        return UiNotificationLog.objects.filter(task__project__in=projects).select_related('task').order_by('-created_at')
+
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
-        """重试发送通知"""
         log = self.get_object()
         if log.status == 'failed':
             # 这里应该触发实际的重试逻辑

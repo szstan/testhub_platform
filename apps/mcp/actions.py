@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 
+from django.db import transaction
 from django.db.models import Q
 
 logger = logging.getLogger(__name__)
@@ -184,29 +185,30 @@ def create_testcase_action(arguments: dict, user) -> dict:
     if not isinstance(steps, list):
         raise McpActionError('data.steps 必须是数组')
 
-    testcase = TestCase.objects.create(
-        project=project,
-        title=title[:500],
-        description=data.get('description', ''),
-        preconditions=data.get('preconditions', ''),
-        expected_result=data.get('expected_result', ''),
-        priority=data.get('priority', 'medium') if data.get('priority') in dict(TestCase.PRIORITY_CHOICES) else 'medium',
-        test_type=data.get('test_type', 'functional') if data.get('test_type') in dict(TestCase.TYPE_CHOICES) else 'functional',
-        author=user,
-    )
+    with transaction.atomic():
+        testcase = TestCase.objects.create(
+            project=project,
+            title=title[:500],
+            description=data.get('description', ''),
+            preconditions=data.get('preconditions', ''),
+            expected_result=data.get('expected_result', ''),
+            priority=data.get('priority', 'medium') if data.get('priority') in dict(TestCase.PRIORITY_CHOICES) else 'medium',
+            test_type=data.get('test_type', 'functional') if data.get('test_type') in dict(TestCase.TYPE_CHOICES) else 'functional',
+            author=user,
+        )
 
-    step_objs = []
-    for idx, item in enumerate(steps, 1):
-        if not isinstance(item, dict):
-            continue
-        step_objs.append(TestCaseStep(
-            testcase=testcase,
-            step_number=item.get('step_number', idx),
-            action=str(item.get('action', '')),
-            expected=str(item.get('expected', '')),
-        ))
-    if step_objs:
-        TestCaseStep.objects.bulk_create(step_objs)
+        step_objs = []
+        for idx, item in enumerate(steps[:200], 1):
+            if not isinstance(item, dict):
+                continue
+            step_objs.append(TestCaseStep(
+                testcase=testcase,
+                step_number=item.get('step_number', idx),
+                action=str(item.get('action', ''))[:4000],
+                expected=str(item.get('expected', ''))[:4000],
+            ))
+        if step_objs:
+            TestCaseStep.objects.bulk_create(step_objs)
 
     return {
         'testcase_id': testcase.id,
@@ -222,23 +224,34 @@ def build_preview(tool_name: str, arguments: dict, user) -> str:
     try:
         if tool_name == 'confirm_run_api_suite':
             from apps.api_testing.models import TestSuite
-            suite = TestSuite.objects.filter(id=arguments.get('suite_id')).first()
-            count = suite.requests.count() if suite else 0
-            return f'将执行 API 测试套件「{suite.name if suite else arguments.get("suite_id")}」（约 {count} 个请求）'
+            suite = TestSuite.objects.filter(id=arguments.get('suite_id'), project__in=accessible_api_projects(user)).first()
+            if not suite:
+                raise McpActionError('测试套件不存在或无权限')
+            count = suite.requests.count()
+            return f'将执行 API 测试套件「{suite.name}」（约 {count} 个请求）'
         if tool_name == 'confirm_run_ui_case':
             from apps.ui_automation.models import TestCase as UiCase
-            case = UiCase.objects.filter(id=arguments.get('case_id')).first()
+            case = UiCase.objects.filter(id=arguments.get('case_id'), project__in=accessible_ui_projects(user)).first()
+            if not case:
+                raise McpActionError('UI 用例不存在或无权限')
             return (f'将以 {arguments.get("engine", "playwright")} 无头模式执行 UI 用例'
-                    f'「{case.name if case else arguments.get("case_id")}」')
+                    f'「{case.name}」')
         if tool_name == 'confirm_run_perf_scene':
             from apps.perf_testing.models import PerfScenario
-            scene = PerfScenario.objects.filter(id=arguments.get('scene_id')).first()
-            load = (scene.get_load_config() if scene else {}) or {}
-            return (f'将对压测场景「{scene.name if scene else arguments.get("scene_id")}」发起压测'
+            scene = PerfScenario.objects.filter(id=arguments.get('scene_id'), project__in=accessible_perf_projects(user)).first()
+            if not scene:
+                raise McpActionError('压测场景不存在或无权限')
+            load = scene.get_load_config() or {}
+            return (f'将对压测场景「{scene.name}」发起压测'
                     f'（并发 {load.get("concurrency", "?")}，时长 {load.get("duration", "?")}s）')
         if tool_name == 'confirm_create_testcase':
+            project = accessible_projects(user).filter(id=arguments.get('project_id')).first()
+            if not project:
+                raise McpActionError('项目不存在或无权限')
             data = arguments.get('data') or {}
-            return f'将在项目 {arguments.get("project_id")} 创建测试用例「{data.get("title", "未命名")}」'
+            return f'将在项目 {project.id} 创建测试用例「{data.get("title", "未命名")}」'
+    except McpActionError:
+        raise
     except Exception as exc:  # noqa: BLE001 - 预览失败不阻断流程
         logger.warning('构造 preview 失败 tool=%s: %s', tool_name, exc)
     return f'即将执行危险操作 {tool_name}'

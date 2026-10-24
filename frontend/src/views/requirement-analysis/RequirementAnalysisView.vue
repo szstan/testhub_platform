@@ -224,7 +224,7 @@
             <button
               class="generate-btn"
               @click="generateFromDocument"
-              :disabled="!documentTitle || isGenerating">
+              :disabled="!documentTitle || !selectedProject || isGenerating">
               <span v-if="isGenerating">{{ $t('requirementAnalysis.generating') }}</span>
               <span v-else>{{ $t('requirementAnalysis.generateButton') }}</span>
             </button>
@@ -434,6 +434,7 @@ export default {
     canGenerateManual() {
       return this.manualInput.title.trim() &&
              this.manualInput.description.trim() &&
+             this.manualInput.selectedProject &&
              this.manualInput.description.length <= 2000
     }
   },
@@ -674,8 +675,8 @@ export default {
     },
 
     async generateFromDocument() {
-      if (!this.selectedFile || !this.documentTitle) {
-        ElMessage.error(this.$t('requirementAnalysis.selectFileAndTitle'))
+      if (!this.selectedFile || !this.documentTitle || !this.selectedProject) {
+        ElMessage.error(this.$t('requirementAnalysis.selectFileAndTitle') + '，并选择项目')
         return
       }
 
@@ -781,7 +782,17 @@ export default {
       }
     },
 
-    startStreamingProgress() {
+    async startStreamingProgress() {
+      try {
+        const ticketResponse = await api.post(`/requirement-analysis/testcase-generation/${this.currentTaskId}/stream-ticket/`)
+        this.startStreamingProgressWithTicket(ticketResponse.data.ticket)
+      } catch (error) {
+        console.error('SSE ticket 获取失败，回退轮询', error)
+        this.startPolling()
+      }
+    },
+
+    startStreamingProgressWithTicket(ticket) {
       // 使用SSE进行流式进度获取
       // 注意：EventSource不使用axios代理，需要直接指向后端服务器
       // 完整的URL路径: /api/requirement-analysis/testcase-generation/{task_id}/stream_progress/
@@ -790,11 +801,11 @@ export default {
       // 在生产环境中(如Docker部署)，通常通过Nginx反向代理访问，端口应该是80或443(与当前页面一致)
       // 而不是直接访问后端端口8000
       const currentOrigin = window.location.origin
-      const apiUrl = `${currentOrigin}/api/requirement-analysis/testcase-generation/${this.currentTaskId}/stream_progress/`
+      const apiUrl = `${currentOrigin}/api/requirement-analysis/testcase-generation/${this.currentTaskId}/stream_progress/?ticket=${encodeURIComponent(ticket)}`
 
       console.log('SSE连接URL:', apiUrl)
 
-      // 创建EventSource（不支持自定义headers，使用withCredentials发送cookie）
+      // EventSource 使用短期 ticket；JWT 只通过 Axios 请求 ticket，不放进 URL。
       this.eventSource = new EventSource(apiUrl, { withCredentials: true })
 
       // 监听连接打开事件

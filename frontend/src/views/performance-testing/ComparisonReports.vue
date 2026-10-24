@@ -111,7 +111,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { marked } from 'marked'
+import { renderSafeMarkdown } from '@/utils/safe-html'
 import {
   getPerfProjects,
   getPerfComparisonReports,
@@ -167,7 +167,7 @@ function deltaText(pct) {
 }
 
 function renderMarkdown(text) {
-  return marked.parse(text || '')
+  return renderSafeMarkdown(text)
 }
 
 async function loadProjects() {

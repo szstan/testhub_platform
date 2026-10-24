@@ -976,6 +976,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'v
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Folder, Document, MagicStick, Search, Close, CopyDocument, Delete } from '@element-plus/icons-vue'
 import api from '@/utils/api'
+import { escapeHtml } from '@/utils/safe-html'
 import KeyValueEditor from './components/KeyValueEditor.vue'
 import DataFactorySelector from '@/components/DataFactorySelector.vue'
 import { RequestModelParser } from '@/utils/requestModel'
@@ -1713,14 +1714,15 @@ const highlightedResponseBody = computed(() => {
   if (!responseBody.value) return ''
 
   try {
-    // 简单的 JSON 语法高亮
-    return responseBody.value
+    // 先转义响应体，再添加可信的高亮标签
+    const safeBody = escapeHtml(responseBody.value)
+    return safeBody
       .replace(/"([^"]+)"\s*:/g, '<span style="color: #268bd2;">"$1"</span>:')
       .replace(/:\s*"([^"]+)"/g, ': <span style="color: #2aa198;">"$1"</span>')
       .replace(/:\s*(true|false|null)/g, ': <span style="color: #cb4b16;">$1</span>')
       .replace(/:\s*([0-9]+(\.[0-9]+)?)/g, ': <span style="color: #d33682;">$1</span>')
   } catch (e) {
-    return responseBody.value
+    return escapeHtml(responseBody.value)
   }
 })
 

@@ -48,6 +48,22 @@
               <el-icon><VideoPlay /></el-icon>
               <span>{{ $t('menu.testPlan') }}</span>
             </el-menu-item>
+            <el-menu-item index="/ai-generation/task-center">
+              <el-icon><List /></el-icon>
+              <span>{{ $t('menu.taskCenter') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-generation/traceability">
+              <el-icon><Connection /></el-icon>
+              <span>{{ $t('menu.traceability') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-generation/ci-profiles">
+              <el-icon><Setting /></el-icon>
+              <span>{{ $t('menu.ciProfiles') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-generation/datasets-plugins">
+              <el-icon><Collection /></el-icon>
+              <span>{{ $t('menu.datasetsPlugins') }}</span>
+            </el-menu-item>
             <el-menu-item index="/ai-generation/reports">
               <el-icon><DataAnalysis /></el-icon>
               <span>{{ $t('menu.testReport') }}</span>
@@ -468,7 +484,7 @@ import {
   Monitor, Folder, Document, Flag, Check, Collection, VideoPlay,
   DataAnalysis, ChatDotRound, DocumentCopy, Link, MagicStick,
   Odometer, Timer, Setting, AlarmClock, Bell, Aim, Edit, Cpu, ArrowDown, Cellphone, Connection, FolderOpened, Tickets, Plus,
-  SetUp, TrendCharts, Warning
+  SetUp, TrendCharts, Warning, List
 } from '@element-plus/icons-vue'
 import logoSvg from '@/assets/images/logo.svg'
 import logoHomePng from '@/assets/images/logo_home.png'
@@ -544,6 +560,10 @@ const breadcrumbTitle = computed(() => {
     '/ai-generation/review-templates': t('menu.reviewTemplates'),
     '/ai-generation/testsuites': t('menu.suiteManagement'),
     '/ai-generation/executions': t('menu.executionRecords'),
+    '/ai-generation/task-center': t('menu.taskCenter'),
+    '/ai-generation/traceability': t('menu.traceability'),
+    '/ai-generation/ci-profiles': t('menu.ciProfiles'),
+    '/ai-generation/datasets-plugins': t('menu.datasetsPlugins'),
     '/ai-generation/reports': t('menu.testReport'),
 
     // 接口测试

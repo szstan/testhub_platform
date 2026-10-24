@@ -10,6 +10,7 @@ from .views import (
     TaskNotificationSettingViewSet, OperationLogViewSet,
     ApiDashboardViewSet, AIServiceConfigViewSet
 )
+from .contracts_views import OpenApiContractSpecViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', ApiDashboardViewSet, basename='dashboard')
@@ -28,6 +29,7 @@ router.register(r'notification-logs', NotificationLogViewSet)
 router.register(r'task-notification-settings', TaskNotificationSettingViewSet)
 router.register(r'operation-logs', OperationLogViewSet)
 router.register(r'ai-service-configs', AIServiceConfigViewSet, basename='aiserviceconfig')
+router.register(r'openapi-contracts', OpenApiContractSpecViewSet, basename='openapi-contract')
 
 urlpatterns = [
     path('api-testing/', include(router.urls)),

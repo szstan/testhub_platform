@@ -12,8 +12,10 @@
 DB 记录承载状态机与监控可视化，两者互补。
 """
 import logging
+from datetime import timedelta
 
 from django.conf import settings
+from django.db import transaction
 from django.core import signing
 from django.utils import timezone
 
@@ -64,6 +66,19 @@ def notify_pending_approval(pending: McpPendingConfirm):
 
 def create_preview(tool_name: str, arguments: dict, user) -> dict:
     """创建待确认记录并返回 preview 结果（供 preview_* 工具使用）。"""
+    from django.core.cache import cache
+    now = timezone.now()
+    rate_key = f'mcp:preview:rate:{user.id}'
+    if not getattr(settings, 'DEBUG', False) and not getattr(settings, 'TESTING', False) and not cache.add(rate_key, '1', timeout=1):
+        raise ConfirmError('危险操作预览请求过于频繁，请稍后重试')
+    active_count = McpPendingConfirm.objects.filter(
+        user=user, status='pending', expires_at__gt=now
+    ).count()
+    if not getattr(settings, 'DEBUG', False) and not getattr(settings, 'TESTING', False) and active_count >= 20:
+        raise ConfirmError('待确认危险操作已达到上限，请先处理或等待过期')
+    McpPendingConfirm.objects.filter(
+        status='expired', expires_at__lt=now - timedelta(days=1)
+    ).delete()
     preview_text = build_preview(tool_name, arguments, user)
     pending = McpPendingConfirm.objects.create(
         user=user,
@@ -116,60 +131,89 @@ def verify_pending(confirm_token: str, user) -> McpPendingConfirm:
 
 
 def consume_pending(pending: McpPendingConfirm, user) -> dict:
-    """执行待确认动作（confirm_* 工具入口），单次消费。
+    """Claim a pending action atomically before executing it once."""
+    with transaction.atomic():
+        locked = McpPendingConfirm.objects.select_for_update().get(pk=pending.pk)
+        if locked.user_id != user.id:
+            raise ConfirmError('无权确认其他用户发起的操作')
+        if locked.status != 'pending':
+            raise ConfirmError(f'该操作当前状态为 {locked.status}，不可重复执行')
+        if locked.is_expired:
+            locked.status = 'expired'
+            locked.save(update_fields=['status', 'updated_at'])
+            raise ConfirmError('该操作已过期，请重新调用 preview')
+        if _human_approval_enabled():
+            if not locked.awaiting_human:
+                locked.awaiting_human = True
+                locked.save(update_fields=['awaiting_human', 'updated_at'])
+            return {
+                'status': 'awaiting_approval',
+                'pending_id': locked.id,
+                'hint': '人工审批模式已开启：该操作已转入 TestHub「MCP 控制台」等待批准，'
+                        '请稍后调用 get_approval_status 轮询审批结果',
+            }
+        action = ACTION_REGISTRY.get(locked.tool_name)
+        if action is None:
+            raise ConfirmError(f'未知的待确认操作: {locked.tool_name}')
+        # Mark consumed before the external side effect so concurrent confirms cannot duplicate it.
+        locked.status = 'consumed'
+        locked.result = {'status': 'executing'}
+        locked.save(update_fields=['status', 'result', 'updated_at'])
+        arguments = dict(locked.arguments or {})
 
-    人工审批模式（MCP_HUMAN_APPROVAL=True）下不直接执行，标记
-    awaiting_human 后返回等待指示，由控制台批准后经 approve_pending 执行。
-    """
-    if _human_approval_enabled():
-        if not pending.awaiting_human:
-            pending.awaiting_human = True
-            pending.save(update_fields=['awaiting_human', 'updated_at'])
-        return {
-            'status': 'awaiting_approval',
-            'pending_id': pending.id,
-            'hint': '人工审批模式已开启：该操作已转入 TestHub「MCP 控制台」等待批准，'
-                    '请稍后调用 get_approval_status 轮询审批结果',
-        }
-    action = ACTION_REGISTRY.get(pending.tool_name)
-    if action is None:
-        raise ConfirmError(f'未知的待确认操作: {pending.tool_name}')
     try:
-        result = action(pending.arguments, user)
-    except McpActionError as e:
-        raise ConfirmError(str(e)) from e
-    pending.status = 'consumed'
-    pending.result = result
-    pending.save(update_fields=['status', 'result', 'updated_at'])
+        result = action(arguments, user)
+    except Exception as e:
+        logger.exception('MCP action failed tool=%s', locked.tool_name)
+        McpPendingConfirm.objects.filter(pk=pending.pk).update(
+            result={'status': 'failed'}, updated_at=timezone.now())
+        raise ConfirmError('危险操作执行失败，请查看审计日志') from e
+    McpPendingConfirm.objects.filter(pk=pending.pk).update(
+        result=result or {}, updated_at=timezone.now())
     return result
 
 
 def approve_pending(pending: McpPendingConfirm, operator) -> dict:
-    """监控页手动批准：服务端触发动作执行。"""
-    if pending.status != 'pending' or pending.is_expired:
-        raise ConfirmError(f'当前状态({pending.status})不可批准')
-    action = ACTION_REGISTRY.get(pending.tool_name)
-    if action is None:
-        raise ConfirmError(f'未知的待确认操作: {pending.tool_name}')
+    """Claim and execute a pending action from the admin console once."""
+    with transaction.atomic():
+        locked = McpPendingConfirm.objects.select_for_update().get(pk=pending.pk)
+        if locked.status != 'pending' or locked.is_expired:
+            raise ConfirmError(f'当前状态({locked.status})不可批准')
+        action = ACTION_REGISTRY.get(locked.tool_name)
+        if action is None:
+            raise ConfirmError(f'未知的待确认操作: {locked.tool_name}')
+        locked.status = 'consumed'
+        locked.result = {'status': 'executing', 'approved_by': operator.username}
+        locked.save(update_fields=['status', 'result', 'updated_at'])
+        arguments = dict(locked.arguments or {})
+
     try:
-        result = action(pending.arguments, pending.user)
-    except McpActionError as e:
-        raise ConfirmError(str(e)) from e
-    pending.status = 'approved'
-    pending.result = {**(result or {}), 'approved_by': operator.username}
-    pending.save(update_fields=['status', 'result', 'updated_at'])
+        result = action(arguments, locked.user)
+    except Exception as e:
+        logger.exception('MCP approved action failed tool=%s', locked.tool_name)
+        McpPendingConfirm.objects.filter(pk=pending.pk).update(
+            result={'status': 'failed', 'approved_by': operator.username}, updated_at=timezone.now())
+        raise ConfirmError('批准操作执行失败，请查看审计日志') from e
+    McpPendingConfirm.objects.filter(pk=pending.pk).update(
+        status='approved',
+        result={**(result or {}), 'approved_by': operator.username},
+        updated_at=timezone.now(),
+    )
     return result
 
 
-def reject_pending(pending: McpPendingConfirm, operator):
-    """监控页拒绝：令牌作废。"""
-    if pending.status != 'pending':
-        raise ConfirmError(f'当前状态({pending.status})不可拒绝')
-    pending.status = 'rejected'
-    pending.result = {'rejected_by': operator.username,
-                      'rejected_at': timezone.now().isoformat()}
-    pending.save(update_fields=['status', 'result', 'updated_at'])
-    return pending
+
+def reject_pending(pending, operator):
+    """监控页拒绝：在行锁内条件作废令牌。"""
+    with transaction.atomic():
+        locked = McpPendingConfirm.objects.select_for_update().get(pk=pending.pk)
+        if locked.status != 'pending':
+            raise ConfirmError(f'当前状态({locked.status})不可拒绝')
+        locked.status = 'rejected'
+        locked.result = {'rejected_by': operator.username,
+                         'rejected_at': timezone.now().isoformat()}
+        locked.save(update_fields=['status', 'result', 'updated_at'])
+        return locked
 
 
 def _unsign_token(confirm_token: str):
@@ -203,6 +247,8 @@ def query_approval_status(confirm_token: str, user) -> dict:
         raise ConfirmError('无权查询其他用户发起的操作')
 
     if pending.status in ('approved', 'consumed'):
+        if (pending.result or {}).get('status') == 'failed':
+            return {'status': 'failed', 'result': pending.result or {}}
         return {'status': 'approved', 'result': pending.result or {}}
     if pending.status == 'rejected':
         return {'status': 'rejected', 'result': pending.result or {}}

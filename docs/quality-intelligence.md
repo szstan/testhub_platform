@@ -58,11 +58,11 @@ The quality layer is derived and can be disabled independently:
 
 - Quality rows are readable only when the caller can access the source project as owner or member; unauthorized object details are returned as `404`.
 - Public payloads are bounded and redacted. Evidence paths, secrets, raw stack traces, and source payloads must not be added to UI copy, logs, or incident tickets.
-- Quarantine and flaky state are informational. They do not skip source executions, rewrite source statuses, or suppress raw performance statistics.
-- Baseline comparisons are deterministic and informational. They do not create CI status checks or block releases.
+- Quarantine and flaky state are read by unified dispatch governance. An active approved quarantine blocks dispatch unless a privileged actor supplies an audited override reason; raw source results remain retained.
+- Baseline comparisons and quality-gate evaluations are deterministic. A configured gate fails closed on missing/invalid data and preserves the raw attempt plus an immutable final snapshot.
 
 ## Verification and Known Limitation
 
 Use SQLite test settings for local automated tests. The default local MySQL migration consistency check requires valid local database credentials; an `Access denied for user 'root'@'localhost'` warning means the database check was not executed, not that a migration diff was generated. Run the same migration check in the deployment environment with its normal credentials before release.
 
-CI/CD quality gates, automatic blocking, automatic quarantine, and AI failure classification are intentionally deferred from this rollout.
+CI profile webhooks, automatic retry outbox, quarantine governance, and audited AI suggestions are implemented behind their feature and permission boundaries. AI remains disabled by default; suggestions are redacted, deterministic, reviewable, and never auto-applied.

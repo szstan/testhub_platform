@@ -138,6 +138,9 @@ class DefectWriteSerializer(serializers.ModelSerializer):
             'assignee_id',
             'verifier_id',
             'related_testcase_id',
+            'external_provider',
+            'external_key',
+            'external_url',
             'due_at',
         )
 

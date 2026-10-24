@@ -110,6 +110,9 @@ class Defect(models.Model):
     )
     resolved_at = models.DateTimeField(null=True, blank=True, verbose_name='解决时间')
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name='关闭时间')
+    external_provider = models.CharField(max_length=32, blank=True, default='', verbose_name='外部平台')
+    external_key = models.CharField(max_length=255, blank=True, default='', verbose_name='外部标识')
+    external_url = models.URLField(blank=True, default='', verbose_name='外部链接')
     due_at = models.DateTimeField(null=True, blank=True, verbose_name='期望修复时间')
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
@@ -136,6 +139,23 @@ class Defect(models.Model):
         verbose_name = 'Bug缺陷'
         verbose_name_plural = 'Bug缺陷'
         ordering = ['-created_at']
+
+
+
+
+class GitHubIssueIntegration(models.Model):
+    """Project-scoped GitHub Issues integration using an environment token ref."""
+
+    project = models.OneToOneField(Project, on_delete=models.CASCADE, related_name='github_issue_integration')
+    repository_url = models.URLField(max_length=512)
+    token_env_ref = models.CharField(max_length=255)
+    enabled = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'github_issue_integrations'
 
 
 class DefectTransition(models.Model):

@@ -383,7 +383,7 @@ echarts.use([
   TooltipComponent,
   CanvasRenderer,
 ])
-import { marked } from 'marked'
+import { renderSafeMarkdown } from '@/utils/safe-html'
 
 import MetricCards from './components/MetricCards.vue'
 import { statusTagType, slaTagType, formatTime, formatDuration, apiError } from './shared'
@@ -431,7 +431,7 @@ const aiRenderedHtml = computed(() => {
     if (boldCount % 2 === 1) src += '**'
     if ((src.match(/^>/gm) || []).length && !/\n\s*$/.test(src)) src += '\n'
   }
-  let html = marked.parse(src)
+  let html = renderSafeMarkdown(src)
   if (aiAnalysis.loading) {
     html += '<span class="ai-streaming-cursor"></span>'
   }

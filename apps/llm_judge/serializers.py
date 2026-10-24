@@ -1,4 +1,6 @@
 """智能评分器 DRF 序列化器。"""
+import json
+
 from rest_framework import serializers
 
 from .models import Rubric, RubricDimension, RubricRule, JudgeRecord, JudgeBatch
@@ -86,12 +88,31 @@ class JudgeBatchSerializer(serializers.ModelSerializer):
 
 class JudgeSingleRequestSerializer(serializers.Serializer):
     """单条评分入参。"""
-    question = serializers.CharField()
-    answer = serializers.CharField()
+    question = serializers.CharField(max_length=20000)
+    answer = serializers.CharField(max_length=50000)
     ground_truth = serializers.JSONField(required=False, allow_null=True)
     auto_gt = serializers.BooleanField(required=False, default=False)
     rubric = serializers.IntegerField(required=False, help_text='Rubric ID；不传则用默认')
     context = serializers.JSONField(required=False, default=dict)
+
+    def validate(self, attrs):
+        for field in ('ground_truth', 'context'):
+            value = attrs.get(field)
+            if value is None:
+                continue
+            try:
+                if len(json.dumps(value, ensure_ascii=False, default=str)) > 100000:
+                    raise serializers.ValidationError({field: 'JSON 内容不能超过 100KB'})
+            except (TypeError, ValueError) as exc:
+                raise serializers.ValidationError({field: 'JSON 内容无效'}) from exc
+        ground_truth = attrs.get('ground_truth') or {}
+        for item in ground_truth.get('values', []) if isinstance(ground_truth, dict) else []:
+            if isinstance(item, dict) and 'value' in item:
+                try:
+                    float(item['value'])
+                except (TypeError, ValueError) as exc:
+                    raise serializers.ValidationError({'ground_truth': 'values.value 必须是数字'}) from exc
+        return attrs
 
 
 class JudgeBatchRequestSerializer(serializers.Serializer):
@@ -101,15 +122,27 @@ class JudgeBatchRequestSerializer(serializers.Serializer):
     cases = serializers.ListField(child=serializers.JSONField(), min_length=1)
 
     def validate_cases(self, cases):
-        if len(cases) > 5000:
-            raise serializers.ValidationError(f'单次批量评分最多 5000 条用例，当前 {len(cases)} 条，请分批提交')
+        try:
+            if len(json.dumps(cases, ensure_ascii=False, default=str)) > 10 * 1024 * 1024:
+                raise serializers.ValidationError('批量评分请求总大小不能超过 10MB')
+        except (TypeError, ValueError) as exc:
+            raise serializers.ValidationError('批量评分数据无法序列化') from exc
+
         for i, case in enumerate(cases):
             if not isinstance(case, dict):
                 raise serializers.ValidationError(f'第 {i+1} 条用例格式错误：应为 JSON 对象')
-            if not (case.get('question') or '').strip():
-                raise serializers.ValidationError(f'第 {i+1} 条用例缺少问题(question)')
-            if not (case.get('answer') or '').strip():
-                raise serializers.ValidationError(f'第 {i+1} 条用例缺少答案(answer)')
+            single = JudgeSingleRequestSerializer(data=case)
+            if not single.is_valid():
+                raise serializers.ValidationError({str(i): single.errors})
+
+            question = case.get('question')
+            answer = case.get('answer')
+            if not isinstance(question, str) or not question.strip():
+                raise serializers.ValidationError(f'第 {i+1} 条用例 question 必须是非空字符串')
+            if not isinstance(answer, str) or not answer.strip():
+                raise serializers.ValidationError(f'第 {i+1} 条用例 answer 必须是非空字符串')
+            if len(question) > 20000 or len(answer) > 50000:
+                raise serializers.ValidationError(f'第 {i+1} 条用例文本过长')
         return cases
 
 

@@ -88,6 +88,7 @@ def send_sms(phone_number, template_code, template_param, sign_name=None):
 
 VERIFY_CODE_LENGTH = 6
 VERIFY_CODE_TTL = 300        # 验证码 5 分钟有效
+VERIFY_MAX_ATTEMPTS = 5
 SMS_RATE_LIMIT_TTL = 60      # 同一手机号 60 秒内只能发一次
 
 
@@ -162,14 +163,22 @@ def validate_verify_code(phone_number, verify_code_token, verify_code):
     """校验短信验证码，返回 (valid: bool, error: str)"""
     redis_client = get_redis()
 
-    # 校验验证码
     code_key = f"sms:verify_code:{verify_code_token}"
+    attempt_key = f"sms:verify_attempts:{verify_code_token}"
+    attempts = redis_client.incr(attempt_key)
+    if attempts == 1:
+        redis_client.expire(attempt_key, VERIFY_CODE_TTL)
+    if attempts > VERIFY_MAX_ATTEMPTS:
+        redis_client.delete(code_key, f"sms:phone:{verify_code_token}", attempt_key)
+        return False, '验证码错误次数过多，请重新获取'
+
+    # 校验验证码
     stored_code = redis_client.get(code_key)
     if stored_code is None:
         return False, '验证码已过期，请重新获取'
 
     stored_code = stored_code.decode('utf-8') if isinstance(stored_code, bytes) else stored_code
-    if stored_code != verify_code:
+    if not hmac.compare_digest(str(stored_code), str(verify_code or '')):
         return False, '验证码错误'
 
     # 校验手机号是否匹配

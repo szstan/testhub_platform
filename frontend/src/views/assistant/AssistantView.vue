@@ -156,6 +156,7 @@ import { useUserStore } from '@/stores/user'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, ChatDotRound, User, Cpu, Promotion, Loading, UserFilled, ArrowDown } from '@element-plus/icons-vue'
 import api from '@/utils/api'
+import { renderSafeMarkdown } from '@/utils/safe-html'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -214,14 +215,7 @@ const formatDate = (dateString) => {
   return date.toLocaleDateString(localeCode, { month: '2-digit', day: '2-digit' })
 }
 
-const formatMessageContent = (content) => {
-  if (!content) return ''
-  // 简单的 markdown 处理，实际项目中建议使用 markdown-it
-  return content
-    .replace(/\n/g, '<br>')
-    .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-}
+const formatMessageContent = (content) => renderSafeMarkdown(content)
 
 const scrollToBottom = () => {
   nextTick(() => {

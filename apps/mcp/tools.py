@@ -130,7 +130,9 @@ def _run_tool(ctx: Context, tool_name: str, arguments: dict, fn):
         result = fn(user)
         _log_call(user, tool_name, arguments, started, client_name=client_name)
         return result
-    except ToolError:
+    except ToolError as e:
+        _log_call(user, tool_name, arguments, started, error=str(e),
+                  status='denied', client_name=client_name)
         raise
     except ConfirmError as e:
         _log_call(user, tool_name, arguments, started, error=str(e),
@@ -144,7 +146,7 @@ def _run_tool(ctx: Context, tool_name: str, arguments: dict, fn):
         logger.exception('MCP 工具 %s 执行异常', tool_name)
         _log_call(user, tool_name, arguments, started, error=str(e),
                   status='error', client_name=client_name)
-        raise ToolError(f'{tool_name} 执行失败: {e}') from e
+        raise ToolError(f'{tool_name} 执行失败，请查看审计日志') from e
     finally:
         if not connection.in_atomic_block:
             close_old_connections()
@@ -357,6 +359,91 @@ def analyze_failure(ctx: Context, execution_id: int) -> dict:
 
 
 # --------------------------------------------------------------------- #
+# P2 安全只读工具：AI draft / 风险选测 / release & contract 状态
+# --------------------------------------------------------------------- #
+
+def get_ai_draft_summary(ctx: Context, task_id: int) -> dict:
+    """查询本人可访问的 AI 生成任务状态和 contract metadata，不返回原始模型输出。"""
+    def run(user):
+        from apps.requirement_analysis.models import TestCaseGenerationTask
+        task = TestCaseGenerationTask.objects.filter(id=task_id).select_related('project').first()
+        if not task:
+            raise ToolError(f'AI 生成任务 {task_id} 不存在')
+        if task.created_by_id != user.id:
+            project = task.project
+            if not project or not act.accessible_projects(user).filter(id=project.id).exists():
+                raise ToolError('无权访问该 AI 生成任务')
+        return {
+            'task_id': task.id,
+            'status': task.status,
+            'progress': task.progress,
+            'output_mode': task.output_mode,
+            'generation_log': task.generation_log,
+            'has_generated_output': bool(task.generated_test_cases),
+            'has_review_feedback': bool(task.review_feedback),
+            'has_final_output': bool(task.final_test_cases),
+            'is_saved_to_records': task.is_saved_to_records,
+            'created_at': task.created_at,
+            'updated_at': task.updated_at,
+        }
+    return _run_tool(ctx, 'get_ai_draft_summary', {'task_id': task_id}, run)
+
+
+def get_quality_risk_candidates(
+    ctx: Context,
+    candidates: list[dict],
+    histories: dict | None = None,
+    change_impacts: dict | None = None,
+    limit: int = 50,
+) -> dict:
+    """基于输入的历史结果生成可解释的风险回归候选集，不写入数据库。"""
+    def run(_user):
+        from apps.quality_intelligence.services.risk_selection import select_regression_candidates
+        if not isinstance(candidates, list) or len(candidates) > 200:
+            raise ToolError('candidates 必须是最多 200 项的数组')
+        result = select_regression_candidates(
+            candidates,
+            histories=histories or {},
+            change_impacts=change_impacts or {},
+            limit=max(1, min(int(limit or 50), 100)),
+        )
+        return {'count': len(result), 'items': result}
+    return _run_tool(
+        ctx,
+        'get_quality_risk_candidates',
+        {'candidates': candidates, 'histories': histories or {}, 'change_impacts': change_impacts or {}, 'limit': limit},
+        run,
+    )
+
+
+def get_release_status(ctx: Context) -> dict:
+    """读取当前 release marker，不执行部署或远程写操作。"""
+    def run(_user):
+        from pathlib import Path
+        from django.conf import settings
+        release_file = Path(getattr(settings, 'BASE_DIR', Path.cwd())) / 'RELEASE'
+        release = ''
+        if release_file.exists():
+            release = release_file.read_text(encoding='utf-8').splitlines()[0].strip()
+        return {'release': release or 'unknown', 'health_path': '/health/', 'readiness_path': '/readiness/'}
+    return _run_tool(ctx, 'get_release_status', {}, run)
+
+
+def get_api_contract_status(ctx: Context) -> dict:
+    """读取 OpenAPI contract baseline 元数据，不生成或修改 schema。"""
+    def run(_user):
+        from hashlib import sha256
+        from pathlib import Path
+        from django.conf import settings
+        baseline = Path(getattr(settings, 'BASE_DIR', Path.cwd())) / 'docs' / 'openapi-contract-baseline.yaml'
+        if not baseline.exists():
+            return {'available': False, 'baseline_name': 'docs/openapi-contract-baseline.yaml'}
+        digest = sha256(baseline.read_bytes()).hexdigest()
+        return {'available': True, 'baseline_name': 'docs/openapi-contract-baseline.yaml', 'sha256': digest, 'size_bytes': baseline.stat().st_size, 'check_command': 'python scripts/api_contract_check.py --baseline docs/openapi-contract-baseline.yaml'}
+    return _run_tool(ctx, 'get_api_contract_status', {}, run)
+
+
+# --------------------------------------------------------------------- #
 # 危险工具：preview 同步返回预览 + confirm_token；confirm 校验后异步执行
 # --------------------------------------------------------------------- #
 
@@ -527,6 +614,7 @@ def get_ui_execution(ctx: Context, execution_id: int) -> dict:
 ALL_TOOLS = [
     list_projects, list_testcases, list_api_requests, list_ui_cases, list_perf_scenes,
     get_report, analyze_failure, get_ui_execution,
+    get_ai_draft_summary, get_quality_risk_candidates, get_release_status, get_api_contract_status,
     preview_run_api_suite, confirm_run_api_suite,
     preview_run_ui_case, confirm_run_ui_case,
     preview_run_perf_scene, confirm_run_perf_scene,

@@ -10,7 +10,9 @@ from django.conf import settings
 from pathlib import Path
 from .test_case_views import AppPagination
 import hashlib
+import os
 import re
+import uuid
 import logging
 
 from ..models import AppElement
@@ -33,6 +35,18 @@ class AppElementViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
     
+    def _safe_template_file_path(self, image_path):
+        """Resolve a stored relative template path without traversal or symlink escape."""
+        if not isinstance(image_path, str) or not image_path.strip():
+            return None
+        base = self.get_template_base_path().resolve()
+        candidate = (base / image_path).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            return None
+        return candidate
+
     def perform_destroy(self, instance):
         """
         删除元素时同时删除物理文件
@@ -44,7 +58,9 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 try:
                     # 构造完整文件路径
                     template_base = self.get_template_base_path()
-                    file_path = template_base / image_path
+                    file_path = self._safe_template_file_path(image_path)
+                    if file_path is None:
+                        raise ValueError('非法图片路径')
                     
                     # 删除文件
                     if file_path.exists():
@@ -125,9 +141,20 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 'success': False
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        # 获取参数
-        category = request.data.get('category', 'common')
+        # 获取参数并限制目录/文件范围
+        category = str(request.data.get('category', 'common')).strip()
         element_id = request.data.get('element_id')  # 编辑模式时传递，用于排除自身
+        if not re.fullmatch(r'[a-zA-Z0-9_\-\u4e00-\u9fa5]+', category):
+            return Response({'code': 400, 'msg': '分类名称非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+        if file_obj.size > 10 * 1024 * 1024:
+            return Response({'code': 400, 'msg': '图片不能超过 10MB', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+
+        safe_name = Path(file_obj.name or '').name
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}:
+            return Response({'code': 400, 'msg': '只允许上传图片文件', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+        if not safe_name:
+            return Response({'code': 400, 'msg': '文件名不能为空', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
             # ✅ 业务逻辑内联：计算文件哈希
@@ -165,12 +192,15 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
             
             # ✅ 业务逻辑内联：保存图片到 Template 目录
-            template_base = self.get_template_base_path()
-            category_path = template_base / category
+            template_base = self.get_template_base_path().resolve()
+            category_path = (template_base / category).resolve()
+            if os.path.commonpath([str(template_base), str(category_path)]) != str(template_base):
+                return Response({'code': 400, 'msg': '非法的保存路径', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
             category_path.mkdir(parents=True, exist_ok=True)
-            
-            # 使用原始文件名
-            file_path = category_path / file_obj.name
+
+            # 使用随机文件名，避免覆盖已有元素或利用原始文件名写入路径
+            filename = f'{uuid.uuid4().hex}{suffix}'
+            file_path = category_path / filename
             
             # 保存文件
             with open(file_path, 'wb+') as destination:
@@ -178,7 +208,7 @@ class AppElementViewSet(viewsets.ModelViewSet):
                     destination.write(chunk)
             
             # 构建相对路径（直接返回 category/filename.png）
-            relative_path = f"{category}/{file_obj.name}"
+            relative_path = f"{category}/{filename}"
             
             logger.info(f"用户 {request.user.username} 上传图片: {relative_path}, 哈希: {file_hash}")
             
@@ -385,11 +415,11 @@ class AppElementViewSet(viewsets.ModelViewSet):
                 'success': False
             }, status=status.HTTP_404_NOT_FOUND)
         
-        # ✅ 业务逻辑内联：从 Template 目录构造完整文件路径
-        template_base = self.get_template_base_path()
-        file_path = template_base / image_path
-        
-        if not file_path.exists():
+        file_path = self._safe_template_file_path(image_path)
+        if file_path is None:
+            return Response({'code': 404, 'msg': '图片路径非法', 'success': False}, status=status.HTTP_404_NOT_FOUND)
+
+        if not file_path.is_file():
             return Response({
                 'code': 404,
                 'msg': '图片文件不存在',
@@ -435,9 +465,15 @@ class AppElementViewSet(viewsets.ModelViewSet):
             y = int(request.data.get('y', 0))
             width = int(request.data.get('width', 100))
             height = int(request.data.get('height', 100))
-            element_name = request.data.get('element_name', 'captured_element')
-            category = request.data.get('category', 'common')
-            element_type = request.data.get('element_type', 'image')  # image/pos/region
+            element_name = str(request.data.get('element_name', 'captured_element')).strip()
+            category = str(request.data.get('category', 'common')).strip()
+            element_type = request.data.get('element_type', 'image')
+            if not re.fullmatch(r'[a-zA-Z0-9_\-\u4e00-\u9fa5]+', category):
+                return Response({'code': 400, 'msg': '分类名称非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+            if not re.fullmatch(r'[a-zA-Z0-9_\-\u4e00-\u9fa5]+', element_name):
+                return Response({'code': 400, 'msg': '元素名称非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
+            if width <= 0 or height <= 0 or width > 4096 or height > 4096 or x < 0 or y < 0:
+                return Response({'code': 400, 'msg': '裁剪区域非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
             
             # 解码 Base64 图片
             if image_data.startswith('data:image'):
@@ -480,7 +516,11 @@ class AppElementViewSet(viewsets.ModelViewSet):
             
             # 保存文件（统一使用 Template 目录）
             base_path = self.get_template_base_path()
-            category_path = base_path / category
+            category_path = (base_path / category).resolve()
+            try:
+                category_path.relative_to(base_path.resolve())
+            except ValueError:
+                return Response({'code': 400, 'msg': '分类路径非法', 'success': False}, status=status.HTTP_400_BAD_REQUEST)
             category_path.mkdir(parents=True, exist_ok=True)
             
             # 使用元素名称 + 时间戳作为文件名

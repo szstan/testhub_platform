@@ -15,9 +15,12 @@ from apps.quality_intelligence.models import (
     QualityEvidence,
     QualityEvidenceType,
     QualityFailure,
+    QualityFailureReviewAudit,
     QualityFailureCategory,
     QualityMetricObservation,
     QualityQuarantine,
+    QualityQuarantineApprovalStatus,
+    QualityQuarantineAudit,
     QualityRun,
     QualityRunItem,
     QualitySourceType,
@@ -194,6 +197,22 @@ class FailureReviewSerializer(serializers.Serializer):
     review_note = serializers.CharField(max_length=4096, required=False, allow_blank=True)
 
 
+class QualityFailureReviewAuditSerializer(PublicModelSerializer):
+    class Meta:
+        model = QualityFailureReviewAudit
+        fields = (
+            'id', 'failure', 'source_failure_key', 'actor', 'previous_taxonomy',
+            'new_taxonomy', 'note', 'metadata', 'created_at', 'classification_mode',
+        )
+        read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result['note'] = _safe_text(result.get('note', ''))
+        result['metadata'] = _public_payload(result.get('metadata', {}))
+        return result
+
+
 class QualityMetricObservationSerializer(PublicModelSerializer):
     class Meta:
         model = QualityMetricObservation
@@ -252,6 +271,11 @@ class QualityQuarantineSerializer(PublicModelSerializer):
             "profile",
             "status",
             "reason",
+            "owner",
+            "approval_status",
+            "approved_by",
+            "approved_at",
+            "approval_note",
             "starts_at",
             "expires_at",
             "released_at",
@@ -266,6 +290,7 @@ class QualityQuarantineSerializer(PublicModelSerializer):
         result = super().to_representation(instance)
         result["reason"] = _safe_text(result.get("reason", ""))
         result["note"] = _safe_text(result.get("note", ""))
+        result["approval_note"] = _safe_text(result.get("approval_note", ""))
         return result
 
 
@@ -274,6 +299,24 @@ class QuarantineCreateSerializer(serializers.Serializer):
     starts_at = serializers.DateTimeField(required=False)
     expires_at = serializers.DateTimeField(required=False, allow_null=True)
     note = serializers.CharField(max_length=4096, required=False, allow_blank=True)
+    requires_approval = serializers.BooleanField(required=False, default=False)
+
+
+class QualityQuarantineAuditSerializer(PublicModelSerializer):
+    class Meta:
+        model = QualityQuarantineAudit
+        fields = (
+            "id", "quarantine", "profile", "execution_job", "action", "actor",
+            "reason", "previous_status", "new_status", "metadata", "created_at",
+            "classification_mode",
+        )
+        read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result["reason"] = _safe_text(result.get("reason", ""))
+        result["metadata"] = _public_payload(result.get("metadata", {}))
+        return result
 
 
 class QualityBaselineSerializer(PublicModelSerializer):
@@ -375,8 +418,10 @@ __all__ = [
     "QualityComparisonSerializer",
     "QualityEvidenceSerializer",
     "QualityFailureSerializer",
+    "QualityFailureReviewAuditSerializer",
     "QualityMetricObservationSerializer",
     "QualityQuarantineSerializer",
+    "QualityQuarantineAuditSerializer",
     "QualityRunItemSerializer",
     "QualityRunSerializer",
     "QualityTestProfileSerializer",

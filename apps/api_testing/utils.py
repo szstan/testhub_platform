@@ -1,5 +1,8 @@
 import json
 import time
+from django.conf import settings
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+from apps.quality_intelligence.services.redaction import redact_payload
 from django.utils import timezone
 from .models import RequestHistory
 from .variable_resolver import VariableResolver
@@ -176,7 +179,14 @@ def execute_test_suite(test_suite, environment, executed_by):
                         body_data = _replace_variables_in_dict(body_data, variables)
                         body_data = _resolve_variables_in_dict(body_data, resolver)
                 
-                # 执行请求
+                try:
+                    url = validate_outbound_url(
+                        url,
+                        allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+                    )
+                except UnsafeOutboundURL:
+                    return {'success': False, 'error': '请求目标地址不允许访问'}
+
                 start_time = time.time()
                 response = requests.request(
                     method=api_request.method,
@@ -184,7 +194,8 @@ def execute_test_suite(test_suite, environment, executed_by):
                     headers=headers,
                     params=params,
                     json=body_data,
-                    timeout=30
+                    timeout=30,
+                    allow_redirects=False
                 )
                 end_time = time.time()
                 response_time = (end_time - start_time) * 1000
@@ -241,14 +252,14 @@ def execute_test_suite(test_suite, environment, executed_by):
                     request_data={
                         'url': url,
                         'method': api_request.method,
-                        'headers': headers,
-                        '极速版params': params,
-                        'body': body_data
+                        'headers': redact_payload(headers),
+                        '极速版params': redact_payload(params),
+                        'body': redact_payload(body_data)
                     },
                     response_data={
-                        'headers': dict(response.headers),
-                        'body': response.text,
-                        'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+                        'headers': redact_payload(dict(response.headers)),
+                        'body': redact_payload(response.text),
+                        'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
                     },
                     status_code=response.status_code,
                     response_time=response_time,
@@ -337,7 +348,14 @@ def execute_api_request(api_request, environment, executed_by):
                 body_data = _replace_variables_in_dict(body_data, variables)
                 body_data = _resolve_variables_in_dict(body_data, resolver)
         
-        # 执行请求
+        try:
+            url = validate_outbound_url(
+                url,
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+            )
+        except UnsafeOutboundURL:
+            return {'success': False, 'error': '请求目标地址不允许访问'}
+
         start_time = time.time()
         response = requests.request(
             method=api_request.method,
@@ -345,7 +363,8 @@ def execute_api_request(api_request, environment, executed_by):
             headers=headers,
             params=params,
             json=body_data,
-            timeout=30
+            timeout=30,
+            allow_redirects=False
         )
         end_time = time.time()
         response_time = (end_time - start_time) * 1000
@@ -365,14 +384,14 @@ def execute_api_request(api_request, environment, executed_by):
             request_data={
                 'url': url,
                 'method': api_request.method,
-                'headers': headers,
-                'params': params,
-                'body': body_data
+                'headers': redact_payload(headers),
+                'params': redact_payload(params),
+                'body': redact_payload(body_data)
             },
             response_data={
-                'headers': dict(response.headers),
-                'body': response.text,
-                'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+                'headers': redact_payload(dict(response.headers)),
+                'body': redact_payload(response.text),
+                'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
             },
             status_code=response.status_code,
             response_time=response_time,
@@ -387,9 +406,9 @@ def execute_api_request(api_request, environment, executed_by):
             'response_time': response_time,
             'assertions_results': assertions_results,
             'response_data': {
-                'headers': dict(response.headers),
-                'body': response.text,
-                'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+                'headers': redact_payload(dict(response.headers)),
+                'body': redact_payload(response.text),
+                'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
             }
         }
         

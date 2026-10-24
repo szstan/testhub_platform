@@ -72,6 +72,11 @@ const routes = [
                 component: () => import('@/views/testcases/TestCaseList.vue')
             },
             {
+                path: 'testcases/sync',
+                name: 'TestCaseSync',
+                component: () => import('@/views/testcases/TestCaseSync.vue')
+            },
+            {
                 path: 'testcases/import-records',
                 name: 'TestCaseImportRecords',
                 component: () => import('@/views/testcases/TestCaseImportRecordList.vue')
@@ -130,6 +135,36 @@ const routes = [
                 path: 'executions',
                 name: 'Executions',
                 component: () => import('@/views/executions/ExecutionListView.vue')
+            },
+            {
+                path: 'task-center',
+                name: 'UnifiedTaskCenter',
+                component: () => import('@/views/executions/TaskCenter.vue')
+            },
+            {
+                path: 'failure-review',
+                name: 'ExecutionFailureReview',
+                component: () => import('@/views/executions/FailureReview.vue')
+            },
+            {
+                path: 'quality-loop',
+                name: 'ExecutionQualityLoop',
+                component: () => import('@/views/executions/QualityLoop.vue')
+            },
+            {
+                path: 'traceability',
+                name: 'ExecutionTraceability',
+                component: () => import('@/views/executions/TraceabilityView.vue')
+            },
+            {
+                path: 'ci-profiles',
+                name: 'CIExecutionProfiles',
+                component: () => import('@/views/executions/CIProfiles.vue')
+            },
+            {
+                path: 'datasets-plugins',
+                name: 'ExecutionDatasetsPlugins',
+                component: () => import('@/views/executions/DatasetsPlugins.vue')
             },
             {
                 path: 'executions/:id',
@@ -722,12 +757,8 @@ router.beforeEach(async (to, _from, next) => {
                 code: code,
             })
             const expiresAt = Date.now() + 30 * 60 * 1000
-            localStorage.setItem('access_token', response.data.access)
-            localStorage.setItem('refresh_token', response.data.refresh)
-            localStorage.setItem('token_expires_at', expiresAt.toString())
-            localStorage.setItem('user', JSON.stringify(response.data.user))
             userStore.accessToken = response.data.access
-            userStore.refreshToken = response.data.refresh
+            userStore.refreshToken = ''
             userStore.tokenExpiresAt = expiresAt
             userStore.user = response.data.user
 
@@ -741,8 +772,14 @@ router.beforeEach(async (to, _from, next) => {
         }
     }
 
-    // 有 token 但没有用户信息时，初始化认证
-    if (!userStore.user && userStore.accessToken) {
+    // 有内存 token 或受保护路由时初始化认证；刷新 cookie 由 store 负责恢复 access token
+    if (to.meta.requiresAuth && !userStore.user && !userStore.accessToken) {
+        try {
+            await userStore.initAuth()
+        } catch (error) {
+            console.error('认证初始化失败:', error)
+        }
+    } else if (!userStore.user && userStore.accessToken) {
         try {
             await userStore.initAuth()
         } catch (error) {

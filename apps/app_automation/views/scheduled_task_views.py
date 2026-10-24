@@ -39,7 +39,22 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return scope_project(super().get_queryset(), self.request.user, 'project')
 
+    @action(detail=True, methods=['post'])
+    def pause(self, request, pk=None):
+        """暂停处于激活状态的任务，保留下次调度时间。"""
         task = self.get_object()
+
+        if task.status == 'PAUSED':
+            return Response(
+                {'success': False, 'message': '任务已经是暂停状态'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if task.status != 'ACTIVE':
+            return Response(
+                {'success': False, 'message': '只有激活状态的任务可以暂停'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         task.status = 'PAUSED'
         task.save(update_fields=['status'])
         return Response({'success': True, 'message': '任务已暂停'})
@@ -164,6 +179,9 @@ class AppNotificationLogViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ['task_name', 'notification_content']
     ordering_fields = ['created_at', 'sent_at']
     ordering = ['-created_at']
+
+    def get_queryset(self):
+        return scope_project(AppNotificationLog.objects.select_related('task'), self.request.user, 'task__project').order_by('-created_at')
 
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):

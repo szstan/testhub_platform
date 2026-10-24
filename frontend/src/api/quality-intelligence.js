@@ -73,8 +73,16 @@ export function getQualityQuarantines(params) {
   return list('quarantines', params)
 }
 
-export function releaseQualityQuarantine(id) {
-  return request({ url: `${baseUrl}/quarantines/${id}/release/`, method: 'post' })
+export function approveQualityQuarantine(id, data = {}) {
+  return request({ url: `${baseUrl}/quarantines/${id}/approve/`, method: 'post', data })
+}
+
+export function rejectQualityQuarantine(id, data = {}) {
+  return request({ url: `${baseUrl}/quarantines/${id}/reject/`, method: 'post', data })
+}
+
+export function releaseQualityQuarantine(id, data = {}) {
+  return request({ url: `${baseUrl}/quarantines/${id}/release/`, method: 'post', data })
 }
 
 export function getQualityBaselines(params) {

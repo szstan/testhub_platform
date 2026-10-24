@@ -148,12 +148,7 @@ class PlaywrightTestEngine:
             # 启动浏览器
             self.browser = await browser_launcher.launch(
                 headless=self.headless,
-                args=[
-                    '--disable-blink-features=AutomationControlled',  # 避免被检测
-                    '--ignore-certificate-errors',  # 忽略证书错误
-                    '--allow-insecure-localhost',  # 允许不安全localhost
-                    '--disable-web-security',  # 禁用web安全限制（跨域）
-                ]
+                args=[]
             )
 
             # 创建浏览器上下文

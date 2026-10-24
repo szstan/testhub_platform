@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.db import models
 from django.utils import timezone
 from datetime import datetime
 from typing import Optional
@@ -290,8 +291,29 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
         task_type = attrs.get('task_type')
         if task_type == 'TEST_SUITE' and not attrs.get('test_suite'):
             raise serializers.ValidationError("测试套件不能为空")
-        elif task_type == 'API_REQUEST' and not attrs.get('api_request'):
+        user = self.context.get('request').user
+        suite = attrs.get('test_suite') or getattr(self.instance, 'test_suite', None)
+        request_obj = attrs.get('api_request') or getattr(self.instance, 'api_request', None)
+        environment = attrs.get('environment') or getattr(self.instance, 'environment', None)
+        if task_type == 'API_REQUEST' and not request_obj:
             raise serializers.ValidationError("API请求不能为空")
+        project_ids = set()
+        if suite:
+            project_ids.add(suite.project_id)
+        if request_obj:
+            project_ids.add(getattr(getattr(request_obj, 'collection', None), 'project_id', None))
+        if environment and environment.project_id:
+            project_ids.add(environment.project_id)
+        project_ids.discard(None)
+        if len(project_ids) > 1:
+            raise serializers.ValidationError('定时任务关联资源必须属于同一项目')
+        if project_ids:
+            from .models import ApiProject
+            project = ApiProject.objects.filter(id=project_ids.pop()).filter(
+                models.Q(owner=user) | models.Q(members=user)
+            ).first()
+            if not project:
+                raise serializers.ValidationError('无权使用定时任务关联项目')
 
         return attrs
 
@@ -822,6 +844,7 @@ class AIServiceConfigSerializer(serializers.ModelSerializer):
             'created_by_name', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at', 'created_by']
+        extra_kwargs = {'api_key': {'write_only': True}}
 
     def create(self, validated_data):
         validated_data['created_by'] = self.context['request'].user

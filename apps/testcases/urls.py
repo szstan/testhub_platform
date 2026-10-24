@@ -4,7 +4,11 @@ from . import views
 urlpatterns = [
     # 测试用例相关
     path('', views.TestCaseListCreateView.as_view(), name='testcase-list'),
+    path('sync-profiles/', views.TestCaseSyncProfileListCreateView.as_view(), name='testcase-sync-profile-list'),
+    path('sync-profiles/<int:pk>/', views.TestCaseSyncProfileDetailView.as_view(), name='testcase-sync-profile-detail'),
+    path('sync-profiles/<int:pk>/sync/', views.TestCaseSyncProfileSyncView.as_view(), name='testcase-sync-profile-sync'),
     path('import/template/', views.TestCaseImportTemplateDownloadView.as_view(), name='testcase-import-template'),
+
     path('import-records/', views.TestCaseImportRecordListCreateView.as_view(), name='testcase-import-record-list'),
     path('import-records/<int:pk>/', views.TestCaseImportRecordDetailView.as_view(), name='testcase-import-record-detail'),
     path('import-records/<int:pk>/failure-report/', views.TestCaseImportFailureReportDownloadView.as_view(), name='testcase-import-record-failure-report'),

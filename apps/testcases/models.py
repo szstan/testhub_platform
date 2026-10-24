@@ -1,8 +1,13 @@
 from django.db import models
 from django.utils import timezone
+import uuid
 from apps.users.models import User
 from apps.projects.models import Project
 from apps.versions.models import Version
+
+def _new_external_ref():
+    return f'TC-{uuid.uuid4().hex[:12].upper()}'
+
 
 class TestCase(models.Model):
     """测试用例模型"""
@@ -29,6 +34,7 @@ class TestCase(models.Model):
     ]
     
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='testcases')
+    external_ref = models.CharField(max_length=255, default=_new_external_ref, verbose_name='外部引用标识')
     versions = models.ManyToManyField(Version, blank=True, related_name='testcases', verbose_name='关联版本')
     title = models.CharField(max_length=500, verbose_name='用例标题')
     description = models.TextField(blank=True, verbose_name='用例描述')
@@ -52,6 +58,12 @@ class TestCase(models.Model):
         verbose_name = '测试用例'
         verbose_name_plural = '测试用例'
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project', 'external_ref'],
+                name='testcase_project_external_ref_uniq',
+            ),
+        ]
 
 class TestCaseStep(models.Model):
     """测试用例步骤"""
@@ -145,5 +157,51 @@ class TestCaseImportRecord(models.Model):
         verbose_name_plural = '测试用例导入记录'
         ordering = ['-created_at']
 
-    def __str__(self):
-        return self.import_no
+class TestCaseSyncProfile(models.Model):
+    """Project-scoped GitHub/GitLab Tests as Code synchronization profile."""
+
+    PROVIDER_CHOICES = (
+        ('github', 'GitHub'),
+        ('gitlab', 'GitLab'),
+    )
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='testcase_sync_profiles')
+    name = models.CharField(max_length=160)
+    provider = models.CharField(max_length=16, choices=PROVIDER_CHOICES)
+    repository_url = models.URLField(max_length=512)
+    api_base_url = models.URLField(max_length=512, blank=True, default='')
+    branch = models.CharField(max_length=255, default='main')
+    path = models.CharField(max_length=512, blank=True, default='')
+    token_env_ref = models.CharField(max_length=255, blank=True, default='')
+    enabled = models.BooleanField(default=True)
+    last_commit_sha = models.CharField(max_length=128, blank=True, default='')
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='testcase_sync_profiles_created')
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'testcase_sync_profiles'
+        ordering = ['project_id', 'name']
+        constraints = [
+            models.UniqueConstraint(fields=('project', 'name'), name='testcase_sync_profile_project_name_uniq'),
+        ]
+
+
+class TestCaseSourceBinding(models.Model):
+    """Source metadata for one synchronized test case."""
+
+    testcase = models.OneToOneField(TestCase, on_delete=models.CASCADE, related_name='source_binding')
+    profile = models.ForeignKey(TestCaseSyncProfile, on_delete=models.CASCADE, related_name='bindings')
+    external_ref = models.CharField(max_length=255)
+    source_path = models.CharField(max_length=512)
+    source_commit = models.CharField(max_length=128, blank=True, default='')
+    source_hash = models.CharField(max_length=64, blank=True, default='')
+    last_synced_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'testcase_source_bindings'
+        constraints = [
+            models.UniqueConstraint(fields=('profile', 'external_ref'), name='testcase_binding_profile_ref_uniq'),
+        ]
+        indexes = [models.Index(fields=('profile', 'source_path'), name='tc_binding_profile_path_idx')]

@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 import logging
 
@@ -17,6 +18,13 @@ from ..models import AppDevice
 from ..access import is_app_admin
 from ..serializers import AppDeviceSerializer
 from ..managers.device_manager import DeviceManager
+from ..device_pool import (
+    DeviceLeaseError,
+    acquire_device,
+    heartbeat_device,
+    release_device,
+    reap_expired_device_leases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +124,13 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                         'ip_address': ip_address,
                         'port': device_info.get('port') or 5555,
                         'connection_type': connection_type,
+                        'health_status': 'healthy' if (device_info.get('status') or '').lower() in {'online', 'available'} else 'unhealthy',
+                        'last_seen_at': timezone.now(),
+                        'capabilities': {
+                            'platform': 'android',
+                            'android_version': device_info.get('android_version') or '',
+                            'connection_type': connection_type,
+                        },
                     }
                 )
                 db_devices.append(device)
@@ -136,16 +151,15 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def lock(self, request, pk=None):
         """锁定设备"""
-        device = self.get_object()
-        
-        if device.status == 'locked':
-            return Response({
-                'success': False,
-                'message': '设备已被锁定'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        device.lock(request.user)
-        
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=pk)
+            if device.status == 'locked':
+                return Response({
+                    'success': False,
+                    'message': '设备已被锁定'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            device.lock(request.user)
+
         return Response({
             'success': True,
             'message': '设备锁定成功',
@@ -264,7 +278,71 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 'message': f'连接设备失败: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    @action(detail=True, methods=['post'], url_path='screenshot')
+    @action(detail=False, methods=['post'])
+    def acquire(self, request):
+        """Acquire a capability-matched lease without changing network policy."""
+        capabilities = request.data.get('capabilities') or {}
+        try:
+            device, lease_token = acquire_device(
+                request.user,
+                capabilities=capabilities,
+                lease_seconds=request.data.get('lease_seconds'),
+            )
+        except (DeviceLeaseError, ValueError) as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response({
+            'device': AppDeviceSerializer(device).data,
+            'lease_token': lease_token,
+            'lease_expires_at': device.lease_expires_at,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def release(self, request, pk=None):
+        device = self.get_object()
+        try:
+            device = release_device(
+                device.pk,
+                request.user,
+                request.data.get('lease_token', ''),
+                force=is_app_admin(request.user),
+            )
+        except DeviceLeaseError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        return Response({'device': AppDeviceSerializer(device).data})
+
+    @action(detail=True, methods=['post'])
+    def heartbeat(self, request, pk=None):
+        try:
+            device = heartbeat_device(
+                pk,
+                request.user,
+                request.data.get('lease_token', ''),
+                lease_seconds=request.data.get('lease_seconds'),
+            )
+        except DeviceLeaseError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        return Response({'device': AppDeviceSerializer(device).data})
+
+    @action(detail=True, methods=['get'])
+    def health(self, request, pk=None):
+        device = self.get_object()
+        return Response({
+            'device_id': device.device_id,
+            'status': device.status,
+            'health_status': device.health_status,
+            'maintenance_mode': device.maintenance_mode,
+            'last_seen_at': device.last_seen_at,
+            'last_heartbeat_at': device.last_heartbeat_at,
+            'lease_expires_at': device.lease_expires_at,
+        })
+
+    @action(detail=False, methods=['post'], url_path='reap-expired')
+    def reap_expired(self, request):
+        denial = self._require_admin(request)
+        if denial:
+            return denial
+        return Response({'reclaimed': reap_expired_device_leases()})
+
     def screenshot(self, request, pk=None):
         """
         获取设备实时截图

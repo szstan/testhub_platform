@@ -1,5 +1,7 @@
 from rest_framework import serializers
-from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord
+from django.db.models import Q
+from apps.projects.models import Project
+from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from apps.users.serializers import UserSerializer
 from apps.versions.serializers import VersionSimpleSerializer
 
@@ -49,7 +51,7 @@ class TestCaseListSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'id', 'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'id', 'external_ref', 'title', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type',
             'author', 'assignee', 'project', 'versions', 'tags', 'created_at', 'updated_at'
         ]
@@ -79,10 +81,16 @@ class TestCaseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type', 'tags', 'project_id', 'version_ids'
         ]
     
+    def validate_external_ref(self, value):
+        value = str(value or '').strip()
+        if not value:
+            raise serializers.ValidationError('external_ref 不能为空')
+        return value
+
     def create(self, validated_data):
         version_ids = validated_data.pop('version_ids', [])
         # project_id会在视图的perform_create中处理
@@ -108,10 +116,16 @@ class TestCaseUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'title', 'description', 'preconditions', 'steps', 'expected_result',
+            'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type', 'tags', 'project_id', 'version_ids'
         ]
     
+    def validate_external_ref(self, value):
+        value = str(value or '').strip()
+        if not value:
+            raise serializers.ValidationError('external_ref 不能为空')
+        return value
+
     def update(self, instance, validated_data):
         version_ids = validated_data.pop('version_ids', None)
         # project_id会在视图中处理
@@ -152,3 +166,27 @@ class TestCaseImportRecordDetailSerializer(TestCaseImportRecordListSerializer):
         if obj.failure_report_file:
             return obj.failure_report_file.url
         return None
+
+
+class TestCaseSyncProfileSerializer(serializers.ModelSerializer):
+    created_by = UserSerializer(read_only=True)
+    secret_configured = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TestCaseSyncProfile
+        fields = '__all__'
+        read_only_fields = ('id', 'created_by', 'last_commit_sha', 'last_sync_at', 'created_at', 'updated_at', 'secret_configured')
+        extra_kwargs = {'token_env_ref': {'write_only': True}}
+
+    def validate_project(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated or not Project.objects.filter(
+            pk=value.pk,
+        ).filter(Q(owner=user) | Q(members=user)).exists():
+            raise serializers.ValidationError('项目不存在或无权限')
+        return value
+
+    def get_secret_configured(self, obj):
+        import os
+        return bool(obj.token_env_ref and os.environ.get(obj.token_env_ref))

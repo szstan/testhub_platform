@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from apps.projects.models import Project
 import json
 
 User = get_user_model()
@@ -591,6 +592,28 @@ class OperationLog(models.Model):
     def __str__(self):
         return f"{self.get_operation_type_display()} - {self.resource_name}"
 
+
+class OpenApiContractSpec(models.Model):
+    """Versioned OpenAPI contract used for coverage and compatibility checks."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='openapi_contract_specs')
+    name = models.CharField(max_length=200)
+    version = models.CharField(max_length=100)
+    document = models.JSONField(default=dict)
+    document_hash = models.CharField(max_length=64, editable=False)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='openapi_contract_specs_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'api_openapi_contract_specs'
+        ordering = ['project_id', '-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=('project', 'name', 'version'), name='api_contract_project_name_version_uniq'),
+        ]
+
+    def __str__(self):
+        return f'{self.project_id}:{self.name}:{self.version}'
 
 class AIServiceConfig(models.Model):
     """AI服务配置模型"""

@@ -405,6 +405,7 @@ def validate_quarantine_state(
     if now is None:
         now = datetime.now(dt_timezone.utc)
     status_value = _normalise_outcome(_value(quarantine, "status", default=None))
+    approval_status = _normalise_outcome(_value(quarantine, "approval_status", default=None))
     starts_at = _value(quarantine, "starts_at", default=None)
     expires_at = _value(quarantine, "expires_at", default=None)
     released_at = _value(quarantine, "released_at", default=None)
@@ -449,6 +450,20 @@ def validate_quarantine_state(
             "reason": "INVALID_STATUS",
         })
 
+    if approval_status in {"PENDING", "REJECTED"}:
+        reason = "APPROVAL_PENDING" if approval_status == "PENDING" else "APPROVAL_REJECTED"
+        return ServiceResult({
+            "valid": False,
+            "is_valid": False,
+            "is_active": False,
+            "active": False,
+            "status": status_value,
+            "effective_status": status_value,
+            "state": status_value,
+            "approval_status": approval_status,
+            "reason": reason,
+        })
+
     if status_value == QUARANTINE_RELEASED or released_at is not None:
         reason = "RELEASED"
         active = False
@@ -486,6 +501,7 @@ def validate_quarantine_state(
         "starts_at": starts_at,
         "expires_at": expires_at,
         "released_at": released_at,
+        "approval_status": approval_status or "APPROVED",
     })
 
 

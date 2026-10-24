@@ -7,6 +7,7 @@ from airtest.core.api import (
     init_device, start_app, stop_app, Template, sleep
 )
 from airtest.core.error import NoDeviceError, TargetNotFoundError
+import re
 import os
 import time
 import logging
@@ -230,6 +231,12 @@ class AirtestBase:
             logger.error(f"截图失败: {str(e)}", exc_info=True)
             return ""
     
+    def _validate_package_name(self, package_name: str) -> str:
+        value = str(package_name or '').strip()
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', value):
+            raise ValueError('非法 Android package name')
+        return value
+
     def open_app(self, package_name: str, retry_count: int = 3, retry_interval: int = 5) -> bool:
         """
         启动指定包名的应用，包含智能重试机制
@@ -242,6 +249,7 @@ class AirtestBase:
         Returns:
             是否启动成功
         """
+        package_name = self._validate_package_name(package_name)
         if not self.is_connected:
             logger.error("设备未连接，无法启动应用")
             return False
@@ -284,6 +292,7 @@ class AirtestBase:
         Returns:
             是否关闭成功
         """
+        package_name = self._validate_package_name(package_name)
         if not self.is_connected:
             logger.warning("设备未连接，无需关闭应用")
             return True
@@ -307,6 +316,7 @@ class AirtestBase:
         Returns:
             是否已安装
         """
+        package_name = self._validate_package_name(package_name)
         if not self.is_connected:
             logger.warning("设备未连接，无法检查应用安装状态")
             return False

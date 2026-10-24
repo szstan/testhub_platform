@@ -33,6 +33,10 @@ export default {
     reviewList: 'Review List',
     reviewTemplates: 'Review Templates',
     testPlan: 'Test Plan',
+    taskCenter: 'Unified Task Center',
+    traceability: 'Quality Traceability',
+    ciProfiles: 'CI Profiles',
+    datasetsPlugins: 'Datasets & Plugins',
     testReport: 'Test Report',
 
     // API Testing

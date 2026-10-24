@@ -1,16 +1,61 @@
 from rest_framework import generics, status, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
-from django.contrib.auth import login, logout
+from django.conf import settings
+from django.contrib.auth import logout
 from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from .models import User
-from .serializers import UserSerializer, UserCreateSerializer, LoginSerializer
+from .serializers import (
+    UserSerializer,
+    UserCreateSerializer,
+    UserDirectorySerializer,
+    UserSelfUpdateSerializer,
+    LoginSerializer,
+)
 
 # JWT 相关导入
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenRefreshView
 
-# 图形验证码 & 短信验证码
+REFRESH_COOKIE_NAME = 'testhub_refresh'
+
+
+def _set_refresh_cookie(response, refresh_token):
+    response.set_cookie(
+        REFRESH_COOKIE_NAME,
+        refresh_token,
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        secure=settings.APP_USE_HTTPS,
+        samesite='Lax',
+        path='/api/auth/',
+    )
+
+
+def _clear_refresh_cookie(response):
+    response.delete_cookie(REFRESH_COOKIE_NAME, path='/api/auth/')
+
+
+class CookieTokenRefreshView(TokenRefreshView):
+    """Refresh JWT from an HttpOnly cookie without exposing it to JavaScript."""
+
+    def post(self, request, *args, **kwargs):
+        data = request.data.copy()
+        if not data.get('refresh'):
+            data['refresh'] = request.COOKIES.get(REFRESH_COOKIE_NAME, '')
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        payload = dict(serializer.validated_data)
+        refresh = payload.pop('refresh', None)
+        response = Response(payload, status=status.HTTP_200_OK)
+        if refresh:
+            _set_refresh_cookie(response, refresh)
+        return response
+
+
+
 from .captcha import create_captcha
 from .sms import send_register_verify_code, validate_verify_code
 from .redis_client import get_redis
@@ -34,58 +79,56 @@ class RegisterView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        
-        # 安全地创建token
-        try:
-            from rest_framework.authtoken.models import Token
-            token, created = Token.objects.get_or_create(user=user)
-            token_key = token.key
-        except ImportError:
-            token_key = f"temp_token_{user.id}"
-        
         return Response({
             'user': UserSerializer(user).data,
-            'token': token_key
         }, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
 def login_view(request):
+    username = str(request.data.get('username') or '')[:150]
+    ip = request.META.get('REMOTE_ADDR', 'unknown')
+    throttle_key = f'auth:login-fail:{ip}:{username.lower()}'
+    attempts = cache.get(throttle_key, 0)
+    if attempts >= 10:
+        return Response({'error': '登录尝试过于频繁，请稍后再试'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
     serializer = LoginSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
+    if not serializer.is_valid():
+        cache.set(throttle_key, attempts + 1, timeout=300)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    cache.delete(throttle_key)
     user = serializer.validated_data['user']
-    login(request, user)
 
-    # JWT Token (优先使用JWT)
+    # JWT authentication is the sole browser API session; do not create a Django session cookie.
     refresh = RefreshToken.for_user(user)
     access_token = str(refresh.access_token)
     refresh_token = str(refresh)
 
-    return Response({
+    response = Response({
         'user': UserSerializer(user).data,
-        'access': access_token,       # JWT access token
-        'refresh': refresh_token,     # JWT refresh token
+        'access': access_token,
         'message': '登录成功'
     })
+    _set_refresh_cookie(response, refresh_token)
+    return response
 
 @api_view(['POST'])
-@csrf_exempt
+@permission_classes([permissions.IsAuthenticated])
 def logout_view(request):
-    """用户退出登录，将refresh token加入黑名单"""
-    if request.user.is_authenticated:
-        # 将 refresh token 加入黑名单
-        refresh_token = request.data.get('refresh')
-        if refresh_token:
-            try:
-                from rest_framework_simplejwt.tokens import RefreshToken as JWTRefreshToken
-                JWTRefreshToken(refresh_token).blacklist()
-            except Exception:
-                pass
+    """用户退出登录，将 refresh token 加入黑名单并清理 HttpOnly cookie"""
+    refresh_token = request.data.get('refresh') or request.COOKIES.get(REFRESH_COOKIE_NAME)
+    if refresh_token:
+        try:
+            from rest_framework_simplejwt.tokens import RefreshToken as JWTRefreshToken
+            JWTRefreshToken(refresh_token).blacklist()
+        except Exception:
+            pass
 
-        logout(request)
-
-    return Response({'message': '退出成功'})
+    logout(request)
+    response = Response({'message': '退出成功'})
+    _clear_refresh_cookie(response)
+    return response
 
 @api_view(['GET'])
 def profile_view(request):
@@ -97,13 +140,44 @@ def profile_view(request):
 
 class UserListView(generics.ListCreateAPIView):
     queryset = User.objects.all().order_by('username')
-    serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [permissions.IsAdminUser()]
+        return super().get_permissions()
+
+    def get_serializer_class(self):
+        return UserCreateSerializer if self.request.method == 'POST' else UserDirectorySerializer
+
+    def get_queryset(self):
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return self.queryset.filter(is_active=True)
+        return self.queryset.filter(pk=self.request.user.pk, is_active=True)
+
 
 class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = User.objects.all().order_by('username')
-    serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return self.queryset
+        return self.queryset.filter(pk=self.request.user.pk)
+
+    def get_permissions(self):
+        if self.request.method == 'DELETE':
+            return [permissions.IsAdminUser()]
+        return super().get_permissions()
+
+    def get_serializer_class(self):
+        if self.request.method in ('PUT', 'PATCH') and not (
+            self.request.user.is_staff or self.request.user.is_superuser
+        ):
+            return UserSelfUpdateSerializer
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return UserSerializer
+        return UserDirectorySerializer
 
 
 # ========== 图形验证码 & 短信验证码 ==========
@@ -189,15 +263,13 @@ def sms_login_view(request):
 
     # 生成 JWT
     refresh = RefreshToken.for_user(user)
-    access_token = str(refresh.access_token)
-    refresh_token = str(refresh)
-
-    return Response({
+    response = Response({
         'user': UserSerializer(user).data,
-        'access': access_token,
-        'refresh': refresh_token,
+        'access': str(refresh.access_token),
         'message': '登录成功',
     })
+    _set_refresh_cookie(response, str(refresh))
+    return response
 
 
 @api_view(['POST'])
@@ -240,11 +312,12 @@ def exchange_token_view(request):
             return Response({'error': '用户已被禁用'}, status=status.HTTP_400_BAD_REQUEST)
 
         refresh = RefreshToken.for_user(user)
-        return Response({
+        response = Response({
             'access': str(refresh.access_token),
-            'refresh': str(refresh),
             'user': UserSerializer(user).data,
         })
+        _set_refresh_cookie(response, str(refresh))
+        return response
 
     else:
         return Response({'error': '无效的 action'}, status=status.HTTP_400_BAD_REQUEST)

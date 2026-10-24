@@ -3,21 +3,47 @@ from rest_framework.decorators import action
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-import shutil
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+import ipaddress
+import socket
 import subprocess
 import platform
 import os
 import json
 import logging
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+_ALLOWED_PLAYWRIGHT_BROWSERS = {'chromium', 'firefox', 'webkit'}
+
+
+def _safe_ai_base_url(value):
+    parsed = urlparse(str(value).strip())
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('AI Base URL 必须使用 HTTPS')
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise ValueError('AI Base URL 无法解析') from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+            raise ValueError('AI Base URL 不允许指向内网或本机地址')
+    return value.rstrip('/')
+
 
 class EnvironmentConfigViewSet(viewsets.ViewSet):
     """
     UI自动化环境配置视图集
     """
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action == 'install_driver':
+            return [IsAdminUser()]
+        return super().get_permissions()
 
     @action(detail=False, methods=['get'])
     def check_environment(self, request):
@@ -185,8 +211,8 @@ class EnvironmentConfigViewSet(viewsets.ViewSet):
         安装浏览器驱动
         """
         browser = request.data.get('browser')
-        if not browser:
-            return Response({'error': 'Browser name is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if browser not in _ALLOWED_PLAYWRIGHT_BROWSERS:
+            return Response({'error': '不支持的浏览器类型'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             # 使用当前 Python 环境执行模块安装命令
@@ -204,7 +230,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
     """
     AI智能模式配置视图集 (Browser-use) - 使用ModelViewSet支持标准CRUD
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAdminUser]
     queryset = AIModelConfig.objects.filter(role='browser_use_text')
 
     def list(self, request):
@@ -407,7 +433,11 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                  status=status.HTTP_400_BAD_REQUEST
              )
 
-        base_url = base_url.rstrip('/')
+        try:
+            base_url = _safe_ai_base_url(base_url)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
 
         try:
             # 尝试调用 chat completions 接口 (OpenAI Compatible)
@@ -425,7 +455,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式预览 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(60, 900))
+            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
 
             logger.info(f"AI智能模式预览 - 收到响应: status_code={response.status_code}")
 
@@ -467,8 +497,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
         logger.info(f"=== AI智能模式 - 开始测试模型连接 ===")
         logger.info(f"模型类型: {config.model_type}")
         logger.info(f"模型名称: {config.model_name}")
-        logger.info(f"API URL: {config.base_url}")
-        logger.info(f"API Key前缀: {config.api_key[:10]}..." if len(config.api_key) > 10 else f"API Key: {config.api_key}")
+        logger.info(f"AI智能模式 - API URL: {config.base_url}")
 
         base_url = config.base_url
         if not base_url:
@@ -489,7 +518,11 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        base_url = base_url.rstrip('/')
+        try:
+            base_url = _safe_ai_base_url(base_url)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
 
         try:
             url = f"{base_url}/chat/completions"
@@ -506,7 +539,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(60, 900))
+            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
 
             logger.info(f"AI智能模式 - 收到响应: status_code={response.status_code}")
 

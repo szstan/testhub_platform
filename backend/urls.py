@@ -9,8 +9,11 @@ from drf_spectacular.views import (
     SpectacularRedocView,
     SpectacularSwaggerView,
 )
+from apps.core.health import health, readiness
 
 urlpatterns = [
+    path('health/', health, name='health'),
+    path('readiness/', readiness, name='readiness'),
     path('admin/', admin.site.urls),
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
@@ -48,17 +51,12 @@ if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += static(settings.STATIC_FILES_URL, document_root=settings.STATIC_FILES_ROOT)
 
-# APP自动化 Template 目录静态访问
+# APP automation development-only static routes; production reports require an authorized view.
 import os
-urlpatterns += [
-    path('app-automation-templates/<path:path>', 
-         serve, 
-         {'document_root': os.path.join(settings.BASE_DIR, 'apps', 'app_automation', 'Template')}),
-]
-
-# APP自动化 Allure 报告访问
-urlpatterns += [
-    path('app-automation-reports/<path:path>', 
-         serve, 
-         {'document_root': os.path.join(settings.MEDIA_ROOT, 'app-automation', 'allure-reports')}),
-]
+if settings.DEBUG:
+    urlpatterns += [
+        path('app-automation-templates/<path:path>', serve,
+             {'document_root': os.path.join(settings.BASE_DIR, 'apps', 'app_automation', 'Template')}),
+        path('app-automation-reports/<path:path>', serve,
+             {'document_root': os.path.join(settings.MEDIA_ROOT, 'app-automation', 'allure-reports')}),
+    ]

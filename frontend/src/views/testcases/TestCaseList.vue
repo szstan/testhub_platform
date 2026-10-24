@@ -26,6 +26,9 @@
         <el-button @click="goToImportRecords">
           {{ $t('testcase.importRecords') }}
         </el-button>
+        <el-button @click="$router.push('/testcases/sync')">
+          {{ $t('testcase.sync.nav') }}
+        </el-button>
         <el-button type="primary" @click="$router.push('/ai-generation/testcases/create')">
           <el-icon><Plus /></el-icon>
           {{ $t('testcase.newCase') }}

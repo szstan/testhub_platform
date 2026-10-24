@@ -39,5 +39,10 @@ class AssistantSessionCreateSerializer(serializers.ModelSerializer):
         fields = ['session_id', 'title']
     
     def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-        return super().create(validated_data)
+        user = self.context['request'].user
+        session, _created = AssistantSession.objects.get_or_create(
+            user=user,
+            session_id=validated_data['session_id'],
+            defaults={'title': validated_data.get('title', '')},
+        )
+        return session

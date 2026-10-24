@@ -14,6 +14,7 @@ import time
 import urllib.parse
 
 import requests
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from django.conf import settings
 from django.core.mail import EmailMessage, get_connection
 
@@ -21,6 +22,13 @@ from django.core.mail import EmailMessage, get_connection
 def send_dingtalk(webhook_url, secret, message, at_all=True, timeout=10):
     if not webhook_url:
         return False, "钉钉 webhook 未配置"
+    try:
+        webhook_url = validate_outbound_url(
+            webhook_url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return False, '钉钉 webhook 地址不允许访问'
     timestamp = str(round(time.time() * 1000))
     secret_enc = (secret or "").encode("utf-8")
     string_to_sign = "{}\n{}".format(timestamp, secret or "")
@@ -28,7 +36,8 @@ def send_dingtalk(webhook_url, secret, message, at_all=True, timeout=10):
         secret_enc, string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
     ).digest()
     sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-    url = "{}&timestamp={}&sign={}".format(webhook_url, timestamp, sign)
+    separator = '&' if '?' in webhook_url else '?'
+    url = "{}{}timestamp={}&sign={}".format(webhook_url, separator, timestamp, sign)
     payload = {
         "msgtype": "text",
         "text": {"content": message},
@@ -47,13 +56,20 @@ def send_dingtalk(webhook_url, secret, message, at_all=True, timeout=10):
         if result.get("errcode") == 0:
             return True, "ok"
         return False, result.get("errmsg", "未知错误")
-    except requests.RequestException as exc:
-        return False, str(exc)
+    except requests.RequestException:
+        return False, '钉钉 webhook 请求失败'
 
 
 def send_wecom(webhook_url, message, mentioned_list=None, at_all=False, timeout=10):
     if not webhook_url:
         return False, "企业微信 webhook 未配置"
+    try:
+        webhook_url = validate_outbound_url(
+            webhook_url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+        )
+    except UnsafeOutboundURL:
+        return False, '企业微信 webhook 地址不允许访问'
     # 构造 @成员列表：若开启 @all，在最前面插入 "@all"
     users = list(mentioned_list or [])
     if at_all and "@all" not in users:
@@ -78,8 +94,8 @@ def send_wecom(webhook_url, message, mentioned_list=None, at_all=False, timeout=
         if result.get("errcode") == 0:
             return True, "ok"
         return False, result.get("errmsg", "未知错误")
-    except requests.RequestException as exc:
-        return False, str(exc)
+    except requests.RequestException:
+        return False, '企业微信 webhook 请求失败'
 
 
 def send_email(message, receivers, subject="监控告警", config=None, timeout=15):

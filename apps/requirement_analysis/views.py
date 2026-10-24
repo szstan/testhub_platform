@@ -6,11 +6,12 @@ import json
 import time
 from rest_framework import viewsets, status
 from django.conf import settings  # Added import
-from rest_framework.decorators import action, permission_classes
+from django.core import signing
+from rest_framework.decorators import action, api_view, permission_classes
 from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 
 
 class PassThroughRenderer(BaseRenderer):
@@ -26,11 +27,9 @@ class PassThroughRenderer(BaseRenderer):
 
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.http import JsonResponse, StreamingHttpResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
 from django.utils import timezone
 from asgiref.sync import sync_to_async
-from django.db import models
+from django.db import models, transaction
 
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
@@ -41,7 +40,8 @@ from .serializers import (
     RequirementDocumentSerializer, RequirementAnalysisSerializer,
     BusinessRequirementSerializer, GeneratedTestCaseSerializer,
     AnalysisTaskSerializer, DocumentUploadSerializer,
-    TestCaseGenerationRequestSerializer, TestCaseReviewRequestSerializer,
+    LegacyTestCaseGenerationRequestSerializer, TestCaseGenerationRequestSerializer,
+    TestCaseReviewRequestSerializer,
     AIModelConfigSerializer, PromptConfigSerializer, TestCaseGenerationTaskSerializer,
     GenerationConfigSerializer
 )
@@ -50,11 +50,50 @@ from .services import RequirementAnalysisService, DocumentProcessor
 logger = logging.getLogger(__name__)
 
 
+def _accessible_documents(user):
+    """Return requirement documents visible to the caller."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return RequirementDocument.objects.none()
+    if user.is_staff or user.is_superuser:
+        return RequirementDocument.objects.all()
+    return RequirementDocument.objects.filter(
+        models.Q(uploaded_by=user)
+        | models.Q(project__owner=user)
+        | models.Q(project__members=user)
+    ).distinct()
+
+
+def _project_for_user(user, project_id):
+    if not project_id:
+        return None
+    from apps.projects.models import Project
+
+    queryset = Project.objects.filter(pk=project_id)
+    if not (user.is_staff or user.is_superuser):
+        queryset = queryset.filter(
+            models.Q(owner=user) | models.Q(members=user)
+        )
+    return queryset.first()
+
+
+def _task_accessible_to_user(task, user):
+    if not user or not getattr(user, 'is_authenticated', False):
+        return False
+    if user.is_staff or user.is_superuser or task.created_by_id == user.id:
+        return True
+    project = task.project
+    return bool(project and (project.owner_id == user.id or project.members.filter(pk=user.pk).exists()))
+
+
 class RequirementDocumentViewSet(viewsets.ModelViewSet):
     """需求文档视图集"""
     queryset = RequirementDocument.objects.all()
     serializer_class = RequirementDocumentSerializer
     parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return _accessible_documents(self.request.user)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -147,13 +186,13 @@ class RequirementDocumentViewSet(viewsets.ModelViewSet):
                     document.save()
                     raise e
 
-            analysis = run_analysis()
-
+            from .tasks import process_requirement_document_task
+            task = process_requirement_document_task.delay(document.id)
             return Response({
-                'message': '分析完成',
-                'analysis_id': analysis.id,
-                'requirements_count': analysis.requirements_count
-            }, status=status.HTTP_200_OK)
+                'message': '分析任务已提交',
+                'document_id': document.id,
+                'task_id': task.id,
+            }, status=status.HTTP_202_ACCEPTED)
 
         except Exception as e:
             logger.error(f"分析文档时出错: {e}")
@@ -190,6 +229,12 @@ class RequirementAnalysisViewSet(viewsets.ReadOnlyModelViewSet):
     """需求分析视图集"""
     queryset = RequirementAnalysis.objects.all()
     serializer_class = RequirementAnalysisSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return super().get_queryset().filter(
+            document__in=_accessible_documents(self.request.user)
+        )
 
     @action(detail=True, methods=['get'])
     def requirements(self, request, pk=None):
@@ -204,13 +249,17 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
     """业务需求视图集"""
     queryset = BusinessRequirement.objects.all()
     serializer_class = BusinessRequirementSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            analysis__document__in=_accessible_documents(self.request.user)
+        )
         analysis_id = self.request.query_params.get('analysis_id')
         if analysis_id:
             queryset = queryset.filter(analysis_id=analysis_id)
         return queryset
+
 
     @classmethod
     def _generate_test_case_content(cls, requirement, case_number, test_level):
@@ -350,7 +399,7 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=['post'])
     def generate_test_cases(self, request):
         """为选中的需求生成测试用例"""
-        serializer = TestCaseGenerationRequestSerializer(data=request.data)
+        serializer = LegacyTestCaseGenerationRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -377,25 +426,20 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
             # 同步生成测试用例
             def run_generation():
                 try:
-                    # 获取需求数据
-                    requirements = BusinessRequirement.objects.filter(id__in=requirement_ids)
+                    if len(requirement_ids) > 200:
+                        raise ValueError('一次最多生成 200 个需求的测试用例')
+                    requirements = self.get_queryset().filter(id__in=requirement_ids)
+                    if requirements.count() != len(set(requirement_ids)):
+                        raise PermissionError('部分需求不存在或无权限')
                     generated_test_cases = []
-
                     for requirement in requirements:
-                        # 获取该需求现有测试用例的数量，作为起始索引
                         existing_count = GeneratedTestCase.objects.filter(requirement=requirement).count()
-
                         for i in range(test_case_count):
-                            # 生成唯一的case_id
                             case_id = generate_unique_case_id(requirement, existing_count + i + 1)
-
-                            # 根据需求类型和序号生成不同的测试用例内容
-                            test_case_content = BusinessRequirementViewSet._generate_test_case_content(requirement,
-                                                                                                       i + 1,
-                                                                                                       test_level)
-
-                            # 创建测试用例
-                            test_case = GeneratedTestCase.objects.create(
+                            test_case_content = BusinessRequirementViewSet._generate_test_case_content(
+                                requirement, i + 1, test_level
+                            )
+                            generated_test_cases.append(GeneratedTestCase.objects.create(
                                 requirement=requirement,
                                 case_id=case_id,
                                 title=test_case_content['title'],
@@ -404,15 +448,12 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
                                 test_steps=test_case_content['test_steps'],
                                 expected_result=test_case_content['expected_result'],
                                 status='generated',
-                                generated_by_ai='AI-Generator-v1.0'
-                            )
-                            generated_test_cases.append(test_case)
-
+                                generated_by_ai='AI-Generator-v1.0',
+                            ))
                     return generated_test_cases
-
                 except Exception as e:
                     logger.error(f"生成测试用例失败: {e}")
-                    raise e
+                    raise
 
             test_cases = run_generation()
 
@@ -454,10 +495,13 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
     queryset = GeneratedTestCase.objects.all()
     serializer_class = GeneratedTestCaseSerializer
     pagination_class = GeneratedTestCasePagination
+    permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'patch']  # 只允许GET和PATCH方法
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            requirement__analysis__document__in=_accessible_documents(self.request.user)
+        )
 
         # 按需求ID过滤
         requirement_id = self.request.query_params.get('requirement_id')
@@ -491,7 +535,10 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
             def run_review():
                 try:
                     # 获取测试用例
-                    test_cases = GeneratedTestCase.objects.filter(id__in=test_case_ids)
+                    test_cases = GeneratedTestCase.objects.filter(
+                        id__in=test_case_ids,
+                        requirement__analysis__document__in=_accessible_documents(request.user),
+                    )
 
                     passed_count = 0
                     reviewed_cases = []
@@ -552,9 +599,12 @@ class AnalysisTaskViewSet(viewsets.ReadOnlyModelViewSet):
     """分析任务视图集"""
     queryset = AnalysisTask.objects.all()
     serializer_class = AnalysisTaskSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().filter(
+            document__in=_accessible_documents(self.request.user)
+        )
         document_id = self.request.query_params.get('document_id')
         if document_id:
             queryset = queryset.filter(document_id=document_id)
@@ -572,14 +622,8 @@ class AnalysisTaskViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
-from django.views.decorators.csrf import csrf_exempt
-
-
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def upload_and_analyze(request):
     """上传文档并立即开始分析"""
     try:
@@ -657,117 +701,21 @@ def upload_and_analyze(request):
                 document.save()
                 raise e
 
-        analysis = run_analysis()
-
+        from .tasks import process_requirement_document_task
+        task = process_requirement_document_task.delay(document.id)
         return Response({
-            'message': '上传并分析完成',
+            'message': '上传成功，分析任务已提交',
             'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
+            'task_id': task.id,
+        }, status=status.HTTP_202_ACCEPTED)
 
     except Exception as e:
         logger.error(f"上传并分析失败: {e}")
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
-def analyze_text(request):
-    """直接分析文本内容"""
-    try:
-        title = request.data.get('title', '')
-        description = request.data.get('description', '')
-        project_id = request.data.get('project')
-
-        if not title or not description:
-            return Response({'error': '标题和描述不能为空'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # 创建一个虚拟的需求文档记录
-        document = RequirementDocument.objects.create(
-            title=title,
-            document_type='txt',
-            status='analyzing',
-            uploaded_by_id=1,  # 使用默认用户ID，或者从request.user获取
-            project_id=project_id if project_id else None,
-            extracted_text=description
-        )
-
-        def run_analysis():
-            try:
-                # 创建模拟分析结果
-                analysis_result = {
-                    'analysis_report': f'对需求"{title}"的分析已完成。\n\n需求描述：{description[:200]}...\n\n识别到若干功能性需求。',
-                    'requirements_count': 2,
-                    'requirements': [
-                        {
-                            'requirement_id': 'REQ001',
-                            'requirement_name': '基础功能需求',
-                            'requirement_type': 'functional',
-                            'module': '核心模块',
-                            'requirement_level': 'high',
-                            'estimated_hours': 8,
-                            'description': f'基于需求描述识别的功能需求：{description[:100]}...',
-                            'acceptance_criteria': '功能正常运行，满足用户需求'
-                        },
-                        {
-                            'requirement_id': 'REQ002',
-                            'requirement_name': '用户交互需求',
-                            'requirement_type': 'usability',
-                            'module': '前端模块',
-                            'requirement_level': 'medium',
-                            'estimated_hours': 6,
-                            'description': '用户界面和交互相关需求',
-                            'acceptance_criteria': '界面友好，操作简单'
-                        }
-                    ]
-                }
-
-                # 创建分析记录
-                analysis = RequirementAnalysis.objects.create(
-                    document=document,
-                    analysis_report=analysis_result['analysis_report'],
-                    requirements_count=analysis_result['requirements_count'],
-                    analysis_time=1.5
-                )
-
-                # 保存需求数据
-                for req_data in analysis_result['requirements']:
-                    BusinessRequirement.objects.create(
-                        analysis=analysis,
-                        **req_data
-                    )
-
-                # 更新文档状态
-                document.status = 'analyzed'
-                document.save()
-
-                return analysis
-
-            except Exception as e:
-                logger.error(f"分析失败: {e}")
-                document.status = 'failed'
-                document.save()
-                raise e
-
-        analysis = run_analysis()
-
-        return Response({
-            'message': '文本分析完成',
-            'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
-
-    except Exception as e:
-        logger.error(f"文本分析失败: {e}")
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-@csrf_exempt
-@api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def analyze_text(request):
     """分析手动输入的需求文本"""
     try:
@@ -778,14 +726,18 @@ def analyze_text(request):
         if not title or not description:
             return Response({'error': '需求标题和描述不能为空'}, status=status.HTTP_400_BAD_REQUEST)
 
+        project = _project_for_user(request.user, project_id)
+        if project_id and project is None:
+            return Response({'error': '无权使用该项目'}, status=status.HTTP_403_FORBIDDEN)
+
         # 创建一个虚拟的需求文档记录
         document = RequirementDocument.objects.create(
             title=title,
-            file=None,  # 手动输入没有文件
+            file='',
             document_type='txt',
             status='analyzing',
-            uploaded_by_id=1,  # 使用默认用户ID，或者从request.user获取
-            project_id=project_id if project_id else None,
+            uploaded_by=request.user,
+            project=project,
             extracted_text=description
         )
 
@@ -888,14 +840,13 @@ def analyze_text(request):
                 document.save()
                 raise e
 
-        analysis = run_analysis()
-
+        from .tasks import process_requirement_document_task
+        task = process_requirement_document_task.delay(document.id)
         return Response({
-            'message': '文本分析完成',
+            'message': '文本分析任务已提交',
             'document_id': document.id,
-            'analysis_id': analysis.id,
-            'requirements_count': analysis.requirements_count
-        })
+            'task_id': task.id,
+        }, status=status.HTTP_202_ACCEPTED)
 
     except Exception as e:
         logger.error(f"文本分析失败: {e}")
@@ -906,6 +857,7 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
     """AI模型配置视图集"""
     queryset = AIModelConfig.objects.all()
     serializer_class = AIModelConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1113,8 +1065,6 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
             logger.info(f"模型类型: {config.model_type}")
             logger.info(f"模型名称: {config.model_name}")
             logger.info(f"API URL: {config.base_url}")
-            logger.info(
-                f"API Key前缀: {config.api_key[:10]}..." if len(config.api_key) > 10 else f"API Key: {config.api_key}")
 
             # 准备测试消息
             test_messages = [
@@ -1222,6 +1172,7 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
     """提示词配置视图集"""
     queryset = PromptConfig.objects.all()
     serializer_class = PromptConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1373,6 +1324,7 @@ class GenerationConfigViewSet(viewsets.ModelViewSet):
     """生成行为配置视图集"""
     queryset = GenerationConfig.objects.all()
     serializer_class = GenerationConfigSerializer
+    permission_classes = [IsAdminUser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1443,6 +1395,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     """测试用例生成任务视图集"""
     queryset = TestCaseGenerationTask.objects.all()
     serializer_class = TestCaseGenerationTaskSerializer
+    permission_classes = [IsAuthenticated]
     pagination_class = TestCaseGenerationTaskPagination
     http_method_names = ['get', 'post', 'patch', 'delete']  # 允许GET、POST、PATCH和DELETE方法
     lookup_field = 'task_id'  # 使用task_id作为查找字段
@@ -1450,7 +1403,13 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        # 安全检查：确保request有query_params属性
+        if not (self.request.user.is_staff or self.request.user.is_superuser):
+            queryset = queryset.filter(
+                models.Q(created_by=self.request.user)
+                | models.Q(project__owner=self.request.user)
+                | models.Q(project__members=self.request.user)
+            ).distinct()
+
         if not hasattr(self.request, 'query_params'):
             return queryset.order_by('-created_at')
 
@@ -1475,6 +1434,17 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
             validated_data = serializer.validated_data
+            active_count = TestCaseGenerationTask.objects.filter(
+                created_by=request.user,
+                status__in=['pending', 'generating', 'reviewing', 'revising'],
+            ).count()
+            if active_count >= 2:
+                return Response({'error': '同时运行的生成任务已达到上限，请等待现有任务完成'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+            if validated_data.get('project'):
+                project = _project_for_user(request.user, validated_data['project'])
+                if not project:
+                    return Response({'error': '无权使用该项目'}, status=status.HTTP_403_FORBIDDEN)
+                validated_data['project'] = project.id
 
             # 获取活跃的配置
             writer_config = None
@@ -1559,10 +1529,14 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                         def execute_task():
                             try:
-                                # 更新任务状态
-                                task.status = 'generating'
-                                task.progress = 10
-                                task.save()
+                                # 原子 claim：取消在 worker 启动前时不再被覆盖。
+                                claimed = TestCaseGenerationTask.objects.filter(
+                                    pk=task.pk, status='pending'
+                                ).update(status='generating', progress=10)
+                                if not claimed:
+                                    logger.info(f"任务 {task.task_id} 已取消或已被其他 worker 领取")
+                                    return
+                                task.refresh_from_db()
 
                                 # 读取生成行为配置
                                 from .models import GenerationConfig
@@ -1620,12 +1594,18 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         generated_cases = loop.run_until_complete(
                                             AIModelService.generate_test_cases_stream(task, callback=stream_callback)
                                         )
+                                        from .ai_contracts import summarize_generation_output
+                                        task.generation_log = json.dumps(
+                                            summarize_generation_output(generated_cases),
+                                            ensure_ascii=False,
+                                        )
 
-                                        # 生成完成后，确保最终的流式内容被保存
-                                        if task.stream_buffer:
-                                            save_stream_buffer(task.stream_buffer)
+                                        # 生成完成后，使用最终 normalized 表示覆盖流式缓冲，避免
+                                        # 原始 JSON transcript 与最终 Markdown 字段不一致。
+                                        task.stream_buffer = str(generated_cases)
+                                        save_stream_buffer(task.stream_buffer)
 
-                                        task.generated_test_cases = generated_cases
+                                        task.generated_test_cases = str(generated_cases)
                                         task.progress = 60
                                         task.save()
 
@@ -1787,6 +1767,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         generated_cases = loop.run_until_complete(
                                             AIModelService.generate_test_cases(task)
                                         )
+                                        from .ai_contracts import summarize_generation_output
+                                        task.generation_log = json.dumps(
+                                            summarize_generation_output(generated_cases),
+                                            ensure_ascii=False,
+                                        )
 
                                         task.generated_test_cases = generated_cases
                                         task.progress = 60
@@ -1918,7 +1903,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                     # 注意：不要直接调用task.save()，因为这会覆盖流式回调保存的final_test_cases
                                     # 从数据库重新获取最新的任务对象
                                     task.refresh_from_db()
-
+                                    if task.status == 'cancelled':
+                                        logger.info(f"任务 {task.task_id} 已取消，停止后续写入")
+                                        return
                                     task.status = 'completed'
                                     task.progress = 100
                                     task.completed_at = timezone.now()
@@ -1969,12 +1956,21 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @action(detail=True, methods=['post'], url_path='stream-ticket')
+    def issue_stream_ticket(self, request, task_id=None):
+        """Issue a short-lived ticket for EventSource, which cannot send JWT headers."""
+        task = self.get_object()
+        value = f'{task.task_id}:{request.user.pk}'
+        ticket = signing.TimestampSigner(salt='requirement-analysis.sse').sign(value)
+        return Response({'ticket': ticket, 'expires_in_seconds': 60})
+
     @action(detail=True, methods=['get'])
     def progress(self, request, task_id=None):
         """获取任务进度"""
         try:
             # DRF会根据lookup_field自动从URL提取task_id并调用get_object()
             task = self.get_object()
+            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
 
             return Response({
                 'task_id': task.task_id,
@@ -1999,7 +1995,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         methods=['get'],
         url_path='stream_progress',
         renderer_classes=[PassThroughRenderer],
-        permission_classes=[]  # 允许访问，task_id本身就是安全标识
+        permission_classes=[],
     )
     def stream_progress_sse(self, request, task_id=None):
         """
@@ -2010,59 +2006,54 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         """
         try:
             # 记录请求信息（用于调试）
-            request_origin = request.META.get('HTTP_ORIGIN', 'unknown')
+            request_origin = request.META.get('HTTP_ORIGIN', '').strip()
             logger.info(
-                f"SSE连接请求: task_id={task_id}, user={request.user}, authenticated={request.user.is_authenticated}, path={request.path}, origin={request_origin}")
+                f"SSE连接请求: task_id={task_id}, user={request.user}, authenticated={request.user.is_authenticated}, path={request.path}, origin={request_origin or 'same-origin'}")
 
-            # 动态获取CORS origin - 使用 Django 配置优先
-            def get_allowed_origin(origin):
-                """获取允许的CORS origin，优先使用 settings 配置"""
-                if getattr(settings, 'CORS_ALLOW_ALL_ORIGINS', False):
-                    return origin or '*'
-
-                allowed_origins = getattr(settings, 'CORS_ALLOWED_ORIGINS', []) or []
-                if origin in allowed_origins:
-                    return origin
-
-                # 兼容未配置时的本地开发默认
-                local_defaults = ['http://localhost:3000', 'http://127.0.0.1:3000']
-                if origin in local_defaults:
-                    return origin
-
-                # 如果未匹配，优先返回第一个允许的 origin（避免返回错误的 localhost）
-                if allowed_origins:
-                    return allowed_origins[0]
-
-                # 最后兜底：返回请求 origin（若存在）
-                return origin or 'http://localhost:3000'
-
-            cors_origin = get_allowed_origin(request_origin)
+            allowed_origins = getattr(settings, 'CORS_ALLOWED_ORIGINS', []) or []
+            if request_origin and request_origin not in allowed_origins:
+                from django.http import HttpResponse
+                return HttpResponse(
+                    json.dumps({'error': 'invalid origin'}),
+                    status=403,
+                    content_type='application/json',
+                )
+            cors_origin = request_origin or None
 
             # 处理 CORS 预检请求
             if request.method == 'OPTIONS':
                 from django.http import HttpResponse
                 response = HttpResponse()
-                response['Access-Control-Allow-Origin'] = cors_origin
+                if cors_origin:
+                    response['Access-Control-Allow-Origin'] = cors_origin
+                    response['Access-Control-Allow-Credentials'] = 'true'
                 response['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
                 response['Access-Control-Allow-Headers'] = 'Content-Type'
-                response['Access-Control-Allow-Credentials'] = 'true'
                 response['Access-Control-Max-Age'] = '86400'
                 return response
 
-            # 获取任务对象
-            task = TestCaseGenerationTask.objects.filter(task_id=task_id).first()
-            if not task:
-                logger.warning(f"SSE连接失败: 任务未找到, task_id={task_id}")
-                # 返回JSON错误而不是SSE
+            # EventSource 无法发送 Authorization；优先校验绑定 user/task 的短期 ticket，
+            # 同源 session 请求仍可直接使用 request.user。
+            sse_user = request.user if getattr(request.user, 'is_authenticated', False) else None
+            ticket = request.GET.get('ticket', '')
+            if ticket:
+                try:
+                    signed = signing.TimestampSigner(salt='requirement-analysis.sse').unsign(ticket, max_age=60)
+                    signed_task_id, signed_user_id = signed.split(':', 1)
+                    if signed_task_id != str(task_id):
+                        raise ValueError('ticket task mismatch')
+                    from django.contrib.auth import get_user_model
+                    sse_user = get_user_model().objects.filter(pk=signed_user_id, is_active=True).first()
+                except (signing.BadSignature, signing.SignatureExpired, ValueError):
+                    sse_user = None
+            if not sse_user:
                 from django.http import HttpResponse
-                response = HttpResponse(
-                    json.dumps({'error': '任务未找到'}),
-                    status=404,
-                    content_type='application/json'
-                )
-                response['Access-Control-Allow-Origin'] = cors_origin
-                response['Access-Control-Allow-Credentials'] = 'true'
-                return response
+                return HttpResponse(json.dumps({'error': 'SSE authentication required'}), status=401, content_type='application/json')
+
+            task = TestCaseGenerationTask.objects.filter(task_id=task_id).first()
+            if not task or not _task_accessible_to_user(task, sse_user):
+                from django.http import HttpResponse
+                return HttpResponse(json.dumps({'error': '任务不存在'}), status=404, content_type='application/json')
 
             # 记录上次发送的stream_position
             last_sent_position = 0
@@ -2302,6 +2293,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         try:
             # DRF会根据lookup_field自动从URL提取task_id并调用get_object()
             task = self.get_object()
+            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
 
             if task.status in ['completed', 'failed', 'cancelled']:
                 return Response(
@@ -2325,12 +2317,14 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @transaction.atomic
     @action(detail=True, methods=['post'])
     def save_to_records(self, request, task_id=None):
         """保存测试用例到AI生成用例记录并导入到测试用例管理系统"""
         try:
             # DRF会根据lookup_field自动从URL提取task_id并调用get_object()
             task = self.get_object()
+            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
 
             if task.status != 'completed':
                 return Response(
@@ -2353,6 +2347,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
             # 解析并导入测试用例到测试用例管理系统
             test_cases = self._parse_test_cases_content(task.final_test_cases)
+            if not test_cases:
+                return Response({'error': '无法解析最终测试用例，未标记为已保存'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if test_cases and not task.project_id:
+                return Response({'error': '任务未绑定项目，不能保存测试用例'}, status=status.HTTP_400_BAD_REQUEST)
 
             if test_cases:
                 try:
@@ -2399,26 +2398,30 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                 )
 
                     adopted_count = 0
-                    for test_case in test_cases:
-                        TestCase.objects.create(
-                            project=project,
-                            author=task.created_by,
-                            title=test_case.get('scenario', '测试用例'),
-                            description=test_case.get('scenario', ''),
-                            preconditions=test_case.get('precondition', ''),
-                            steps=test_case.get('steps', ''),
-                            expected_result=test_case.get('expected', ''),
-                            priority=self._map_priority(test_case.get('priority', '中')),
-                            test_type='functional',
-                            status='draft'
-                        )
-                        adopted_count += 1
+                    with transaction.atomic():
+                        for test_case in test_cases:
+                            TestCase.objects.create(
+                                project=project,
+                                author=task.created_by,
+                                title=test_case.get('scenario', '测试用例'),
+                                description=test_case.get('scenario', ''),
+                                preconditions=test_case.get('precondition', ''),
+                                steps=test_case.get('steps', ''),
+                                expected_result=test_case.get('expected', ''),
+                                priority=self._map_priority(test_case.get('priority', '中')),
+                                test_type='functional',
+                                status='draft'
+                            )
+                            adopted_count += 1
 
                     logger.info(f"成功导入 {adopted_count} 条测试用例到项目 {project.name}")
 
                 except Exception as import_error:
                     logger.error(f"导入测试用例失败: {import_error}")
-                    # 即使导入失败，仍然标记为已保存
+                    return Response(
+                        {'error': '导入测试用例失败，任务未标记为已保存，请重试'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
 
             # 标记任务为已保存
             task.is_saved_to_records = True
@@ -2443,14 +2446,16 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     def saved_records(self, request):
         """获取已保存的测试用例记录列表"""
         try:
-            # 获取已保存到记录的任务
-            saved_tasks = TestCaseGenerationTask.objects.filter(
+            # get_object 使用 created_by/project scope，避免跨用户读取统计和记录。
+            saved_tasks = self.get_queryset().filter(
                 is_saved_to_records=True,
                 status='completed'
             ).order_by('-saved_at')
-
-            # 序列化数据
-            serializer = TestCaseGenerationTaskSerializer(saved_tasks, many=True)
+            page = self.paginate_queryset(saved_tasks)
+            if page is not None:
+                serializer = TestCaseGenerationTaskSerializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            serializer = TestCaseGenerationTaskSerializer(saved_tasks[:100], many=True)
 
             return Response({
                 'message': '获取已保存记录成功',
@@ -2464,205 +2469,114 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @transaction.atomic
     @action(detail=True, methods=['post'], url_path='batch_adopt')
     def batch_adopt(self, request, task_id=None):
         """批量采纳任务的所有测试用例"""
         try:
             task = self.get_object()
-
+            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
             if task.status != 'completed':
-                return Response(
-                    {'error': '只能采纳已完成的测试用例生成任务'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
+                return Response({'error': '只能采纳已完成的测试用例生成任务'}, status=status.HTTP_400_BAD_REQUEST)
+            if task.is_saved_to_records:
+                return Response({'message': '测试用例已经采纳', 'already_saved': True}, status=status.HTTP_200_OK)
             if not task.final_test_cases:
-                return Response(
-                    {'error': '没有最终测试用例可以采纳'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # 解析最终测试用例
+                return Response({'error': '没有最终测试用例可以采纳'}, status=status.HTTP_400_BAD_REQUEST)
             test_cases = self._parse_test_cases_content(task.final_test_cases)
-
             if not test_cases:
-                return Response(
-                    {'error': '无法解析测试用例内容'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # 导入到testcases应用（使用与单条采纳相同的逻辑）
-            try:
-                from apps.testcases.models import TestCase
-                from apps.projects.models import Project
-                from django.db import models
-
-                # 优先使用任务关联的项目
-                if task.project:
-                    project = task.project
-                    logger.info(f"使用任务关联的项目: {project.name}")
-                else:
-                    # 回退到项目选择逻辑
-                    user = task.created_by
-                    accessible_projects = Project.objects.filter(
-                        models.Q(owner=user) | models.Q(members=user)
-                    ).distinct()
-
-                    # 尝试从前端获取项目ID
-                    project_id = request.data.get('project_id')
-
-                    if project_id:
-                        try:
-                            project = accessible_projects.get(id=project_id)
-                        except Project.DoesNotExist:
-                            # 如果指定项目不存在或无权限，使用第一个可访问的项目
-                            project = accessible_projects.first()
-                            if not project:
-                                # 如果用户没有任何项目，创建默认项目
-                                project = Project.objects.create(
-                                    name="默认项目",
-                                    owner=user,
-                                    description='系统自动创建的默认项目'
-                                )
-                    else:
-                        # 没有指定项目，使用第一个可访问的项目
-                        project = accessible_projects.first()
-                        if not project:
-                            # 如果用户没有任何项目，创建默认项目
-                            project = Project.objects.create(
-                                name="默认项目",
-                                owner=user,
-                                description='系统自动创建的默认项目'
-                            )
-
+                return Response({'error': '无法解析测试用例内容'}, status=status.HTTP_400_BAD_REQUEST)
+            project = task.project
+            if not project:
+                return Response({'error': '任务未绑定项目，不能采纳'}, status=status.HTTP_400_BAD_REQUEST)
+            from apps.testcases.models import TestCase
+            with transaction.atomic():
                 adopted_count = 0
-                for test_case in test_cases:
+                for test_case in test_cases[:200]:
                     TestCase.objects.create(
-                        project=project,  # 使用统一的项目选择逻辑
+                        project=project,
                         author=task.created_by,
                         title=test_case.get('scenario', '测试用例'),
-                        description=test_case.get('scenario', ''),  # 使用scenario作为描述
+                        description=test_case.get('scenario', ''),
                         preconditions=test_case.get('precondition', ''),
                         steps=test_case.get('steps', ''),
                         expected_result=test_case.get('expected', ''),
                         priority=self._map_priority(test_case.get('priority', '中')),
                         test_type='functional',
-                        status='draft'
+                        status='draft',
                     )
                     adopted_count += 1
-
-                return Response({
-                    'message': f'成功采纳 {adopted_count} 条测试用例到项目 "{project.name}"',
-                    'adopted_count': adopted_count,
-                    'project_name': project.name
-                }, status=status.HTTP_200_OK)
-
-            except Exception as import_error:
-                logger.error(f"导入测试用例失败: {import_error}")
-                return Response(
-                    {'error': f'导入测试用例失败: {str(import_error)}'},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
+                task.is_saved_to_records = True
+                task.saved_at = timezone.now()
+                task.save(update_fields=['is_saved_to_records', 'saved_at'])
+            return Response({
+                'message': f'成功采纳 {adopted_count} 条测试用例到项目 "{project.name}"',
+                'adopted_count': adopted_count,
+                'project_name': project.name,
+            }, status=status.HTTP_200_OK)
         except Exception as e:
             logger.error(f"批量采纳测试用例时出错: {e}")
-            return Response(
-                {'error': f'批量采纳失败: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'批量采纳失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @transaction.atomic
     @action(detail=True, methods=['post'], url_path='batch-adopt-selected')
     def batch_adopt_selected(self, request, task_id=None):
         """批量采纳选中的测试用例"""
         try:
             task = self.get_object()
+            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
+            if task.status != 'completed':
+                return Response({'error': '只能采纳已完成的测试用例生成任务'}, status=status.HTTP_400_BAD_REQUEST)
+            if task.is_saved_to_records:
+                return Response({'message': '测试用例已经采纳', 'already_saved': True}, status=status.HTTP_200_OK)
             test_cases_data = request.data.get('test_cases', [])
+            if not isinstance(test_cases_data, list) or not test_cases_data:
+                return Response({'error': 'test_cases 必须是非空数组'}, status=status.HTTP_400_BAD_REQUEST)
+            if len(test_cases_data) > 200:
+                return Response({'error': '一次最多采纳 200 条测试用例'}, status=status.HTTP_400_BAD_REQUEST)
+            if not task.final_test_cases or not task.project_id:
+                return Response({'error': '任务没有可采纳的最终测试用例或未绑定项目'}, status=status.HTTP_400_BAD_REQUEST)
+            canonical = self._parse_test_cases_content(task.final_test_cases)
+            allowed_titles = {str(item.get('scenario') or item.get('title') or '').strip() for item in canonical}
+            seen_titles = set()
+            for item in test_cases_data:
+                if not isinstance(item, dict):
+                    return Response({'error': '每条测试用例必须是对象'}, status=status.HTTP_400_BAD_REQUEST)
+                title = str(item.get('title') or item.get('scenario') or '').strip()
+                if not title or title not in allowed_titles:
+                    return Response({'error': '只能采纳任务最终输出中的测试用例'}, status=status.HTTP_400_BAD_REQUEST)
+                if title in seen_titles:
+                    return Response({'error': '同一测试用例不能重复采纳'}, status=status.HTTP_400_BAD_REQUEST)
+                seen_titles.add(title)
 
-            if not test_cases_data:
-                return Response(
-                    {'error': '没有提供要采纳的测试用例数据'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # 导入到testcases应用
-            try:
-                from apps.testcases.models import TestCase
-                from apps.projects.models import Project
-                from django.db import models
-
-                # 优先使用任务关联的项目
-                if task.project:
-                    project = task.project
-                    logger.info(f"使用任务关联的项目: {project.name}")
-                else:
-                    # 回退到项目选择逻辑
-                    user = task.created_by
-                    accessible_projects = Project.objects.filter(
-                        models.Q(owner=user) | models.Q(members=user)
-                    ).distinct()
-
-                    # 尝试从前端获取项目ID
-                    project_id = request.data.get('project_id')
-
-                    if project_id:
-                        try:
-                            project = accessible_projects.get(id=project_id)
-                        except Project.DoesNotExist:
-                            # 如果指定项目不存在或无权限，使用第一个可访问的项目
-                            project = accessible_projects.first()
-                            if not project:
-                                # 如果用户没有任何项目，创建默认项目
-                                project = Project.objects.create(
-                                    name="默认项目",
-                                    owner=user,
-                                    description='系统自动创建的默认项目'
-                                )
-                    else:
-                        # 没有指定项目，使用第一个可访问的项目
-                        project = accessible_projects.first()
-                        if not project:
-                            # 如果用户没有任何项目，创建默认项目
-                            project = Project.objects.create(
-                                name="默认项目",
-                                owner=user,
-                                description='系统自动创建的默认项目'
-                            )
-
+            from apps.testcases.models import TestCase
+            project = task.project
+            with transaction.atomic():
                 adopted_count = 0
                 for case_data in test_cases_data:
                     TestCase.objects.create(
-                        project=project,  # 使用统一的项目选择逻辑
+                        project=project,
                         author=task.created_by,
-                        title=case_data.get('title', '测试用例'),
+                        title=case_data.get('title') or case_data.get('scenario') or '测试用例',
                         description=case_data.get('description', ''),
-                        preconditions=case_data.get('preconditions', ''),
+                        preconditions=case_data.get('preconditions', case_data.get('precondition', '')),
                         steps=case_data.get('steps', ''),
-                        expected_result=case_data.get('expected_result', ''),
-                        priority=case_data.get('priority', 'medium'),
-                        test_type=case_data.get('test_type', 'functional'),
-                        status=case_data.get('status', 'draft')
+                        expected_result=case_data.get('expected_result', case_data.get('expected', '')),
+                        priority=case_data.get('priority', 'medium') if case_data.get('priority') in {'low', 'medium', 'high', 'critical'} else 'medium',
+                        test_type='functional',
+                        status='draft',
                     )
                     adopted_count += 1
-
-                return Response({
-                    'message': f'成功采纳 {adopted_count} 条测试用例到项目 "{project.name}"',
-                    'adopted_count': adopted_count,
-                    'project_name': project.name
-                }, status=status.HTTP_200_OK)
-
-            except Exception as import_error:
-                logger.error(f"导入选中测试用例失败: {import_error}")
-                return Response(
-                    {'error': f'导入测试用例失败: {str(import_error)}'},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
+                task.is_saved_to_records = True
+                task.saved_at = timezone.now()
+                task.save(update_fields=['is_saved_to_records', 'saved_at'])
+            return Response({
+                'message': f'成功采纳 {adopted_count} 条测试用例到项目 "{project.name}"',
+                'adopted_count': adopted_count,
+                'project_name': project.name,
+            }, status=status.HTTP_200_OK)
         except Exception as e:
             logger.error(f"批量采纳选中测试用例时出错: {e}")
-            return Response(
-                {'error': f'批量采纳失败: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'批量采纳失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='batch_discard')
     def batch_discard(self, request, task_id=None):
@@ -3125,13 +3039,13 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             status_param = request.query_params.get('status')
             created_by = request.query_params.get('created_by')
 
-            # 构建查询
-            queryset = TestCaseGenerationTask.objects.all()
+            # 构建查询：复用 get_queryset 的创建者/项目权限范围。
+            queryset = self.get_queryset()
 
             if status_param:
                 queryset = queryset.filter(status=status_param)
 
-            if created_by:
+            if created_by and (request.user.is_staff or request.user.is_superuser):
                 queryset = queryset.filter(created_by_id=created_by)
 
             # 使用聚合查询获取统计信息

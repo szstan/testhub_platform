@@ -4,6 +4,7 @@ APP自动化测试 Celery 任务
 """
 from celery import shared_task
 from django.utils import timezone
+from django.db import transaction
 import logging
 import os
 from asgiref.sync import async_to_sync
@@ -58,6 +59,9 @@ def _send_app_webhook_notification(task, detail_content, status_text):
     """发送 Webhook 通知"""
     import requests
     import json
+    from django.conf import settings
+    from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+    from apps.quality_intelligence.services.redaction import redact_payload
     from .models import AppNotificationLog
 
     try:
@@ -82,6 +86,15 @@ def _send_app_webhook_notification(task, detail_content, status_text):
     for bot in all_bots:
         webhook_url = bot.get('webhook_url')
         if not webhook_url:
+            continue
+
+        try:
+            webhook_url = validate_outbound_url(
+                webhook_url,
+                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+            )
+        except UnsafeOutboundURL:
+            logger.warning('拒绝向不安全 Webhook 地址发送 APP 通知')
             continue
 
         bot_type = bot.get('type', 'unknown')
@@ -109,24 +122,24 @@ def _send_app_webhook_notification(task, detail_content, status_text):
                 task=task, task_name=task.name, task_type=task.task_type,
                 notification_type='task_execution', sender_name='系统Webhook通知',
                 sender_email='system@notification.com',
-                recipient_info=[{'name': bot.get('name', 'Unknown'), 'webhook_url': webhook_url}],
-                webhook_bot_info=bot,
-                notification_content=json.dumps(message_data, ensure_ascii=False),
+                recipient_info=[{'name': bot.get('name', 'Unknown')}],
+                webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                 status=log_status,
-                error_message='' if log_status == 'success' else f'HTTP {resp.status_code}: {resp.text}',
-                response_info={'status_code': resp.status_code, 'response': resp.text[:500]},
+                error_message='' if log_status == 'success' else f'HTTP {resp.status_code}',
+                response_info=redact_payload({'status_code': resp.status_code, 'response': resp.text[:500]}),
                 sent_at=timezone.now()
             )
-        except Exception as e:
-            logger.error(f"发送Webhook失败: {e}")
+        except Exception:
+            logger.error('发送Webhook失败')
             AppNotificationLog.objects.create(
                 task=task, task_name=task.name, task_type=task.task_type,
                 notification_type='task_execution', sender_name='系统Webhook通知',
                 sender_email='system@notification.com',
                 recipient_info=[{'name': bot.get('name', 'Unknown')}],
-                webhook_bot_info=bot,
-                notification_content=json.dumps(message_data, ensure_ascii=False),
-                status='failed', error_message=str(e)
+                webhook_bot_info={'type': bot_type, 'name': bot.get('name', 'Unknown'), 'configured': True},
+                notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
+                status='failed', error_message='Webhook notification failed'
             )
 
 
@@ -216,6 +229,7 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
     
     execution = None
     device = None
+    lock_acquired = False
     
     try:
         # 获取执行记录
@@ -223,7 +237,7 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
         test_case = execution.test_case
         
         device = execution.device
-        
+
         # 更新状态为执行中
         execution.status = 'running'
         execution.started_at = timezone.now()
@@ -234,12 +248,14 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
         logger.info(f"开始执行APP测试: {test_case.name}")
         
         # 1. 检查并锁定设备
-        if device.status == 'locked' and device.locked_by != execution.user:
-            raise RuntimeError(f"设备 {device.device_id} 已被其他用户锁定")
-        
-        if device.status != 'locked':
-            device.lock(execution.user)
-        
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=execution.device_id)
+            if device.status == 'locked' and device.locked_by_id != execution.user_id:
+                raise RuntimeError(f"设备 {device.device_id} 已被其他用户锁定")
+            if device.status != 'locked':
+                device.lock(execution.user)
+                lock_acquired = True
+
         logger.info(f"设备已锁定: {device.device_id}")
         
         # 2. 由 pytest + allure 插件执行测试
@@ -359,7 +375,7 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
     finally:
         # 7. 清理：释放设备
         try:
-            if device and device.locked_by == execution.user:
+            if lock_acquired and device and execution and device.locked_by_id == execution.user_id:
                 device.unlock()
                 logger.info(f"设备已释放: {device.device_id}")
         except Exception as e:
@@ -382,6 +398,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
 
     suite = None
     device = None
+    lock_acquired = False
     passed = 0
     failed = 0
 
@@ -400,12 +417,15 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             logger.error(f"套件 {suite_id} 未找到执行记录")
             return
 
-        device = executions[0].device
-        user = executions[0].user
-
         # 锁定设备
-        if device.status != 'locked':
-            device.lock(user)
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=executions[0].device_id)
+            user = executions[0].user
+            if device.status == 'locked' and device.locked_by_id != user.id:
+                raise RuntimeError(f"设备 {device.device_id} 已被其他用户锁定")
+            if device.status != 'locked':
+                device.lock(user)
+                lock_acquired = True
         logger.info(f"套件执行开始: {suite.name}, 设备: {device.device_id}, 共 {len(executions)} 个用例")
 
         for idx, execution in enumerate(executions):
@@ -560,7 +580,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
         try:
             if device:
                 device.refresh_from_db()
-                if device.status == 'locked':
+                if lock_acquired and device.locked_by_id == user.id:
                     device.unlock()
                     logger.info(f"设备已释放: {device.device_id}")
         except Exception as e:
@@ -588,3 +608,11 @@ def check_and_release_expired_devices():
         
     except Exception as e:
         logger.error(f"检查设备锁定失败: {str(e)}", exc_info=True)
+
+@shared_task
+def reap_expired_device_leases_task():
+    """Reclaim capability-pool leases whose heartbeat has expired."""
+    from .device_pool import reap_expired_device_leases
+    reclaimed = reap_expired_device_leases()
+    logger.info('回收过期设备租约: %s', reclaimed)
+    return reclaimed

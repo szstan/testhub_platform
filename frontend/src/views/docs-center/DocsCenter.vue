@@ -41,7 +41,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
-import { marked } from 'marked'
+import { renderSafeMarkdown } from '@/utils/safe-html'
 import api from '@/utils/api'
 
 const { t } = useI18n()
@@ -61,10 +61,7 @@ const filteredDocs = computed(() => {
   )
 })
 
-const renderedHtml = computed(() => {
-  if (!currentContent.value) return ''
-  return marked.parse(currentContent.value)
-})
+const renderedHtml = computed(() => renderSafeMarkdown(currentContent.value))
 
 const fetchDocs = async () => {
   loading.value = true
