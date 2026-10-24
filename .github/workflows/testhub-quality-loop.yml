@@ -35,8 +35,10 @@ jobs:
       - name: Install backend dependencies
         shell: bash
         run: |
-          python --version
-          python -m pip install -r requirements-prod.txt
+          python3.12 -m venv "$RUNNER_TEMP/testhub-ci-venv"
+          "$RUNNER_TEMP/testhub-ci-venv/bin/python" --version
+          "$RUNNER_TEMP/testhub-ci-venv/bin/python" -m pip install -r requirements-prod.txt
+          echo "$RUNNER_TEMP/testhub-ci-venv/bin" >> "$GITHUB_PATH"
 
       - name: Validate TestHub configuration
         shell: bash
