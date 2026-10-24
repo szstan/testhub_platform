@@ -38,6 +38,10 @@ jobs:
           test -n "$TESTHUB_BASE_URL"
           test -n "$TESTHUB_TOKEN"
           test -n "$TESTHUB_PROJECT_ID"
+          case "$TESTHUB_TOKEN" in
+            th_ci_*) ;;
+            *) echo 'TESTHUB_TOKEN must be a long-lived th_ci service token' >&2; exit 1 ;;
+          esac
           python scripts/testhub_ci.py --help >/dev/null
 
       - name: Run project tests

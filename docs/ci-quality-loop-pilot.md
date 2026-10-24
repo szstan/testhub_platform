@@ -75,7 +75,7 @@ python manage.py revoke_ci_token --project-id 1 --name github-pilot
 
 - `TESTHUB_BASE_URL`：例如 `https://testhub.example.com`；
 - `TESTHUB_TOKEN`：项目级 `th_ci_...` service token；
-- `TESTHUB_PROJECT_ID`：TestHub 项目 ID；
+- workflow_dispatch 输入 `project_id`：TestHub 项目 ID；
 - `TESTHUB_BASELINE_JOB_ID`：可选的基线 job ID。
 
 最小流程：
