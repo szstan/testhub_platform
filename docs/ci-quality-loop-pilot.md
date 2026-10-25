@@ -200,6 +200,18 @@ quality-gate:
 - gate 失败有明确 case、signature 和 artifact；
 - 试点结束前至少完成一次真实发布门禁。
 
+## 50 人内网 pilot 运行边界
+
+适用于 TestHub CI pilot 的受控内网使用：
+
+- TestHub backend 只绑定 staging 主机回环地址 `127.0.0.1:18002`；Nginx 对外提供 `18003`。
+- 防火墙只允许 `192.168.1.0/24` 访问 `18003`；不要把该端口放到公网、访客 Wi-Fi 或未受控 VPN。
+- 当前 pilot 使用 HTTP。长期 token 只能在受控内网中使用，并应按轮换周期重新创建和撤销。
+- 当前 release 保留 rollback 目录；上线前应确认数据库备份属于当前 release 和当前 staging 数据库。历史 testall 备份不能替代本次 release 的新备份。
+- pilot 默认使用 allowlisted `test_suite`；测试命令不再从 workflow 输入自由执行。`max_unmatched` 在 external_ref 物化后应设置为 `0`。
+
+APP authenticated smoke、TLS/WSS、证书、公网访问和外部设备不属于内网 CI pilot，必须单独授权。
+
 ## 试点结束决策
 
 试点结束后只做三种决策：
