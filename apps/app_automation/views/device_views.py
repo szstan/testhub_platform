@@ -364,6 +364,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             return denial
         return Response({'reclaimed': reap_expired_device_leases()})
 
+    @action(detail=True, methods=['post'])
     def screenshot(self, request, pk=None):
         """
         获取设备实时截图

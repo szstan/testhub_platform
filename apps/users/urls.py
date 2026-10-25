@@ -20,4 +20,5 @@ urlpatterns = [
     path('send-register-code/', views.send_register_code, name='send_register_code'),  # 发送注册验证码
     path('sms-login/', views.sms_login_view, name='sms_login'),                 # 短信验证码登录
     path('exchange-token/', views.exchange_token_view, name='exchange_token'),  # SSO 授权码交换
+    path('websocket-ticket/', views.websocket_ticket_view, name='websocket_ticket'),
 ]

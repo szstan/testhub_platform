@@ -16,11 +16,15 @@ on:
         required: false
         default: '1000'
         type: string
-      test_command:
-        description: Test command that writes JUnit XML to test-results.xml
+      test_suite:
+        description: Allowlisted test suite to run on the staging runner
         required: true
-        default: python -m pytest -q --ignore=apps/app_automation/tests/test_app_flow.py --ignore=apps/app_automation/tests/test_executor.py --junitxml=test-results.xml
-        type: string
+        default: backend
+        type: choice
+        options:
+          - backend
+          - ci-token
+          - full
 
 permissions:
   contents: read
@@ -31,7 +35,6 @@ jobs:
     timeout-minutes: 45
     env:
       TESTHUB_BASE_URL: ${{ vars.TESTHUB_BASE_URL }}
-      TESTHUB_TOKEN: ${{ secrets.TESTHUB_TOKEN }}
       TESTHUB_PROJECT_ID: ${{ inputs.project_id }}
       TESTHUB_MAX_UNMATCHED: ${{ inputs.max_unmatched }}
     steps:
@@ -50,22 +53,42 @@ jobs:
         shell: bash
         run: |
           test -n "$TESTHUB_BASE_URL"
-          test -n "$TESTHUB_TOKEN"
           test -n "$TESTHUB_PROJECT_ID"
-          case "$TESTHUB_TOKEN" in
-            th_ci_*) ;;
-            *) echo 'TESTHUB_TOKEN must be a long-lived th_ci service token' >&2; exit 1 ;;
-          esac
           python scripts/testhub_ci.py --help >/dev/null
 
       - name: Run project tests
         shell: bash
-        run: ${{ inputs.test_command }}
+        run: |
+          case "${{ inputs.test_suite }}" in
+            backend)
+              python -m pytest -q \
+                --ignore=apps/app_automation/tests/test_app_flow.py \
+                --ignore=apps/app_automation/tests/test_executor.py \
+                --junitxml=test-results.xml
+              ;;
+            ci-token)
+              python -m pytest -q apps/users/tests/test_ci_token.py --junitxml=test-results.xml
+              ;;
+            full)
+              python -m pytest -q --junitxml=test-results.xml
+              ;;
+            *)
+              echo 'Unknown test suite' >&2
+              exit 2
+              ;;
+          esac
 
       - name: Import JUnit results
         id: import
         shell: bash
+        env:
+          TESTHUB_TOKEN: ${{ secrets.TESTHUB_TOKEN }}
         run: |
+          test -n "$TESTHUB_TOKEN"
+          case "$TESTHUB_TOKEN" in
+            th_ci_*) ;;
+            *) echo 'TESTHUB_TOKEN must be a long-lived th_ci service token' >&2; exit 1 ;;
+          esac
           test -s test-results.xml
           python scripts/testhub_ci.py \
             --base-url "$TESTHUB_BASE_URL" \
@@ -85,6 +108,7 @@ jobs:
         shell: bash
         env:
           BASELINE_JOB_ID: ${{ inputs.baseline_job_id }}
+          TESTHUB_TOKEN: ${{ secrets.TESTHUB_TOKEN }}
         run: |
           args=(
             --job-id "${{ steps.import.outputs.job_id }}"

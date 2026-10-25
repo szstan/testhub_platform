@@ -600,7 +600,12 @@ class DataFactoryViewSet(viewsets.ModelViewSet):
         tool_name = request.data.get('tool_name')
         tool_category = request.data.get('tool_category')
         tool_scenario = request.data.get('tool_scenario')
-        count = request.data.get('count', 10)
+        try:
+            count = int(request.data.get('count', 10))
+        except (TypeError, ValueError):
+            return Response({'error': 'count 必须是整数'}, status=status.HTTP_400_BAD_REQUEST)
+        if not 1 <= count <= 100:
+            return Response({'error': 'count 必须在 1 到 100 之间'}, status=status.HTTP_400_BAD_REQUEST)
         input_data = request.data.get('input_data', {})
 
         if not tool_name or not tool_category:

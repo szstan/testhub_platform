@@ -1452,8 +1452,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             reviewer_prompt = None
 
             if validated_data.get('use_writer_model', True):
-                # 优先查找任意启用的编写模型配置
-                writer_config = AIModelConfig.objects.filter(role='writer', is_active=True).first()
+                writer_configs = AIModelConfig.objects.filter(role='writer', is_active=True)
+                if not (request.user.is_staff or request.user.is_superuser):
+                    writer_configs = writer_configs.filter(created_by=request.user)
+                writer_config = writer_configs.order_by('-created_at').first()
 
                 if not writer_config:
                     return Response(
@@ -1469,8 +1471,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     )
 
             if validated_data.get('use_reviewer_model', True):
-                # 优先查找任意启用的评审模型配置
-                reviewer_config = AIModelConfig.objects.filter(role='reviewer', is_active=True).first()
+                reviewer_configs = AIModelConfig.objects.filter(role='reviewer', is_active=True)
+                if not (request.user.is_staff or request.user.is_superuser):
+                    reviewer_configs = reviewer_configs.filter(created_by=request.user)
+                reviewer_config = reviewer_configs.order_by('-created_at').first()
 
                 if not reviewer_config:
                     return Response(

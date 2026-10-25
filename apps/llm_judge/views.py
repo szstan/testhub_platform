@@ -83,7 +83,7 @@ class RubricViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='presets')
     def presets(self, request):
         """列出可克隆的预设模板。"""
-        qs = Rubric.objects.filter(is_active=True).exclude(domain='custom')
+        qs = self.get_queryset().exclude(domain='custom')
         return Response(RubricSerializer(qs, many=True).data)
 
 
@@ -146,7 +146,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
 
         rubric_id = data.get('rubric')
         if rubric_id:
-            rubric = Rubric.objects.filter(pk=rubric_id, is_active=True).first()
+            rubric = self.get_queryset().filter(pk=rubric_id).first()
             if rubric is None:
                 return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
         else:

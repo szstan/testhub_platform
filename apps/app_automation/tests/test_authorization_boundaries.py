@@ -1,6 +1,8 @@
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient, APIRequestFactory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from apps.app_automation.models import (
     AppDevice,
@@ -108,7 +110,27 @@ class AppAuthorizationBoundaryTests(TestCase):
         response = client.get(f"/api/app-automation/devices/{device.id}/")
         self.assertEqual(response.status_code, 200)
 
-    def test_custom_component_writes_require_admin(self):
+    def test_screenshot_action_is_routed_and_scoped(self):
+        device = AppDevice.objects.create(
+            device_id='screenshot-device', status='online', locked_by=self.owner,
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        with patch(
+            'apps.app_automation.views.device_views.subprocess.run',
+            return_value=SimpleNamespace(stdout=b'png-bytes'),
+        ):
+            response = client.post(
+                f'/api/app-automation/devices/{device.id}/screenshot/'
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data['data']['content'].startswith('data:image/png;base64,'))
+
+        client.force_authenticate(user=self.outsider)
+        denied = client.post(f'/api/app-automation/devices/{device.id}/screenshot/')
+        self.assertEqual(denied.status_code, 404)
+
+
         client = APIClient()
         payload = {
             "name": "Login Component",
