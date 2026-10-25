@@ -44,10 +44,15 @@ jobs:
       - name: Install backend dependencies
         shell: bash
         run: |
-          python3.12 -m venv "$RUNNER_TEMP/testhub-ci-venv"
-          "$RUNNER_TEMP/testhub-ci-venv/bin/python" --version
-          "$RUNNER_TEMP/testhub-ci-venv/bin/python" -m pip install -r requirements-prod.txt
-          echo "$RUNNER_TEMP/testhub-ci-venv/bin" >> "$GITHUB_PATH"
+          if test -x /opt/testhub_platform/venv-prod/bin/python; then
+            /opt/testhub_platform/venv-prod/bin/python --version
+            echo /opt/testhub_platform/venv-prod/bin >> "$GITHUB_PATH"
+          else
+            python3.12 -m venv "$RUNNER_TEMP/testhub-ci-venv"
+            "$RUNNER_TEMP/testhub-ci-venv/bin/python" --version
+            "$RUNNER_TEMP/testhub-ci-venv/bin/python" -m pip install -r requirements-prod.txt
+            echo "$RUNNER_TEMP/testhub-ci-venv/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Validate TestHub configuration
         shell: bash
