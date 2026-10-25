@@ -30,6 +30,9 @@ class ConfirmFlowBase(TestCase):
     def setUp(self):
         self.user = User.objects.create(username='mcp_confirm_user', email='c@a.com')
         self.other = User.objects.create(username='mcp_confirm_other', email='c@b.com')
+        self.admin = User.objects.create(
+            username='mcp_confirm_admin', email='c@admin.com', is_staff=True,
+        )
         self.project = Project.objects.create(name='MCP 项目', owner=self.user)
         self.arguments = {
             'project_id': self.project.id,
@@ -106,22 +109,37 @@ class ConfirmTokenFlowTest(ConfirmFlowBase):
     def test_approve_executes_server_side(self):
         self._create_pending()
         pending = McpPendingConfirm.objects.get()
-        result = approve_pending(pending, self.other)
+        result = approve_pending(pending, self.admin)
 
         self.assertTrue(FunctionalTestCase.objects.filter(project=self.project).exists())
         pending.refresh_from_db()
         self.assertEqual(pending.status, 'approved')
-        self.assertEqual(pending.result.get('approved_by'), self.other.username)
+        self.assertEqual(pending.result.get('approved_by'), self.admin.username)
         self.assertEqual(result['project_id'], self.project.id)
 
-        # 已批准的操作不能重复批准
         with self.assertRaises(ConfirmError):
+            approve_pending(pending, self.admin)
+
+    def test_initiator_cannot_approve_own_action(self):
+        self._create_pending()
+        pending = McpPendingConfirm.objects.get()
+        with self.assertRaisesRegex(ConfirmError, '发起人不能批准'):
+            approve_pending(pending, self.user)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, 'pending')
+
+    def test_non_privileged_operator_cannot_approve(self):
+        self._create_pending()
+        pending = McpPendingConfirm.objects.get()
+        with self.assertRaisesRegex(ConfirmError, '仅管理员'):
             approve_pending(pending, self.other)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, 'pending')
 
     def test_reject_non_pending_rejected(self):
         self._create_pending()
         pending = McpPendingConfirm.objects.get()
-        approve_pending(pending, self.user)
+        approve_pending(pending, self.admin)
         with self.assertRaises(ConfirmError):
             reject_pending(pending, self.user)
 
@@ -163,7 +181,7 @@ class HumanApprovalModeTest(ConfirmFlowBase):
         result = self._create_pending()
         consume_pending(verify_pending(result['confirm_token'], self.user), self.user)
         pending = McpPendingConfirm.objects.get()
-        approve_pending(pending, self.other)
+        approve_pending(pending, self.admin)
 
         info = query_approval_status(result['confirm_token'], self.user)
         self.assertEqual(info['status'], 'approved')

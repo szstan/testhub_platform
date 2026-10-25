@@ -2423,7 +2423,12 @@ class TaskNotificationSettingViewSet(viewsets.ModelViewSet):
     def update_notification_settings(self, request, pk=None):
         """更新通知设置"""
         setting = self.get_object()
-        serializer = TaskNotificationSettingDetailSerializer(setting, data=request.data, partial=True)
+        serializer = TaskNotificationSettingDetailSerializer(
+            setting,
+            data=request.data,
+            partial=True,
+            context=self.get_serializer_context(),
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         

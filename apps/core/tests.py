@@ -41,6 +41,9 @@ class NotificationConfigApiTests(APITestCase):
         self.assertEqual(response.data['name'], '飞书通知')
         self.assertEqual(response.data['config_type'], 'webhook_feishu')
         self.assertEqual(response.data['created_by'], self.user.id)
+        self.assertNotIn('webhook_bots', response.data)
+        self.assertEqual(response.data['webhook_bots_display'][0]['type'], 'feishu')
+        self.assertNotIn('webhook_url', response.data['webhook_bots_display'][0])
 
     def test_list_and_filter_configs(self):
         """列表查询与按 config_type 过滤"""

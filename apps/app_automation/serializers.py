@@ -5,7 +5,7 @@ from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from django.core.signing import TimestampSigner
-from .access import accessible_projects, scope_test_cases
+from .access import accessible_projects, scope_test_cases, scope_executions
 from .models import (
     AppProject,
     AppTestConfig,
@@ -215,13 +215,27 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     case_name = serializers.CharField(read_only=True)
     device_name = serializers.CharField(read_only=True)
     user_name = serializers.CharField(read_only=True)
+    report_path = serializers.SerializerMethodField()
     report_access_token = serializers.SerializerMethodField()
     pass_rate = serializers.FloatField(read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     result_display = serializers.CharField(source='get_result_display', read_only=True, default=None)
 
+    def get_report_path(self, obj) -> bool:
+        """Expose report availability without leaking a server filesystem path."""
+        return bool(obj.report_path)
+
     def get_report_access_token(self, obj) -> str:
-        if not obj.report_path:
+        """Mint a short-lived share token only for an authorized request."""
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not self.context.get('include_report_access_token', True):
+            return ''
+        if not obj.report_path or not request or not getattr(user, 'is_authenticated', False):
+            return ''
+        if not scope_executions(
+            AppTestExecution.objects.filter(pk=obj.pk), user
+        ).exists():
             return ''
         return TimestampSigner().sign(str(obj.pk))
 

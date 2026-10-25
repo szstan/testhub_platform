@@ -9,6 +9,7 @@ from .models import (
     MonitorTarget, MonitorCheckLog, NotificationChannel, AlertEvent,
 )
 from .utils.crypto import is_secret_key
+from .utils.probes import redact_probe_detail, redact_probe_message
 
 
 def mask_secrets(data):
@@ -112,6 +113,12 @@ class MonitorCheckLogSerializer(serializers.ModelSerializer):
         model = MonitorCheckLog
         fields = '__all__'
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['detail'] = redact_probe_detail(data.get('detail') or {})
+        data['error_message'] = redact_probe_message(data.get('error_message') or '')
+        return data
+
     def get_target_name(self, obj):
         return obj.target.name if obj.target else ''
 
@@ -126,6 +133,12 @@ class AlertEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = AlertEvent
         fields = '__all__'
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['message'] = redact_probe_message(data.get('message') or '')
+        data['send_detail'] = redact_probe_detail(data.get('send_detail') or [])
+        return data
 
     def get_target_name(self, obj):
         return obj.target.name if obj.target else ''

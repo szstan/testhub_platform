@@ -9,6 +9,8 @@ from .models import (
     AICase, AIExecutionRecord
 )
 from django.contrib.auth import get_user_model
+from django.conf import settings
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 User = get_user_model()
 
@@ -34,11 +36,31 @@ class UiProjectCreateSerializer(serializers.ModelSerializer):
         model = UiProject
         fields = ('name', 'description', 'status', 'base_url', 'start_date', 'end_date', 'owner', 'members')
 
+    def validate_base_url(self, value):
+        try:
+            return validate_outbound_url(
+                value,
+                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+            )
+        except UnsafeOutboundURL as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
 
 class UiProjectUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = UiProject
         fields = ('name', 'description', 'status', 'base_url', 'start_date', 'end_date', 'members')
+
+    def validate_base_url(self, value):
+        try:
+            return validate_outbound_url(
+                value,
+                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+            )
+        except UnsafeOutboundURL as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
 
 class LocatorStrategySerializer(serializers.ModelSerializer):

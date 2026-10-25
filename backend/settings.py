@@ -81,6 +81,25 @@ MCP_HUMAN_APPROVAL = config('MCP_HUMAN_APPROVAL', default=True, cast=bool)
 # MCP 协议端点 Host 白名单追加项（逗号分隔）：SDK 的 DNS Rebinding 防护
 MCP_ALLOWED_HOSTS = config('MCP_ALLOWED_HOSTS', default='')
 
+# Tests-as-Code sync credentials and destination policy.  Profile values are
+# aliases from this server-owned map, never arbitrary environment variable names.
+# Override with e.g. ``gitlab=TESTHUB_GITLAB_TOKEN,github=TESTHUB_GITHUB_TOKEN``.
+TESTCASE_SYNC_SECRET_ALIASES = config(
+    'TESTCASE_SYNC_SECRET_ALIASES',
+    default='github=TESTHUB_GIT_TOKEN,gitlab=TESTHUB_GIT_TOKEN,TESTHUB_GIT_TOKEN=TESTHUB_GIT_TOKEN',
+)
+TESTCASE_SYNC_PROVIDER_HOSTS = {
+    'github': parse_csv(config(
+        'TESTCASE_SYNC_GITHUB_ALLOWED_HOSTS',
+        default='github.com,api.github.com,raw.githubusercontent.com',
+    )),
+    'gitlab': parse_csv(config(
+        'TESTCASE_SYNC_GITLAB_ALLOWED_HOSTS',
+        default='gitlab.com',
+    )),
+}
+TESTCASE_SYNC_ALLOWED_HOSTS = config('TESTCASE_SYNC_ALLOWED_HOSTS', default='')
+
 # ---------- 监控中心（monitor）全局默认 ----------
 # 自动监测持续 DOWN 时的重提醒周期、手动检测的冷却，均可在 .env 调整基线
 MONITOR_DEFAULT_ALERT_REPEAT_INTERVAL = config(

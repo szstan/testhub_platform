@@ -128,6 +128,23 @@ class ApproveRejectViewTest(McpRestBase):
         resp = self.client.post(f'/api/mcp/pending/{pending.id}/reject/')
         self.assertEqual(resp.status_code, 403)
 
+    def test_approve_requires_independent_privileged_operator(self):
+        self._make_pending()
+        pending = McpPendingConfirm.objects.get()
+
+        self.client.force_authenticate(user=self.user)
+        initiator_resp = self.client.post(f'/api/mcp/pending/{pending.id}/approve/')
+        self.assertEqual(initiator_resp.status_code, 403)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, 'pending')
+
+        reviewer = User.objects.create(username='mcp_reviewer', email='reviewer@a.com')
+        self.client.force_authenticate(user=reviewer)
+        reviewer_resp = self.client.post(f'/api/mcp/pending/{pending.id}/approve/')
+        self.assertEqual(reviewer_resp.status_code, 403)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status, 'pending')
+
     def test_approve_nonexistent_returns_404(self):
         self.client.force_authenticate(user=self.admin)
         resp = self.client.post('/api/mcp/pending/99999/approve/')

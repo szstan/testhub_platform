@@ -18,6 +18,9 @@ import re
 import time
 
 import httpx
+from django.conf import settings
+
+from apps.core.network import validate_outbound_url, validate_redirect_url
 
 from ..services.metrics import MetricsCollector
 from ..services.variables import VariableContext
@@ -27,6 +30,21 @@ from .base import BaseEngine, EngineError, build_load_profile, build_proxy_kwarg
 # 磁盘和 GIL 都吃满，直接反噬压测结果，这里统一压到 WARNING。
 for _noisy in ('httpx', 'httpcore', 'hpack'):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+def _allow_private_targets():
+    return bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))
+
+
+async def _validate_httpx_redirect(response):
+    """Validate each redirect Location before httpx follows it."""
+    location = getattr(response, 'headers', {}).get('location')
+    if location:
+        validate_redirect_url(
+            str(response.url),
+            location,
+            allow_private=_allow_private_targets(),
+        )
 
 
 def _parse_form_body(raw_body):
@@ -243,6 +261,7 @@ class BuiltinEngine(BaseEngine):
             limits=limits,
             verify=verify_ssl,
             follow_redirects=follow_redirects,
+            event_hooks={'response': [_validate_httpx_redirect]},
             headers=self._global_headers(),
             **build_proxy_kwargs(self.runtime),
         ) as client:
@@ -490,7 +509,10 @@ class BuiltinEngine(BaseEngine):
         response = None
 
         try:
-            response = await self._client.request(method, url, **kwargs)
+            # Render variables first, then validate at the last boundary before
+            # handing the URL to httpx.
+            safe_url = validate_outbound_url(url, allow_private=_allow_private_targets())
+            response = await self._client.request(method, safe_url, **kwargs)
             status_code = response.status_code
             recv_bytes = len(response.content or b'')
             ok = 200 <= status_code < 400
@@ -699,6 +721,7 @@ async def debug_run(snapshot, max_steps=50):
         timeout=httpx.Timeout(float(runtime.get('timeout') or 30)),
         verify=bool(env.get('verify_ssl', True)),
         follow_redirects=bool(runtime.get('follow_redirects', False)),
+        event_hooks={'response': [_validate_httpx_redirect]},
         headers=headers_global,
         **build_proxy_kwargs(runtime),
     ) as client:
@@ -755,6 +778,9 @@ async def debug_run(snapshot, max_steps=50):
                 'files': [f['filename'] for f in step_files],
             }
             try:
+                # Validate after variable expansion and immediately before request.
+                url = validate_outbound_url(url, allow_private=_allow_private_targets())
+                entry['url'] = url
                 response = await client.request(method, url, **kwargs)
                 elapsed = (time.perf_counter() - started) * 1000
                 passed, fail_msg = BuiltinEngine._run_assertions(

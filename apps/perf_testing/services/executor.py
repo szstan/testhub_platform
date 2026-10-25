@@ -10,12 +10,10 @@
 3. 独立进程可以被 SIGTERM 精确停止，并且进程崩溃不会带走整个 web 服务。
 """
 import asyncio
-import ipaddress
 import logging
 import os
 import queue
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +23,8 @@ from urllib.parse import urlparse
 from django.conf import settings
 from django.db import close_old_connections, connection
 from django.utils import timezone
+
+from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +48,15 @@ STOP_GRACE_SECONDS = 15
 
 
 def _target_network_error(host):
-    """Reject private and link-local targets unless explicitly enabled for tests/ops."""
+    """Reject private, link-local, reserved, or unresolved targets."""
     if getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False):
         return None
+    target_host = f'[{host}]' if ':' in str(host) and not str(host).startswith('[') else host
     try:
-        resolved = {host}
-        try:
-            resolved = {
-                item[4][0]
-                for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-            }
-        except socket.gaierror:
-            return f'目标主机 {host} 无法解析，已拒绝压测'
-        for address in resolved:
-            ip = ipaddress.ip_address(address)
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-                return f'目标主机 {host} 解析到受限地址 {ip}，已拒绝压测'
-    except ValueError:
-        return f'目标主机 {host} 地址格式非法，已拒绝压测'
+        validate_outbound_url(f'http://{target_host}', allow_private=False)
+    except UnsafeOutboundURL as exc:
+        return f'目标主机 {host} 已拒绝压测：{exc}'
+
     return None
 
 
@@ -251,17 +241,25 @@ def preflight(scenario, load_config=None, script_ref=None):
         if not url.startswith(('http://', 'https://')) and not base_url:
             errors.append(f'步骤「{step.name}」使用相对路径，但环境未配置 base_url')
             continue
-        host = (urlparse(full).hostname or '').lower()
+        try:
+            host = (urlparse(full).hostname or '').lower()
+        except ValueError:
+            errors.append(f'步骤「{step.name}」目标 URL 格式非法')
+            continue
         if host:
             hosts.add(host)
+            try:
+                validate_outbound_url(
+                    full,
+                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+                )
+            except UnsafeOutboundURL as exc:
+                errors.append(f'步骤「{step.name}」目标 URL 已拒绝：{exc}')
 
     forbidden = [h.lower() for h in (settings.PERF_FORBIDDEN_HOSTS or [])]
     for host in hosts:
         if any(host == f or host.endswith('.' + f) for f in forbidden):
             errors.append(f'目标主机 {host} 在平台禁止压测名单中')
-        network_error = _target_network_error(host)
-        if network_error:
-            errors.append(network_error)
     self_hosts = {h.lower() for h in (settings.ALLOWED_HOSTS or []) if h not in ('*', '')}
     hit_self = hosts & self_hosts
     if hit_self:
@@ -377,7 +375,10 @@ def _preflight_script(scenario, script_ref):
         peak = meta.get('total_threads')
         planned = meta.get('max_duration')
         hosts = meta.get('hosts') or []
-
+        dynamic_hosts = meta.get('dynamic_hosts') or []
+        if dynamic_hosts:
+            errors.append('脚本包含无法静态验证的动态目标主机：'
+                          f'{", ".join(dynamic_hosts[:10])}；请使用固定、可验证的主机')
         if peak is None:
             warnings.append('脚本线程数使用了 ${__P(...)} 等动态表达式，'
                             '平台无法静态校验并发上限，请自行确认不会超过 '

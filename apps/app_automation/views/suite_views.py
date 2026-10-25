@@ -253,5 +253,9 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
         """获取套件的执行历史"""
         suite = self.get_object()
         execs = AppTestExecution.objects.filter(test_suite=suite).order_by('-created_at')[:50]
-        serializer = AppTestExecutionSerializer(execs, many=True)
+        serializer = AppTestExecutionSerializer(
+            execs,
+            many=True,
+            context=self.get_serializer_context(),
+        )
         return Response({'success': True, 'data': serializer.data})

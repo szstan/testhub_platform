@@ -15,6 +15,7 @@ from ..models import (
     AppTestCase,
     AppTestExecution,
 )
+from ..access import scope_executions, scope_test_cases
 from ..serializers import AppTestExecutionSerializer
 
 logger = logging.getLogger(__name__)
@@ -28,18 +29,28 @@ class AppDashboardViewSet(viewsets.ViewSet):
     def statistics(self, request):
         """获取统计数据"""
         try:
+            user = request.user
+            # Devices are not directly assigned to projects. Only count devices
+            # that appear in executions the current tenant can access.
+            accessible_executions = scope_executions(
+                AppTestExecution.objects.all(), user
+            )
+            accessible_devices = AppDevice.objects.filter(
+                Q(executions__in=accessible_executions) | Q(locked_by=user)
+            ).distinct()
+
             # 设备统计
-            total_devices = AppDevice.objects.count()
-            online_devices = AppDevice.objects.filter(status='online').count()
-            locked_devices = AppDevice.objects.filter(status='locked').count()
+            total_devices = accessible_devices.count()
+            online_devices = accessible_devices.filter(status='online').count()
+            locked_devices = accessible_devices.filter(status='locked').count()
             
             # 测试用例统计
-            total_cases = AppTestCase.objects.count()
+            total_cases = scope_test_cases(AppTestCase.objects.all(), user).count()
             
             # 执行统计（最近30天）
             thirty_days_ago = timezone.now() - timedelta(days=30)
             
-            executions = AppTestExecution.objects.filter(
+            executions = accessible_executions.filter(
                 created_at__gte=thirty_days_ago
             )
             
@@ -50,8 +61,17 @@ class AppDashboardViewSet(viewsets.ViewSet):
             pass_rate = round((success_executions / total_executions * 100) if total_executions > 0 else 0, 2)
             
             # 最近执行记录
-            recent_executions = AppTestExecution.objects.order_by('-created_at')[:10]
-            recent_executions_data = AppTestExecutionSerializer(recent_executions, many=True).data
+            recent_executions = accessible_executions.order_by('-created_at')[:10]
+            recent_executions_data = AppTestExecutionSerializer(
+                recent_executions,
+                many=True,
+                context={
+                    'request': request,
+                    # The dashboard only needs an availability indicator. Do
+                    # not mint bearer tokens into an aggregate response.
+                    'include_report_access_token': False,
+                },
+            ).data
             
             return Response({
                 'success': True,

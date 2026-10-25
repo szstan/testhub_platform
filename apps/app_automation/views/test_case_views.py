@@ -97,7 +97,10 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
             return Response({
                 'success': True,
                 'message': '测试已提交执行',
-                'execution': AppTestExecutionSerializer(execution).data
+                'execution': AppTestExecutionSerializer(
+                    execution,
+                    context=self.get_serializer_context(),
+                ).data
             })
             
         except AppDevice.DoesNotExist:

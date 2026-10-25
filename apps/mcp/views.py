@@ -268,15 +268,22 @@ class McpPendingListView(ListAPIView):
 
 
 class _PendingActionView(APIView):
-    """approve/reject 公共基座：仅本人或管理员可操作。"""
+    """approve/reject 公共基座：批准必须由独立管理员完成，拒绝可由本人或管理员操作。"""
     permission_classes = [IsAuthenticated]
 
-    def _get_pending(self, request, pk):
+    def _get_pending(self, request, pk, *, independent_approval=False):
         pending = McpPendingConfirm.objects.filter(id=pk).first()
         if pending is None:
             return None, Response({'error': '待确认操作不存在'},
                                   status=status.HTTP_404_NOT_FOUND)
-        if pending.user_id != request.user.id and not _is_privileged(request.user):
+        if independent_approval:
+            if pending.user_id == request.user.id:
+                return None, Response({'error': '危险操作发起人不能批准自己的操作'},
+                                      status=status.HTTP_403_FORBIDDEN)
+            if not _is_privileged(request.user):
+                return None, Response({'error': '仅管理员或超级管理员可以批准危险操作'},
+                                      status=status.HTTP_403_FORBIDDEN)
+        elif pending.user_id != request.user.id and not _is_privileged(request.user):
             return None, Response({'error': '无权操作其他用户发起的待确认操作'},
                                   status=status.HTTP_403_FORBIDDEN)
         return pending, None
@@ -286,7 +293,7 @@ class McpPendingApproveView(_PendingActionView):
     """手动批准：服务端直接触发该危险操作执行。"""
 
     def post(self, request, pk):
-        pending, err = self._get_pending(request, pk)
+        pending, err = self._get_pending(request, pk, independent_approval=True)
         if err:
             return err
         try:

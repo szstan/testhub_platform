@@ -58,7 +58,7 @@ class AppExecutionConsumer(AsyncJsonWebsocketConsumer):
             'result': execution.result,
             'progress': execution.progress,
             'message': None,
-            'report_path': execution.report_path or None,
+            'report_path': bool(execution.report_path),
             'finished_at': execution.finished_at.isoformat() if execution.finished_at else None,
             'total_steps': execution.total_steps,
             'passed_steps': execution.passed_steps,

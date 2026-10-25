@@ -4,6 +4,8 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.settings import api_settings
 from rest_framework.filters import SearchFilter
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
@@ -128,6 +130,41 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
 REPORT_TOKEN_MAX_AGE = 300
 
 
+def _request_user(request):
+    """Resolve session/DRF authentication for this non-APIView endpoint."""
+    forced_user = getattr(request, '_force_auth_user', None)
+    if forced_user is not None:
+        return forced_user
+
+    user = getattr(request, 'user', None)
+    if user is not None and getattr(user, 'is_authenticated', False):
+        return user
+
+    # URL-token sharing is anonymous by design, but a real JWT/token-auth
+    # request must still be resolved before deciding whether project access is
+    # allowed. The report view is a plain Django function, so DRF does not do
+    # this automatically as it would for a ViewSet.
+    if request.META.get('HTTP_AUTHORIZATION'):
+        drf_request = Request(request)
+        for authenticator_class in api_settings.DEFAULT_AUTHENTICATION_CLASSES:
+            try:
+                authenticator = authenticator_class()
+                result = authenticator.authenticate(drf_request)
+            except Exception:
+                continue
+            if result:
+                return result[0]
+    return None
+
+
+def _execution_is_accessible(request, execution):
+    """Return whether the authenticated user may read this execution."""
+    user = _request_user(request)
+    return scope_executions(
+        AppTestExecution.objects.filter(pk=execution.pk), user
+    ).exists()
+
+
 def _valid_report_token(execution_id, access_token):
     if not access_token:
         return False
@@ -140,31 +177,53 @@ def _valid_report_token(execution_id, access_token):
 
 @csrf_exempt
 def serve_report_file(request, execution_id, access_token='', file_path=''):
-    """提供带短时签名令牌的 Allure 报告文件访问。"""
-    if not _valid_report_token(execution_id, access_token):
-        return HttpResponse('报告访问令牌无效或已过期', status=403)
+    """Serve an APP report to an authorized user or explicit short-lived share.
+
+    A valid signed token is intentionally sufficient for anonymous, short-lived
+    sharing. Authenticated users still need access to the execution, so a
+    token copied from another tenant cannot bypass project authorization.
+    """
     try:
         execution = AppTestExecution.objects.get(id=execution_id)
-        if not execution.report_path:
-            raise Http404("报告路径不存在")
-
-        if not file_path:
-            file_path = 'index.html'
-
-        report_dir = execution.report_path
-        full_path = os.path.join(report_dir, file_path)
-
-        report_dir_abs = os.path.realpath(report_dir)
-        full_path_abs = os.path.realpath(full_path)
-        if os.path.commonpath([report_dir_abs, full_path_abs]) != report_dir_abs:
-            raise Http404("无效的文件路径")
-
-        if not os.path.exists(full_path_abs) or not os.path.isfile(full_path_abs):
-            raise Http404("文件不存在")
-
-        return FileResponse(open(full_path_abs, 'rb'), content_type=_get_content_type(file_path))
     except AppTestExecution.DoesNotExist:
         raise Http404("执行记录不存在")
+
+    token_valid = _valid_report_token(execution_id, access_token)
+    user = _request_user(request)
+    authenticated = bool(user and getattr(user, 'is_authenticated', False))
+    authorized = _execution_is_accessible(request, execution) if authenticated else False
+
+    # Anonymous access is an explicit share flow and requires a valid token.
+    # Authenticated access is scoped by the same project/user rules as the API;
+    # a supplied token must also be valid, so malformed shares are rejected.
+    if authenticated:
+        allowed = authorized and (not access_token or token_valid)
+    else:
+        allowed = token_valid
+    if not allowed:
+        return HttpResponse('无权访问报告或报告访问令牌无效', status=403)
+    if not execution.report_path:
+        raise Http404("报告路径不存在")
+
+    if not file_path:
+        file_path = 'index.html'
+
+    report_dir = execution.report_path
+    full_path = os.path.join(report_dir, file_path)
+
+    report_dir_abs = os.path.realpath(report_dir)
+    full_path_abs = os.path.realpath(full_path)
+    try:
+        inside_report = os.path.commonpath([report_dir_abs, full_path_abs]) == report_dir_abs
+    except ValueError:
+        inside_report = False
+    if not inside_report:
+        raise Http404("无效的文件路径")
+
+    if not os.path.exists(full_path_abs) or not os.path.isfile(full_path_abs):
+        raise Http404("文件不存在")
+
+    return FileResponse(open(full_path_abs, 'rb'), content_type=_get_content_type(file_path))
 
 
 def _get_content_type(file_path):
