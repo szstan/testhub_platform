@@ -1,6 +1,4 @@
 from django.urls import path, include
-from django.conf import settings
-from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 from .views import (
     UiProjectViewSet,
@@ -9,6 +7,7 @@ from .views import (
     ElementViewSet,
     TestScriptViewSet,
     PageObjectViewSet,
+    PageObjectElementViewSet,
     ScriptStepViewSet,
     TestSuiteViewSet,
     TestExecutionViewSet,
@@ -37,6 +36,7 @@ router.register(r'element-groups', ElementGroupViewSet)
 router.register(r'elements', ElementViewSet)
 router.register(r'test-scripts', TestScriptViewSet)
 router.register(r'page-objects', PageObjectViewSet)
+router.register(r'page-object-elements', PageObjectElementViewSet, basename='page-object-elements')
 router.register(r'steps', ScriptStepViewSet)
 router.register(r'test-suites', TestSuiteViewSet)
 router.register(r'test-executions', TestExecutionViewSet)
@@ -60,6 +60,3 @@ router.register(r'ai-models', AIModelConfigAliasViewSet, basename='ai-models')
 urlpatterns = [
     path('', include(router.urls)),
 ]
-
-# 添加媒体文件路由
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

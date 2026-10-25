@@ -259,6 +259,7 @@ import {
 } from '@/api/app-automation'
 import { getDeviceList } from '@/api/app-automation'
 import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
+import { buildWebSocketUrl, issueWebSocketTicket } from '@/utils/websocket'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -294,6 +295,8 @@ const executionData = ref({
   results: []
 })
 const websockets = ref({})
+const websocketConnecting = new Set()
+let unmounted = false
 const lastStatusMessages = ref({})
 
 // 定时刷新执行记录
@@ -604,14 +607,52 @@ const stopAllPolling = () => {
   Object.keys(pollingTimers.value).forEach(id => stopPolling(id))
 }
 
-// --- WebSocket 模式：实时推送 ---
-const connectWebSocket = (executionId) => {
-  if (websockets.value[executionId]) return
+const scheduleWebSocketRetry = (executionId) => {
+  const retries = (wsRetryCount.value[executionId] || 0) + 1
+  wsRetryCount.value[executionId] = retries
+  if (retries <= WS_MAX_RETRY) {
+    console.warn(`WebSocket 连接异常 (${retries}/${WS_MAX_RETRY})，${retries}秒后重试`)
+    setTimeout(() => {
+      const target = executionData.value.results.find(e => e.id === executionId)
+      if (!unmounted && target && ['pending', 'running'].includes(target.status)) {
+        connectWebSocket(executionId)
+      }
+    }, retries * 1000)
+  } else {
+    console.warn(`WebSocket 重试超限，execution_id=${executionId} 切换为轮询`)
+    delete wsRetryCount.value[executionId]
+    startPolling(executionId)
+  }
+}
 
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const wsUrl = `${protocol}://${window.location.host}/ws/app-automation/executions/${executionId}/`
+const connectWebSocket = async (executionId) => {
+  if (websockets.value[executionId] || websocketConnecting.has(executionId)) return
+  websocketConnecting.add(executionId)
 
-  const ws = new WebSocket(wsUrl)
+  let ticket
+  try {
+    const response = await issueWebSocketTicket('app-automation', executionId)
+    if (!response.ticket) throw new Error('WebSocket ticket missing')
+    ticket = response.ticket
+  } catch (error) {
+    websocketConnecting.delete(executionId)
+    scheduleWebSocketRetry(executionId)
+    return
+  }
+
+  websocketConnecting.delete(executionId)
+  if (unmounted) return
+  const wsUrl = buildWebSocketUrl(
+    `/ws/app-automation/executions/${executionId}/`,
+    ticket,
+  )
+  let ws
+  try {
+    ws = new WebSocket(wsUrl)
+  } catch (error) {
+    scheduleWebSocketRetry(executionId)
+    return
+  }
   websockets.value[executionId] = ws
 
   ws.onopen = () => {
@@ -642,21 +683,7 @@ const connectWebSocket = (executionId) => {
 
   ws.onerror = () => {
     closeWebSocket(executionId)
-    const retries = (wsRetryCount.value[executionId] || 0) + 1
-    wsRetryCount.value[executionId] = retries
-    if (retries <= WS_MAX_RETRY) {
-      console.warn(`WebSocket 连接异常 (${retries}/${WS_MAX_RETRY})，${retries}秒后重试`)
-      setTimeout(() => {
-        const target = executionData.value.results.find(e => e.id === executionId)
-        if (target && ['pending', 'running'].includes(target.status)) {
-          connectWebSocket(executionId)
-        }
-      }, retries * 1000)
-    } else {
-      console.warn(`WebSocket 重试超限，execution_id=${executionId} 切换为轮询`)
-      delete wsRetryCount.value[executionId]
-      startPolling(executionId)
-    }
+    scheduleWebSocketRetry(executionId)
   }
 }
 
@@ -799,6 +826,7 @@ onMounted(async () => {
 
 // 组件卸载
 onBeforeUnmount(() => {
+  unmounted = true
   if (refreshTimer) {
     clearInterval(refreshTimer)
   }

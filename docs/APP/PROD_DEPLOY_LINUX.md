@@ -251,8 +251,10 @@ server {
         alias /opt/testhub_platform/static/;
     }
 
-    location /media/ {
-        alias /opt/testhub_platform/media/;
+    # Never expose MEDIA_ROOT directly. Reports, recordings, and downloads
+    # must use their authenticated API endpoints.
+    location ^~ /media/ {
+        return 404;
     }
 
     # API
@@ -441,8 +443,10 @@ server {
         alias /opt/testhub_platform/static/;
     }
 
-    location /media/ {
-        alias /opt/testhub_platform/media/;
+    # Do not publish MEDIA_ROOT through Nginx; private artifacts are served
+    # by authenticated API actions only.
+    location ^~ /media/ {
+        return 404;
     }
 
     location /api/ {

@@ -164,6 +164,7 @@ import {
   getPerfExecution, getPerfRealtime, stopPerfExecution, getEngineStatus,
   getPerfRunLog, getPerfRequestStats, getPerfScenario
 } from '@/api/performance-testing'
+import { buildWebSocketUrl, issueWebSocketTicket } from '@/utils/websocket'
 
 const route = useRoute()
 const router = useRouter()
@@ -196,6 +197,8 @@ let lastTs = -1
 let finished = false
 let wsGotMessage = false
 let wsSilenceTimer = null
+let wsTicketPending = false
+let unmounted = false
 
 const isActive = computed(() => ACTIVE_STATUSES.includes(execution.status))
 const plannedDuration = computed(() => {
@@ -342,9 +345,26 @@ function pushSample(sample) {
 // ------------------------------------------------------------------ //
 // WebSocket
 // ------------------------------------------------------------------ //
-function connectWs() {
-  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const url = `${proto}://${window.location.host}/ws/perf-testing/executions/${executionId}/`
+async function connectWs() {
+  if (wsTicketPending || finished || unmounted) return
+  wsTicketPending = true
+  let ticket
+  try {
+    const response = await issueWebSocketTicket('perf-testing', executionId)
+    ticket = response.ticket
+    if (!ticket) throw new Error('WebSocket ticket missing')
+  } catch (e) {
+    wsTicketPending = false
+    startPolling()
+    return
+  }
+  wsTicketPending = false
+  if (finished || unmounted) return
+
+  const url = buildWebSocketUrl(
+    `/ws/perf-testing/executions/${executionId}/`,
+    ticket,
+  )
   try {
     socket = new WebSocket(url)
   } catch (e) {
@@ -415,7 +435,7 @@ function connectWs() {
     }
     wsRetry += 1
     if (wsRetry <= 2) {
-      setTimeout(() => { if (!finished) connectWs() }, wsRetry * 1000)
+      setTimeout(() => { if (!finished && !unmounted) connectWs() }, wsRetry * 1000)
     } else {
       startPolling()
     }
@@ -463,6 +483,7 @@ async function pollOnce() {
 async function onFinished() {
   if (finished) return
   finished = true
+  wsTicketPending = false
   stopPolling()
   if (logTimer) { clearInterval(logTimer); logTimer = null }
   if (socket) {
@@ -544,7 +565,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  unmounted = true
   finished = true
+  wsTicketPending = false
   stopPolling()
   if (logTimer) clearInterval(logTimer)
   if (socket) {

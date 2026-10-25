@@ -266,7 +266,7 @@ echarts.use([
   TooltipComponent,
   CanvasRenderer,
 ])
-import { getAIExecutionReport, exportAIExecutionReportPDF } from '@/api/ui_automation'
+import { getAIExecutionReport, getAIExecutionRecording, exportAIExecutionReportPDF } from '@/api/ui_automation'
 
 const { t } = useI18n()
 
@@ -303,20 +303,33 @@ const reportTypeDisplay = computed(() => {
   return map[currentReportType.value] || t('uiAutomation.ai.executionReport.summary')
 })
 
-// GIF URL
-const gifUrl = computed(() => {
-  if (reportData.value && reportData.value.gif_path) {
-    // gif_path格式：media/ai_recording/xxx.gif
-    const path = reportData.value.gif_path
-    // 如果路径已经包含media/，直接使用；否则添加media/
-    if (path.startsWith('media/')) {
-      return `/${path}`
-    } else {
-      return `/media/${path}`
-    }
+// GIF URL (loaded through the authenticated API instead of /media/)
+const gifUrl = ref('')
+let gifObjectUrl = ''
+
+const clearGifUrl = () => {
+  if (gifObjectUrl) {
+    URL.revokeObjectURL(gifObjectUrl)
+    gifObjectUrl = ''
   }
-  return ''
-})
+  gifUrl.value = ''
+}
+
+const loadGif = async () => {
+  clearGifUrl()
+  if (!reportData.value?.gif_path || !props.recordId) return
+
+  try {
+    const response = await getAIExecutionRecording(props.recordId)
+    const blob = response.data instanceof Blob
+      ? response.data
+      : new Blob([response.data], { type: 'image/gif' })
+    gifObjectUrl = URL.createObjectURL(blob)
+    gifUrl.value = gifObjectUrl
+  } catch (error) {
+    console.error('加载执行录制失败:', error)
+  }
+}
 
 // 监听 modelValue 变化
 watch(() => props.modelValue, (newVal) => {
@@ -332,6 +345,7 @@ watch(visible, (newVal) => {
   emit('update:modelValue', newVal)
   if (!newVal) {
     // 清理
+    clearGifUrl()
     if (pieChart) {
       pieChart.dispose()
       pieChart = null
@@ -353,6 +367,7 @@ const loadReport = async (reportType = 'summary') => {
     console.log('API Response:', response.data)
     if (response.data.success) {
       reportData.value = response.data.data
+      await loadGif()
       console.log('Report Data:', reportData.value)
       await nextTick()
       // 等待DOM更新后再初始化图表

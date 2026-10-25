@@ -1,5 +1,7 @@
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from pathlib import Path
+import tempfile
 from rest_framework.test import APIClient, APIRequestFactory
 
 from apps.ui_automation.models import (
@@ -13,6 +15,8 @@ from apps.ui_automation.models import (
     TestSuiteScript as UiTestSuiteScript,
     TestSuiteTestCase as UiTestSuiteTestCase,
     UiProject,
+    PageObject,
+    PageObjectElement,
 )
 from apps.ui_automation.views import AICaseViewSet, AIExecutionRecordViewSet, STOP_SIGNALS
 from apps.ui_automation.serializers import (
@@ -77,6 +81,40 @@ class UiAuthorizationBoundaryTests(TestCase):
         request.user = user
         return request
 
+    def test_ai_recording_route_requires_record_access(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recording = Path(temp_dir) / 'ai_recording' / 'run.gif'
+            recording.parent.mkdir()
+            recording.write_bytes(b'GIF89a')
+            with override_settings(MEDIA_ROOT=temp_dir):
+                record = AIExecutionRecord.objects.create(
+                    case_name='private-recording',
+                    task_description='private task',
+                    executed_by=self.owner,
+                    gif_path='media/ai_recording/run.gif',
+                )
+                client = APIClient()
+                client.force_authenticate(user=self.owner)
+                allowed = client.get(
+                    f'/api/ui-automation/ai-execution-records/{record.id}/recording/'
+                )
+                self.assertEqual(allowed.status_code, 200)
+                self.assertEqual(b''.join(allowed.streaming_content), b'GIF89a')
+                allowed.close()
+
+                client.force_authenticate(user=self.outsider)
+                denied = client.get(
+                    f'/api/ui-automation/ai-execution-records/{record.id}/recording/'
+                )
+                self.assertEqual(denied.status_code, 404)
+
+                client.force_authenticate(user=None)
+                anonymous = client.get(
+                    f'/api/ui-automation/ai-execution-records/{record.id}/recording/'
+                )
+                self.assertEqual(anonymous.status_code, 401)
+
+
     def test_element_serializer_denies_foreign_project_and_accepts_member_project(self):
         foreign_data = {
             "project_id": self.other_project.id,
@@ -106,6 +144,40 @@ class UiAuthorizationBoundaryTests(TestCase):
         self.assertTrue(allowed.is_valid(), allowed.errors)
         relation = allowed.save()
         self.assertEqual(relation.test_suite_id, self.own_suite.id)
+
+    def test_page_object_elements_route_is_authenticated_and_project_scoped(self):
+        page_object = PageObject.objects.create(
+            project=self.project,
+            name='owned-page',
+            class_name='OwnedPage',
+            created_by=self.owner,
+        )
+        relation = PageObjectElement.objects.create(
+            page_object=page_object,
+            element=self.own_element,
+            method_name='own_button',
+        )
+
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        allowed = client.get(
+            f'/api/ui-automation/page-objects/{page_object.id}/elements/'
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.data)
+        self.assertEqual(allowed.data[0]['id'], relation.id)
+
+        client.force_authenticate(user=self.outsider)
+        denied = client.get(
+            f'/api/ui-automation/page-objects/{page_object.id}/elements/'
+        )
+        self.assertEqual(denied.status_code, 404)
+
+        client.force_authenticate(user=None)
+        anonymous = client.get(
+            f'/api/ui-automation/page-objects/{page_object.id}/elements/'
+        )
+        self.assertEqual(anonymous.status_code, 401)
+
 
     def test_projectless_ai_records_are_creator_scoped(self):
         ai_case = AICase.objects.create(

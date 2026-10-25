@@ -273,6 +273,57 @@ def sms_login_view(request):
 
 
 @api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def websocket_ticket_view(request):
+    """Issue a one-shot ticket for a browser WebSocket handshake.
+
+    The browser sends its in-memory JWT through this authenticated HTTP call;
+    only the short-lived, path-bound ticket is placed in the WebSocket URL.
+    """
+    channel = str(request.data.get('channel') or '').strip()
+    execution_id = str(request.data.get('execution_id') or '').strip()
+    if (
+        channel not in {'app-automation', 'perf-testing'}
+        or not execution_id.isascii()
+        or not execution_id.isdigit()
+        or len(execution_id) > 12
+    ):
+        return Response({'error': '无效的 WebSocket 通道或执行记录'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if channel == 'app-automation':
+        from apps.app_automation.access import scope_executions
+        from apps.app_automation.models import AppTestExecution
+        allowed = scope_executions(
+            AppTestExecution.objects.filter(pk=int(execution_id)), request.user
+        ).exists()
+    else:
+        from apps.perf_testing.access import can_access_project
+        from apps.perf_testing.models import PerfExecution
+        execution = PerfExecution.objects.select_related('project').filter(
+            pk=int(execution_id)
+        ).first()
+        allowed = bool(execution and can_access_project(request.user, execution.project))
+
+    # Do not disclose whether an inaccessible execution exists.
+    if not allowed:
+        return Response({'error': '执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+    from apps.core.websocket_auth import issue_websocket_ticket
+
+    path = f'/ws/{channel}/executions/{execution_id}/'
+    ticket, expires_in_seconds = issue_websocket_ticket(
+        user=request.user,
+        path=path,
+    )
+    return Response({
+        'ticket': ticket,
+        'expires_in_seconds': expires_in_seconds,
+        'path': path,
+    })
+
+
+@api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
 def exchange_token_view(request):

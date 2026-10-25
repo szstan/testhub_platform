@@ -1049,6 +1049,15 @@ export function getAIExecutionReport(id, params = {}) {
   })
 }
 
+// 获取 AI 执行录制文件（受记录权限保护）
+export function getAIExecutionRecording(id) {
+  return request({
+    url: `/ui-automation/ai-execution-records/${id}/recording/`,
+    method: 'get',
+    responseType: 'blob'
+  })
+}
+
 // 导出 AI 执行报告为 PDF
 export function exportAIExecutionReportPDF(id, params = {}) {
   return request({
