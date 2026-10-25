@@ -4,11 +4,15 @@
 写入时接受明文（加密落库在当前阶段由 create/update 逻辑在 #2/#3 接入）。
 """
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+
+from .access import is_monitor_admin
 
 from .models import (
     MonitorTarget, MonitorCheckLog, NotificationChannel, AlertEvent,
 )
 from .utils.crypto import is_secret_key
+from .utils.probes import redact_probe_detail, redact_probe_message
 
 
 def mask_secrets(data):
@@ -65,9 +69,10 @@ class MonitorTargetSerializer(serializers.ModelSerializer):
     def _validate_channels(self, value):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
-        if user is not None and not getattr(user, 'is_staff', False):
-            if any(channel.created_by_id != user.id for channel in value):
-                raise serializers.ValidationError('不能绑定其他用户的通知渠道')
+        if user is not None and not getattr(user, 'is_staff', False) and any(
+            channel.created_by_id != user.id for channel in value
+        ):
+            raise serializers.ValidationError('不能绑定其他用户的通知渠道')
         return value
 
     def validate_primary_channels(self, value):
@@ -76,6 +81,7 @@ class MonitorTargetSerializer(serializers.ModelSerializer):
     def validate_secondary_channels(self, value):
         return self._validate_channels(value)
 
+    def update(self, instance, validated_data):
         incoming = validated_data.get('check_config')
         if incoming is not None:
             validated_data['check_config'] = merge_config(
@@ -112,6 +118,26 @@ class MonitorCheckLogSerializer(serializers.ModelSerializer):
         model = MonitorCheckLog
         fields = '__all__'
 
+    def validate(self, attrs):
+        target = attrs.get('target', getattr(self.instance, 'target', None))
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if (
+            target is not None
+            and user is not None
+            and getattr(user, 'is_authenticated', False)
+            and not is_monitor_admin(user)
+            and target.created_by_id != user.id
+        ):
+            raise PermissionDenied('不能操作其他用户的监控记录')
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['detail'] = redact_probe_detail(data.get('detail') or {})
+        data['error_message'] = redact_probe_message(data.get('error_message') or '')
+        return data
+
     def get_target_name(self, obj):
         return obj.target.name if obj.target else ''
 
@@ -126,6 +152,26 @@ class AlertEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = AlertEvent
         fields = '__all__'
+
+    def validate(self, attrs):
+        target = attrs.get('target', getattr(self.instance, 'target', None))
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if (
+            target is not None
+            and user is not None
+            and getattr(user, 'is_authenticated', False)
+            and not is_monitor_admin(user)
+            and target.created_by_id != user.id
+        ):
+            raise PermissionDenied('不能操作其他用户的告警')
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['message'] = redact_probe_message(data.get('message') or '')
+        data['send_detail'] = redact_probe_detail(data.get('send_detail') or [])
+        return data
 
     def get_target_name(self, obj):
         return obj.target.name if obj.target else ''

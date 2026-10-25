@@ -549,6 +549,50 @@ class NotificationLogSerializer(serializers.ModelSerializer):
         return ', '.join(targets) if targets else '-'
 
 
+
+
+def _task_projects(task):
+    """Return API projects reached by a scheduled task."""
+    projects = []
+    if task.test_suite_id and task.test_suite and task.test_suite.project_id:
+        projects.append(task.test_suite.project)
+    if task.api_request_id and task.api_request and task.api_request.collection_id:
+        project = task.api_request.collection.project
+        if project and project.id not in {item.id for item in projects}:
+            projects.append(project)
+    return projects
+
+
+def _user_can_access_task(task, user):
+    if not user or not getattr(user, 'is_authenticated', False):
+        return False
+    if user.is_staff or user.is_superuser or task.created_by_id == user.id:
+        return True
+    return any(
+        project.owner_id == user.id or project.members.filter(pk=user.pk).exists()
+        for project in _task_projects(task)
+    )
+
+
+def _user_can_use_notification_config(config, task, user):
+    """Keep notification configs inside the task's tenant boundary."""
+    if not user or not getattr(user, 'is_authenticated', False):
+        return False
+    if user.is_staff or user.is_superuser:
+        return True
+    if config.created_by_id == user.id:
+        return True
+    # Staff-created configs are deployment-wide defaults, not tenant data.
+    creator = getattr(config, 'created_by', None)
+    if creator and (creator.is_staff or creator.is_superuser):
+        return True
+    return any(
+        config.created_by_id == project.owner_id
+        or project.members.filter(pk=config.created_by_id).exists()
+        for project in _task_projects(task)
+    )
+
+
 class TaskNotificationSettingSerializer(serializers.ModelSerializer):
     """定时任务通知设置序列化器"""
     notification_type_display = serializers.SerializerMethodField()
@@ -561,6 +605,13 @@ class TaskNotificationSettingSerializer(serializers.ModelSerializer):
                   'is_enabled', 'notify_on_success', 'notify_on_failure',
                   'notify_on_timeout', 'notify_on_error', 'active_types']
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate_task(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not _user_can_access_task(value, user):
+            raise serializers.ValidationError('无权使用该定时任务')
+        return value
 
     def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示"""
@@ -675,16 +726,24 @@ class NotificationLogDetailSerializer(serializers.ModelSerializer):
         return recipients
 
     def get_webhook_bot_info_display(self, obj):
-        """获取Webhook机器人信息显示"""
-        # 检查任务的通知类型是否包含webhook
-        if obj.task:
-            try:
-                notification_setting = obj.task.notification_settings.first()
-                if notification_setting and notification_setting.notification_type in ['webhook', 'both']:
-                    return obj.webhook_bot_info or {}
-            except:
-                pass
-        return None
+        """Show notification target metadata without webhook credentials."""
+        if not obj.task:
+            return None
+        try:
+            notification_setting = obj.task.notification_settings.first()
+        except Exception:
+            notification_setting = None
+        if not notification_setting or notification_setting.notification_type not in ['webhook', 'both']:
+            return None
+
+        info = obj.webhook_bot_info or {}
+        if not isinstance(info, dict):
+            return {'configured': bool(info)}
+        return {
+            'configured': True,
+            'type': info.get('type') or info.get('bot_type'),
+            'name': info.get('name') or info.get('bot_name'),
+        }
 
     def get_notification_target_display(self, obj) -> Optional[str]:
         """获取通知对象显示 - 返回详细信息"""
@@ -742,7 +801,19 @@ class TaskNotificationSettingDetailSerializer(serializers.ModelSerializer):
                   'is_enabled', 'notify_on_success', 'notify_on_failure',
                   'notify_on_timeout', 'notify_on_error', 'custom_webhook_bots',
                   'custom_recipients', 'webhook_bots_display', 'recipients_detail', 'created_at', 'updated_at']
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at', 'task']
+        extra_kwargs = {
+            # Accept secrets for updates, but never echo them in API output.
+            'custom_webhook_bots': {'write_only': True},
+        }
+
+    def validate_notification_config(self, value):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        task = self.instance.task if self.instance else None
+        if value and not _user_can_use_notification_config(value, task, user):
+            raise serializers.ValidationError('无权使用该通知配置')
+        return value
 
     def get_notification_type_display(self, obj) -> str:
         """获取通知类型显示"""
@@ -760,39 +831,31 @@ class TaskNotificationSettingDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_webhook_bots_display(self, obj):
-        """获取自定义webhook机器人显示"""
+        """Show webhook metadata without URLs, tokens, or signing secrets."""
         custom_bots = obj.custom_webhook_bots or {}
-        config_bots = []
+        config_bots = obj.notification_config.get_webhook_bots() if obj.notification_config else []
 
-        if obj.notification_config:
-            config_bots = obj.notification_config.get_webhook_bots()
-
-        # 合并自定义机器人和配置机器人
         all_bots = []
         bot_types = ['feishu', 'wechat', 'dingtalk']
-
         for bot_type in bot_types:
-            # 检查自定义机器人
             if bot_type in custom_bots:
+                bot = custom_bots[bot_type] or {}
                 all_bots.append({
                     'type': bot_type,
-                    'name': custom_bots[bot_type].get('name', f'{bot_type}机器人'),
-                    'webhook_url': custom_bots[bot_type].get('webhook_url'),
-                    'enabled': custom_bots[bot_type].get('enabled', True),
-                    'source': 'custom'
+                    'name': bot.get('name', f'{bot_type}机器人'),
+                    'enabled': bot.get('enabled', True),
+                    'configured': bool(bot.get('webhook_url') or bot.get('url')),
+                    'source': 'custom',
                 })
-
-            # 检查配置机器人
             for config_bot in config_bots:
                 if config_bot['type'] == bot_type:
                     all_bots.append({
                         'type': bot_type,
                         'name': config_bot['name'],
-                        'webhook_url': config_bot['webhook_url'],
                         'enabled': config_bot['enabled'],
-                        'source': 'config'
+                        'configured': bool(config_bot.get('webhook_url')),
+                        'source': 'config',
                     })
-
         return all_bots
 
     def get_recipients_detail(self, obj):

@@ -18,6 +18,11 @@ class UnifiedNotificationConfigSerializer(serializers.ModelSerializer):
             'created_by', 'webhook_bots_display'
         ]
         read_only_fields = ['created_at', 'updated_at', 'created_by', 'webhook_bots_display']
+        extra_kwargs = {
+            # Webhook URLs and signing secrets are write-only. The display
+            # field below intentionally exposes metadata only.
+            'webhook_bots': {'write_only': True},
+        }
 
     def get_webhook_bots_display(self, obj):
         """获取webhook机器人显示信息"""

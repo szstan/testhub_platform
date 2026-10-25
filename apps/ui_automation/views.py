@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from django.conf import settings
@@ -48,6 +48,7 @@ from .serializers import (
     AICaseSerializer, AIExecutionRecordSerializer
 )
 from .operation_logger import log_operation
+from .access import accessible_projects, is_ui_admin
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -145,9 +146,7 @@ class UiProjectViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目
         user = self.request.user
-        return UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        return accessible_projects(user)
 
     def perform_create(self, serializer):
         # 创建项目时，当前用户自动成为负责人
@@ -193,10 +192,8 @@ class ElementViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的元素
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return Element.objects.filter(project__in=accessible_projects).select_related(
+        project_scope = accessible_projects(user)
+        return Element.objects.filter(project__in=project_scope).select_related(
             'project', 'group', 'locator_strategy', 'created_by', 'parent_element'
         ).prefetch_related('script_usages__script').order_by('page', 'order', 'name')
 
@@ -375,10 +372,8 @@ class ElementGroupViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的元素分组
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return ElementGroup.objects.filter(project__in=accessible_projects).select_related('project',
+        project_scope = accessible_projects(user)
+        return ElementGroup.objects.filter(project__in=project_scope).select_related('project',
                                                                                            'parent_group').order_by(
             'order', 'name')
 
@@ -409,10 +404,8 @@ class PageObjectViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的页面对象
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return PageObject.objects.filter(project__in=accessible_projects).select_related(
+        project_scope = accessible_projects(user)
+        return PageObject.objects.filter(project__in=project_scope).select_related(
             'project', 'created_by'
         ).prefetch_related('page_object_elements__element').order_by('-created_at')
 
@@ -450,10 +443,14 @@ class PageObjectViewSet(viewsets.ModelViewSet):
     def add_element(self, request, pk=None):
         """向页面对象添加元素"""
         page_object = self.get_object()
-        serializer = PageObjectElementSerializer(data=request.data)
-
+        data = request.data.copy()
+        data['page_object_id'] = page_object.id
+        serializer = PageObjectElementSerializer(
+            data=data,
+            context=self.get_serializer_context(),
+        )
         if serializer.is_valid():
-            serializer.save(page_object=page_object)
+            serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -475,11 +472,9 @@ class PageObjectElementViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的页面对象元素
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
         return PageObjectElement.objects.filter(
-            page_object__project__in=accessible_projects
+            page_object__project__in=project_scope
         ).select_related('page_object', 'element').order_by('id')
 
 
@@ -493,11 +488,9 @@ class ScriptStepViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的脚本步骤
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
         return ScriptStep.objects.filter(
-            script__project__in=accessible_projects
+            script__project__in=project_scope
         ).select_related('script', 'target_element', 'page_object').order_by('step_order')
 
     @action(detail=False, methods=['post'])
@@ -507,7 +500,7 @@ class ScriptStepViewSet(viewsets.ModelViewSet):
         created_steps = []
 
         for step_data in steps_data:
-            serializer = ScriptStepSerializer(data=step_data)
+            serializer = ScriptStepSerializer(data=step_data, context=self.get_serializer_context())
             if serializer.is_valid():
                 step = serializer.save()
                 created_steps.append(step)
@@ -530,11 +523,9 @@ class ScriptElementUsageViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的脚本元素使用记录
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
         return ScriptElementUsage.objects.filter(
-            script__project__in=accessible_projects
+            script__project__in=project_scope
         ).select_related('script', 'element').order_by('script', 'line_number')
 
     @action(detail=False, methods=['post'])
@@ -545,7 +536,12 @@ class ScriptElementUsageViewSet(viewsets.ModelViewSet):
             return Response({'error': '需要指定脚本ID'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            script = TestScript.objects.get(id=script_id)
+            script = TestScript.objects.filter(
+                pk=script_id,
+                project__in=accessible_projects(request.user),
+            ).first()
+            if script is None:
+                return Response({'error': '脚本不存在或无权访问'}, status=status.HTTP_404_NOT_FOUND)
             analysis_result = self._analyze_script_elements(script)
 
             serializer = ScriptAnalysisSerializer(analysis_result)
@@ -633,10 +629,8 @@ class TestScriptViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的测试脚本
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return TestScript.objects.filter(project__in=accessible_projects)
+        project_scope = accessible_projects(user)
+        return TestScript.objects.filter(project__in=project_scope)
 
 
 class TestSuiteViewSet(viewsets.ModelViewSet):
@@ -659,10 +653,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的测试套件
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return TestSuite.objects.filter(project__in=accessible_projects)
+        project_scope = accessible_projects(user)
+        return TestSuite.objects.filter(project__in=project_scope)
 
     def perform_create(self, serializer):
         instance = serializer.save()
@@ -691,9 +683,9 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     def add_script(self, request, pk=None):
         """向测试套件添加脚本"""
         test_suite = self.get_object()
-        data = request.data
-        data['test_suite'] = pk
-        serializer = TestSuiteScriptSerializer(data=data)
+        data = request.data.copy()
+        data['test_suite_id'] = pk
+        serializer = TestSuiteScriptSerializer(data=data, context=self.get_serializer_context())
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -727,9 +719,15 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
 
         try:
             from .models import TestSuiteTestCase
+            test_case = TestCase.objects.filter(
+                id=test_case_id,
+                project_id=test_suite.project_id,
+            ).first()
+            if test_case is None:
+                return Response({'error': '测试用例必须属于同一项目'}, status=status.HTTP_403_FORBIDDEN)
             suite_test_case = TestSuiteTestCase.objects.create(
                 test_suite=test_suite,
-                test_case_id=test_case_id,
+                test_case=test_case,
                 order=order
             )
             serializer = TestSuiteTestCaseSerializer(suite_test_case)
@@ -783,6 +781,10 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         if test_case_count == 0:
             return Response({
                 'error': '该测试套件未包含任何测试用例，无法执行'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        if test_suite.suite_test_cases.exclude(test_case__project_id=test_suite.project_id).exists():
+            return Response({
+                'error': '测试套件包含其他项目的测试用例，无法执行'
             }, status=status.HTTP_400_BAD_REQUEST)
 
         engine = request.data.get('engine', 'playwright')
@@ -873,11 +875,9 @@ class TestExecutionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的测试执行记录
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
         return TestExecution.objects.filter(
-            project__in=accessible_projects
+            project__in=project_scope
         ).select_related('project', 'test_suite', 'test_script', 'executed_by')
 
     def get_serializer_class(self):
@@ -902,10 +902,8 @@ class ScreenshotViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的截图
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        executions = TestExecution.objects.filter(project__in=accessible_projects)
+        project_scope = accessible_projects(user)
+        executions = TestExecution.objects.filter(project__in=project_scope)
         return Screenshot.objects.filter(execution__in=executions)
 
 
@@ -923,20 +921,21 @@ class TestCaseViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的测试用例
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
+        return TestCase.objects.filter(project__in=project_scope).select_related('project', 'created_by')
 
-    def get_queryset(self):
-        # 只显示用户有权限访问的项目的测试用例
-        user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return TestCase.objects.filter(project__in=accessible_projects).select_related('project', 'created_by')
+    def _validate_step_relations(self, project, steps_data):
+        for step_data in steps_data or []:
+            if not isinstance(step_data, dict):
+                raise ValidationError({'steps': '步骤数据格式错误'})
+            element_id = step_data.get('element_id', step_data.get('element'))
+            if element_id and not Element.objects.filter(pk=element_id, project_id=project.id).exists():
+                raise ValidationError({'steps': '步骤引用的元素必须属于同一项目'})
 
     def perform_create(self, serializer):
         # 创建测试用例
+        project = serializer.validated_data.get('project')
+        self._validate_step_relations(project, self.request.data.get('steps', []))
         instance = serializer.save(created_by=self.request.user)
 
         # 记录操作
@@ -1033,6 +1032,8 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         # 更新测试用例步骤
+        project = serializer.validated_data.get('project', serializer.instance.project)
+        self._validate_step_relations(project, self.request.data.get('steps', []))
         instance = serializer.save()
 
         # 记录操作
@@ -1940,11 +1941,9 @@ class TestCaseStepViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的测试用例的步骤
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        accessible_test_cases = TestCase.objects.filter(project__in=accessible_projects)
-        return TestCaseStep.objects.filter(test_case__in=accessible_projects)
+        project_scope = accessible_projects(user)
+        accessible_test_cases = TestCase.objects.filter(project__in=project_scope)
+        return TestCaseStep.objects.filter(test_case__in=accessible_test_cases)
 
 
 class TestCaseExecutionViewSet(viewsets.ModelViewSet):
@@ -1964,11 +1963,9 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # 只显示用户有权限访问的项目的执行记录
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        project_scope = accessible_projects(user)
         return TestCaseExecution.objects.filter(
-            project__in=accessible_projects
+            project__in=project_scope
         ).select_related(
             'test_case', 'project', 'test_suite', 'created_by'
         )
@@ -2058,10 +2055,8 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """只显示用户有权限访问的项目的定时任务"""
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        return UiScheduledTask.objects.filter(project__in=accessible_projects)
+        project_scope = accessible_projects(user)
+        return UiScheduledTask.objects.filter(project__in=project_scope)
 
     def perform_create(self, serializer):
         """创建定时任务"""
@@ -2099,6 +2094,18 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
     def run_now(self, request, pk=None):
         """立即运行任务"""
         task = self.get_object()
+
+        validation_serializer = UiScheduledTaskSerializer(
+            task,
+            data={},
+            partial=True,
+            context=self.get_serializer_context(),
+        )
+        if not validation_serializer.is_valid():
+            return Response(
+                {'error': '任务关联资源不一致', 'details': validation_serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             # 更新任务执行时间和次数
@@ -2915,8 +2922,9 @@ class UiNotificationLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        projects = UiProject.objects.filter(models.Q(owner=user) | models.Q(members=user)).distinct()
-        return UiNotificationLog.objects.filter(task__project__in=projects).select_related('task').order_by('-created_at')
+        project_scope = accessible_projects(user)
+        return UiNotificationLog.objects.filter(task__project__in=project_scope).select_related('task').order_by('-created_at')
+
 
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
@@ -2938,6 +2946,12 @@ class UiTaskNotificationSettingViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['task', 'is_enabled', 'notification_type']
 
+    def get_queryset(self):
+        project_scope = accessible_projects(self.request.user)
+        return UiTaskNotificationSetting.objects.filter(
+            task__project__in=project_scope
+        ).select_related('task')
+
 
 class AICaseViewSet(viewsets.ModelViewSet):
     queryset = AICase.objects.all()
@@ -2950,12 +2964,12 @@ class AICaseViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        # 返回用户有权限的项目下的AI用例，以及没有关联项目的AI用例
+        if is_ui_admin(user):
+            return AICase.objects.all()
+        projects = accessible_projects(user)
         return AICase.objects.filter(
-            models.Q(project__in=accessible_projects) | models.Q(project__isnull=True)
+            models.Q(project__in=projects)
+            | models.Q(project__isnull=True, created_by=user)
         ).distinct()
 
     def perform_create(self, serializer):
@@ -3421,12 +3435,12 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        # 返回用户有权限的项目下的执行记录，以及没有关联项目的执行记录
+        if is_ui_admin(user):
+            return AIExecutionRecord.objects.all()
+        projects = accessible_projects(user)
         return AIExecutionRecord.objects.filter(
-            models.Q(project__in=accessible_projects) | models.Q(project__isnull=True)
+            models.Q(project__in=projects)
+            | models.Q(project__isnull=True, executed_by=user)
         ).distinct()
 
     def perform_destroy(self, instance):
@@ -3479,10 +3493,9 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
         # 获取项目对象（如果提供了project_id）
         project = None
         if project_id:
-            try:
-                project = UiProject.objects.get(id=project_id)
-            except UiProject.DoesNotExist:
-                return Response({'error': '项目不存在'}, status=status.HTTP_404_NOT_FOUND)
+            project = accessible_projects(request.user).filter(pk=project_id).first()
+            if project is None:
+                return Response({'error': '项目不存在或无权使用'}, status=status.HTTP_404_NOT_FOUND)
 
         # 创建执行记录
         execution_record = AIExecutionRecord.objects.create(
@@ -3728,6 +3741,7 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='stop')
     def stop_task(self, request, pk=None):
         """停止正在执行的任务"""
+        record = self.get_object()
         try:
             execution_id = int(pk)
             if execution_id in STOP_SIGNALS:
@@ -3736,7 +3750,6 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
             else:
                 # 如果不在内存中，可能已经结束，或者重启过服务
                 # 尝试直接更新数据库状态
-                record = self.get_object()
                 if record.status == 'running':
                     record.status = 'stopped'
                     record.end_time = timezone.now()
@@ -3936,13 +3949,11 @@ class UiDashboardViewSet(viewsets.ViewSet):
         user = request.user
 
         # 获取用户可访问的项目ID列表
-        accessible_projects = UiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
-        project_ids = accessible_projects.values_list('id', flat=True)
+        accessible_project_scope = accessible_projects(request.user)
+        project_ids = accessible_project_scope.values_list('id', flat=True)
 
         # 统计数据
-        project_count = accessible_projects.count()
+        project_count = accessible_project_scope.count()
 
         # 测试用例数量
         test_case_count = TestCase.objects.filter(project_id__in=project_ids).count()

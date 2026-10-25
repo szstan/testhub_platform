@@ -15,6 +15,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
+from django.conf import settings
+from apps.core.network import configure_selenium_network_guard, validate_outbound_url
 import logging
 
 logger = logging.getLogger(__name__)
@@ -336,6 +338,9 @@ class SeleniumTestEngine:
 
             # 设置隐式等待
             self.driver.implicitly_wait(3)
+            # Configure Chromium request blocking before the first navigation;
+            # navigate() performs the authoritative rendered URL validation.
+            configure_selenium_network_guard(self.driver)
 
             logger.info(f"浏览器启动成功: {self.browser_type}, headless={self.headless}")
 
@@ -1044,7 +1049,16 @@ class SeleniumTestEngine:
             (是否成功, 日志信息)
         """
         try:
-            self.driver.get(url)
+            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+            safe_url = validate_outbound_url(url, allow_private=allow_private)
+            # Validate immediately before the browser request.  Chromium's CDP
+            # deny list additionally blocks common private redirect targets.
+            self.driver.get(safe_url)
+
+            # Reject redirects not caught by the browser deny list.
+            final_url = getattr(self.driver, 'current_url', safe_url) or safe_url
+            validate_outbound_url(final_url, allow_private=allow_private)
 
             # 等待页面基本加载完成
             # 在服务器环境（特别是无头模式）需要更长的等待时间

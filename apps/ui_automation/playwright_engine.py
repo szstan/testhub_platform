@@ -9,6 +9,11 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PlaywrightTimeout
 import logging
+from django.conf import settings
+from apps.core.network import (
+    guard_playwright_route,
+    validate_outbound_url,
+)
 from .variable_resolver import resolve_variables
 
 logger = logging.getLogger(__name__)
@@ -155,6 +160,16 @@ class PlaywrightTestEngine:
             self.context = await self.browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+            )
+            # Guard every navigation, redirect, and subresource request.  A
+            # stored public base URL can still redirect into private space.
+            await self.context.route(
+                '**/*',
+                lambda route: guard_playwright_route(
+                    route,
+                    allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                               getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+                ),
             )
 
             # 创建页面
@@ -844,15 +859,16 @@ class PlaywrightTestEngine:
             (是否成功, 日志信息)
         """
         try:
-            # 检测是否在Linux服务器环境
-            import platform
-            is_linux = platform.system() == 'Linux'
-
-            # 使用 networkidle 等待页面加载完成
-            await self.page.goto(url, wait_until='networkidle', timeout=30000)
+            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+            safe_url = validate_outbound_url(url, allow_private=allow_private)
+            # 检验紧邻导航请求，避免 a stored URL changing between setup and use.
+            await self.page.goto(safe_url, wait_until='networkidle', timeout=30000)
 
             # 额外等待，确保动态内容加载（Vue/React等SPA应用）
             # 服务器无头模式需要更长的等待时间
+            import platform
+            is_linux = platform.system() == 'Linux'
             extra_wait = 3 if is_linux else 2
             await asyncio.sleep(extra_wait)
 

@@ -12,7 +12,6 @@ from urllib.parse import quote, urlparse
 import requests
 import yaml
 from django.conf import settings
-from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -22,6 +21,18 @@ from .models import TestCase, TestCaseSourceBinding, TestCaseSyncProfile
 
 MAX_FILES = 1000
 MAX_FILE_BYTES = 1 * 1024 * 1024
+
+_DEFAULT_SECRET_ALIASES = {
+    'github': 'TESTHUB_GIT_TOKEN',
+    'gitlab': 'TESTHUB_GIT_TOKEN',
+    # Keep the original deployment name usable only because it is explicitly
+    # allowlisted here; arbitrary environment variable names are never read.
+    'TESTHUB_GIT_TOKEN': 'TESTHUB_GIT_TOKEN',
+}
+_DEFAULT_PROVIDER_HOSTS = {
+    'github': {'github.com', 'api.github.com', 'raw.githubusercontent.com'},
+    'gitlab': {'gitlab.com'},
+}
 
 
 class TestCaseSyncError(ValueError):
@@ -41,9 +52,114 @@ class SyncSummary:
     warnings: list[str]
 
 
+def _secret_aliases() -> dict[str, str]:
+    """Return the server-owned alias -> environment variable mapping.
+
+    The profile value is an alias, never an environment variable name selected
+    by a project member.  A string setting is accepted for deployments that
+    configure ``alias=ENV_NAME`` pairs through environment configuration.
+    """
+    configured = getattr(settings, 'TESTCASE_SYNC_SECRET_ALIASES', None)
+    if configured is None:
+        configured = getattr(settings, 'TESTCASE_SYNC_SECRET_ALIAS_MAP', None)
+    if configured is None:
+        configured = _DEFAULT_SECRET_ALIASES
+
+    if isinstance(configured, dict):
+        pairs = configured.items()
+    elif isinstance(configured, str):
+        parsed = []
+        for item in configured.split(','):
+            if '=' in item:
+                parsed.append(item.split('=', 1))
+        pairs = parsed
+    elif isinstance(configured, (list, tuple, set)):
+        # A list is useful for deployments where the alias and environment
+        # variable deliberately share a name; it remains server-controlled.
+        pairs = ((item, item) for item in configured)
+    else:
+        pairs = ()
+
+    aliases = {}
+    for alias, env_name in pairs:
+        alias = str(alias or '').strip()
+        env_name = str(env_name or '').strip()
+        if alias and env_name:
+            aliases[alias] = env_name
+    return aliases
+
+
+def _resolve_secret_alias(alias: str) -> str:
+    alias = str(alias or '').strip()
+    aliases = _secret_aliases()
+    env_name = aliases.get(alias)
+    if env_name is None:
+        env_name = aliases.get(alias.lower())
+    if not env_name:
+        raise TestCaseSyncError('token_env_ref 必须是服务端已配置的 secret alias')
+    return env_name
+
+
 def _token(profile: TestCaseSyncProfile) -> str:
     ref = str(profile.token_env_ref or '').strip()
-    return os.environ.get(ref, '') if ref else ''
+    if not ref:
+        return ''
+    env_name = _resolve_secret_alias(ref)
+    token = os.environ.get(env_name, '')
+    if not token:
+        raise TestCaseSyncError(f'同步 secret alias 未配置: {ref}')
+    return token
+
+
+def _provider_hosts(provider: str) -> set[str]:
+    configured = None
+    for setting_name in (
+        'TESTCASE_SYNC_ALLOWED_PROVIDER_HOSTS',
+        'TESTCASE_SYNC_ALLOWED_HOSTS',
+        'TESTCASE_SYNC_PROVIDER_HOSTS',
+    ):
+        candidate = getattr(settings, setting_name, None)
+        if candidate:
+            configured = candidate
+            break
+
+    if isinstance(configured, dict):
+        values = configured.get(provider)
+        if values is None:
+            values = _DEFAULT_PROVIDER_HOSTS.get(provider, set())
+    elif isinstance(configured, str):
+        values = configured.split(',')
+    elif configured is None:
+        values = _DEFAULT_PROVIDER_HOSTS.get(provider, set())
+    else:
+        values = configured
+    return {str(value).strip().lower() for value in values or () if str(value).strip()}
+
+
+def _host_allowed(host: str, allowed: set[str]) -> bool:
+    host = (host or '').lower().rstrip('.')
+    for pattern in allowed:
+        pattern = pattern.lower().rstrip('.')
+        if pattern.startswith('*.'):
+            suffix = pattern[1:]
+            if host.endswith(suffix) and host != suffix[1:]:
+                return True
+        elif host == pattern:
+            return True
+    return False
+
+
+def _validate_provider_url(url: str, provider: str, *, allow_query: bool = True) -> str:
+    try:
+        safe_url = validate_outbound_url(url, allow_private=False)
+    except UnsafeOutboundURL as exc:
+        raise TestCaseSyncError('同步源地址不允许访问') from exc
+    parsed = urlparse(safe_url)
+    if not allow_query and (parsed.query or parsed.fragment):
+        raise TestCaseSyncError('同步源基础地址不能包含 query 或 fragment')
+    if not _host_allowed(parsed.hostname or '', _provider_hosts(provider)):
+        raise TestCaseSyncError(f'{provider} 同步主机不在服务端允许列表中')
+    return safe_url
 
 
 def _request_json(url: str, *, token: str = ''):
@@ -75,9 +191,14 @@ def _repository_parts(repository_url: str) -> tuple[str, str]:
 
 
 def _github_files(profile: TestCaseSyncProfile, token: str):
-    owner, repository = _repository_parts(profile.repository_url)
+    repository_url = _validate_provider_url(profile.repository_url, 'github', allow_query=False)
+    owner, repository = _repository_parts(repository_url)
     branch = quote(profile.branch or 'main', safe='')
-    tree = _request_json(f'https://api.github.com/repos/{quote(owner)}/{quote(repository)}/git/trees/{branch}?recursive=1', token=token)
+    tree_url = _validate_provider_url(
+        f'https://api.github.com/repos/{quote(owner)}/{quote(repository)}/git/trees/{branch}?recursive=1',
+        'github',
+    )
+    tree = _request_json(tree_url, token=token)
     if not isinstance(tree, dict) or tree.get('truncated'):
         raise TestCaseSyncError('GitHub tree 结果为空或被截断')
     prefix = (profile.path or '').strip('/ ')
@@ -85,22 +206,39 @@ def _github_files(profile: TestCaseSyncProfile, token: str):
     for item in tree.get('tree') or []:
         path = str(item.get('path') or '')
         if item.get('type') == 'blob' and (not prefix or path == prefix or path.startswith(prefix + '/')) and path.lower().endswith(('.yml', '.yaml')):
-            files.append((path, str(item.get('sha') or ''), f'https://raw.githubusercontent.com/{owner}/{repository}/{quote(profile.branch or "main", safe="")}/{quote(path, safe="/")}'))
+            raw_url = _validate_provider_url(
+                f'https://raw.githubusercontent.com/{owner}/{repository}/{quote(profile.branch or "main", safe="")}/{quote(path, safe="/")}',
+                'github',
+            )
+            files.append((path, str(item.get('sha') or ''), raw_url))
     return str(tree.get('sha') or ''), files
 
 
 def _gitlab_files(profile: TestCaseSyncProfile, token: str):
-    owner, repository = _repository_parts(profile.repository_url)
-    base = profile.api_base_url or f'{urlparse(profile.repository_url).scheme}://{urlparse(profile.repository_url).netloc}/api/v4'
-    base = validate_outbound_url(base.rstrip('/'), allow_private=False)
+    repository_url = _validate_provider_url(profile.repository_url, 'gitlab', allow_query=False)
+    parsed_repository = urlparse(repository_url)
+    owner, repository = _repository_parts(repository_url)
+    if profile.api_base_url:
+        base = _validate_provider_url(profile.api_base_url.rstrip('/'), 'gitlab', allow_query=False)
+    else:
+        base = _validate_provider_url(
+            f'{parsed_repository.scheme}://{parsed_repository.netloc}/api/v4',
+            'gitlab',
+            allow_query=False,
+        )
     project = quote(f'{owner}/{repository}', safe='')
-    tree = _request_json(f'{base}/projects/{project}/repository/tree?ref={quote(profile.branch or "main", safe="")}&recursive=true&per_page=100', token=token)
+    tree_url = f'{base}/projects/{project}/repository/tree?ref={quote(profile.branch or "main", safe="")}&recursive=true&per_page=100'
+    tree = _request_json(tree_url, token=token)
     prefix = (profile.path or '').strip('/ ')
     files = []
     for item in tree if isinstance(tree, list) else []:
         path = str(item.get('path') or '')
         if item.get('type') == 'blob' and (not prefix or path == prefix or path.startswith(prefix + '/')) and path.lower().endswith(('.yml', '.yaml')):
-            files.append((path, str(item.get('id') or ''), f'{base}/projects/{project}/repository/files/{quote(path, safe="")}/raw?ref={quote(profile.branch or "main", safe="")}'))
+            raw_url = _validate_provider_url(
+                f'{base}/projects/{project}/repository/files/{quote(path, safe="")}/raw?ref={quote(profile.branch or "main", safe="")}',
+                'gitlab',
+            )
+            files.append((path, str(item.get('id') or ''), raw_url))
     return '', files
 
 
@@ -114,10 +252,7 @@ def _load_files(profile: TestCaseSyncProfile, token: str):
     loaded = []
     for path, source_sha, raw_url in files:
         response = requests.get(
-            validate_outbound_url(
-                raw_url,
-                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-            ),
+            _validate_provider_url(raw_url, profile.provider),
             headers={'Accept': 'text/plain', 'User-Agent': 'TestHub-TestsAsCode/1.0', **({'PRIVATE-TOKEN': token} if token else {})},
             timeout=20,
             allow_redirects=False,

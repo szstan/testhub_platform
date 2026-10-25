@@ -11,7 +11,7 @@ from unittest import mock
 import pytest
 
 from apps.monitor.utils.probes import (
-    _login, _jsonpath_extract, _run_assertions, probe_http, probe_online, run_probe,
+    _login, _jsonpath_extract, _run_assertions, probe_http, probe_login, probe_online, run_probe,
 )
 def _mk_resp(payload, status_code=200):
     resp = mock.Mock()
@@ -87,6 +87,42 @@ def test_login_token_extraction(cfg_extra, payload, expect_ok, expect_token):
     else:
         # 失败信息需可诊断：包含配置路径
         assert "obj.token" in r.message
+
+
+
+
+def test_probe_login_redacts_bearer_token_from_result_detail():
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(type='LOGIN', url='https://example.com/api/login', method='POST', host='', port=None)
+    cfg = {**BASE_CFG, 'token_path': 'data.access_token'}
+    with mock.patch(
+        'apps.monitor.utils.probes.requests.request',
+        return_value=_mk_resp({'code': 200, 'data': {'access_token': 'super-secret-token'}}),
+    ):
+        result = probe_login(target, cfg)
+
+    assert result.ok is True
+    assert result.detail.get('token') == '******'
+    assert 'super-secret-token' not in repr(result.detail)
+
+
+def test_login_assertion_failure_does_not_echo_token():
+    cfg = {
+        **BASE_CFG,
+        'assertions': [
+            {'field': 'data.access_token', 'operator': 'equals', 'expect': 'different-token'},
+        ],
+    }
+    with mock.patch(
+        'apps.monitor.utils.probes.requests.request',
+        return_value=_mk_resp({'code': 200, 'data': {'access_token': 'super-secret-token'}}),
+    ):
+        result = _login(cfg)
+
+    assert result.ok is False
+    assert 'super-secret-token' not in result.message
+    assert 'different-token' not in result.message
 
 
 def test_jsonpath_extract_basic():

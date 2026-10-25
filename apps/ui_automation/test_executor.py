@@ -6,7 +6,13 @@ import time
 import json
 from datetime import datetime
 from django.utils import timezone
+from django.conf import settings
 from django.db import connection
+from apps.core.network import (
+    configure_selenium_network_guard,
+    guard_playwright_route_sync,
+    validate_outbound_url,
+)
 from playwright.sync_api import sync_playwright
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -306,6 +312,14 @@ class TestExecutor:
                         viewport={'width': 1920, 'height': 1080},
                         user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
                     )
+                    self.context.route(
+                        '**/*',
+                        lambda route: guard_playwright_route_sync(
+                            route,
+                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+                        ),
+                    )
                     self.current_page = self.context.new_page()
 
                     # 导航到项目基础URL
@@ -317,8 +331,13 @@ class TestExecutor:
                             import platform
                             is_linux = platform.system() == 'Linux'
 
-                            # 使用 networkidle 等待页面加载完成
-                            self.current_page.goto(self.test_suite.project.base_url, wait_until='networkidle',
+                            # Validate immediately before the browser request.
+                            safe_base_url = validate_outbound_url(
+                                self.test_suite.project.base_url,
+                                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+                            )
+                            self.current_page.goto(safe_base_url, wait_until='networkidle',
                                                    timeout=30000)
 
                             # 额外等待，确保动态内容加载（Vue/React等SPA应用）
@@ -1459,8 +1478,19 @@ class TestExecutor:
                         import platform
                         is_linux = platform.system() == 'Linux'
 
-                        # 导航到URL
-                        driver.get(self.test_suite.project.base_url)
+                        # Validate immediately before the browser request.
+                        safe_base_url = validate_outbound_url(
+                            self.test_suite.project.base_url,
+                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+                        )
+                        driver.get(safe_base_url)
+                        final_url = getattr(driver, 'current_url', safe_base_url) or safe_base_url
+                        validate_outbound_url(
+                            final_url,
+                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
+                        )
 
                         # 等待页面基本加载完成
                         # 在服务器环境（特别是无头模式）需要更长的等待时间
@@ -1751,6 +1781,8 @@ class TestExecutor:
             service = ChromeService(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=options)
 
+        driver.implicitly_wait(3)
+        configure_selenium_network_guard(driver)
         return driver
 
     def execute_test_case_selenium_no_db(self, driver, case_data):

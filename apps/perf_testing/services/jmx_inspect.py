@@ -10,7 +10,7 @@
 - 纯函数 + 仅依赖标准库，不触碰 DB / Django settings，便于 unittest 直跑。
 - 解析失败不抛异常，统一以 {'valid': False, 'error': ...} 返回，调用方决定如何提示。
 - 对 JMeter 属性函数（如 ${__P(threads,50)}）不做求值，识别为「不可静态判定」，
-  由上层降级为 warning 而不是 error——否则参数化脚本会被一刀切拒绝。
+  由上层保守拒绝动态目标主机（并对动态压力参数保留告警）。
 """
 import os
 from defusedxml import ElementTree as ET
@@ -92,7 +92,7 @@ def inspect_jmx_text(text):
           'total_threads': int|None,   # None 表示存在动态表达式，无法静态判定
           'max_duration': int|None,
           'sampler_count': int, 'controller_count': int,
-          'hosts': [str], 'csv_datasets': [{filename, variable_names}],
+          'hosts': [str], 'dynamic_hosts': [str], 'csv_datasets': [{filename, variable_names}],
           'has_dynamic_props': bool,
           'unsafe_elements': [str],
         }
@@ -108,6 +108,7 @@ def inspect_jmx_text(text):
         'sampler_count': 0,
         'controller_count': 0,
         'hosts': [],
+        'dynamic_hosts': [],
         'csv_datasets': [],
         'has_dynamic_props': False,
         'unsafe_elements': [],
@@ -191,15 +192,23 @@ def inspect_jmx_text(text):
         if tag.endswith('Sampler') or tag.endswith('SamplerProxy'):
             result['sampler_count'] += 1
             domain = _props(elem).get('HTTPSampler.domain', '')
-            if domain and not _is_dynamic(domain):
-                hosts.add(domain.strip().lower())
+            if domain:
+                if _is_dynamic(domain):
+                    result['dynamic_hosts'].append(domain.strip())
+                    result['has_dynamic_props'] = True
+                else:
+                    hosts.add(domain.strip().lower())
             continue
 
         if tag == 'ConfigTestElement':
             # HTTP Request Defaults：域名常常只写在这里
             domain = _props(elem).get('HTTPSampler.domain', '')
-            if domain and not _is_dynamic(domain):
-                hosts.add(domain.strip().lower())
+            if domain:
+                if _is_dynamic(domain):
+                    result['dynamic_hosts'].append(domain.strip())
+                    result['has_dynamic_props'] = True
+                else:
+                    hosts.add(domain.strip().lower())
             continue
 
         if tag.endswith('Controller'):
@@ -217,6 +226,7 @@ def inspect_jmx_text(text):
     result['total_threads'] = None if threads_dynamic else total_threads
     result['max_duration'] = None if duration_dynamic else max_duration
     result['hosts'] = sorted(hosts)
+    result['dynamic_hosts'] = sorted(set(result['dynamic_hosts']))
     result['valid'] = True
     return result
 
@@ -273,6 +283,7 @@ def summarize(meta):
         'sampler_count': meta.get('sampler_count', 0),
         'controller_count': meta.get('controller_count', 0),
         'hosts': (meta.get('hosts') or [])[:20],
+        'dynamic_hosts': (meta.get('dynamic_hosts') or [])[:20],
         'csv_datasets': (meta.get('csv_datasets') or [])[:20],
         'has_dynamic_props': bool(meta.get('has_dynamic_props')),
         'unsafe_elements': (meta.get('unsafe_elements') or [])[:20],

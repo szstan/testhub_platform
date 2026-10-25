@@ -41,9 +41,22 @@ from apps.versions.models import Version
 
 
 def accessible_execution_projects(user):
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return Project.objects.none()
     if user.is_staff or user.is_superuser:
         return Project.objects.all()
     return Project.objects.filter(Q(owner=user) | Q(members=user)).distinct()
+
+
+def _ensure_project_access(user, project, detail='没有权限访问该项目'):
+    if project is None or user is None or not getattr(user, 'is_authenticated', False):
+        return
+    if not accessible_execution_projects(user).filter(pk=project.pk).exists():
+        raise PermissionDenied(detail)
+
+
+def _project_from_requirement(requirement):
+    return requirement.analysis.document.project_id
 
 
 class ExecutionAttemptSerializer(serializers.ModelSerializer):
@@ -103,12 +116,25 @@ class ExecutionDatasetSerializer(serializers.ModelSerializer):
         except Exception:
             return 0
 
+    def validate(self, attrs):
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        _ensure_project_access(self.context.get('request').user if self.context.get('request') else None, project,
+                               '没有权限管理该项目的数据集')
+        return attrs
+
 
 class ExecutionDataMatrixSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExecutionDataMatrix
         fields = '__all__'
         read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def validate(self, attrs):
+        dataset = attrs.get('dataset', getattr(self.instance, 'dataset', None))
+        user = self.context.get('request').user if self.context.get('request') else None
+        if dataset is not None:
+            _ensure_project_access(user, dataset.project, '没有权限管理该数据集项目')
+        return attrs
 
 
 class ExecutionFixtureSerializer(serializers.ModelSerializer):
@@ -123,6 +149,17 @@ class ExecutionPluginManifestSerializer(serializers.ModelSerializer):
         model = ExecutionPluginManifest
         fields = '__all__'
         read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        if project is None:
+            if user is not None and getattr(user, 'is_authenticated', False) and not (user.is_staff or user.is_superuser):
+                raise PermissionDenied('仅管理员可以管理全局插件声明')
+        else:
+            _ensure_project_access(user, project, '没有权限管理该项目插件声明')
+        return attrs
 
 
 class ExecutionProfileSerializer(serializers.ModelSerializer):
@@ -353,12 +390,33 @@ class ExecutionBuildSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('id', 'created_by', 'created_at', 'updated_at')
 
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        _ensure_project_access(user, project, '没有权限管理该项目的构建')
+        version = attrs.get('version', getattr(self.instance, 'version', None))
+        if version is not None and project is not None and not version.projects.filter(pk=project.pk).exists():
+            raise serializers.ValidationError({'version': '版本不属于所选项目'})
+        return attrs
+
 
 class RequirementTestCaseLinkSerializer(serializers.ModelSerializer):
     class Meta:
         model = RequirementTestCaseLink
         fields = '__all__'
         read_only_fields = ('id', 'created_by', 'created_at')
+
+    def validate(self, attrs):
+        requirement = attrs.get('requirement', getattr(self.instance, 'requirement', None))
+        test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        project_id = _project_from_requirement(requirement) if requirement is not None else None
+        if requirement is not None and test_case is not None and project_id != test_case.project_id:
+            raise serializers.ValidationError('需求和测试用例必须属于同一项目')
+        user = self.context.get('request').user if self.context.get('request') else None
+        project = Project.objects.filter(pk=project_id).first() if project_id is not None else None
+        _ensure_project_access(user, project, '没有权限关联该项目')
+        return attrs
 
 
 class TestCaseDefectLinkSerializer(serializers.ModelSerializer):
@@ -367,6 +425,16 @@ class TestCaseDefectLinkSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('id', 'created_by', 'created_at')
 
+    def validate(self, attrs):
+        test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        defect = attrs.get('defect', getattr(self.instance, 'defect', None))
+        if test_case is not None and defect is not None and test_case.project_id != defect.project_id:
+            raise serializers.ValidationError('测试用例和缺陷必须属于同一项目')
+        user = self.context.get('request').user if self.context.get('request') else None
+        project = getattr(test_case, 'project', None)
+        _ensure_project_access(user, project, '没有权限关联该项目')
+        return attrs
+
 
 class ExecutionRequirementLinkSerializer(serializers.ModelSerializer):
     class Meta:
@@ -374,12 +442,31 @@ class ExecutionRequirementLinkSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('id', 'created_at')
 
+    def validate(self, attrs):
+        job = attrs.get('job', getattr(self.instance, 'job', None))
+        requirement = attrs.get('requirement', getattr(self.instance, 'requirement', None))
+        project_id = _project_from_requirement(requirement) if requirement is not None else None
+        if job is not None and requirement is not None and job.project_id != project_id:
+            raise serializers.ValidationError('需求和执行任务必须属于同一项目')
+        user = self.context.get('request').user if self.context.get('request') else None
+        _ensure_project_access(user, getattr(job, 'project', None), '没有权限关联该执行任务')
+        return attrs
+
 
 class ExecutionDefectLinkSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExecutionDefectLink
         fields = '__all__'
         read_only_fields = ('id', 'created_at')
+
+    def validate(self, attrs):
+        job = attrs.get('job', getattr(self.instance, 'job', None))
+        defect = attrs.get('defect', getattr(self.instance, 'defect', None))
+        if job is not None and defect is not None and job.project_id != defect.project_id:
+            raise serializers.ValidationError('缺陷和执行任务必须属于同一项目')
+        user = self.context.get('request').user if self.context.get('request') else None
+        _ensure_project_access(user, getattr(job, 'project', None), '没有权限关联该执行任务')
+        return attrs
 
 
 class TestCaseRevisionSerializer(serializers.ModelSerializer):
@@ -465,3 +552,12 @@ class TestRunCaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestRunCase
         fields = '__all__'
+
+    def validate(self, attrs):
+        test_run = attrs.get('test_run', getattr(self.instance, 'test_run', None))
+        testcase = attrs.get('testcase', getattr(self.instance, 'testcase', None))
+        if test_run is not None and testcase is not None and test_run.project_id != testcase.project_id:
+            raise serializers.ValidationError({'testcase': '测试用例必须属于执行任务所在项目'})
+        user = self.context.get('request').user if self.context.get('request') else None
+        _ensure_project_access(user, getattr(test_run, 'project', None), '没有权限管理该执行任务用例')
+        return attrs

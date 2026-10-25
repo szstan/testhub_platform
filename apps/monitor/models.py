@@ -160,7 +160,9 @@ class MonitorTarget(models.Model):
 
         返回新建的 MonitorCheckLog 实例。任何探针异常都不会抛出（保证调度稳定）。
         """
-        from .utils.probes import run_probe, ProbeResult
+        from .utils.probes import (
+            run_probe, ProbeResult, redact_probe_detail, redact_probe_message,
+        )
 
         cfg = self.get_decrypted_check_config()
         try:
@@ -185,8 +187,8 @@ class MonitorTarget(models.Model):
             status=status,
             latency_ms=result.latency_ms,
             http_status=result.http_status,
-            error_message="" if result.ok else result.message,
-            detail=result.detail,
+            error_message='' if result.ok else redact_probe_message(result.message),
+            detail=redact_probe_detail(result.detail),
             triggered_alert=False,
         )
         # 告警钩子：连续失败达阈值时创建 AlertEvent 并分发通知（#7 实现）
@@ -284,6 +286,7 @@ class MonitorTarget(models.Model):
         每条发送结果带 level 字段（primary/secondary）便于前端回显与追溯。
         """
         from .utils.notifiers import send_via_channel
+        from .utils.probes import redact_probe_detail, redact_probe_message
 
         type_label = dict(TargetType.CHOICES).get(self.type, self.type)
         cfg = self.get_decrypted_check_config()
@@ -301,10 +304,12 @@ class MonitorTarget(models.Model):
         if latest_log and latest_log.detail:
             raw = latest_log.detail.get('body') or latest_log.detail.get('resp') or ''
             if isinstance(raw, str) and raw.strip():
-                resp_body = raw[:200] + '...' if len(raw) > 200 else raw
+                resp_body = redact_probe_message(raw)
+                resp_body = resp_body[:200] + '...' if len(resp_body) > 200 else resp_body
             elif isinstance(raw, (dict, list)):
                 import json
-                raw_str = json.dumps(raw, ensure_ascii=False)
+                raw_value = redact_probe_detail(raw)
+                raw_str = json.dumps(raw_value, ensure_ascii=False)
                 resp_body = raw_str[:200] + '...' if len(raw_str) > 200 else raw_str
 
         if recovered:
@@ -347,7 +352,7 @@ class MonitorTarget(models.Model):
                 type_label,
                 target_url,
                 self.consecutive_failures,
-                (alert.message or '-')[:200],
+                redact_probe_message((alert.message or '-')[:200]),
                 resp_body,
             )
 

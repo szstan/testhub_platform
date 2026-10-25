@@ -174,8 +174,10 @@ class HumanApprovalToolTest(ToolBase):
         info = mcp_tools.get_approval_status(self.ctx, token)
         self.assertEqual(info['status'], 'awaiting_approval')
 
-        # 控制台批准 → 轮询可取执行结果
-        approve_pending(McpPendingConfirm.objects.get(), self.user)
+        # 控制台批准：必须由独立的 staff 审批者完成
+        approver = User.objects.create(
+            username='mcp_console_approver', email='approver@a.com', is_staff=True)
+        approve_pending(McpPendingConfirm.objects.get(), approver)
         info = mcp_tools.get_approval_status(self.ctx, token)
         self.assertEqual(info['status'], 'approved')
         self.assertIn('testcase_id', info['result'])

@@ -44,8 +44,65 @@ class ProbeResult:
     detail: dict = field(default_factory=dict)
 
 
+_SENSITIVE_RESULT_KEYS = {
+    'password', 'passwd', 'token', 'access_token', 'refresh_token',
+    'id_token', 'authorization', 'proxy_authorization', 'secret',
+}
+
+
+def _is_sensitive_key(key) -> bool:
+    normalized = str(key or '').strip().lower().replace('-', '_')
+    return (
+        normalized in _SENSITIVE_RESULT_KEYS
+        or normalized.endswith('_token')
+        or normalized.endswith('_secret')
+        or normalized.endswith('_password')
+    )
+
+
+def _path_is_sensitive(path) -> bool:
+    parts = re.split(r'[.\[\]"\']+', str(path or ''))
+    return any(_is_sensitive_key(part) for part in parts if part)
+
+
+def _redact_text(value) -> str:
+    text = str(value)
+    # Redact both HTTP Authorization output and common JSON/form token fields.
+    text = re.sub(
+        r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+',
+        'Bearer [REDACTED]',
+        text,
+    )
+    return re.sub(
+        r'(?i)(["\']?(?:access_token|refresh_token|id_token|token|authorization|password|secret)["\']?\s*[:=]\s*["\']?)([^,\s}\"\']+)',
+        r'\1[REDACTED]',
+        text,
+    )
+
+
+def redact_probe_detail(value):
+    """Remove credentials from a probe result before it can be stored or sent."""
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if _is_sensitive_key(key):
+                result[key] = '******' if item not in (None, '') else item
+            else:
+                result[key] = redact_probe_detail(item)
+        return result
+    if isinstance(value, list):
+        return [redact_probe_detail(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def redact_probe_message(value) -> str:
+    return _redact_text(value)
+
+
 def _clip(s, n=300):
-    s = str(s)
+    s = _redact_text(s)
     return s if len(s) <= n else s[:n] + "..."
 
 
@@ -301,6 +358,8 @@ def _run_assertions(data, assertions):
 
         val = _jsonpath_extract(data, field)
         ok, desc = _assert_compare(val, operator, expect)
+        if _path_is_sensitive(field):
+            desc = '敏感字段的期望值和实际值已隐藏'
         if ok:
             passed += 1
         else:
@@ -474,7 +533,7 @@ def probe_login(target, cfg):
     if not lr.ok:
         return lr
     return ProbeResult(True, lr.message, lr.latency_ms, lr.http_status,
-                        lr.detail)
+                        redact_probe_detail(lr.detail))
 
 
 def probe_http(target, cfg):

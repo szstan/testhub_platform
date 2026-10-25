@@ -2,7 +2,14 @@ import pytest
 from rest_framework.test import APIClient
 
 from apps.api_testing.contracts import coverage_for_spec, diff_contracts, generate_contract_cases
-from apps.api_testing.models import OpenApiContractSpec
+from apps.api_testing.models import (
+    ApiProject,
+    OpenApiContractSpec,
+    ScheduledTask,
+    TaskNotificationSetting,
+    TestSuite as ApiTestSuite,
+)
+from apps.core.models import UnifiedNotificationConfig
 from apps.executions.models import ExecutionAttempt, ExecutionJob, ExecutionStepResult
 from apps.executions.state_machine import AttemptStatus, StepStatus
 from apps.projects.models import Project
@@ -27,6 +34,57 @@ def _document(include_orders=False):
             },
         }
     return {'openapi': '3.0.0', 'paths': paths}
+
+
+@pytest.mark.django_db
+def test_api_notification_setting_rejects_cross_tenant_config_and_redacts_secrets():
+    owner = User.objects.create_user(username='notification-owner', password='pass')
+    foreign = User.objects.create_user(username='notification-foreign', password='pass')
+    project = ApiProject.objects.create(
+        name='Notification project', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    suite = ApiTestSuite.objects.create(project=project, name='suite', created_by=owner)
+    task = ScheduledTask.objects.create(
+        name='task', task_type='TEST_SUITE', trigger_type='INTERVAL', interval_seconds=60,
+        test_suite=suite, created_by=owner,
+    )
+    setting = TaskNotificationSetting.objects.create(task=task)
+    foreign_config = UnifiedNotificationConfig.objects.create(
+        name='foreign', config_type='webhook_feishu', created_by=foreign,
+        webhook_bots={'feishu': {'name': 'foreign-bot', 'webhook_url': 'https://secret.invalid/hook'}},
+    )
+    own_config = UnifiedNotificationConfig.objects.create(
+        name='own', config_type='webhook_feishu', created_by=owner,
+        webhook_bots={'feishu': {'name': 'own-bot', 'webhook_url': 'https://secret.invalid/hook', 'secret': 'signing-secret'}},
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    url = f'/api/api-testing/task-notification-settings/{setting.id}/update-settings/'
+    denied = client.post(url, {'notification_config': foreign_config.id}, format='json')
+    assert denied.status_code == 400
+    setting.refresh_from_db()
+    assert setting.notification_config_id is None
+
+    allowed = client.post(
+        url,
+        {
+            'notification_config': own_config.id,
+            'custom_webhook_bots': {
+                'feishu': {
+                    'name': 'custom-bot',
+                    'webhook_url': 'https://secret.invalid/custom',
+                    'secret': 'custom-secret',
+                },
+            },
+        },
+        format='json',
+    )
+    assert allowed.status_code == 200, allowed.data
+    assert 'custom_webhook_bots' not in allowed.data
+    displayed = allowed.data['webhook_bots_display']
+    assert displayed and displayed[0]['configured'] is True
+    assert all('webhook_url' not in bot and 'secret' not in bot for bot in displayed)
 
 
 @pytest.mark.django_db

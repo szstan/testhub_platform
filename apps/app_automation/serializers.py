@@ -5,7 +5,12 @@ from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from django.core.signing import TimestampSigner
-from .access import accessible_projects, scope_test_cases
+from .access import (
+    accessible_projects,
+    scope_test_cases,
+    scope_executions,
+    scheduled_task_relation_errors,
+)
 from .models import (
     AppProject,
     AppTestConfig,
@@ -216,12 +221,29 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     device_name = serializers.CharField(read_only=True)
     user_name = serializers.CharField(read_only=True)
     report_access_token = serializers.SerializerMethodField()
+
+
     pass_rate = serializers.FloatField(read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     result_display = serializers.CharField(source='get_result_display', read_only=True, default=None)
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Preserve the legacy string contract without exposing filesystem paths.
+        data['report_path'] = ''
+        return data
+
     def get_report_access_token(self, obj) -> str:
-        if not obj.report_path:
+        """Mint a short-lived share token only for an authorized request."""
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not self.context.get('include_report_access_token', True):
+            return ''
+        if not obj.report_path or not request or not getattr(user, 'is_authenticated', False):
+            return ''
+        if not scope_executions(
+            AppTestExecution.objects.filter(pk=obj.pk), user
+        ).exists():
             return ''
         return TimestampSigner().sign(str(obj.pk))
 
@@ -373,6 +395,14 @@ class AppTestSuiteUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('无权使用该 APP 项目')
         return value
 
+    def validate(self, attrs):
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        if project is not None and self.instance.suite_cases.exclude(
+            test_case__project_id=project.id
+        ).exists():
+            raise serializers.ValidationError('套件中的所有测试用例必须属于同一项目')
+        return attrs
+
     class Meta:
         model = AppTestSuite
         fields = ('name', 'description', 'project')
@@ -435,26 +465,41 @@ class AppScheduledTaskSerializer(serializers.ModelSerializer):
         return obj.get_notification_type_display() if obj.notification_type else '-'
 
     def validate(self, attrs):
-        trigger_type = attrs.get('trigger_type')
-        if trigger_type == 'CRON' and not attrs.get('cron_expression'):
+        trigger_type = attrs.get('trigger_type', getattr(self.instance, 'trigger_type', None))
+        if trigger_type == 'CRON' and not attrs.get('cron_expression', getattr(self.instance, 'cron_expression', '')):
             raise serializers.ValidationError('Cron表达式不能为空')
         if trigger_type == 'INTERVAL':
-            if not attrs.get('interval_seconds'):
+            interval_seconds = attrs.get('interval_seconds', getattr(self.instance, 'interval_seconds', None))
+            if not interval_seconds:
                 raise serializers.ValidationError('间隔秒数不能为空')
-            if attrs['interval_seconds'] < 60:
+            if interval_seconds < 60:
                 raise serializers.ValidationError('间隔秒数不能小于60秒')
         if trigger_type == 'ONCE':
-            if not attrs.get('execute_at'):
+            execute_at = attrs.get('execute_at', getattr(self.instance, 'execute_at', None))
+            if not execute_at:
                 raise serializers.ValidationError('执行时间不能为空')
-            if attrs['execute_at'] <= timezone.now():
+            if execute_at <= timezone.now():
                 raise serializers.ValidationError('执行时间必须大于当前时间')
 
-        task_type = attrs.get('task_type')
-        if task_type == 'TEST_SUITE' and not attrs.get('test_suite'):
-            raise serializers.ValidationError('请选择测试套件')
-        if task_type == 'TEST_CASE' and not attrs.get('test_case'):
-            raise serializers.ValidationError('请选择测试用例')
-
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        device = attrs.get('device', getattr(self.instance, 'device', None))
+        app_package = attrs.get('app_package', getattr(self.instance, 'app_package', None))
+        test_suite = attrs.get('test_suite', getattr(self.instance, 'test_suite', None))
+        test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        task_type = attrs.get('task_type', getattr(self.instance, 'task_type', None))
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        errors = scheduled_task_relation_errors(
+            user=user,
+            project=project,
+            device=device,
+            app_package=app_package,
+            test_suite=test_suite,
+            test_case=test_case,
+            task_type=task_type,
+        )
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
 
     def create(self, validated_data):

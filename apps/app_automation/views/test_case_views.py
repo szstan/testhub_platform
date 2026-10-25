@@ -10,7 +10,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 import logging
 
 from ..models import AppPackage, AppTestCase, AppDevice, AppTestExecution
-from ..access import scope_test_cases
+from ..access import scope_test_cases, device_action_allowed
 from ..serializers import AppPackageSerializer, AppTestCaseSerializer, AppTestExecutionSerializer
 
 logger = logging.getLogger(__name__)
@@ -67,10 +67,15 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
         try:
             # 检查设备是否可用
             device = AppDevice.objects.get(device_id=device_id)
-            if device.status == 'locked' and device.locked_by != request.user:
+            if not device_action_allowed(request.user, device):
                 return Response({
                     'success': False,
-                    'message': '设备已被其他用户锁定'
+                    'message': '无权使用其他用户锁定的设备'
+                }, status=status.HTTP_403_FORBIDDEN)
+            if test_case.app_package and package_name and package_name != test_case.app_package.package_name:
+                return Response({
+                    'success': False,
+                    'message': '执行包名必须与测试用例一致'
                 }, status=status.HTTP_400_BAD_REQUEST)
             if device.locked_by_id != request.user.id:
                 return Response({
@@ -97,7 +102,10 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
             return Response({
                 'success': True,
                 'message': '测试已提交执行',
-                'execution': AppTestExecutionSerializer(execution).data
+                'execution': AppTestExecutionSerializer(
+                    execution,
+                    context=self.get_serializer_context(),
+                ).data
             })
             
         except AppDevice.DoesNotExist:

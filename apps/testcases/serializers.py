@@ -4,6 +4,7 @@ from apps.projects.models import Project
 from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from apps.users.serializers import UserSerializer
 from apps.versions.serializers import VersionSimpleSerializer
+from .sync import TestCaseSyncError, _resolve_secret_alias
 
 class TestCaseStepSerializer(serializers.ModelSerializer):
     class Meta:
@@ -187,6 +188,32 @@ class TestCaseSyncProfileSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('项目不存在或无权限')
         return value
 
+    def validate_token_env_ref(self, value):
+        value = str(value or '').strip()
+        if not value:
+            return value
+        try:
+            _resolve_secret_alias(value)
+        except TestCaseSyncError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        return value
+
+    def validate(self, attrs):
+        # On PATCH the provider may be omitted; aliases remain server-owned.
+        alias = attrs.get('token_env_ref')
+        if alias:
+            try:
+                _resolve_secret_alias(alias)
+            except TestCaseSyncError as exc:
+                raise serializers.ValidationError({'token_env_ref': str(exc)}) from exc
+        return super().validate(attrs)
+
     def get_secret_configured(self, obj):
         import os
-        return bool(obj.token_env_ref and os.environ.get(obj.token_env_ref))
+        if not obj.token_env_ref:
+            return False
+        try:
+            env_name = _resolve_secret_alias(obj.token_env_ref)
+        except TestCaseSyncError:
+            return False
+        return bool(os.environ.get(env_name))

@@ -1348,17 +1348,16 @@ class GenerationConfigViewSet(viewsets.ModelViewSet):
                 'error': f'获取失败: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @transaction.atomic
     @action(detail=True, methods=['post'])
     def enable(self, request, pk=None):
         """启用配置"""
         try:
-            # 禁用其他所有配置
-            GenerationConfig.objects.all().update(is_active=False)
-
-            # 启用当前配置
             config = self.get_object()
+            config = GenerationConfig.objects.select_for_update().get(pk=config.pk)
+            GenerationConfig.objects.exclude(pk=config.pk).update(is_active=False)
             config.is_active = True
-            config.save()
+            config.save(update_fields=['is_active', 'updated_at'] if hasattr(config, 'updated_at') else ['is_active'])
 
             return Response({
                 'message': '生成配置已启用',
@@ -2287,6 +2286,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             response['Access-Control-Allow-Credentials'] = 'true'
             return response
 
+    @transaction.atomic
     @action(detail=True, methods=['post'])
     def cancel(self, request, task_id=None):
         """取消正在运行的任务"""

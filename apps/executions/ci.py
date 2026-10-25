@@ -120,6 +120,8 @@ def process_webhook(profile: ExecutionProfile, provider: str, event_id: str, pay
             external_event_id=event_id,
         ).first()
         if existing:
+            if existing.payload_hash != payload_hash:
+                raise ValueError('Webhook event payload mismatch')
             return WebhookReceipt(existing.pk, False, existing.job_id, existing.status)
         build, _ = ExecutionBuild.objects.get_or_create(
             project=profile.project,

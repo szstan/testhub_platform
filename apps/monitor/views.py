@@ -74,7 +74,7 @@ class MonitorTargetViewSet(viewsets.ModelViewSet):
         """管理员调试一次探测；普通用户只能探测已保存且归属自己的目标。"""
         if not is_monitor_admin(request.user):
             return Response({'detail': '仅管理员可以执行未保存目标探测'}, status=403)
-        from .utils.probes import run_probe, ProbeResult
+        from .utils.probes import run_probe, redact_probe_detail, redact_probe_message
 
         probe_type = request.data.get('type', 'HTTP')
         cfg = request.data.get('check_config', {})
@@ -90,15 +90,11 @@ class MonitorTargetViewSet(viewsets.ModelViewSet):
 
         result = run_probe(temp, cfg)
 
-        # 对敏感字段做截断
-        detail = dict(result.detail or {})
-        for sk in ('token', 'password', 'secret'):
-            if sk in detail:
-                detail[sk] = str(detail[sk])[:12] + '...' if len(str(detail[sk])) > 12 else detail[sk]
+        detail = redact_probe_detail(result.detail)
 
         return Response({
             'ok': result.ok,
-            'message': result.message,
+            'message': redact_probe_message(result.message),
             'latency_ms': result.latency_ms,
             'http_status': result.http_status,
             'detail': detail,

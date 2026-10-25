@@ -35,6 +35,13 @@ def _human_approval_enabled() -> bool:
     return bool(getattr(settings, 'MCP_HUMAN_APPROVAL', False))
 
 
+def _is_privileged_operator(operator) -> bool:
+    return bool(
+        operator is not None
+        and (getattr(operator, 'is_staff', False) or getattr(operator, 'is_superuser', False))
+    )
+
+
 def notify_pending_approval(pending: McpPendingConfirm):
     """人工审批提醒：复用 monitor 模块已启用的通知渠道。
 
@@ -174,9 +181,19 @@ def consume_pending(pending: McpPendingConfirm, user) -> dict:
 
 
 def approve_pending(pending: McpPendingConfirm, operator) -> dict:
-    """Claim and execute a pending action from the admin console once."""
+    """Claim and execute a pending action from the admin console once.
+
+    Approval is a second-party control: only a privileged operator who is not
+    the action initiator may approve it.  Keep this invariant here as well as
+    in the REST view so callers cannot bypass it by invoking the service layer.
+    """
     with transaction.atomic():
         locked = McpPendingConfirm.objects.select_for_update().get(pk=pending.pk)
+        operator_id = getattr(operator, 'id', None)
+        if operator_id is not None and locked.user_id == operator_id:
+            raise ConfirmError('危险操作发起人不能批准自己的操作')
+        if not _is_privileged_operator(operator):
+            raise ConfirmError('仅管理员或超级管理员可以批准危险操作')
         if locked.status != 'pending' or locked.is_expired:
             raise ConfirmError(f'当前状态({locked.status})不可批准')
         action = ACTION_REGISTRY.get(locked.tool_name)

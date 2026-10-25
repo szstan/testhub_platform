@@ -196,7 +196,7 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
             "result": result,
             "progress": progress,
             "message": message,
-            "report_path": report_path,
+            "report_path": bool(report_path),
             "finished_at": finished_at.isoformat() if finished_at else None,
         }
         async_to_sync(channel_layer.group_send)(

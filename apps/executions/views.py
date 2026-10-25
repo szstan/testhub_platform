@@ -101,6 +101,10 @@ class ExecutionPagination(PageNumberPagination):
 
 
 def get_accessible_projects(user):
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return Project.objects.none()
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
     return Project.objects.filter(
         Q(owner=user) | Q(members=user)
     ).distinct()
@@ -355,29 +359,40 @@ class TestPlanViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def perform_update(self, serializer):
-        # 在更新TestPlan时，处理版本信息
-        version_id = self.request.data.get('version')
-        version = None
-        if version_id:
-            from apps.versions.models import Version
-            try:
-                version = Version.objects.get(id=version_id)
-            except Version.DoesNotExist:
-                pass
-        
-        project_ids = self.request.data.get('projects', [])
-        testcase_ids = self.request.data.get('testcases', [])
-        self._validate_project_ids(project_ids)
+        # 在更新TestPlan时，保留未提交字段，避免普通 PATCH 清空关联项目/用例
+        current_plan = serializer.instance
+        if 'version' in self.request.data:
+            version_id = self.request.data.get('version')
+            version = None
+            if version_id:
+                from apps.versions.models import Version
+                try:
+                    version = Version.objects.get(id=version_id)
+                except Version.DoesNotExist:
+                    raise ValidationError({'version': '版本不存在'})
+        else:
+            version = current_plan.version
 
-        with transaction.atomic():
+        if 'projects' in self.request.data:
+            project_ids = self.request.data.get('projects') or []
+        else:
+            project_ids = list(current_plan.projects.values_list('id', flat=True))
+        if 'testcases' in self.request.data:
+            testcase_ids = self.request.data.get('testcases') or []
+        else:
+            testcase_ids = list(current_plan.test_runs.values_list(
+                'run_cases__testcase_id', flat=True
+            ).distinct())
+        self._validate_project_ids(project_ids)
+        if version is not None and version.project_id not in set(project_ids):
+            raise ValidationError({'version': '版本不属于所选项目'})
+
             test_plan = serializer.save(version=version)
             self._sync_test_runs(test_plan, project_ids, testcase_ids)
 
-            assignee_ids = self.request.data.get('assignees', [])
-            if assignee_ids:
+            if 'assignees' in self.request.data:
+                assignee_ids = self.request.data.get('assignees') or []
                 test_plan.assignees.set(assignee_ids)
-            else:
-                test_plan.assignees.clear()
 
 
 class TestRunViewSet(viewsets.ModelViewSet):
@@ -421,6 +436,9 @@ class TestRunCaseViewSet(viewsets.ModelViewSet):
         
         if not new_status:
             return Response({'error': 'Status is required'}, status=status.HTTP_400_BAD_REQUEST)
+        valid_statuses = {value for value, _label in TestRunCase.STATUS_CHOICES}
+        if new_status not in valid_statuses:
+            return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
         
         # 创建历史记录
         TestRunCaseHistory.objects.create(
