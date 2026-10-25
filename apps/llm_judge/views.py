@@ -146,7 +146,10 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
 
         rubric_id = data.get('rubric')
         if rubric_id:
-            rubric = self.get_queryset().filter(pk=rubric_id).first()
+            rubric_queryset = Rubric.objects.filter(is_active=True)
+            if not (request.user.is_staff or request.user.is_superuser):
+                rubric_queryset = rubric_queryset.filter(is_default=True)
+            rubric = rubric_queryset.filter(pk=rubric_id).first()
             if rubric is None:
                 return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
         else:

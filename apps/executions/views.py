@@ -384,9 +384,10 @@ class TestPlanViewSet(viewsets.ModelViewSet):
                 'run_cases__testcase_id', flat=True
             ).distinct())
         self._validate_project_ids(project_ids)
-        if version is not None and version.project_id not in set(project_ids):
+        if version is not None and not version.projects.filter(id__in=project_ids).exists():
             raise ValidationError({'version': '版本不属于所选项目'})
 
+        with transaction.atomic():
             test_plan = serializer.save(version=version)
             self._sync_test_runs(test_plan, project_ids, testcase_ids)
 
@@ -437,7 +438,7 @@ class TestRunCaseViewSet(viewsets.ModelViewSet):
         if not new_status:
             return Response({'error': 'Status is required'}, status=status.HTTP_400_BAD_REQUEST)
         valid_statuses = {value for value, _label in TestRunCase.STATUS_CHOICES}
-        if new_status not in valid_statuses:
+        if not isinstance(new_status, str) or new_status not in valid_statuses:
             return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
         
         # 创建历史记录

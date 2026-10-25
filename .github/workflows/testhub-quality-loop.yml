@@ -14,7 +14,7 @@ on:
       max_unmatched:
         description: Maximum unmatched imported tests for this pilot; set to 0 after TestHub cases are materialized
         required: false
-        default: '1000'
+        default: '0'
         type: string
       test_suite:
         description: Allowlisted test suite to run on the staging runner

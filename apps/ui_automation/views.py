@@ -3457,10 +3457,14 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
             raw_path = raw_path[len(media_prefix):].lstrip('/')
         elif raw_path.startswith('media/'):
             raw_path = raw_path[len('media/'):]
+        if raw_path.startswith('ai_recording/'):
+            raw_path = raw_path[len('ai_recording/'):]
+
 
         media_root = Path(settings.MEDIA_ROOT).resolve()
-        file_path = (media_root / raw_path).resolve()
-        if not raw_path or media_root not in file_path.parents or not file_path.is_file():
+        recording_root = (media_root / 'ai_recording').resolve()
+        file_path = (recording_root / raw_path).resolve()
+        if not raw_path or recording_root not in file_path.parents or not file_path.is_file():
             return Response({'detail': '录制文件不存在'}, status=status.HTTP_404_NOT_FOUND)
 
         return FileResponse(file_path.open('rb'), content_type='image/gif')

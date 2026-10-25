@@ -2517,7 +2517,11 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
         queryset = AIServiceConfig.objects.filter(role=role, is_active=True)
         user = self.request.user
         if not (user.is_staff or user.is_superuser):
-            queryset = queryset.filter(created_by=user)
+            queryset = queryset.filter(
+                models.Q(created_by=user)
+                | models.Q(created_by__is_staff=True)
+                | models.Q(created_by__is_superuser=True)
+            )
         return queryset.order_by('-created_at').first()
 
     @action(detail=False, methods=['post'])
@@ -2771,8 +2775,10 @@ URL参数:
         parameters = request.data.get('parameters', [])
         if not parameters:
             return Response({'error': '请提供参数列表'}, status=status.HTTP_400_BAD_REQUEST)
-        if not isinstance(parameters, list) or len(parameters) > 100:
-            return Response({'error': 'parameters 必须是最多 100 项的列表'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(parameters, list) or len(parameters) > 100 or any(
+            not isinstance(item, dict) for item in parameters
+        ):
+            return Response({'error': 'parameters 必须是最多 100 项的对象列表'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             config = self._active_config_for_request('naming')

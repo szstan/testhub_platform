@@ -165,6 +165,8 @@ def validate_mirror(mirror: Path) -> dict[str, Any]:
         if not isinstance(artifacts, list):
             raise ValueError('manifest.json artifacts must be a list')
         for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                raise ValueError('manifest.json artifacts must contain objects')
             filename = str(artifact.get('filename') or '')
             path = (mirror / filename).resolve()
             if not filename or mirror not in path.parents or not path.is_file():
