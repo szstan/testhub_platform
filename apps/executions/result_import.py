@@ -276,7 +276,9 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
             )
         if not created:
             existing_hash = str((job.result or {}).get('source_sha256') or '')
-            if existing_hash and existing_hash != payload_hash:
+            if not existing_hash:
+                raise ResultImportError('旧结果缺少 payload hash，无法安全重放')
+            if existing_hash != payload_hash:
                 raise ResultImportError('相同 external_run_id 的结果内容不一致')
             summary = job.result or {}
             return ImportSummary(

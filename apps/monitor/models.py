@@ -352,7 +352,7 @@ class MonitorTarget(models.Model):
                 type_label,
                 target_url,
                 self.consecutive_failures,
-                redact_probe_message((alert.message or '-')[:200]),
+                redact_probe_message(alert.message or '-')[:200],
                 resp_body,
             )
 

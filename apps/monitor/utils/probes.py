@@ -47,6 +47,7 @@ class ProbeResult:
 _SENSITIVE_RESULT_KEYS = {
     'password', 'passwd', 'token', 'access_token', 'refresh_token',
     'id_token', 'authorization', 'proxy_authorization', 'secret',
+    'api_key', 'x_api_key', 'cookie', 'set_cookie',
 }
 
 

@@ -1354,7 +1354,8 @@ class GenerationConfigViewSet(viewsets.ModelViewSet):
         """启用配置"""
         try:
             config = self.get_object()
-            config = GenerationConfig.objects.select_for_update().get(pk=config.pk)
+            locked_configs = list(GenerationConfig.objects.select_for_update().order_by('pk'))
+            config = next(item for item in locked_configs if item.pk == config.pk)
             GenerationConfig.objects.exclude(pk=config.pk).update(is_active=False)
             config.is_active = True
             config.save(update_fields=['is_active', 'updated_at'] if hasattr(config, 'updated_at') else ['is_active'])
@@ -1454,7 +1455,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             if validated_data.get('use_writer_model', True):
                 writer_configs = AIModelConfig.objects.filter(role='writer', is_active=True)
                 if not (request.user.is_staff or request.user.is_superuser):
-                    writer_configs = writer_configs.filter(created_by=request.user)
+                    writer_configs = writer_configs.filter(
+                        models.Q(created_by=request.user)
+                        | models.Q(created_by__is_staff=True)
+                        | models.Q(created_by__is_superuser=True)
+                    )
                 writer_config = writer_configs.order_by('-created_at').first()
 
                 if not writer_config:
@@ -1473,7 +1478,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             if validated_data.get('use_reviewer_model', True):
                 reviewer_configs = AIModelConfig.objects.filter(role='reviewer', is_active=True)
                 if not (request.user.is_staff or request.user.is_superuser):
-                    reviewer_configs = reviewer_configs.filter(created_by=request.user)
+                    reviewer_configs = reviewer_configs.filter(
+                        models.Q(created_by=request.user)
+                        | models.Q(created_by__is_staff=True)
+                        | models.Q(created_by__is_superuser=True)
+                    )
                 reviewer_config = reviewer_configs.order_by('-created_at').first()
 
                 if not reviewer_config:

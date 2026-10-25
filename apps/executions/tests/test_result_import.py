@@ -134,15 +134,14 @@ def test_result_import_rejects_changed_payload_and_reuses_legacy_key(execution_f
         requested_by=user,
         result={'total': 1, 'passed': 1, 'failed': 0, 'skipped': 0, 'matched': 0, 'unmatched': 1},
     )
-    replay = import_results(
-        project=project,
-        payload=first_payload,
-        result_format='junit',
-        external_run_id='legacy-run',
-        requested_by=user,
-    )
-    assert replay.created is False
-    assert replay.job.id == legacy.id
+    with pytest.raises(ResultImportError):
+        import_results(
+            project=project,
+            payload=first_payload,
+            result_format='junit',
+            external_run_id='legacy-run',
+            requested_by=user,
+        )
 
 
 @pytest.mark.django_db

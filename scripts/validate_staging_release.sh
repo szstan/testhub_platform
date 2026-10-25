@@ -43,6 +43,7 @@ if id nginx >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
         || fail "nginx cannot read frontend/dist/index.html"
 fi
 
+"$PYTHON_BIN" manage.py check
 migration_plan="$("$PYTHON_BIN" manage.py migrate --plan 2>&1)" || fail "migration plan failed"
 printf '%s\n' "$migration_plan"
 if ! grep -q 'No planned migration operations' <<<"$migration_plan"; then
