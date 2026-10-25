@@ -60,7 +60,8 @@ python scripts/validate_linux_runtime.py --profile web --repo-root "$PWD" --mirr
 - `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy（loguru、Pillow 已由 `requirements-prod.txt` 提供）。
 - `requirements-report-optional.txt`：Allure pytest 插件及 Python 运行时；仓库内 `allure/bin/allure` 提供报告命令。
 
-APP worker 必须使用独立的 `venv-automation`，不要复用 `venv-prod`。安装后先执行与运行时相同的依赖和可执行文件检查：
+Selenium 仅作为显式兼容引擎保留。生产环境默认 `UI_SELENIUM_COMPATIBILITY=False`，新 UI 项目使用 Playwright；只有完成 legacy Selenium 项目评估并经过管理员配置，才设置为 `True`。APP 自动化仍使用独立 Airtest worker。
+
 
 ```bash
 cd /opt/testhub_platform
