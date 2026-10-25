@@ -286,7 +286,7 @@ def websocket_ticket_view(request):
         channel not in {'app-automation', 'perf-testing'}
         or not execution_id.isascii()
         or not execution_id.isdigit()
-        or len(execution_id) > 12
+        or len(execution_id) > 19
     ):
         return Response({'error': '无效的 WebSocket 通道或执行记录'},
                         status=status.HTTP_400_BAD_REQUEST)

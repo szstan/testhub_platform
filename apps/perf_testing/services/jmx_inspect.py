@@ -39,6 +39,12 @@ UNSAFE_SCRIPT_MARKERS = (
 )
 
 
+UNSAFE_NETWORK_SAMPLER_TAGS = {
+    'TCPSampler', 'JMSPublisherSampler', 'JMSSubscriberSampler',
+    'MailReaderSampler', 'LDAPExtSampler',
+}
+
+
 def _local(tag):
     """取标签名最后一段：com.blazemeter...ConcurrencyThreadGroup -> ConcurrencyThreadGroup。"""
     return str(tag or '').rsplit('.', 1)[-1]
@@ -191,7 +197,13 @@ def inspect_jmx_text(text):
 
         if tag.endswith('Sampler') or tag.endswith('SamplerProxy'):
             result['sampler_count'] += 1
-            domain = _props(elem).get('HTTPSampler.domain', '')
+            props = _props(elem)
+            domain = props.get('HTTPSampler.domain', '')
+            if tag in UNSAFE_NETWORK_SAMPLER_TAGS:
+                domain = domain or props.get(f'{tag}.server') or props.get('server') or props.get('host', '')
+                if not domain:
+                    result['unsafe_elements'].append(f'unsupported network sampler: {tag}')
+                    continue
             if domain:
                 if _is_dynamic(domain):
                     result['dynamic_hosts'].append(domain.strip())

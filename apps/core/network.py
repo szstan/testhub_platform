@@ -109,7 +109,10 @@ def validate_redirect_url(base_url: str, location: str, *, allow_private: bool =
     location_raw = str(location)
     if any(ord(char) < 32 or ord(char) == 127 for char in location_raw):
         raise UnsafeOutboundURL('重定向地址不允许包含控制字符')
-    target = urljoin(str(base_url or ''), location_raw.strip())
+    try:
+        target = urljoin(str(base_url or ''), location_raw.strip())
+    except ValueError as exc:
+        raise UnsafeOutboundURL('重定向地址格式非法') from exc
     return validate_outbound_url(target, allow_private=allow_private)
 
 
