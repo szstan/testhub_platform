@@ -101,6 +101,10 @@ class ExecutionPagination(PageNumberPagination):
 
 
 def get_accessible_projects(user):
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return Project.objects.none()
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
     return Project.objects.filter(
         Q(owner=user) | Q(members=user)
     ).distinct()

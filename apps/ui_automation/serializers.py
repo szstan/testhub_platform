@@ -10,7 +10,38 @@ from .models import (
 )
 from django.contrib.auth import get_user_model
 from django.conf import settings
+from .access import project_accessible, is_ui_admin
+
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+
+
+def _serializer_user(serializer):
+    request = serializer.context.get('request')
+    return getattr(request, 'user', None)
+
+
+def _ensure_project_access(serializer, project, field='project'):
+    user = _serializer_user(serializer)
+    if project is None:
+        raise serializers.ValidationError({field: '请选择有效的项目'})
+    if user is not None and getattr(user, 'is_authenticated', False) and not project_accessible(user, project):
+        raise serializers.ValidationError({field: '无权使用该 UI 项目'})
+    return project
+
+
+def _load_object(model, value, field):
+    try:
+        return model.objects.get(pk=value)
+    except (model.DoesNotExist, TypeError, ValueError):
+        raise serializers.ValidationError({field: '关联对象不存在'})
+
+
+def _same_project_error(left, right, field):
+    left_project_id = getattr(left, 'project_id', getattr(left, 'pk', None)) if left is not None else None
+    right_project_id = getattr(right, 'project_id', getattr(right, 'pk', None)) if right is not None else None
+    if left is not None and right is not None and left_project_id != right_project_id:
+        raise serializers.ValidationError({field: '关联对象必须属于同一项目'})
+
 
 User = get_user_model()
 
@@ -75,6 +106,7 @@ class ElementSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
     project_id = serializers.IntegerField(write_only=True)
     group_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    parent_element_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     locator_strategy_id = serializers.IntegerField()  # 显式定义，支持读写
 
     class Meta:
@@ -83,36 +115,39 @@ class ElementSerializer(serializers.ModelSerializer):
         read_only_fields = ('created_at', 'updated_at', 'created_by')
 
     def validate_project_id(self, value):
-        """验证项目ID是否有效"""
-        try:
-            UiProject.objects.get(id=value)
-        except UiProject.DoesNotExist:
-            raise serializers.ValidationError("请选择有效的项目")
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
         return value
 
     def validate_locator_strategy_id(self, value):
-        """验证定位策略ID是否有效"""
         if value is not None:
-            try:
-                LocatorStrategy.objects.get(id=value)
-            except LocatorStrategy.DoesNotExist:
-                raise serializers.ValidationError("请选择有效的定位策略")
+            _load_object(LocatorStrategy, value, 'locator_strategy_id')
         return value
 
     def validate_group_id(self, value):
-        """验证分组ID是否有效"""
-        if value is not None:  # 允许None值
-            try:
-                ElementGroup.objects.get(id=value)
-            except ElementGroup.DoesNotExist:
-                raise serializers.ValidationError("请选择有效的元素分组")
+        if value is not None:
+            _load_object(ElementGroup, value, 'group_id')
         return value
+
+    def validate(self, attrs):
+        project = _load_object(UiProject, attrs['project_id'], 'project_id') if 'project_id' in attrs else getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project, 'project_id')
+        group_id = attrs.get('group_id')
+        if group_id is not None:
+            group = _load_object(ElementGroup, group_id, 'group_id')
+            _same_project_error(project, group, 'group_id')
+        parent_id = attrs.get('parent_element_id')
+        if parent_id is not None:
+            parent = _load_object(Element, parent_id, 'parent_element_id')
+            _same_project_error(project, parent, 'parent_element_id')
+        return attrs
 
     def create(self, validated_data):
         # 处理外键字段
         project_id = validated_data.pop('project_id')
         locator_strategy_id = validated_data.pop('locator_strategy_id', None)
         group_id = validated_data.pop('group_id', None)
+        parent_element_id = validated_data.pop('parent_element_id', None)
 
         validated_data['project'] = UiProject.objects.get(id=project_id)
 
@@ -122,6 +157,9 @@ class ElementSerializer(serializers.ModelSerializer):
         if group_id:
             validated_data['group'] = ElementGroup.objects.get(id=group_id)
 
+        if parent_element_id:
+            validated_data['parent_element'] = Element.objects.get(id=parent_element_id)
+
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
@@ -129,6 +167,7 @@ class ElementSerializer(serializers.ModelSerializer):
         project_id = validated_data.pop('project_id', None)
         locator_strategy_id = validated_data.pop('locator_strategy_id', None)
         group_id = validated_data.pop('group_id', None)
+        parent_element_id = validated_data.pop('parent_element_id', None)
 
         if project_id:
             validated_data['project'] = UiProject.objects.get(id=project_id)
@@ -142,12 +181,22 @@ class ElementSerializer(serializers.ModelSerializer):
             else:
                 validated_data['group'] = None
 
+        if parent_element_id is not None:
+            validated_data['parent_element'] = (
+                Element.objects.get(id=parent_element_id) if parent_element_id else None
+            )
+
         return super().update(instance, validated_data)
 
 
 class TestScriptSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     project_id = serializers.IntegerField(write_only=True)
+
+    def validate_project_id(self, value):
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
 
     class Meta:
         model = TestScript
@@ -160,6 +209,9 @@ class TestScriptCreateSerializer(serializers.ModelSerializer):
         model = TestScript
         fields = ('project', 'name', 'description', 'script_type', 'content', 'language', 'framework')
 
+    def validate_project(self, value):
+        return _ensure_project_access(self, value)
+
 
 class TestScriptUpdateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -170,19 +222,55 @@ class TestScriptUpdateSerializer(serializers.ModelSerializer):
 class TestSuiteScriptSerializer(serializers.ModelSerializer):
     test_script = TestScriptSerializer(read_only=True)
     test_script_id = serializers.IntegerField(write_only=True)
+    test_suite_id = serializers.IntegerField(write_only=True, required=False)
 
     class Meta:
         model = TestSuiteScript
-        fields = ('id', 'test_script', 'test_script_id', 'order')
+        fields = ('id', 'test_script', 'test_script_id', 'test_suite_id', 'order')
+
+    def validate(self, attrs):
+        script = _load_object(TestScript, attrs.get('test_script_id'), 'test_script_id')
+        suite_id = attrs.get('test_suite_id')
+        suite = _load_object(TestSuite, suite_id, 'test_suite_id') if suite_id else None
+        if suite is not None:
+            _ensure_project_access(self, suite.project)
+            _same_project_error(suite, script, 'test_script_id')
+        return attrs
+
+    def create(self, validated_data):
+        suite_id = validated_data.pop('test_suite_id', None)
+        script_id = validated_data.pop('test_script_id')
+        if suite_id is not None:
+            validated_data['test_suite'] = _load_object(TestSuite, suite_id, 'test_suite_id')
+        validated_data['test_script'] = _load_object(TestScript, script_id, 'test_script_id')
+        return super().create(validated_data)
 
 
 class TestSuiteTestCaseSerializer(serializers.ModelSerializer):
     test_case = serializers.SerializerMethodField()
     test_case_id = serializers.IntegerField(write_only=True)
+    test_suite_id = serializers.IntegerField(write_only=True, required=False)
 
     class Meta:
         model = TestSuiteTestCase
-        fields = ('id', 'test_case', 'test_case_id', 'order')
+        fields = ('id', 'test_case', 'test_case_id', 'test_suite_id', 'order')
+
+    def validate(self, attrs):
+        test_case = _load_object(TestCase, attrs.get('test_case_id'), 'test_case_id')
+        suite_id = attrs.get('test_suite_id')
+        suite = _load_object(TestSuite, suite_id, 'test_suite_id') if suite_id else None
+        if suite is not None:
+            _ensure_project_access(self, suite.project)
+            _same_project_error(suite, test_case, 'test_case_id')
+        return attrs
+
+    def create(self, validated_data):
+        suite_id = validated_data.pop('test_suite_id', None)
+        case_id = validated_data.pop('test_case_id')
+        if suite_id is not None:
+            validated_data['test_suite'] = _load_object(TestSuite, suite_id, 'test_suite_id')
+        validated_data['test_case'] = _load_object(TestCase, case_id, 'test_case_id')
+        return super().create(validated_data)
 
     def get_test_case(self, obj):
         """获取测试用例信息"""
@@ -211,6 +299,11 @@ class TestSuiteSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'execution_status', 'passed_count', 'failed_count')
 
+    def validate_project_id(self, value):
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
+
     def get_test_cases_data(self, obj):
         """获取测试用例数据"""
         return TestSuiteTestCaseSerializer(obj.suite_test_cases.all(), many=True).data
@@ -225,6 +318,9 @@ class TestSuiteCreateSerializer(serializers.ModelSerializer):
         model = TestSuite
         fields = ('id', 'project', 'name', 'description')
         read_only_fields = ('id',)
+
+    def validate_project(self, value):
+        return _ensure_project_access(self, value)
 
 
 class TestSuiteUpdateSerializer(serializers.ModelSerializer):
@@ -265,10 +361,42 @@ class TestExecutionSerializer(serializers.ModelSerializer):
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases'
         )
 
+    def validate(self, attrs):
+        project_id = attrs.pop('project_id', None)
+        if project_id is not None:
+            project = _load_object(UiProject, project_id, 'project_id')
+        else:
+            project = getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project)
+
+        suite_id = attrs.pop('test_suite_id', None) if 'test_suite_id' in attrs else None
+        suite = _load_object(TestSuite, suite_id, 'test_suite_id') if suite_id is not None else getattr(self.instance, 'test_suite', None)
+        script_id = attrs.pop('test_script_id', None) if 'test_script_id' in attrs else None
+        script = _load_object(TestScript, script_id, 'test_script_id') if script_id is not None else getattr(self.instance, 'test_script', None)
+        if suite is not None:
+            _same_project_error(project, suite, 'test_suite_id')
+            attrs['test_suite'] = suite
+        if script is not None:
+            _same_project_error(project, script, 'test_script_id')
+            attrs['test_script'] = script
+
+        if 'executed_by_id' in attrs:
+            executed_by_id = attrs.pop('executed_by_id')
+            executed_by = _load_object(User, executed_by_id, 'executed_by_id') if executed_by_id is not None else None
+            user = _serializer_user(self)
+            if user is not None and getattr(user, 'is_authenticated', False) and not is_ui_admin(user) and executed_by is not None and executed_by.pk != user.pk:
+                raise serializers.ValidationError({'executed_by_id': '只能以当前用户身份创建执行记录'})
+            attrs['executed_by'] = executed_by
+        elif self.instance is None:
+            user = _serializer_user(self)
+            if user is not None and getattr(user, 'is_authenticated', False):
+                attrs['executed_by'] = user
+        attrs['project'] = project
+        return attrs
+
     def get_test_suite_name(self, obj):
         """获取测试套件名称"""
         return obj.test_suite.name if obj.test_suite else '-'
-    
     def get_executed_by_name(self, obj):
         """获取执行人姓名"""
         return obj.executed_by.username if obj.executed_by else '-'
@@ -283,6 +411,22 @@ class TestExecutionCreateSerializer(serializers.ModelSerializer):
         model = TestExecution
         fields = ('project', 'test_suite', 'test_script', 'environment', 'executed_by')
 
+    def validate(self, attrs):
+        project = _ensure_project_access(self, attrs.get('project'))
+        suite = attrs.get('test_suite')
+        script = attrs.get('test_script')
+        if suite is not None:
+            _same_project_error(project, suite, 'test_suite')
+        if script is not None:
+            _same_project_error(project, script, 'test_script')
+        user = _serializer_user(self)
+        executed_by = attrs.get('executed_by')
+        if executed_by is not None and user is not None and getattr(user, 'is_authenticated', False) and not is_ui_admin(user) and executed_by.pk != user.pk:
+            raise serializers.ValidationError({'executed_by': '只能以当前用户身份创建执行记录'})
+        if executed_by is None and user is not None and getattr(user, 'is_authenticated', False):
+            attrs['executed_by'] = user
+        return attrs
+
 
 class ScreenshotSerializer(serializers.ModelSerializer):
     execution = TestExecutionSerializer(read_only=True)
@@ -292,6 +436,22 @@ class ScreenshotSerializer(serializers.ModelSerializer):
         model = Screenshot
         fields = '__all__'
         read_only_fields = ('created_at', 'captured_at')
+
+    def validate_execution_id(self, value):
+        execution = _load_object(TestExecution, value, 'execution_id')
+        _ensure_project_access(self, execution.project, 'execution_id')
+        return value
+
+    def create(self, validated_data):
+        execution_id = validated_data.pop('execution_id')
+        validated_data['execution'] = _load_object(TestExecution, execution_id, 'execution_id')
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'execution_id' in validated_data:
+            execution_id = validated_data.pop('execution_id')
+            validated_data['execution'] = _load_object(TestExecution, execution_id, 'execution_id')
+        return super().update(instance, validated_data)
 
 
 # 新增的serializers
@@ -306,10 +466,35 @@ class ElementGroupSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
+    def validate_project_id(self, value):
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
+
+    def validate(self, attrs):
+        project_id = attrs.get('project_id')
+        project = _load_object(UiProject, project_id, 'project_id') if project_id is not None else getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project, 'project_id')
+        parent_id = attrs.get('parent_group')
+        if parent_id is not None:
+            parent = parent_id if isinstance(parent_id, ElementGroup) else _load_object(ElementGroup, parent_id, 'parent_group')
+            _same_project_error(project, parent, 'parent_group')
+        return attrs
+
+    def create(self, validated_data):
+        project_id = validated_data.pop('project_id')
+        validated_data['project'] = _load_object(UiProject, project_id, 'project_id')
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'project_id' in validated_data:
+            project_id = validated_data.pop('project_id')
+            validated_data['project'] = _load_object(UiProject, project_id, 'project_id')
+        return super().update(instance, validated_data)
+
     def get_elements_count(self, obj):
         """获取分组下的元素数量"""
         return obj.elements.count()
-
     def get_children(self, obj):
         """获取子分组"""
         children = obj.elementgroup_set.all()
@@ -320,6 +505,13 @@ class ElementGroupCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ElementGroup
         fields = ('project', 'name', 'description', 'parent_group', 'order')
+
+    def validate(self, attrs):
+        project = _ensure_project_access(self, attrs.get('project'))
+        parent = attrs.get('parent_group')
+        if parent is not None:
+            _same_project_error(project, parent, 'parent_group')
+        return attrs
 
 
 class ElementEnhancedSerializer(serializers.ModelSerializer):
@@ -343,6 +535,29 @@ class ElementEnhancedSerializer(serializers.ModelSerializer):
         model = Element
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'created_by', 'usage_count', 'last_validated')
+
+    def validate_project_id(self, value):
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
+
+    def validate_locator_strategy_id(self, value):
+        _load_object(LocatorStrategy, value, 'locator_strategy_id')
+        return value
+
+    def validate(self, attrs):
+        project_id = attrs.get('project_id')
+        project = _load_object(UiProject, project_id, 'project_id') if project_id is not None else getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project, 'project_id')
+        group_id = attrs.get('group_id')
+        if group_id is not None:
+            group = _load_object(ElementGroup, group_id, 'group_id')
+            _same_project_error(project, group, 'group_id')
+        parent_id = attrs.get('parent_element_id')
+        if parent_id is not None:
+            parent = _load_object(Element, parent_id, 'parent_element_id')
+            _same_project_error(project, parent, 'parent_element_id')
+        return attrs
 
     def get_parent_element(self, obj):
         """获取父元素信息"""
@@ -435,6 +650,29 @@ class PageObjectSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'created_by', 'template_code')
 
+    def validate_project_id(self, value):
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
+
+    def validate(self, attrs):
+        project_id = attrs.get('project_id')
+        project = _load_object(UiProject, project_id, 'project_id') if project_id is not None else getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project, 'project_id')
+        return attrs
+
+    def create(self, validated_data):
+        project_id = validated_data.pop('project_id')
+        validated_data['project'] = _load_object(UiProject, project_id, 'project_id')
+        validated_data.setdefault('created_by', _serializer_user(self))
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'project_id' in validated_data:
+            project_id = validated_data.pop('project_id')
+            validated_data['project'] = _load_object(UiProject, project_id, 'project_id')
+        return super().update(instance, validated_data)
+
     def get_elements_count(self, obj):
         """获取页面对象包含的元素数量"""
         return obj.page_object_elements.count()
@@ -457,8 +695,11 @@ class PageObjectCreateSerializer(serializers.ModelSerializer):
         model = PageObject
         fields = ('project', 'name', 'class_name', 'url_pattern', 'description')
 
+    def validate_project(self, value):
+        return _ensure_project_access(self, value)
+
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        validated_data['created_by'] = _serializer_user(self)
         return super().create(validated_data)
 
 
@@ -472,6 +713,31 @@ class PageObjectElementSerializer(serializers.ModelSerializer):
         model = PageObjectElement
         fields = '__all__'
         read_only_fields = ('created_at',)
+
+    def validate(self, attrs):
+        page_object_id = attrs.get('page_object_id')
+        page_object = _load_object(PageObject, page_object_id, 'page_object_id') if page_object_id is not None else getattr(self.instance, 'page_object', None)
+        element_id = attrs.get('element_id')
+        element = _load_object(Element, element_id, 'element_id') if element_id is not None else getattr(self.instance, 'element', None)
+        _ensure_project_access(self, page_object.project, 'page_object_id')
+        _same_project_error(page_object, element, 'element_id')
+        return attrs
+
+    def create(self, validated_data):
+        page_object_id = validated_data.pop('page_object_id')
+        element_id = validated_data.pop('element_id')
+        validated_data['page_object'] = _load_object(PageObject, page_object_id, 'page_object_id')
+        validated_data['element'] = _load_object(Element, element_id, 'element_id')
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'page_object_id' in validated_data:
+            page_object_id = validated_data.pop('page_object_id')
+            validated_data['page_object'] = _load_object(PageObject, page_object_id, 'page_object_id')
+        if 'element_id' in validated_data:
+            element_id = validated_data.pop('element_id')
+            validated_data['element'] = _load_object(Element, element_id, 'element_id')
+        return super().update(instance, validated_data)
 
     def validate_method_name(self, value):
         """验证方法名称是否符合命名规范"""
@@ -495,17 +761,40 @@ class ScriptStepSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
-    def validate(self, data):
-        """验证步骤配置"""
-        target_element_id = data.get('target_element_id')
-        page_object_id = data.get('page_object_id')
-        action_type = data.get('action_type')
-
-        # 某些操作类型需要指定目标元素
-        if action_type in ['CLICK', 'INPUT', 'SELECT', 'HOVER', 'VERIFY'] and not target_element_id and not page_object_id:
+    def validate(self, attrs):
+        script_id = attrs.get('script_id')
+        script = _load_object(TestScript, script_id, 'script_id') if script_id is not None else getattr(self.instance, 'script', None)
+        _ensure_project_access(self, script.project, 'script_id')
+        target_element_id = attrs.get('target_element_id')
+        target_element = _load_object(Element, target_element_id, 'target_element_id') if target_element_id is not None else getattr(self.instance, 'target_element', None)
+        _same_project_error(script, target_element, 'target_element_id')
+        page_object_id = attrs.get('page_object_id')
+        page_object = _load_object(PageObject, page_object_id, 'page_object_id') if page_object_id is not None else getattr(self.instance, 'page_object', None)
+        _same_project_error(script, page_object, 'page_object_id')
+        action_type = attrs.get('action_type', getattr(self.instance, 'action_type', None))
+        if action_type in ['CLICK', 'INPUT', 'SELECT', 'HOVER', 'VERIFY'] and target_element is None and page_object is None:
             raise serializers.ValidationError("此操作类型需要指定目标元素或页面对象")
+        return attrs
 
-        return data
+    def create(self, validated_data):
+        script_id = validated_data.pop('script_id')
+        target_id = validated_data.pop('target_element_id', None)
+        page_id = validated_data.pop('page_object_id', None)
+        validated_data['script'] = _load_object(TestScript, script_id, 'script_id')
+        validated_data['target_element'] = _load_object(Element, target_id, 'target_element_id') if target_id else None
+        validated_data['page_object'] = _load_object(PageObject, page_id, 'page_object_id') if page_id else None
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'script_id' in validated_data:
+            validated_data['script'] = _load_object(TestScript, validated_data.pop('script_id'), 'script_id')
+        if 'target_element_id' in validated_data:
+            target_id = validated_data.pop('target_element_id')
+            validated_data['target_element'] = _load_object(Element, target_id, 'target_element_id') if target_id else None
+        if 'page_object_id' in validated_data:
+            page_id = validated_data.pop('page_object_id')
+            validated_data['page_object'] = _load_object(PageObject, page_id, 'page_object_id') if page_id else None
+        return super().update(instance, validated_data)
 
 
 class ScriptElementUsageSerializer(serializers.ModelSerializer):
@@ -518,6 +807,29 @@ class ScriptElementUsageSerializer(serializers.ModelSerializer):
         model = ScriptElementUsage
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
+    def validate(self, attrs):
+        script_id = attrs.get('script_id')
+        script = _load_object(TestScript, script_id, 'script_id') if script_id is not None else getattr(self.instance, 'script', None)
+        element_id = attrs.get('element_id')
+        element = _load_object(Element, element_id, 'element_id') if element_id is not None else getattr(self.instance, 'element', None)
+        _ensure_project_access(self, script.project, 'script_id')
+        _same_project_error(script, element, 'element_id')
+        return attrs
+
+    def create(self, validated_data):
+        script_id = validated_data.pop('script_id')
+        element_id = validated_data.pop('element_id')
+        validated_data['script'] = _load_object(TestScript, script_id, 'script_id')
+        validated_data['element'] = _load_object(Element, element_id, 'element_id')
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'script_id' in validated_data:
+            validated_data['script'] = _load_object(TestScript, validated_data.pop('script_id'), 'script_id')
+        if 'element_id' in validated_data:
+            validated_data['element'] = _load_object(Element, validated_data.pop('element_id'), 'element_id')
+        return super().update(instance, validated_data)
 
 
 class ScriptAnalysisSerializer(serializers.Serializer):
@@ -548,15 +860,25 @@ class CodeGenerationSerializer(serializers.Serializer):
 
 class TestCaseStepSerializer(serializers.ModelSerializer):
     """测试用例步骤序列化器"""
+    test_case = serializers.PrimaryKeyRelatedField(queryset=TestCase.objects.all(), write_only=True)
+    element = serializers.PrimaryKeyRelatedField(queryset=Element.objects.all(), allow_null=True, required=False)
     element_name = serializers.CharField(source='element.name', read_only=True)
     element_locator = serializers.CharField(source='element.locator_value', read_only=True)
 
     class Meta:
         model = TestCaseStep
         fields = [
-            'id', 'step_number', 'action_type', 'element', 'element_name', 'element_locator',
+            'id', 'test_case', 'step_number', 'action_type', 'element', 'element_name', 'element_locator',
             'input_value', 'wait_time', 'assert_type', 'assert_value', 'description', 'created_at'
         ]
+        read_only_fields = ('created_at',)
+
+    def validate(self, attrs):
+        test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        element = attrs.get('element', getattr(self.instance, 'element', None))
+        _ensure_project_access(self, test_case.project, 'test_case')
+        _same_project_error(test_case, element, 'element')
+        return attrs
 
 
 class TestCaseSerializer(serializers.ModelSerializer):
@@ -573,8 +895,16 @@ class TestCaseSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_by']
 
+    def validate_project(self, value):
+        project = _ensure_project_access(self, value)
+        if self.instance is not None and self.instance.steps.filter(
+            element__isnull=False
+        ).exclude(element__project_id=project.id).exists():
+            raise serializers.ValidationError('现有步骤元素必须属于目标项目')
+        return project
+
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        validated_data['created_by'] = _serializer_user(self)
         return super().create(validated_data)
 
 
@@ -596,6 +926,18 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['created_by']
     
+    def validate(self, attrs):
+        project = _ensure_project_access(self, attrs.get('project', getattr(self.instance, 'project', None)))
+        test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        test_suite = attrs.get('test_suite', getattr(self.instance, 'test_suite', None))
+        if test_case is not None:
+            _same_project_error(project, test_case, 'test_case')
+        if test_suite is not None:
+            _same_project_error(project, test_suite, 'test_suite')
+            if test_case is not None and not test_suite.suite_test_cases.filter(test_case=test_case).exists():
+                raise serializers.ValidationError({'test_suite': '测试套件不包含该测试用例'})
+        return attrs
+
     def get_test_suite_name(self, obj):
         """获取测试套件名称"""
         return obj.test_suite.name if obj.test_suite else None
@@ -605,7 +947,7 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         return obj.created_by.username if obj.created_by else '-'
 
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        validated_data['created_by'] = _serializer_user(self)
         return super().create(validated_data)
 
 
@@ -615,12 +957,12 @@ class TestCaseRunSerializer(serializers.Serializer):
     project_id = serializers.IntegerField()
     browser = serializers.ChoiceField(choices=['chrome', 'firefox', 'safari'], default='chrome')
 
-    def validate_test_case_id(self, value):
-        try:
-            TestCase.objects.get(id=value)
-        except TestCase.DoesNotExist:
-            raise serializers.ValidationError("测试用例不存在")
-        return value
+    def validate(self, attrs):
+        test_case = _load_object(TestCase, attrs.get('test_case_id'), 'test_case_id')
+        project = _load_object(UiProject, attrs.get('project_id'), 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        _same_project_error(project, test_case, 'test_case_id')
+        return attrs
 
     def validate_project_id(self, value):
         try:
@@ -704,31 +1046,29 @@ class UiScheduledTaskSerializer(serializers.ModelSerializer):
             if attrs['execute_at'] <= timezone.now():
                 raise serializers.ValidationError("执行时间必须大于当前时间")
 
-        # 验证任务类型配置
-        task_type = attrs.get('task_type')
-        if task_type == 'TEST_SUITE' and not attrs.get('test_suite'):
+        task_type = attrs.get('task_type', getattr(self.instance, 'task_type', None))
+        if task_type == 'TEST_SUITE' and not attrs.get('test_suite', getattr(self.instance, 'test_suite', None)):
             raise serializers.ValidationError("测试套件不能为空")
-        if task_type == 'TEST_CASE':
-            test_cases = attrs.get('test_cases')
-            if test_cases is None and self.instance is not None:
-                test_cases = list(self.instance.test_cases.all())
-            if not test_cases:
-                raise serializers.ValidationError("至少选择一个测试用例")
+        raw_test_cases = attrs.get('test_cases')
+        if raw_test_cases is None and self.instance is not None:
+            raw_test_cases = list(self.instance.test_cases or [])
+        raw_test_cases = raw_test_cases or []
+        if task_type == 'TEST_CASE' and not raw_test_cases:
+            raise serializers.ValidationError("至少选择一个测试用例")
+
         project = attrs.get('project') or getattr(self.instance, 'project', None)
+        _ensure_project_access(self, project)
         suite = attrs.get('test_suite') or getattr(self.instance, 'test_suite', None)
         if suite and project and suite.project_id != project.id:
             raise serializers.ValidationError('测试套件必须属于同一项目')
-        test_cases = attrs.get('test_cases')
-        if test_cases is None and self.instance is not None:
-            test_cases = list(self.instance.test_cases.all())
-        case_ids = [case for case in (test_cases or []) if isinstance(case, int)]
-        if project and case_ids:
-            valid_count = TestCase.objects.filter(pk__in=case_ids, project_id=project.id).values('pk').distinct().count()
-            if valid_count != len(set(case_ids)):
-                raise serializers.ValidationError('所有测试用例必须属于同一项目')
-        for case in test_cases or []:
-            if project and getattr(case, 'project_id', project.id) != project.id:
-                raise serializers.ValidationError('所有测试用例必须属于同一项目')
+        try:
+            case_ids = [case.pk if isinstance(case, TestCase) else int(case) for case in raw_test_cases]
+        except (TypeError, ValueError):
+            raise serializers.ValidationError({'test_cases': '测试用例列表格式错误'})
+        cases = list(TestCase.objects.filter(pk__in=case_ids))
+        if len(cases) != len(set(case_ids)) or any(case.project_id != project.id for case in cases):
+            raise serializers.ValidationError('所有测试用例必须属于同一项目')
+        attrs['test_cases'] = case_ids
 
         return attrs
 
@@ -847,8 +1187,18 @@ class AICaseSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'created_by')
 
+    def validate_project_id(self, value):
+        if value is None:
+            return value
+        project = _load_object(UiProject, value, 'project_id')
+        _ensure_project_access(self, project, 'project_id')
+        return value
+
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        project_id = validated_data.pop('project_id', None)
+        if project_id is not None:
+            validated_data['project'] = _load_object(UiProject, project_id, 'project_id')
+        validated_data['created_by'] = _serializer_user(self)
         return super().create(validated_data)
 
 
@@ -856,7 +1206,7 @@ class AIExecutionRecordSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     ai_case = AICaseSerializer(read_only=True)
     executed_by = UserSerializer(read_only=True)
-    project_id = serializers.IntegerField(write_only=True)
+    project_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     ai_case_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
     ai_case_name = serializers.CharField(source='ai_case.name', read_only=True)
@@ -873,6 +1223,27 @@ class AIExecutionRecordSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ('start_time', 'end_time', 'duration', 'executed_by', 'gif_path', 'screenshots_sequence')
 
+    def validate(self, attrs):
+        project_id = attrs.pop('project_id', None)
+        project = _load_object(UiProject, project_id, 'project_id') if project_id is not None else getattr(self.instance, 'project', None)
+        if project is not None:
+            _ensure_project_access(self, project)
+        ai_case_id = attrs.pop('ai_case_id', None) if 'ai_case_id' in attrs else None
+        ai_case = _load_object(AICase, ai_case_id, 'ai_case_id') if ai_case_id is not None else getattr(self.instance, 'ai_case', None)
+        if ai_case is not None and ai_case.project_id is None:
+            user = _serializer_user(self)
+            if not is_ui_admin(user) and ai_case.created_by_id != getattr(user, 'id', None):
+                raise serializers.ValidationError({'ai_case_id': '无权使用其他用户的项目外 AI 用例'})
+        if ai_case is not None:
+            attrs['ai_case'] = ai_case
+        attrs['project'] = project
+        return attrs
+
+    def create(self, validated_data):
+        user = _serializer_user(self)
+        if user is not None and getattr(user, 'is_authenticated', False):
+            validated_data['executed_by'] = user
+        return super().create(validated_data)
 
 
 class UiNotificationLogSerializer(serializers.ModelSerializer):
@@ -968,6 +1339,9 @@ class UiTaskNotificationSettingSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate_task(self, value):
+        return _ensure_project_access(self, value.project, 'task')
 
     def get_active_types(self, obj):
         """获取激活的通知类型"""

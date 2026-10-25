@@ -10,6 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 import logging
 
@@ -60,6 +61,16 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['status', 'connection_type']
     search_fields = ['device_id', 'name']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if is_app_admin(self.request.user):
+            return queryset
+        # Available devices form a shared pool; a device locked by another
+        # user is hidden from list/retrieve and all detail actions.
+        return queryset.filter(
+            Q(locked_by__isnull=True) | Q(locked_by=self.request.user)
+        )
 
     def _require_admin(self, request):
         if not is_app_admin(request.user):
@@ -151,14 +162,19 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def lock(self, request, pk=None):
         """锁定设备"""
-        with transaction.atomic():
-            device = AppDevice.objects.select_for_update().get(pk=pk)
-            if device.status == 'locked':
-                return Response({
-                    'success': False,
-                    'message': '设备已被锁定'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            device.lock(request.user)
+        try:
+            with transaction.atomic():
+                # Scope before locking so a regular user cannot lock another
+                # user's lease through a direct primary-key request.
+                device = self.get_queryset().select_for_update().get(pk=pk)
+                if device.status == 'locked':
+                    return Response({
+                        'success': False,
+                        'message': '设备已被锁定'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                device.lock(request.user)
+        except AppDevice.DoesNotExist:
+            return Response({'detail': '设备不存在或无权操作'}, status=status.HTTP_404_NOT_FOUND)
 
         return Response({
             'success': True,
@@ -312,6 +328,11 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def heartbeat(self, request, pk=None):
+        # Resolve through the scoped queryset before touching the lease store.
+        try:
+            self.get_queryset().get(pk=pk)
+        except AppDevice.DoesNotExist:
+            return Response({'detail': '设备不存在或无权操作'}, status=status.HTTP_404_NOT_FOUND)
         try:
             device = heartbeat_device(
                 pk,

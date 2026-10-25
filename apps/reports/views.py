@@ -3,12 +3,12 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
-from django.db.models import Count, Q, Sum, F, Avg
+from django.db.models import Count, Sum, F, Avg
 from django.db.models.functions import TruncDate, Length
 from django.utils import timezone
 from datetime import timedelta, datetime
 from .models import TestReport, ReportTemplate
-from .serializers import TestReportSerializer
+from .serializers import TestReportSerializer, accessible_report_projects
 from apps.executions.models import TestPlan, TestRun, TestRunCase
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
@@ -16,9 +16,7 @@ from apps.requirement_analysis.models import RequirementAnalysis, GeneratedTestC
 
 
 def get_accessible_projects(user):
-    return Project.objects.filter(
-        Q(owner=user) | Q(members=user)
-    ).distinct()
+    return accessible_report_projects(user)
 
 @extend_schema_view(
     list=extend_schema(operation_id='test_reports_list', responses=OpenApiTypes.OBJECT),

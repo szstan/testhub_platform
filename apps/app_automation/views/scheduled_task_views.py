@@ -15,7 +15,7 @@ from ..models import (
     AppScheduledTask, AppNotificationLog,
     AppTestSuite, AppTestCase, AppDevice,
 )
-from ..access import scope_project
+from ..access import scope_project, scheduled_task_relation_errors
 from ..serializers import (
     AppScheduledTaskSerializer,
     AppNotificationLogSerializer,
@@ -72,17 +72,36 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
         """立即运行任务"""
         task = self.get_object()
 
+        relation_errors = scheduled_task_relation_errors(
+            user=request.user,
+            project=task.project,
+            device=task.device,
+            app_package=task.app_package,
+            test_suite=task.test_suite,
+            test_case=task.test_case,
+            task_type=task.task_type,
+        )
+        if relation_errors:
+            return Response(
+                {'success': False, 'message': '任务关联资源不一致', 'errors': relation_errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             if not task.device:
-                return Response({'success': False, 'message': '该任务未配置执行设备'},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {'success': False, 'message': '该任务未配置执行设备'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             device = task.device
             if device.status == 'locked' and device.locked_by != request.user:
-                return Response({'success': False, 'message': '设备已被其他用户锁定'},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {'success': False, 'message': '设备已被其他用户锁定'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-            # 更新统计
+            # Update counters only after every foreign-key relation passed validation.
             task.last_run_time = timezone.now()
             task.total_runs += 1
             task.next_run_time = task.calculate_next_run()
@@ -91,29 +110,26 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
             package_name = task.app_package.package_name if task.app_package else ''
 
             if task.task_type == 'TEST_SUITE':
-                if not task.test_suite:
-                    return Response({'success': False, 'message': '该任务未配置测试套件'},
-                                    status=status.HTTP_400_BAD_REQUEST)
-
                 suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
                 if not suite_cases.exists():
-                    return Response({'success': False, 'message': '测试套件没有用例'},
-                                    status=status.HTTP_400_BAD_REQUEST)
+                    return Response(
+                        {'success': False, 'message': '测试套件没有用例'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
-                # 创建执行记录并调用 Celery
                 from ..models import AppTestExecution
                 from ..tasks import execute_app_suite_task
 
-                executions = []
-                for sc in suite_cases:
-                    execution = AppTestExecution.objects.create(
+                executions = [
+                    AppTestExecution.objects.create(
                         test_case=sc.test_case,
                         test_suite=task.test_suite,
                         device=device,
                         user=request.user,
-                        status='pending'
+                        status='pending',
                     )
-                    executions.append(execution)
+                    for sc in suite_cases
+                ]
 
                 task.test_suite.execution_status = 'running'
                 task.test_suite.save(update_fields=['execution_status'])
@@ -124,18 +140,13 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                     package_name=package_name,
                     scheduled_task_id=task.id,
                 )
-
                 return Response({
                     'success': True,
                     'message': f'测试套件开始执行，共 {len(executions)} 个用例',
-                    'data': {'task_id': celery_task.id, 'test_case_count': len(executions)}
+                    'data': {'task_id': celery_task.id, 'test_case_count': len(executions)},
                 })
 
-            elif task.task_type == 'TEST_CASE':
-                if not task.test_case:
-                    return Response({'success': False, 'message': '该任务未配置测试用例'},
-                                    status=status.HTTP_400_BAD_REQUEST)
-
+            if task.task_type == 'TEST_CASE':
                 from ..models import AppTestExecution
                 from ..tasks import execute_app_test_task
 
@@ -143,7 +154,7 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                     test_case=task.test_case,
                     device=device,
                     user=request.user,
-                    status='pending'
+                    status='pending',
                 )
                 celery_task = execute_app_test_task.delay(
                     execution.id,
@@ -152,20 +163,22 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                 )
                 execution.task_id = celery_task.id
                 execution.save(update_fields=['task_id'])
-
                 return Response({
                     'success': True,
                     'message': '测试用例开始执行',
-                    'data': {'task_id': celery_task.id}
+                    'data': {'task_id': celery_task.id},
                 })
 
-            return Response({'success': False, 'message': '不支持的任务类型'},
-                            status=status.HTTP_400_BAD_REQUEST)
-
+            return Response(
+                {'success': False, 'message': '不支持的任务类型'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except Exception as e:
             logger.error(f'执行定时任务失败: {str(e)}', exc_info=True)
-            return Response({'success': False, 'message': f'执行失败: {str(e)}'},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {'success': False, 'message': f'执行失败: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class AppNotificationLogViewSet(viewsets.ReadOnlyModelViewSet):

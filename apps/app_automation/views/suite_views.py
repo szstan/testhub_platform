@@ -69,7 +69,7 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
 
         if not scope_test_cases(
-                AppTestCase.objects.filter(pk=test_case_id), request.user).exists():
+                AppTestCase.objects.filter(pk=test_case_id, project_id=suite.project_id), request.user).exists():
             return Response({'success': False, 'message': '无权使用该测试用例'},
                             status=status.HTTP_403_FORBIDDEN)
 
@@ -102,7 +102,7 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
 
         allowed_ids = set(scope_test_cases(
-            AppTestCase.objects.filter(id__in=test_case_ids), request.user
+            AppTestCase.objects.filter(id__in=test_case_ids, project_id=suite.project_id), request.user
         ).values_list('id', flat=True))
         if any(tc_id not in allowed_ids for tc_id in test_case_ids):
             return Response({'success': False, 'message': '包含无权使用的测试用例'},
@@ -182,9 +182,19 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
             return Response({'success': False, 'message': '执行设备必须先取得有效 lease'}, status=status.HTTP_403_FORBIDDEN)
 
         suite_cases = suite.suite_cases.select_related('test_case').all()
+        if suite_cases.filter(test_case__project_id__isnull=False).exclude(
+            test_case__project_id=suite.project_id
+        ).exists():
+            return Response(
+                {'success': False, 'message': '测试套件包含其他项目的测试用例'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         if not suite_cases.exists():
-            return Response({'success': False, 'message': '该套件未包含任何测试用例'},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'success': False, 'message': '该套件未包含任何测试用例'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             with transaction.atomic():

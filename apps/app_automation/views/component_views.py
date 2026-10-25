@@ -18,6 +18,7 @@ from ..serializers import (
     AppCustomComponentSerializer,
     AppComponentPackageSerializer
 )
+from ..access import is_app_admin
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,11 @@ class AppCustomComponentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = AppPagination
 
+    def _require_admin(self, request):
+        if not is_app_admin(request.user):
+            return Response({'detail': '仅管理员可以修改全局自定义组件'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
     def get_queryset(self):
         queryset = AppCustomComponent.objects.all()
         enabled = self.request.query_params.get('enabled')
@@ -107,6 +113,9 @@ class AppCustomComponentViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """创建自定义组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -118,6 +127,9 @@ class AppCustomComponentViewSet(viewsets.ModelViewSet):
 
     def update(self, request, *args, **kwargs):
         """更新自定义组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=kwargs.pop('partial', False))
         serializer.is_valid(raise_exception=True)
@@ -129,6 +141,9 @@ class AppCustomComponentViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         """删除自定义组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         instance = self.get_object()
         self.perform_destroy(instance)
         return Response({
