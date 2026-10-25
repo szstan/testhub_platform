@@ -16,7 +16,11 @@ def parse_csv(value):
 
 
 DEBUG = config('DEBUG', default=TESTING, cast=bool)
-UI_SELENIUM_COMPATIBILITY = config('UI_SELENIUM_COMPATIBILITY', default=True, cast=bool)
+UI_SELENIUM_COMPATIBILITY = config(
+    'UI_SELENIUM_COMPATIBILITY',
+    default=APP_ENV in {'development', 'testing'},
+    cast=bool,
+)
 _secret_key = config('SECRET_KEY', default='')
 if _secret_key:
     SECRET_KEY = _secret_key
