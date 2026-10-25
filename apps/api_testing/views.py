@@ -1087,6 +1087,24 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
             )
         ).distinct()
     
+    @action(detail=True, methods=['get'], url_path='report')
+    def report(self, request, pk=None):
+        """Stream a generated report through the authenticated execution scope."""
+        execution = self.get_object()
+        report_path = os.path.join(
+            settings.MEDIA_ROOT,
+            'api-testing',
+            'allure-reports',
+            f'execution_{execution.pk}',
+            'summary.html',
+        )
+        if not os.path.isfile(report_path):
+            raise Http404('报告尚未生成')
+        return FileResponse(
+            open(report_path, 'rb'),
+            content_type='text/html; charset=utf-8',
+        )
+
     @action(detail=True, methods=['post'], url_path='generate-allure-report')
     def generate_allure_report(self, request, pk=None):
         """生成Allure报告数据"""
@@ -1518,7 +1536,7 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
             
             return Response({
                 'message': 'Allure报告生成成功',
-                'report_url': f'/media/api-testing/allure-reports/execution_{execution.id}/summary.html'
+                'report_url': f'/api-testing/test-executions/{execution.id}/report/'
             })
         except Exception as e:
             import traceback

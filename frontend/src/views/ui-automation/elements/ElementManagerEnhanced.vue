@@ -271,7 +271,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -298,6 +298,8 @@ import {
 
 // 国际化
 const { t } = useI18n()
+let hideMenuTimeout = null
+let activeHideMenu = null
 
 // 响应式数据
 const projects = ref([])
@@ -497,6 +499,13 @@ onMounted(async () => {
   exposeToWindow()
 
   console.log('=== 组件挂载完成 ===')
+})
+
+onBeforeUnmount(() => {
+  if (hideMenuTimeout) clearTimeout(hideMenuTimeout)
+  if (activeHideMenu) document.removeEventListener('click', activeHideMenu)
+  hideMenuTimeout = null
+  activeHideMenu = null
 })
 
 // 加载项目列表
@@ -872,11 +881,16 @@ const onNodeRightClick = (event, data) => {
     console.log('Hide context menu')
     showContextMenu.value = false
     document.removeEventListener('click', hideMenu)
+    if (activeHideMenu === hideMenu) activeHideMenu = null
   }
+  activeHideMenu = hideMenu
 
   // 延迟添加监听器，避免立即触发
-  setTimeout(() => {
-    document.addEventListener('click', hideMenu)
+  hideMenuTimeout = setTimeout(() => {
+    hideMenuTimeout = null
+    if (activeHideMenu === hideMenu) {
+      document.addEventListener('click', hideMenu)
+    }
   }, 100)
 }
 

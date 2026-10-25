@@ -861,6 +861,7 @@ export default {
       emailConfigFailed: 'Failed to save email config',
       emailTestFailed: 'Email connection test failed',
       reportGenerateFailed: 'Failed to generate report',
+      popupBlocked: 'The browser blocked the new window. Allow popups and retry',
       readFileFailed: 'Failed to read file',
       operationFailed: 'Operation failed',
       websocketError: 'WebSocket connection error',

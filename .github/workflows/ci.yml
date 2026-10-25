@@ -283,6 +283,10 @@ jobs:
           assert any(name.endswith('/frontend/dist/index.html') for name in members)
           validator = next(name for name in members if name.endswith('/scripts/validate_staging_release.sh'))
           assert members[validator].mode & 0o111
+          allure = next(name for name in members if name.endswith('/allure/bin/allure'))
+          assert members[allure].mode & 0o111
           assert not any('/node_modules/' in name for name in members)
+          assert not any(name.rsplit('/', 1)[-1].startswith('.env') for name in members)
+          assert not any(name.endswith(('.pem', '.key')) for name in members)
           PY
           bash -n scripts/validate_staging_release.sh frontend/deploy.sh

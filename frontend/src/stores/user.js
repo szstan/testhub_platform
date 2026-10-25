@@ -11,6 +11,7 @@ export const useUserStore = defineStore('user', () => {
   const tokenExpiresAt = ref(0)
 
   let refreshTimer = null
+  let refreshPromise = null
 
   const isAuthenticated = computed(() => !!accessToken.value && !!user.value)
 
@@ -128,19 +129,29 @@ export const useUserStore = defineStore('user', () => {
   }
 
   const refreshAccessToken = async () => {
+    if (refreshPromise) return refreshPromise
+
+    refreshPromise = (async () => {
+      try {
+        // The browser automatically sends the HttpOnly refresh cookie.
+        const response = await api.post('/auth/token/refresh/')
+        accessToken.value = response.data.access
+        tokenExpiresAt.value = Date.now() + 30 * 60 * 1000
+        return response.data.access
+      } catch (error) {
+        console.error('Token refresh failed:', error)
+        accessToken.value = ''
+        refreshToken.value = ''
+        tokenExpiresAt.value = 0
+        if (user.value) user.value = null
+        throw error
+      }
+    })()
+
     try {
-      // The browser automatically sends the HttpOnly refresh cookie.
-      const response = await api.post('/auth/token/refresh/')
-      accessToken.value = response.data.access
-      tokenExpiresAt.value = Date.now() + 30 * 60 * 1000
-      return response.data.access
-    } catch (error) {
-      console.error('Token refresh failed:', error)
-      accessToken.value = ''
-      refreshToken.value = ''
-      tokenExpiresAt.value = 0
-      if (user.value) user.value = null
-      throw error
+      return await refreshPromise
+    } finally {
+      refreshPromise = null
     }
   }
 

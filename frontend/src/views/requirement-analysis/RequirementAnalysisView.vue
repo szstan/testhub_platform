@@ -461,10 +461,15 @@ export default {
   beforeUnmount() {
     if (this.pollInterval) {
       clearInterval(this.pollInterval)
+      this.pollInterval = null
     }
-    // 停止token自动刷新定时器
-    const userStore = useUserStore()
-    userStore.stopAutoRefresh()
+    if (this.eventSource) {
+      this.eventSource.onopen = null
+      this.eventSource.onmessage = null
+      this.eventSource.onerror = null
+      this.eventSource.close()
+      this.eventSource = null
+    }
   },
 
   methods: {

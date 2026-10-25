@@ -570,7 +570,7 @@ export function deletePageObjectElement(id) {
 // 脚本步骤相关API
 export function getScriptSteps(params) {
   return request({
-    url: '/ui-automation/script-steps/',
+    url: '/ui-automation/steps/',
     method: 'get',
     params
   })
@@ -578,7 +578,7 @@ export function getScriptSteps(params) {
 
 export function createScriptStep(data) {
   return request({
-    url: '/ui-automation/script-steps/',
+    url: '/ui-automation/steps/',
     method: 'post',
     data
   })
@@ -586,7 +586,7 @@ export function createScriptStep(data) {
 
 export function batchCreateScriptSteps(data) {
   return request({
-    url: '/ui-automation/script-steps/batch_create/',
+    url: '/ui-automation/steps/batch_create/',
     method: 'post',
     data
   })
@@ -594,7 +594,7 @@ export function batchCreateScriptSteps(data) {
 
 export function updateScriptStep(id, data) {
   return request({
-    url: `/ui-automation/script-steps/${id}/`,
+    url: `/ui-automation/steps/${id}/`,
     method: 'patch',
     data
   })
@@ -602,7 +602,7 @@ export function updateScriptStep(id, data) {
 
 export function deleteScriptStep(id) {
   return request({
-    url: `/ui-automation/script-steps/${id}/`,
+    url: `/ui-automation/steps/${id}/`,
     method: 'delete'
   })
 }

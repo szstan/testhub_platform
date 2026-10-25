@@ -872,6 +872,7 @@ export default {
       emailConfigFailed: '保存邮箱配置失败',
       emailTestFailed: '邮箱连接测试失败',
       reportGenerateFailed: '生成报告失败',
+      popupBlocked: '浏览器拦截了新窗口，请允许弹窗后重试',
       readFileFailed: '读取文件失败',
       operationFailed: '操作失败',
       websocketError: 'WebSocket连接错误',

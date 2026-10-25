@@ -123,7 +123,9 @@ export default {
     levelSecondary: '备',
     fallbackTip: '一级通道推送失败，已自动容灾切换到此二级通道',
     empty: '暂无告警',
+    loadFailed: '加载告警失败，请稍后重试',
     opSuccess: '操作成功',
+    operationFailed: '操作失败，请稍后重试',
     ackConfirm: '确认认领该告警？'
   },
   channels: {

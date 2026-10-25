@@ -840,7 +840,7 @@
 
       <template #footer>
         <el-button @click="closeEditCollectionDialog">{{ $t('apiTesting.common.cancel') }}</el-button>
-        <el-button type="primary" @click="editCollection">{{ $t('apiTesting.common.save') }}</el-button>
+        <el-button type="primary" @click="updateCollection">{{ $t('apiTesting.common.save') }}</el-button>
       </template>
     </el-dialog>
 
@@ -1072,24 +1072,18 @@ const onSearchDebounced = debounce((value) => {
 }, 300)
 
 const onSearch = async (value) => {
-  if (!value || value.trim() === '') {
+  const keyword = String(value || '').trim().toLowerCase()
+  if (!keyword) {
     filteredCollections.value = []
     return
   }
 
-  try {
-    const response = await api.get('/api-testing/collections/search', {
-      params: {
-        project: selectedProject.value,
-        keyword: value
-      }
-    })
-    // 后端可能返回分页格式 { results: [...] } 或直接返回数组
-    filteredCollections.value = response.data.results || response.data || []
-  } catch (error) {
-    ElMessage.error('搜索失败')
-    console.error('搜索失败:', error)
-  }
+  filteredCollections.value = flatCollections.value
+    .filter(collection =>
+      String(collection.name || '').toLowerCase().includes(keyword) ||
+      String(collection.description || '').toLowerCase().includes(keyword)
+    )
+    .slice(0, 50)
 }
 
 const selectSearchResult = (item) => {
@@ -2726,6 +2720,15 @@ onBeforeUnmount(() => {
   // 移除全局点击事件监听器
   document.removeEventListener('click', handleGlobalClick)
   document.removeEventListener('contextmenu', handleGlobalClick)
+  if (websocketConnection.value) {
+    websocketConnection.value.onopen = null
+    websocketConnection.value.onmessage = null
+    websocketConnection.value.onclose = null
+    websocketConnection.value.onerror = null
+    websocketConnection.value.close()
+    websocketConnection.value = null
+  }
+  websocketConnectionStatus.value = 'disconnected'
 })
 
 // 处理全局点击事件，隐藏右键菜单

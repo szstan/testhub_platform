@@ -11,6 +11,7 @@ FRONTEND_URL="http://127.0.0.1:8003"
 HEALTH_URL="${FRONTEND_URL}/health"
 HEALTH_ATTEMPTS="${TESTHUB_HEALTH_ATTEMPTS:-30}"
 HEALTH_INTERVAL="${TESTHUB_HEALTH_INTERVAL:-1}"
+PREVIOUS_DIST_DIR=""
 
 # 颜色输出
 RED='\033[0;31m'
@@ -59,16 +60,21 @@ compose() {
     docker compose --project-directory "${SCRIPT_DIR}" -f "${COMPOSE_FILE}" "$@"
 }
 
-check_dist() {
-    [[ -f "${SCRIPT_DIR}/dist/index.html" ]] || die "找不到 frontend/dist/index.html，请先完成生产构建"
+check_dist_dir() {
+    local dist_dir="$1"
+    [[ -f "${dist_dir}/index.html" ]] || die "找不到 ${dist_dir}/index.html"
     if command -v restorecon >/dev/null 2>&1; then
-        restorecon -R "${SCRIPT_DIR}/dist" || die "无法恢复 frontend/dist 的 SELinux 上下文"
+        restorecon -R "${dist_dir}" || die "无法恢复 ${dist_dir} 的 SELinux 上下文"
     fi
-    [[ -r "${SCRIPT_DIR}/dist/index.html" ]] || die "frontend/dist/index.html 不可读"
+    [[ -r "${dist_dir}/index.html" ]] || die "${dist_dir}/index.html 不可读"
     if id nginx >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-        runuser -u nginx -- test -r "${SCRIPT_DIR}/dist/index.html" \
-            || die "nginx 用户无法读取 frontend/dist/index.html"
+        runuser -u nginx -- test -r "${dist_dir}/index.html" \
+            || die "nginx 用户无法读取 ${dist_dir}/index.html"
     fi
+}
+
+check_dist() {
+    check_dist_dir "${SCRIPT_DIR}/dist"
 }
 
 # Compose 仅挂载 dist，因此生产构建必须在宿主机完成。
@@ -76,14 +82,29 @@ build_frontend() {
     check_node
 
     print_step "安装前端依赖并构建生产静态资源..."
+    local staging_dir
+    staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/testhub-frontend-dist.XXXXXX")"
     (
         cd "${SCRIPT_DIR}"
         npm ci --no-audit --no-fund
-        npm run build
-    )
+        npm run build -- --outDir "${staging_dir}"
+    ) || {
+        rm -rf "${staging_dir}"
+        die "前端构建失败，保留当前 dist"
+    }
 
-    check_dist
-    print_info "✓ 前端静态资源构建完成"
+    check_dist_dir "${staging_dir}"
+    PREVIOUS_DIST_DIR="${SCRIPT_DIR}/dist.previous.$(date +%Y%m%d%H%M%S)"
+    if [[ -e "${SCRIPT_DIR}/dist" ]]; then
+        mv "${SCRIPT_DIR}/dist" "${PREVIOUS_DIST_DIR}" \
+            || { rm -rf "${staging_dir}"; die "无法保存上一版 dist"; }
+    fi
+    if ! mv "${staging_dir}" "${SCRIPT_DIR}/dist"; then
+        [[ -e "${PREVIOUS_DIST_DIR}" ]] && mv "${PREVIOUS_DIST_DIR}" "${SCRIPT_DIR}/dist" || true
+        rm -rf "${staging_dir}"
+        die "无法切换新的 dist"
+    fi
+    print_info "✓ 前端静态资源已原子切换，上一版保留在 ${PREVIOUS_DIST_DIR}"
 }
 
 health_request() {
@@ -125,8 +146,15 @@ start_production() {
     build_frontend
 
     print_step "启动前端生产环境..."
-    compose up -d
-    wait_for_health
+    if ! compose up -d || ! wait_for_health; then
+        if [[ -n "${PREVIOUS_DIST_DIR}" && -d "${PREVIOUS_DIST_DIR}" ]]; then
+            print_warn "新版本健康检查失败，恢复上一版静态资源"
+            rm -rf "${SCRIPT_DIR}/dist"
+            mv "${PREVIOUS_DIST_DIR}" "${SCRIPT_DIR}/dist"
+            compose up -d || true
+        fi
+        die "前端生产环境启动或健康检查失败"
+    fi
 
     print_info ""
     print_info "========================================="

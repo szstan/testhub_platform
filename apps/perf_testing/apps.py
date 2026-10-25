@@ -1,4 +1,8 @@
 from django.apps import AppConfig
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class PerfTestingConfig(AppConfig):
@@ -28,5 +32,5 @@ class PerfTestingConfig(AppConfig):
         try:
             from apps.perf_testing.services.cleanup import reap_stale_executions
             reap_stale_executions(startup=True)
-        except Exception:  # noqa: BLE001 - 启动自愈失败不能阻断服务
-            pass
+        except Exception:  # noqa: BLE001 - startup recovery must not block service boot
+            logger.exception('Failed to reap stale performance executions during startup')

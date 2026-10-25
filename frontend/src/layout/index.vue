@@ -493,6 +493,7 @@ const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
 const appStore = useAppStore()
+const { t } = useI18n()
 const QUALITY_INTELLIGENCE_ENABLED = String(import.meta.env.VITE_QUALITY_INTELLIGENCE_ENABLED || '').toLowerCase() === 'true'
 const qualityIntelligenceEnabled = QUALITY_INTELLIGENCE_ENABLED
 

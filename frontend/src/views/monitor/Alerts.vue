@@ -159,7 +159,10 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Switch } from '@element-plus/icons-vue'
+import { useI18n } from 'vue-i18n'
 import { getAlerts, acknowledgeAlert, resolveAlert } from '@/api/monitor'
+
+const { t } = useI18n()
 
 const loading = ref(false)
 const list = ref([])
@@ -168,6 +171,7 @@ const page = ref(1)
 const pageSize = ref(20)
 const filters = ref({ status: '' })
 const dateRange = ref(null)
+const errorMessage = ref('')
 
 const alertStatusType = (s) => {
   if (s === 'FIRING') return 'danger'
@@ -190,11 +194,12 @@ const fetchAlerts = async () => {
       params.end_time = dateRange.value[1]
     }
     const res = await getAlerts(params)
+    errorMessage.value = ''
     list.value = res.data.results || res.data || []
     total.value = res.data.count ?? list.value.length
-  } catch {
-    list.value = []
-    total.value = 0
+  } catch (error) {
+    errorMessage.value = error.response?.data?.detail || error.response?.data?.error || t('monitor.alerts.loadFailed')
+    ElMessage.error(errorMessage.value)
   } finally {
     loading.value = false
   }
@@ -207,9 +212,9 @@ const onFilterChange = () => {
 
 const onAck = async (row) => {
   try {
-    await ElMessageBox.confirm(row.message, $t('monitor.alerts.ackConfirm'), {
-      confirmButtonText: $t('monitor.alerts.ack'),
-      cancelButtonText: $t('monitor.dashboard.refresh') && '取消',
+    await ElMessageBox.confirm(row.message, t('monitor.alerts.ackConfirm'), {
+      confirmButtonText: t('monitor.alerts.ack'),
+      cancelButtonText: t('common.cancel'),
       type: 'warning',
     })
   } catch {
@@ -217,20 +222,20 @@ const onAck = async (row) => {
   }
   try {
     await acknowledgeAlert(row.id)
-    ElMessage.success($t('monitor.alerts.opSuccess'))
+    ElMessage.success(t('monitor.alerts.opSuccess'))
     fetchAlerts()
-  } catch {
-    /* 错误提示由拦截器统一处理 */
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || error.response?.data?.error || t('monitor.alerts.operationFailed'))
   }
 }
 
 const onResolve = async (row) => {
   try {
     await resolveAlert(row.id)
-    ElMessage.success($t('monitor.alerts.opSuccess'))
+    ElMessage.success(t('monitor.alerts.opSuccess'))
     fetchAlerts()
-  } catch {
-    /* 错误提示由拦截器统一处理 */
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || error.response?.data?.error || t('monitor.alerts.operationFailed'))
   }
 }
 

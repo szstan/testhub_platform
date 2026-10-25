@@ -6,6 +6,8 @@
 
 > 当前共享主机的 TestHub 发布边界：Daphne 使用 `8002`，前端 Nginx 容器使用 `8003`；既有 `80/8001` 服务不属于 TestHub 发布流程，不得停止或重配置。前端构建、Compose、健康检查和代理配置以 [frontend/README.Docker.md](../../frontend/README.Docker.md) 为准。当前 systemd 服务保持 `active` 但 `disabled`，不要在发布脚本中自动 `enable`。
 
+> 该文件中的 HTTP/80 Nginx 示例仅用于受控内网或已批准的外部 TLS 终止层之后。正式公网生产必须先完成域名/DNS、证书、443/WSS、代理和回滚窗口审批；没有这些材料不得直接暴露 HTTP。
+
 ---
 
 ## 1) 创建用户与目录
@@ -29,7 +31,7 @@ sudo chown -R testhub:testhub /opt/testhub_platform
 ├── manage.py
 ├── requirements.txt
 ├── media/
-├── static/
+├── static_files/
 └── frontend/
 ```
 
@@ -132,7 +134,7 @@ SECRET_KEY=replace-with-a-random-secret
 ALLOWED_HOSTS=172.13.6.230
 
 DB_NAME=testhub
-DB_USER=root
+DB_USER=your_least_privilege_user
 DB_PASSWORD=your_db_password
 DB_HOST=127.0.0.1
 DB_PORT=3306
@@ -172,7 +174,7 @@ cd /opt/testhub_platform
 bash scripts/validate_staging_release.sh
 ```
 
-该检查会验证 `frontend/dist/index.html`、Django system check、迁移计划、SELinux 上下文、Nginx 用户可读性、后端 health/readiness、前端 health/index 和 API docs。SELinux enforcing 时如果没有 `restorecon`，检查会失败。发布同步应排除 `.env`、`media/`、`static_files/`、虚拟环境、依赖 wheelhouse、日志、备份和 `frontend/node_modules/`，并保留独立 rollback 目录。
+该检查会验证 `frontend/dist/index.html`、Django system check、迁移计划、SELinux 上下文、Nginx 用户可读性、后端 health/readiness、前端 health/index 和 API docs。SELinux enforcing 时如果没有 `restorecon`，检查会失败。发布同步应排除 `.env`、`media/`、`static_files/`、虚拟环境、依赖 wheelhouse、日志、备份和 `frontend/node_modules/`，并保留独立 rollback 目录。采用候选目录切换时，必须从上一版本显式继承 `.env`、`logs/`、`media/`、`static_files/`、`staging-nginx`、`venv-prod` 和 `venv-automation`，并在 `testhub` 用户身份下运行启动前检查，避免 root 创建不可写日志。
 
 ---
 
@@ -192,7 +194,7 @@ WorkingDirectory=/opt/testhub_platform
 Environment="DJANGO_SETTINGS_MODULE=backend.settings"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=/opt/testhub_platform/.env
-ExecStart=/opt/testhub_platform/venv-prod/bin/daphne -b 0.0.0.0 -p 8000 backend.asgi:application
+ExecStart=/opt/testhub_platform/venv-prod/bin/daphne -b 0.0.0.0 -p 8002 backend.asgi:application
 Restart=always
 
 [Install]
@@ -220,14 +222,35 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### 6.3 启动服务
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable testhub-asgi testhub-celery
-sudo systemctl start testhub-asgi testhub-celery
+### 6.3 统一调度器服务
+`/etc/systemd/system/testhub-scheduler.service`
+
+```ini
+[Unit]
+Description=TestHub scheduled task dispatcher
+After=network.target
+
+[Service]
+User=testhub
+WorkingDirectory=/opt/testhub_platform
+Environment="DJANGO_SETTINGS_MODULE=backend.settings"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/opt/testhub_platform/.env
+ExecStart=/opt/testhub_platform/venv-prod/bin/python manage.py run_all_scheduled_tasks --interval 60
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-### 6.4 状态与日志
+### 6.4 启动服务
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart testhub-asgi testhub-celery testhub-scheduler
+```
+
+### 6.5 状态与日志
 ```bash
 sudo systemctl status testhub-asgi
 sudo systemctl status testhub-celery
@@ -249,7 +272,7 @@ server {
 
     # 静态与媒体
     location /static/ {
-        alias /opt/testhub_platform/static/;
+        alias /opt/testhub_platform/static_files/;
     }
 
     # Never expose MEDIA_ROOT directly. Reports, recordings, and downloads
@@ -260,7 +283,7 @@ server {
 
     # API
     location /api/ {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8002;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -268,7 +291,7 @@ server {
 
     # WebSocket
     location /ws/ {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8002;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -373,15 +396,18 @@ test -x "$APP_DIR/allure/bin/allure"
 echo "=== 4) 写入 .env ==="
 : "${SECRET_KEY:?请通过安全环境注入 SECRET_KEY}"
 : "${DB_PASSWORD:?请通过安全环境注入 DB_PASSWORD}"
+: "${DB_USER:?请设置非 root 的 DB_USER}"
 : "${REDIS_URL:?请通过安全环境注入 REDIS_URL}"
-cat > "$APP_DIR/.env" <<EOF
+umask 077
+env_file_tmp="$(mktemp "$APP_DIR/.env.XXXXXX")"
+cat > "$env_file_tmp" <<EOF
 APP_ENV=production
 DEBUG=False
 SECRET_KEY=$SECRET_KEY
 ALLOWED_HOSTS=${ALLOWED_HOSTS:?请设置 ALLOWED_HOSTS}
 
 DB_NAME=${DB_NAME:-testhub}
-DB_USER=${DB_USER:-root}
+DB_USER=$DB_USER
 DB_PASSWORD=$DB_PASSWORD
 DB_HOST=${DB_HOST:-127.0.0.1}
 DB_PORT=${DB_PORT:-3306}
@@ -389,9 +415,15 @@ DB_PORT=${DB_PORT:-3306}
 APP_ADB_PATH=$APP_ADB_PATH
 REDIS_URL=$REDIS_URL
 EOF
+install -o testhub -g testhub -m 600 "$env_file_tmp" "$APP_DIR/.env"
+rm -f "$env_file_tmp"
 
-echo "=== 5) 收集静态文件 ==="
-python "$APP_DIR/manage.py" collectstatic --noinput
+echo "=== 5) 迁移与静态文件 ==="
+"$VENV_DIR/bin/python" "$APP_DIR/manage.py" check
+migration_plan="$("$VENV_DIR/bin/python" "$APP_DIR/manage.py" migrate --plan 2>&1)"
+printf '%s\n' "$migration_plan"
+grep -q 'No planned migration operations' <<<"$migration_plan"
+"$VENV_DIR/bin/python" "$APP_DIR/manage.py" collectstatic --noinput
 
 echo "=== 6) systemd 服务 ==="
 cat > /etc/systemd/system/testhub-asgi.service <<EOF
@@ -405,7 +437,7 @@ WorkingDirectory=$APP_DIR
 Environment="DJANGO_SETTINGS_MODULE=backend.settings"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=$APP_DIR/.env
-ExecStart=$VENV_DIR/bin/daphne -b 0.0.0.0 -p 8000 backend.asgi:application
+ExecStart=$VENV_DIR/bin/daphne -b 0.0.0.0 -p 8002 backend.asgi:application
 Restart=always
 
 [Install]
@@ -430,9 +462,27 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/testhub-scheduler.service <<EOF
+[Unit]
+Description=TestHub scheduled task dispatcher
+After=network.target
+
+[Service]
+User=testhub
+WorkingDirectory=$APP_DIR
+Environment="DJANGO_SETTINGS_MODULE=backend.settings"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$VENV_DIR/bin/python "$APP_DIR/manage.py" run_all_scheduled_tasks --interval 60
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable testhub-asgi testhub-celery
-systemctl restart testhub-asgi testhub-celery
+systemctl restart testhub-asgi testhub-celery testhub-scheduler
 
 echo "=== 7) Nginx 配置 ==="
 cat > "$NGINX_CONF" <<EOF
@@ -441,7 +491,7 @@ server {
     server_name 172.13.6.230;
 
     location /static/ {
-        alias /opt/testhub_platform/static/;
+        alias /opt/testhub_platform/static_files/;
     }
 
     # Do not publish MEDIA_ROOT through Nginx; private artifacts are served
@@ -451,14 +501,14 @@ server {
     }
 
     location /api/ {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8002;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 
     location /ws/ {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8002;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";

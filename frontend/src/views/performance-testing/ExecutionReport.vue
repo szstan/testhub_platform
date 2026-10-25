@@ -655,15 +655,27 @@ async function loadAiAnalysis() {
 
   resetIdleTimer()
   try {
-    const resp = await fetch(`/api/perf-testing/executions/${executionId}/ai-analysis/`, {
+    const analysisUrl = `/api/perf-testing/executions/${executionId}/ai-analysis/`
+    const fetchAnalysis = (token) => fetch(analysisUrl, {
       method: 'GET',
       signal: ctrl.signal,
       credentials: 'include',
       headers: {
         Accept: 'text/event-stream, application/json',
-        ...(userStore.accessToken ? { Authorization: `Bearer ${userStore.accessToken}` } : {})
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
       }
     })
+
+    let resp = await fetchAnalysis(userStore.accessToken)
+    if (resp.status === 401) {
+      try {
+        const refreshedToken = await userStore.refreshAccessToken()
+        resp = await fetchAnalysis(refreshedToken)
+      } catch {
+        fail(t('performanceTesting.report.aiAuthExpired'))
+        return
+      }
+    }
 
     if (!resp.ok) {
       let detail = ''

@@ -136,7 +136,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, nextTick, computed } from 'vue'
+import { ref, reactive, nextTick, computed, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import { VideoPlay, DocumentAdd, CircleCheckFilled, CircleCheck, Loading, SwitchButton } from '@element-plus/icons-vue'
 import { useI18n } from 'vue-i18n'
@@ -156,6 +156,7 @@ const logs = ref('')
 const plannedTasks = ref([])
 const currentExecutionId = ref(null)
 const logContainer = ref(null)
+let pollInterval = null
 
 const taskForm = reactive({
   description: '',
@@ -219,9 +220,11 @@ const handleStop = async () => {
 
 // 轮询日志
 const pollLogs = () => {
-  const pollInterval = setInterval(async () => {
+  if (pollInterval) clearInterval(pollInterval)
+  pollInterval = setInterval(async () => {
     if (!currentExecutionId.value) {
       clearInterval(pollInterval)
+      pollInterval = null
       return
     }
     
@@ -246,6 +249,7 @@ const pollLogs = () => {
       
       if (record.status === 'passed' || record.status === 'failed' || record.status === 'stopped') {
         clearInterval(pollInterval)
+        pollInterval = null
         running.value = false
         analyzing.value = false // 确保结束时必然取消分析状态
         if (record.status === 'passed') {
@@ -262,6 +266,14 @@ const pollLogs = () => {
     }
   }, 2000) // 每2秒轮询一次
 }
+
+
+onBeforeUnmount(() => {
+  if (pollInterval) {
+    clearInterval(pollInterval)
+    pollInterval = null
+  }
+})
 
 // 保存为用例
 const handleSaveAsCase = () => {

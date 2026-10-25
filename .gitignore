@@ -98,6 +98,8 @@ frontend/node_modules/
 frontend/.DS_Store
 frontend/*.log
 frontend/dist/
+frontend/dist.previous.*
+frontend/.dist-staging.*
 
 # Docker
 Dockerfile*

@@ -34,6 +34,8 @@ def git_release() -> str:
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=REPO_ROOT,
             text=True,
+            encoding='utf-8',
+            errors='replace',
         ).strip()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"unable to determine git release: {exc}") from exc
@@ -63,13 +65,34 @@ def should_include(path: Path) -> bool:
         return False
     if relative.parts[0] in EXCLUDED_ROOTS:
         return False
+    if path.name.startswith('.env') or path.suffix.lower() in {'.pem', '.key'}:
+        return False
+    if any(part.startswith('dist.previous.') or part.startswith('.dist-staging.') for part in relative.parts):
+        return False
     return not any(part in EXCLUDED_PARTS for part in relative.parts)
 
 
-def archive_mode(relative: Path) -> int:
-    if relative == Path("frontend/deploy.sh"):
-        return 0o755
-    if relative.parts and relative.parts[0] == "scripts" and relative.suffix in {".py", ".sh"}:
+def tracked_executable_paths() -> set[str]:
+    try:
+        output = subprocess.check_output(
+            ['git', 'ls-files', '-s'],
+            cwd=REPO_ROOT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    executable_paths = set()
+    for line in output.splitlines():
+        fields = line.split(maxsplit=3)
+        if len(fields) == 4 and fields[0] == '100755':
+            executable_paths.add(fields[3])
+    return executable_paths
+
+
+def archive_mode(relative: Path, source: Path, executable_paths: set[str]) -> int:
+    if relative.as_posix() in executable_paths or source.stat().st_mode & 0o111:
         return 0o755
     return 0o644
 
@@ -89,13 +112,14 @@ def build_archive(output: Path, release: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     archive_root = f"testhub_platform-{release}"
+    executable_paths = tracked_executable_paths()
     with tarfile.open(output, "w:gz") as archive:
         for path in sorted(REPO_ROOT.rglob("*")):
             if not path.is_file() or not should_include(path):
                 continue
             relative = path.relative_to(REPO_ROOT)
             info = archive.gettarinfo(str(path), arcname=Path(archive_root) / relative)
-            info.mode = archive_mode(relative)
+            info.mode = archive_mode(relative, path, executable_paths)
             with path.open("rb") as handle:
                 archive.addfile(info, handle)
 

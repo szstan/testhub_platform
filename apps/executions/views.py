@@ -74,7 +74,7 @@ from .serializers import (
     accessible_execution_projects,
 )
 from .state_machine import InvalidExecutionTransition
-from .adapters import AdapterConflict, get_executor_adapter
+from .adapters import AdapterConflict, UnsupportedExecutorError, get_executor_adapter
 from .result_events import ResultEventError, ResultEventIngestor
 from .run_comparison import compare_jobs, evaluate_release_gate
 from .failure_intelligence import analyze_job_failures
@@ -587,7 +587,10 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        adapter = get_executor_adapter(job.source_type)
+        try:
+            adapter = get_executor_adapter(job.source_type)
+        except UnsupportedExecutorError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
         try:
             receipt = adapter.submit(
                 job,
@@ -623,7 +626,10 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
     def retry(self, request, pk=None):
         """Queue a new attempt and retain the operator's retry reason."""
         job = self.get_object()
-        adapter = get_executor_adapter(job.source_type)
+        try:
+            adapter = get_executor_adapter(job.source_type)
+        except UnsupportedExecutorError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
         reason = str(request.data.get('reason') or 'manual retry requested')[:4000]
         automatic = bool(request.data.get('automatic'))
         try:

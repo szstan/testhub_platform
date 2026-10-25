@@ -25,6 +25,14 @@ require_http() {
         || fail "HTTP check failed: $url"
 }
 
+run_python() {
+    if id testhub >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        runuser -u testhub -- "$PYTHON_BIN" "$@"
+    else
+        "$PYTHON_BIN" "$@"
+    fi
+}
+
 cd "$REPO_ROOT"
 require_file "frontend/dist/index.html"
 
@@ -43,8 +51,8 @@ if id nginx >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
         || fail "nginx cannot read frontend/dist/index.html"
 fi
 
-"$PYTHON_BIN" manage.py check
-migration_plan="$("$PYTHON_BIN" manage.py migrate --plan 2>&1)" || fail "migration plan failed"
+run_python manage.py check
+migration_plan="$(run_python manage.py migrate --plan 2>&1)" || fail "migration plan failed"
 printf '%s\n' "$migration_plan"
 if ! grep -q 'No planned migration operations' <<<"$migration_plan"; then
     fail "pending migrations remain; apply migrations before validating this release"
@@ -55,6 +63,9 @@ require_http "${BACKEND_URL}/readiness/"
 require_http "${BACKEND_URL}/api/docs/"
 require_http "${FRONTEND_URL}/health"
 require_http "${FRONTEND_URL}/"
+frontend_asset="$(curl --fail --silent --show-error --max-time 15 "${FRONTEND_URL}/" | grep -oE 'assets/[^" ]+\.js' | head -n 1)"
+test -n "$frontend_asset" || fail "frontend index does not reference a JavaScript asset"
+require_http "${FRONTEND_URL}/${frontend_asset}"
 require_http "${FRONTEND_URL}/api/docs/"
 
 echo "staging release validation passed"

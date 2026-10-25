@@ -210,7 +210,12 @@ class DataFactoryViewSet(viewsets.ModelViewSet):
     def execute_tool(self, tool_name: str, tool_category: str, input_data: dict):
         """执行工具"""
         try:
-            logger.info(f'开始执行工具: {tool_name}, 分类: {tool_category}, 输入数据: {input_data}')
+            logger.info(
+                '开始执行工具: %s, 分类: %s, 输入字段: %s',
+                tool_name,
+                tool_category,
+                sorted(str(key) for key in (input_data or {})),
+            )
             
             # 字符工具
             if tool_category == 'string':

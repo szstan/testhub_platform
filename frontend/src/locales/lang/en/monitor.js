@@ -123,7 +123,9 @@ export default {
     levelSecondary: 'Secondary',
     fallbackTip: 'Primary channel failed; auto-failover to this secondary channel',
     empty: 'No alerts yet',
+    loadFailed: 'Failed to load alerts. Please try again.',
     opSuccess: 'Operation succeeded',
+    operationFailed: 'Operation failed. Please try again.',
     ackConfirm: 'Confirm acknowledge this alert?'
   },
   channels: {
