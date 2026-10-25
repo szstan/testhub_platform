@@ -10,6 +10,9 @@ import os
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
+logger = logging.getLogger(__name__)
+
+
 def _assert_scheduled_task_scope(*, scheduled_task_id, project_id, device_id,
                                  app_package_id=None, test_suite_id=None,
                                  test_case_id=None):
