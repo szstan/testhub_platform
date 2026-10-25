@@ -90,15 +90,18 @@ def test_debug_run_validates_rendered_public_url_before_request(monkeypatch):
     assert fake.last_calls[0][1] == 'https://public.example.test/health'
 
 
-@pytest.mark.asyncio
-async def test_httpx_redirect_hook_rejects_private_next_request(monkeypatch):
+def test_httpx_redirect_hook_rejects_private_next_request(monkeypatch):
     monkeypatch.setattr(builtin, '_allow_private_targets', lambda: False)
     response = SimpleNamespace(
         url='https://public.example.test/start',
         headers={'location': 'http://127.0.0.1:8080/admin'},
     )
-    with pytest.raises(UnsafeOutboundURL):
-        await builtin._validate_httpx_redirect(response)
+
+    async def check_redirect():
+        with pytest.raises(UnsafeOutboundURL):
+            await builtin._validate_httpx_redirect(response)
+
+    asyncio.run(check_redirect())
 
 
 def test_jmx_inspection_exposes_dynamic_hosts():
