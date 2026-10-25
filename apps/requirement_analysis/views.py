@@ -1935,9 +1935,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                             except Exception as e:
                                 logger.error(f"生成任务执行失败: {e}")
-                                task.status = 'failed'
-                                task.error_message = str(e)
-                                task.save()
+                                TestCaseGenerationTask.objects.filter(
+                                    pk=task.pk,
+                                ).exclude(status='cancelled').update(
+                                    status='failed', error_message=str(e), updated_at=timezone.now()
+                                )
 
                         # 在新线程中执行任务
                         thread = threading.Thread(target=execute_task)
@@ -1946,9 +1948,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                     except Exception as e:
                         logger.error(f"启动生成任务失败: {e}")
-                        task.status = 'failed'
-                        task.error_message = str(e)
-                        task.save()
+                        TestCaseGenerationTask.objects.filter(
+                            pk=task.pk,
+                        ).exclude(status='cancelled').update(
+                            status='failed', error_message=str(e), updated_at=timezone.now()
+                        )
 
                 # 启动异步任务
                 run_generation_task()

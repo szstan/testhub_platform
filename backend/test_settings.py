@@ -3,6 +3,8 @@ from backend.settings import *  # noqa: F401,F403
 
 SECRET_KEY = 'test-secret-key-for-unit-tests-32chars'
 DEBUG = True
+TESTING = True
+WEBSOCKET_TICKET_REQUIRE_SHARED_CACHE = False
 ROOT_URLCONF = 'backend.urls'
 
 class DisableMigrations:

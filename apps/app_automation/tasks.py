@@ -13,6 +13,26 @@ from channels.layers import get_channel_layer
 logger = logging.getLogger(__name__)
 
 
+def _assert_scheduled_task_scope(*, scheduled_task_id, project_id, device_id,
+                                 app_package_id=None, test_suite_id=None,
+                                 test_case_id=None):
+    """Revalidate scheduler foreign keys at the worker boundary."""
+    if not scheduled_task_id:
+        return
+    from .models import AppScheduledTask
+    task = AppScheduledTask.objects.select_related(
+        'project', 'device', 'app_package', 'test_suite', 'test_case'
+    ).filter(pk=scheduled_task_id).first()
+    if task is None or task.project_id != project_id or task.device_id != device_id:
+        raise RuntimeError('定时任务资源已变更或不属于同一项目')
+    if app_package_id is not None and task.app_package_id != app_package_id:
+        raise RuntimeError('定时任务应用包已变更')
+    if test_suite_id is not None and task.test_suite_id != test_suite_id:
+        raise RuntimeError('定时任务测试套件已变更')
+    if test_case_id is not None and task.test_case_id != test_case_id:
+        raise RuntimeError('定时任务测试用例已变更')
+
+
 def send_scheduled_task_notification(task_id, success):
     """发送定时任务执行通知（Webhook + 邮件）"""
     try:
@@ -237,6 +257,13 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
         test_case = execution.test_case
         
         device = execution.device
+        _assert_scheduled_task_scope(
+            scheduled_task_id=scheduled_task_id,
+            project_id=test_case.project_id,
+            device_id=execution.device_id,
+            app_package_id=test_case.app_package_id,
+            test_case_id=test_case.id,
+        )
 
         # 更新状态为执行中
         execution.status = 'running'
@@ -416,6 +443,14 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
         if not executions:
             logger.error(f"套件 {suite_id} 未找到执行记录")
             return
+
+        _assert_scheduled_task_scope(
+            scheduled_task_id=scheduled_task_id,
+            project_id=suite.project_id,
+            device_id=executions[0].device_id,
+            app_package_id=executions[0].test_case.app_package_id if executions[0].test_case else None,
+            test_suite_id=suite.id,
+        )
 
         # 锁定设备
         with transaction.atomic():

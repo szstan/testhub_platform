@@ -57,6 +57,16 @@ def issue_websocket_ticket(*, user, path: str) -> tuple[str, int]:
     return ticket, ttl
 
 
+def _shared_cache_required() -> bool:
+    """Production single-use tickets require a cache shared by ASGI workers."""
+    if getattr(settings, 'TESTING', False):
+        return True
+    if not getattr(settings, 'WEBSOCKET_TICKET_REQUIRE_SHARED_CACHE', not getattr(settings, 'DEBUG', False)):
+        return True
+    backend = str(settings.CACHES.get('default', {}).get('BACKEND', ''))
+    return 'LocMemCache' not in backend
+
+
 def consume_websocket_ticket(ticket: str, path: str):
     """Validate and consume a ticket, returning the active user or ``None``.
 
@@ -82,6 +92,9 @@ def consume_websocket_ticket(ticket: str, path: str):
 
     cache_key = f'{TICKET_CACHE_PREFIX}{nonce}'
     claim_key = f'{cache_key}:claim'
+    if not _shared_cache_required():
+        logger.error('WebSocket ticket rejected because production cache is not shared')
+        return None
     if not cache.add(claim_key, True, timeout=ticket_ttl()):
         return None
     try:
