@@ -59,7 +59,7 @@ class AppAuthorizationBoundaryTests(TransactionTestCase):
         recent_ids = [item['id'] for item in response.data['data']['recent_executions']]
         self.assertIn(self.execution.id, recent_ids)
         self.assertNotIn(other_execution.id, recent_ids)
-        self.assertTrue(all(item['report_path'] is False for item in response.data['data']['recent_executions']))
+        self.assertTrue(all(item['report_path'] == '' for item in response.data['data']['recent_executions']))
 
     def test_report_requires_execution_authorization_even_with_valid_share_token(self):
         token = TimestampSigner().sign(str(self.execution.id))
@@ -92,8 +92,7 @@ class AppAuthorizationBoundaryTests(TransactionTestCase):
                 context={'request': request},
             ).data
 
-        self.assertTrue(data['report_path'])
-        self.assertNotEqual(data['report_path'], temp_dir)
+        self.assertEqual(data['report_path'], '')
         self.assertEqual(data['report_access_token'], '')
 
     def test_report_token_is_execution_bound(self):

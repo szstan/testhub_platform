@@ -220,15 +220,18 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     case_name = serializers.CharField(read_only=True)
     device_name = serializers.CharField(read_only=True)
     user_name = serializers.CharField(read_only=True)
-    report_path = serializers.SerializerMethodField()
     report_access_token = serializers.SerializerMethodField()
+
+
     pass_rate = serializers.FloatField(read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     result_display = serializers.CharField(source='get_result_display', read_only=True, default=None)
 
-    def get_report_path(self, obj) -> bool:
-        """Expose report availability without leaking a server filesystem path."""
-        return bool(obj.report_path)
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Preserve the legacy string contract without exposing filesystem paths.
+        data['report_path'] = ''
+        return data
 
     def get_report_access_token(self, obj) -> str:
         """Mint a short-lived share token only for an authorized request."""
