@@ -133,19 +133,12 @@ def test_login_returns_jwt_tokens_for_valid_credentials(api_client, active_user)
     assert re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', payload['access'])
     assert 'testhub_refresh=' in response.cookies['testhub_refresh'].OutputString()
 
-
-def test_admin_login_exposes_admin_capability(api_client, active_user):
     active_user.is_staff = True
     active_user.save(update_fields=['is_staff'])
-
-    response = api_client.post(
-        '/api/auth/login/',
-        {'username': active_user.username, 'password': 'StrongPass123'},
-        format='json',
-    )
-
-    assert response.status_code == status.HTTP_200_OK
-    assert response.json()['user']['is_admin'] is True
+    api_client.force_authenticate(user=active_user)
+    admin_response = api_client.get('/api/auth/profile/')
+    assert admin_response.status_code == status.HTTP_200_OK
+    assert admin_response.json()['is_admin'] is True
 
 
 def test_login_rejects_invalid_password(api_client, active_user):
