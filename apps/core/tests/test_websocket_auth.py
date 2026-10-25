@@ -4,6 +4,7 @@ from urllib.parse import urlencode
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
+from django.test import override_settings
 from django.core.cache import cache
 from rest_framework.test import APIClient
 
@@ -18,6 +19,7 @@ pytestmark = pytest.mark.django_db(transaction=True)
 User = get_user_model()
 
 
+@override_settings(WEBSOCKET_TICKET_REQUIRE_SHARED_CACHE=False)
 def test_ticket_is_path_bound_and_single_use():
     user = User.objects.create_user(username='ws-ticket-owner', password='pass')
     path = '/ws/app-automation/executions/17/'
@@ -30,6 +32,7 @@ def test_ticket_is_path_bound_and_single_use():
     assert consume_websocket_ticket(ticket, path) is None
 
 
+@override_settings(WEBSOCKET_TICKET_REQUIRE_SHARED_CACHE=False)
 def test_ticket_middleware_resolves_user_and_rejects_reuse():
     user = User.objects.create_user(username='ws-middleware-owner', password='pass')
     path = '/ws/perf-testing/executions/23/'

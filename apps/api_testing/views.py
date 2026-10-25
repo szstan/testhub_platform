@@ -14,6 +14,7 @@ from django.utils import timezone
 from django.http import HttpResponse, FileResponse, Http404, HttpResponseNotFound
 from django.views.static import serve
 from django.conf import settings
+from django.core.cache import cache
 from django.views.decorators.csrf import csrf_exempt
 import html
 import requests
@@ -2513,6 +2514,17 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
         user = self.request.user
         return AIServiceConfig.objects.filter(created_by=user)
 
+    def _check_ai_action_rate(self, role, limit=30):
+        key = f'api-ai-action:{self.request.user.pk}:{role}'
+        current = cache.get(key)
+        if current is not None and int(current) >= limit:
+            return False
+        if current is None:
+            cache.add(key, 1, timeout=60)
+        else:
+            cache.incr(key)
+        return True
+
     def _active_config_for_request(self, role):
         queryset = AIServiceConfig.objects.filter(role=role, is_active=True)
         user = self.request.user
@@ -2705,6 +2717,8 @@ URL参数:
             return Response({'error': 'count 必须在 1 到 100 之间'}, status=status.HTTP_400_BAD_REQUEST)
         if len(json.dumps(schema, ensure_ascii=False)) > 100_000:
             return Response({'error': 'schema 过大'}, status=status.HTTP_400_BAD_REQUEST)
+        if not self._check_ai_action_rate('mock_data'):
+            return Response({'error': 'AI 操作频率超限，请稍后再试'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         try:
             config = self._active_config_for_request('mock_data')
@@ -2779,6 +2793,8 @@ URL参数:
             not isinstance(item, dict) for item in parameters
         ):
             return Response({'error': 'parameters 必须是最多 100 项的对象列表'}, status=status.HTTP_400_BAD_REQUEST)
+        if not self._check_ai_action_rate('naming'):
+            return Response({'error': 'AI 操作频率超限，请稍后再试'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         try:
             config = self._active_config_for_request('naming')
