@@ -218,6 +218,10 @@ def _import_idempotency_key(result_format: str, external_run_id: str) -> str:
     return f'result-import:{digest}'
 
 
+def _legacy_import_idempotency_key(result_format: str, external_run_id: str) -> str:
+    return f'result-import:{result_format}:{external_run_id}'
+
+
 def _step_idempotency_key(import_key: str, case_key: str) -> str:
     digest = hashlib.sha256(f'{import_key}:{case_key}'.encode('utf-8')).hexdigest()
     return f'result-step:{digest}'
@@ -230,9 +234,19 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
         raise ResultImportError("external_run_id 不能为空")
     cases = parse_results(payload, result_format)
     result_format = str(result_format).strip().lower()
+    payload_hash = hashlib.sha256(payload).hexdigest()
     idempotency_key = _import_idempotency_key(result_format, external_run_id)
 
     with transaction.atomic():
+        legacy_key = _legacy_import_idempotency_key(result_format, external_run_id)
+        legacy_job = None
+        if len(legacy_key) <= 128:
+            legacy_job = ExecutionJob.objects.filter(
+                project=project, idempotency_key=legacy_key
+            ).first()
+            if legacy_job is not None:
+                idempotency_key = legacy_key
+
         build = None
         if build_reference:
             build, _ = ExecutionBuild.objects.get_or_create(
@@ -244,20 +258,26 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
                     "created_by": requested_by,
                 },
             )
-        job, created = ExecutionJob.objects.create_idempotent(
-            project=project,
-            idempotency_key=idempotency_key,
-            requested_by=requested_by,
-            defaults={
-                "source_type": "ci",
-                "source_id": external_run_id,
-                "build": build,
-                "build_reference": build_reference,
-                "trigger": "ci",
-                "status": ExecutionStatus.PENDING,
-            },
-        )
+        if legacy_job is not None:
+            job, created = legacy_job, False
+        else:
+            job, created = ExecutionJob.objects.create_idempotent(
+                project=project,
+                idempotency_key=idempotency_key,
+                requested_by=requested_by,
+                defaults={
+                    "source_type": "ci",
+                    "source_id": external_run_id,
+                    "build": build,
+                    "build_reference": build_reference,
+                    "trigger": "ci",
+                    "status": ExecutionStatus.PENDING,
+                },
+            )
         if not created:
+            existing_hash = str((job.result or {}).get('source_sha256') or '')
+            if existing_hash and existing_hash != payload_hash:
+                raise ResultImportError('相同 external_run_id 的结果内容不一致')
             summary = job.result or {}
             return ImportSummary(
                 job=job,
@@ -320,7 +340,7 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
             "skipped": skipped,
             "matched": matched,
             "unmatched": len(cases) - matched,
-            "source_sha256": hashlib.sha256(payload).hexdigest(),
+            "source_sha256": payload_hash,
         })
         attempt.result = summary
         attempt.is_final = True
@@ -337,9 +357,9 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
         ExecutionArtifact.objects.create(
             job=job,
             attempt=attempt,
-            idempotency_key=f"{idempotency_key}:artifact",
+            idempotency_key=f"result-artifact:{job.pk}:{attempt.pk}:{payload_hash[:32]}",
             uri=f"result-import://{result_format}/{external_run_id}/{_text(filename, 255)}",
-            content_hash=hashlib.sha256(payload).hexdigest(),
+            content_hash=payload_hash,
             media_type="application/xml" if result_format == "junit" else "application/json",
             size_bytes=len(payload),
             metadata=redact_result_payload({"format": result_format, "external_run_id": external_run_id}),

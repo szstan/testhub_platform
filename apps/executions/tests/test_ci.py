@@ -49,6 +49,16 @@ def test_signed_ci_webhook_is_idempotent_and_creates_build_job(monkeypatch):
     assert replay.status_code == 200
     assert WebhookEvent.objects.count() == 1
 
+    tampered = b'{"build_number":"build-10","commit_sha":"different"}'
+    tampered_headers = dict(headers)
+    tampered_headers['HTTP_X_TESTHUB_SIGNATURE'] = _signature(secret, timestamp, tampered)
+    conflict = client.generic(
+        'POST', '/api/executions/webhooks/generic/', tampered,
+        content_type='application/json', **tampered_headers
+    )
+    assert conflict.status_code == 400
+    assert WebhookEvent.objects.count() == 1
+
 
 @pytest.mark.django_db
 def test_ci_webhook_rejects_invalid_signature(monkeypatch):

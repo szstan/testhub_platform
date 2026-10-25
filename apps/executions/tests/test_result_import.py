@@ -5,7 +5,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 
 from apps.executions.models import ExecutionArtifact, ExecutionJob, ExecutionStepResult
-from apps.executions.result_import import import_results, parse_allure, parse_junit
+from apps.executions.result_import import ResultImportError, import_results, parse_allure, parse_junit
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
 from apps.users.models import User
@@ -102,6 +102,47 @@ def test_result_import_hashes_long_idempotency_keys(execution_fixture):
     step = ExecutionStepResult.objects.get(attempt__job_id=summary.job.id)
     assert len(step.idempotency_key) <= 128
     assert step.idempotency_key.startswith('result-step:')
+
+
+@pytest.mark.django_db
+def test_result_import_rejects_changed_payload_and_reuses_legacy_key(execution_fixture):
+    user, project, _ = execution_fixture
+    first_payload = b'<testsuite><testcase name="one"/></testsuite>'
+    changed_payload = b'<testsuite><testcase name="two"/></testsuite>'
+    first = import_results(
+        project=project,
+        payload=first_payload,
+        result_format='junit',
+        external_run_id='payload-run',
+        requested_by=user,
+    )
+    with pytest.raises(ResultImportError):
+        import_results(
+            project=project,
+            payload=changed_payload,
+            result_format='junit',
+            external_run_id='payload-run',
+            requested_by=user,
+        )
+
+    legacy_key = 'result-import:junit:legacy-run'
+    legacy = ExecutionJob.objects.create(
+        project=project,
+        idempotency_key=legacy_key,
+        source_type='ci',
+        source_id='legacy-run',
+        requested_by=user,
+        result={'total': 1, 'passed': 1, 'failed': 0, 'skipped': 0, 'matched': 0, 'unmatched': 1},
+    )
+    replay = import_results(
+        project=project,
+        payload=first_payload,
+        result_format='junit',
+        external_run_id='legacy-run',
+        requested_by=user,
+    )
+    assert replay.created is False
+    assert replay.job.id == legacy.id
 
 
 @pytest.mark.django_db
