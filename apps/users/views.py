@@ -9,6 +9,7 @@ from django.utils.decorators import method_decorator
 from .models import User
 from .serializers import (
     UserSerializer,
+    user_session_data,
     UserCreateSerializer,
     UserDirectorySerializer,
     UserSelfUpdateSerializer,
@@ -66,8 +67,7 @@ import uuid
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_current_user(request):
-    serializer = UserSerializer(request.user)
-    return Response(serializer.data)
+    return Response(user_session_data(request.user))
 
 @method_decorator(csrf_exempt, name='dispatch')
 class RegisterView(generics.CreateAPIView):
@@ -80,7 +80,7 @@ class RegisterView(generics.CreateAPIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         return Response({
-            'user': UserSerializer(user).data,
+            'user': user_session_data(user),
         }, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
@@ -106,7 +106,7 @@ def login_view(request):
     refresh_token = str(refresh)
 
     response = Response({
-        'user': UserSerializer(user).data,
+        'user': user_session_data(user),
         'access': access_token,
         'message': '登录成功'
     })
@@ -135,8 +135,7 @@ def profile_view(request):
     if not request.user.is_authenticated:
         return Response({'error': '未登录'}, status=status.HTTP_401_UNAUTHORIZED)
     
-    serializer = UserSerializer(request.user)
-    return Response(serializer.data)
+    return Response(user_session_data(request.user))
 
 class UserListView(generics.ListCreateAPIView):
     queryset = User.objects.all().order_by('username')
@@ -264,7 +263,7 @@ def sms_login_view(request):
     # 生成 JWT
     refresh = RefreshToken.for_user(user)
     response = Response({
-        'user': UserSerializer(user).data,
+        'user': user_session_data(user),
         'access': str(refresh.access_token),
         'message': '登录成功',
     })
@@ -365,7 +364,7 @@ def exchange_token_view(request):
         refresh = RefreshToken.for_user(user)
         response = Response({
             'access': str(refresh.access_token),
-            'user': UserSerializer(user).data,
+            'user': user_session_data(user),
         })
         _set_refresh_cookie(response, str(refresh))
         return response

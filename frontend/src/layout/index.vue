@@ -262,7 +262,7 @@
                 <el-icon><Edit /></el-icon>
                 <span>{{ $t('menu.promptConfig') }}</span>
               </el-menu-item>
-              <el-menu-item index="/configuration/generation-config">
+              <el-menu-item v-if="userStore.isAdmin" index="/configuration/generation-config">
                 <el-icon><Setting /></el-icon>
                 <span>{{ $t('menu.generationConfig') }}</span>
               </el-menu-item>

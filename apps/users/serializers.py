@@ -15,6 +15,12 @@ class UserSerializer(serializers.ModelSerializer):
                  'date_joined', 'created_at', 'updated_at']
         read_only_fields = ['id', 'date_joined', 'created_at', 'updated_at']
 
+
+def user_session_data(user):
+    data = UserSerializer(user).data
+    data['is_admin'] = bool(user.is_staff or user.is_superuser)
+    return data
+
 class UserDirectorySerializer(serializers.ModelSerializer):
     """安全的用户目录表示，不暴露手机号或管理状态。"""
 

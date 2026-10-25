@@ -1,11 +1,20 @@
 <template>
   <div class="generation-config">
-    <div class="page-header">
+    <div v-if="isForbidden" class="forbidden-state" role="alert">
+      <div class="forbidden-icon">🔒</div>
+      <h1>{{ $t('generationConfig.accessDeniedTitle') }}</h1>
+      <p>{{ $t('generationConfig.accessDenied') }}</p>
+      <button type="button" class="back-home-btn" @click="$router.push('/home')">
+        {{ $t('generationConfig.backToHome') }}
+      </button>
+    </div>
+
+    <div v-if="!isForbidden" class="page-header">
       <h1>{{ $t('generationConfig.title') }}</h1>
       <p>{{ $t('generationConfig.subtitle') }}</p>
     </div>
 
-    <div class="main-content">
+    <div v-if="!isForbidden" class="main-content">
       <!-- 配置列表 -->
       <div class="configs-section">
         <div class="section-header">
@@ -91,7 +100,7 @@
     </div>
 
     <!-- 添加/编辑配置弹窗 -->
-    <div v-if="showAddModal || showEditModal" class="config-modal">
+    <div v-if="!isForbidden && (showAddModal || showEditModal)" class="config-modal">
       <div class="modal-content" @click.stop>
         <div class="modal-header">
           <h3>{{ isEditing ? $t('generationConfig.editTitle') : $t('generationConfig.addTitle') }}{{ $t('generationConfig.formTitle') }}</h3>
@@ -187,15 +196,18 @@ import { getGenerationConfigs, createGenerationConfig, updateGenerationConfig, d
 import api from '@/utils/api'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
+import { useUserStore } from '@/stores/user'
 
 export default {
   name: 'GenerationConfigView',
   setup() {
     const { t, locale } = useI18n()
-    return { t, locale }
+    const userStore = useUserStore()
+    return { t, locale, isAdmin: userStore.isAdmin }
   },
   data() {
     return {
+      isForbidden: false,
       configs: [],
       showAddModal: false,
       showEditModal: false,
@@ -213,6 +225,11 @@ export default {
   },
 
   mounted() {
+    if (!this.isAdmin) {
+      this.isForbidden = true
+      return
+    }
+
     this.configForm.name = this.t('generationConfig.defaultConfigName')
     this.loadConfigs()
   },
@@ -247,6 +264,9 @@ export default {
 
         if (error.response?.status === 401) {
           ElMessage.error(this.t('generationConfig.pleaseLogin'))
+        } else if (error.response?.status === 403) {
+          this.isForbidden = true
+          ElMessage.warning(this.t('generationConfig.accessDenied'))
         } else {
           ElMessage.error(this.t('generationConfig.loadFailed') + ': ' + (error.response?.data?.error || error.message))
         }
@@ -348,6 +368,43 @@ export default {
 </script>
 
 <style scoped>
+.forbidden-state {
+  max-width: 640px;
+  margin: 80px auto;
+  padding: 48px 32px;
+  text-align: center;
+  background: #fff;
+  border: 1px solid #ebeef5;
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+}
+
+.forbidden-icon {
+  font-size: 3rem;
+  margin-bottom: 12px;
+}
+
+.forbidden-state h1 {
+  margin: 0 0 12px;
+  color: #303133;
+  font-size: 1.6rem;
+}
+
+.forbidden-state p {
+  margin: 0 0 24px;
+  color: #606266;
+  line-height: 1.6;
+}
+
+.back-home-btn {
+  padding: 10px 20px;
+  color: #fff;
+  background: #409eff;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .generation-config {
   padding: 20px;
   max-width: 1400px;

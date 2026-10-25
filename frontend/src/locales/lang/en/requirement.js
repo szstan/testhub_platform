@@ -422,6 +422,9 @@ export default {
     // Page
     title: '⚙️ Generation Behavior Config',
     subtitle: 'Configure default behavior and automation flow for test case generation',
+    accessDeniedTitle: 'Generation Configuration Restricted',
+    accessDenied: 'This page is available to administrators only. Contact an administrator to change generation settings.',
+    backToHome: 'Back to Home',
     description: 'Configure default behavior and automation flow for test case generation',
 
     // Config List

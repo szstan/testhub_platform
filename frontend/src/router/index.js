@@ -424,7 +424,8 @@ const routes = [
                     {
                         path: 'generation-config',
                         name: 'ConfigGenerationConfig',
-                        component: () => import('@/views/requirement-analysis/GenerationConfigView.vue')
+                        component: () => import('@/views/requirement-analysis/GenerationConfigView.vue'),
+                        meta: { requiresAdmin: true }
                     },
                     {
                         path: 'ui-env',
@@ -793,6 +794,8 @@ router.beforeEach(async (to, _from, next) => {
         next('/login')
     } else if (to.meta.requiresGuest && userStore.isAuthenticated) {
         next('/home')
+    } else if (to.meta.requiresAdmin && !userStore.isAdmin) {
+        next({ name: 'Home', query: { forbidden: 'generation-config' } })
     } else {
         next()
     }

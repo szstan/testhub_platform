@@ -14,6 +14,10 @@ export const useUserStore = defineStore('user', () => {
 
   const isAuthenticated = computed(() => !!accessToken.value && !!user.value)
 
+  const isAdmin = computed(() => Boolean(
+    user.value?.is_admin || user.value?.is_staff || user.value?.is_superuser
+  ))
+
   const isTokenExpiringSoon = computed(() => {
     if (!tokenExpiresAt.value) return false
     return tokenExpiresAt.value - Date.now() < 5 * 60 * 1000
@@ -182,6 +186,7 @@ export const useUserStore = defineStore('user', () => {
     refreshToken,
     tokenExpiresAt,
     isAuthenticated,
+    isAdmin,
     isTokenExpiringSoon,
     isTokenExpired,
     login,

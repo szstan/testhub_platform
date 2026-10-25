@@ -219,7 +219,7 @@
 
 <script setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useUserStore } from '@/stores/user'
 import { useAppStore } from '@/stores/app'
@@ -228,6 +228,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { MagicStick, Link, Monitor, DataLine, Cpu, Setting, ChatDotRound, UserFilled, ArrowDown, Cellphone, Tickets, Select, Odometer, Connection, Document } from '@element-plus/icons-vue'
 
 const router = useRouter()
+const route = useRoute()
 const { t } = useI18n()
 const userStore = useUserStore()
 const appStore = useAppStore()
@@ -267,6 +268,13 @@ onMounted(() => {
   } catch {
     // ignore
   }
+  if (route.query.forbidden === 'generation-config') {
+    ElMessage.warning(t('generationConfig.accessDenied'))
+    const query = { ...route.query }
+    delete query.forbidden
+    router.replace({ query })
+  }
+
   updateMobileTip()
   window.addEventListener('resize', updateMobileTip)
 })

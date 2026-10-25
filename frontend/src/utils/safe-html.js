@@ -18,10 +18,15 @@ function isSafeUrl(value) {
 }
 
 export function sanitizeHtml(html) {
+  const rawHtml = String(html || '')
   const template = document.createElement('template')
-  template.innerHTML = String(html || '')
+  if (!template || !template.content || typeof template.content.querySelectorAll !== 'function') {
+    return escapeHtml(rawHtml)
+  }
+  template.innerHTML = rawHtml
 
-  for (const element of Array.from(template.content.querySelectorAll('*'))) {
+  const elements = template.content.querySelectorAll('*')
+  for (const element of Array.from(elements)) {
     if (!ALLOWED_TAGS.has(element.tagName)) {
       element.replaceWith(document.createTextNode(element.textContent || ''))
       continue

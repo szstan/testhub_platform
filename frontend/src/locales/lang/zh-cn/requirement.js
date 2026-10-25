@@ -422,6 +422,9 @@ export default {
     // Page
     title: '⚙️ 生成行为配置',
     subtitle: '配置测试用例生成的默认行为和自动化流程',
+    accessDeniedTitle: '无权访问生成配置',
+    accessDenied: '此页面仅限管理员使用。如需修改生成配置，请联系管理员。',
+    backToHome: '返回首页',
     description: '配置测试用例生成的默认行为和自动化流程',
 
     // Config List
