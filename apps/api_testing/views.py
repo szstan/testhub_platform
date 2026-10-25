@@ -2513,6 +2513,13 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
         user = self.request.user
         return AIServiceConfig.objects.filter(created_by=user)
 
+    def _active_config_for_request(self, role):
+        queryset = AIServiceConfig.objects.filter(role=role, is_active=True)
+        user = self.request.user
+        if not (user.is_staff or user.is_superuser):
+            queryset = queryset.filter(created_by=user)
+        return queryset.order_by('-created_at').first()
+
     @action(detail=False, methods=['post'])
     def test_connection(self, request):
         """测试AI服务连接"""
@@ -2686,12 +2693,17 @@ URL参数:
         count = request.data.get('count', 1)
         if not schema:
             return Response({'error': '请提供数据结构定义'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return Response({'error': 'count 必须是整数'}, status=status.HTTP_400_BAD_REQUEST)
+        if not 1 <= count <= 100:
+            return Response({'error': 'count 必须在 1 到 100 之间'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(json.dumps(schema, ensure_ascii=False)) > 100_000:
+            return Response({'error': 'schema 过大'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            config = AIServiceConfig.objects.filter(
-                role='mock_data',
-                is_active=True
-            ).first()
+            config = self._active_config_for_request('mock_data')
 
             if not config:
                 return Response({'error': '未找到可用的模拟数据生成AI配置'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2759,12 +2771,11 @@ URL参数:
         parameters = request.data.get('parameters', [])
         if not parameters:
             return Response({'error': '请提供参数列表'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(parameters, list) or len(parameters) > 100:
+            return Response({'error': 'parameters 必须是最多 100 项的列表'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            config = AIServiceConfig.objects.filter(
-                role='naming',
-                is_active=True
-            ).first()
+            config = self._active_config_for_request('naming')
 
             if not config:
                 return Response({'error': '未找到可用的参数命名规范化AI配置'}, status=status.HTTP_400_BAD_REQUEST)

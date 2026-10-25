@@ -155,6 +155,26 @@ def validate_mirror(mirror: Path) -> dict[str, Any]:
             raise ValueError("manifest.json must contain an object")
         expected = manifest_sha.read_text(encoding="ascii").split()[0]
         actual = sha256_file(manifest)
+        sum_entries = {}
+        for line in sums.read_text(encoding='ascii').splitlines():
+            if not line.strip():
+                continue
+            digest, filename = line.split(None, 1)
+            sum_entries[filename.strip().lstrip('*')] = digest
+        artifacts = metadata.get('artifacts')
+        if not isinstance(artifacts, list):
+            raise ValueError('manifest.json artifacts must be a list')
+        for artifact in artifacts:
+            filename = str(artifact.get('filename') or '')
+            path = (mirror / filename).resolve()
+            if not filename or mirror not in path.parents or not path.is_file():
+                raise ValueError(f'missing or unsafe artifact: {filename}')
+            expected_hash = str(artifact.get('sha256') or '')
+            expected_size = int(artifact.get('size') or -1)
+            if path.stat().st_size != expected_size or sha256_file(path) != expected_hash:
+                raise ValueError(f'artifact hash/size mismatch: {filename}')
+            if sum_entries.get(filename) != expected_hash:
+                raise ValueError(f'SHA256SUMS mismatch: {filename}')
     except (OSError, ValueError, IndexError, TypeError) as exc:
         result["error"] = f"invalid mirror metadata: {exc}"
         return result
