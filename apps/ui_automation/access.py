@@ -1,5 +1,6 @@
 """Authorization helpers for UI automation resources."""
 
+from django.conf import settings
 from django.db.models import Q
 
 
@@ -9,6 +10,12 @@ def is_ui_admin(user):
         and getattr(user, "is_authenticated", False)
         and (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
     )
+
+
+def selenium_compatibility_enabled(user=None):
+    """Return whether legacy Selenium execution is enabled for this deployment."""
+    enabled = bool(getattr(settings, 'UI_SELENIUM_COMPATIBILITY', True))
+    return enabled or is_ui_admin(user)
 
 
 def accessible_projects(user):

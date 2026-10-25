@@ -49,7 +49,7 @@ from .serializers import (
     AICaseSerializer, AIExecutionRecordSerializer
 )
 from .operation_logger import log_operation
-from .access import accessible_projects, is_ui_admin
+from .access import accessible_projects, is_ui_admin, selenium_compatibility_enabled
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -791,6 +791,9 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         engine = request.data.get('engine', 'playwright')
         browser = request.data.get('browser', 'chrome')
         headless = request.data.get('headless', False)
+
+        if engine == 'selenium' and not selenium_compatibility_enabled(request.user):
+            return Response({'error': 'Selenium 兼容模式已被当前部署禁用'}, status=status.HTTP_403_FORBIDDEN)
 
         if engine == 'selenium':
             from .selenium_engine import SeleniumTestEngine

@@ -10,7 +10,7 @@ from .models import (
 )
 from django.contrib.auth import get_user_model
 from django.conf import settings
-from .access import project_accessible, is_ui_admin
+from .access import project_accessible, is_ui_admin, selenium_compatibility_enabled
 
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
@@ -929,6 +929,11 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         project = _ensure_project_access(self, attrs.get('project', getattr(self.instance, 'project', None)))
         test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
+        if attrs.get('engine', getattr(self.instance, 'engine', 'playwright')) == 'selenium' and not selenium_compatibility_enabled(
+            getattr(self.context.get('request'), 'user', None)
+        ):
+            raise serializers.ValidationError({'engine': 'Selenium 兼容模式已被当前部署禁用'})
+
         test_suite = attrs.get('test_suite', getattr(self.instance, 'test_suite', None))
         if test_case is not None:
             _same_project_error(project, test_case, 'test_case')
@@ -1047,6 +1052,11 @@ class UiScheduledTaskSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("执行时间必须大于当前时间")
 
         task_type = attrs.get('task_type', getattr(self.instance, 'task_type', None))
+        if attrs.get('engine', getattr(self.instance, 'engine', 'playwright')) == 'selenium' and not selenium_compatibility_enabled(
+            getattr(self.context.get('request'), 'user', None)
+        ):
+            raise serializers.ValidationError({'engine': 'Selenium 兼容模式已被当前部署禁用'})
+
         if task_type == 'TEST_SUITE' and not attrs.get('test_suite', getattr(self.instance, 'test_suite', None)):
             raise serializers.ValidationError("测试套件不能为空")
         raw_test_cases = attrs.get('test_cases')

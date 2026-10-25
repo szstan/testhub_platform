@@ -16,7 +16,7 @@ def parse_csv(value):
 
 
 DEBUG = config('DEBUG', default=TESTING, cast=bool)
-WEBSOCKET_TICKET_REQUIRE_SHARED_CACHE = not DEBUG
+UI_SELENIUM_COMPATIBILITY = config('UI_SELENIUM_COMPATIBILITY', default=True, cast=bool)
 _secret_key = config('SECRET_KEY', default='')
 if _secret_key:
     SECRET_KEY = _secret_key
