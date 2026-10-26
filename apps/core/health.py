@@ -93,7 +93,7 @@ def _check_frontend_assets():
         references = [match.group(1) for match in _ASSET_RE.finditer(index.read_text(encoding='utf-8'))]
     except (OSError, UnicodeError):
         return 'error'
-    assets = [reference for reference in references if reference.startswith('assets/')]
+    assets = [reference.lstrip('/') for reference in references if reference.lstrip('/').startswith('assets/')]
     if not assets:
         return 'error'
     for reference in assets:
