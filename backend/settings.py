@@ -412,6 +412,10 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_TASK_TRACK_STARTED = config('CELERY_TASK_TRACK_STARTED', default=True, cast=bool)
 CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
+# Durable unified-execution retry routes. Format: ``api=package.task,ui=package.task``.
+# An empty default is fail-closed: the outbox consumer marks unsupported rows
+# failed instead of claiming that a retry was dispatched.
+EXECUTION_RETRY_DISPATCH_ROUTES = config('EXECUTION_RETRY_DISPATCH_ROUTES', default='')
 
 # Channels Configuration
 CHANNEL_LAYERS = {

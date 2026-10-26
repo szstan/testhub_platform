@@ -283,6 +283,8 @@ class ScheduledTask(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE', verbose_name='任务状态')
     last_run_time = models.DateTimeField(null=True, blank=True, verbose_name='最后运行时间')
     next_run_time = models.DateTimeField(null=True, blank=True, verbose_name='下次运行时间')
+    scheduler_lease_token = models.CharField(max_length=64, blank=True, default='', verbose_name='调度租约令牌')
+    scheduler_lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='调度租约过期时间')
     total_runs = models.IntegerField(default=0, verbose_name='总运行次数')
     successful_runs = models.IntegerField(default=0, verbose_name='成功运行次数')
     failed_runs = models.IntegerField(default=0, verbose_name='失败运行次数')

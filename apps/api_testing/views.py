@@ -1802,13 +1802,9 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
     
     def _execute_task_async(self, task, execution_log):
         """异步执行任务"""
-        import threading
-        from datetime import datetime
-        
-        # 添加测试日志
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("=== _execute_task_async 方法被调用 ===")
+        from .tasks import execute_scheduled_task
+        return execute_scheduled_task.delay(task.pk, execution_log.pk)
+        # Legacy inline worker removed: scheduled work must remain durable.
         
         def execute():
             try:
@@ -1908,10 +1904,8 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
                     logger.info("通知设置未启用或不存在，跳过失败通知")
                 logger.info("=== 结束检查发送失败通知 ===")
         
-        # 在新线程中执行
-        thread = threading.Thread(target=execute)
-        thread.daemon = True
-        thread.start()
+        # Inline daemon workers are intentionally not used; Celery is the durable boundary.
+        return None
     
     def _execute_test_suite(self, task):
         """执行测试套件"""

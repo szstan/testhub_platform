@@ -38,6 +38,10 @@ apps/*/migrations/*
 # Additive execution/device/report migrations are part of the reviewable change.
 !apps/executions/migrations/
 !apps/executions/migrations/*.py
+!apps/api_testing/migrations/
+!apps/api_testing/migrations/*.py
+!apps/ui_automation/migrations/
+!apps/ui_automation/migrations/*.py
 !apps/app_automation/migrations/
 !apps/app_automation/migrations/*.py
 !apps/reports/migrations/

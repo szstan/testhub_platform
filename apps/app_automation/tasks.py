@@ -13,6 +13,42 @@ from channels.layers import get_channel_layer
 logger = logging.getLogger(__name__)
 
 
+def _record_scheduled_result(task_id, success, result, scheduler_lease_token=''):
+    """Persist APP schedule counters and release a scheduler lease when owned."""
+    from .models import AppScheduledTask
+    from apps.core.scheduler import clear_claim, load_claimed_task
+
+    with transaction.atomic():
+        if scheduler_lease_token:
+            task = load_claimed_task(
+                AppScheduledTask,
+                task_id,
+                scheduler_lease_token,
+                require_active=True,
+            )
+            task.total_runs += 1
+            task.last_run_time = timezone.now()
+            task.next_run_time = task.calculate_next_run()
+            clear_claim(task, token=scheduler_lease_token)
+            fields = [
+                'total_runs', 'last_run_time', 'next_run_time',
+                'scheduler_lease_token', 'scheduler_lease_expires_at', 'updated_at',
+            ]
+        else:
+            task = AppScheduledTask.objects.select_for_update().get(pk=task_id)
+            fields = []
+        if success:
+            task.successful_runs += 1
+            fields.append('successful_runs')
+        else:
+            task.failed_runs += 1
+            fields.append('failed_runs')
+        task.last_result = result or {}
+        fields.extend(['last_result', 'updated_at'])
+        task.save(update_fields=list(dict.fromkeys(fields)))
+    return task
+
+
 def _assert_scheduled_task_scope(*, scheduled_task_id, project_id, device_id,
                                  app_package_id=None, test_suite_id=None,
                                  test_case_id=None):
@@ -234,7 +270,7 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
 
 
 @shared_task
-def execute_app_test_task(execution_id, package_name: str = None, scheduled_task_id: int = None):
+def execute_app_test_task(execution_id, package_name: str = None, scheduled_task_id: int = None, scheduler_lease_token: str = ''):
     """
     异步执行APP测试任务
     
@@ -354,18 +390,21 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
         
         logger.info(f"APP测试执行完成: {test_case.name}, 状态: {execution.status}, 结果: {execution.result}")
 
-        # 定时任务通知
+        # 定时任务通知和 durable schedule completion
         if scheduled_task_id:
             try:
-                from .models import AppScheduledTask
-                st = AppScheduledTask.objects.get(id=scheduled_task_id)
                 is_success = execution.result == 'passed'
-                if is_success:
-                    st.successful_runs += 1
-                else:
-                    st.failed_runs += 1
-                st.last_result = {'status': execution.status, 'result': execution.result, 'message': f'{test_case.name} - {execution.result or execution.status}'}
-                st.save(update_fields=['successful_runs', 'failed_runs', 'last_result'])
+                result = {
+                    'status': execution.status,
+                    'result': execution.result,
+                    'message': f'{test_case.name} - {execution.result or execution.status}',
+                }
+                _record_scheduled_result(
+                    scheduled_task_id,
+                    is_success,
+                    result,
+                    scheduler_lease_token=scheduler_lease_token,
+                )
                 send_scheduled_task_notification(scheduled_task_id, success=is_success)
             except Exception as ne:
                 logger.error(f"更新定时任务状态失败: {ne}")
@@ -399,6 +438,17 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
                 executor._generate_allure_report(execution_id=execution_id)
             except Exception:
                 pass
+
+        if scheduled_task_id and scheduler_lease_token:
+            try:
+                _record_scheduled_result(
+                    scheduled_task_id,
+                    False,
+                    {'status': 'error', 'message': str(e)[:4000]},
+                    scheduler_lease_token=scheduler_lease_token,
+                )
+            except Exception as schedule_error:
+                logger.error('更新 APP 调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
         # 7. 清理：释放设备
         try:
@@ -410,7 +460,7 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
 
 
 @shared_task
-def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled_task_id=None):
+def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled_task_id=None, scheduler_lease_token=''):
     """
     异步执行APP测试套件（顺序执行多个用例）
 
@@ -579,22 +629,21 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
 
         logger.info(f"套件执行完成: {suite.name}, 通过: {passed}, 失败: {failed}")
 
-        # 定时任务通知
+        # 定时任务通知和 durable schedule completion
         if scheduled_task_id:
             try:
-                from .models import AppScheduledTask
-                st = AppScheduledTask.objects.get(id=scheduled_task_id)
                 is_success = failed == 0
-                if is_success:
-                    st.successful_runs += 1
-                else:
-                    st.failed_runs += 1
-                st.last_result = {
+                result = {
                     'status': suite.execution_status,
                     'result': suite.execution_result,
-                    'message': f'通过: {passed}, 失败: {failed}'
+                    'message': f'通过: {passed}, 失败: {failed}',
                 }
-                st.save(update_fields=['successful_runs', 'failed_runs', 'last_result'])
+                _record_scheduled_result(
+                    scheduled_task_id,
+                    is_success,
+                    result,
+                    scheduler_lease_token=scheduler_lease_token,
+                )
                 send_scheduled_task_notification(scheduled_task_id, success=is_success)
             except Exception as ne:
                 logger.error(f"更新定时任务状态失败: {ne}")
@@ -610,6 +659,17 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             suite.passed_count = passed
             suite.last_run_at = timezone.now()
             suite.save(update_fields=['execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'])
+
+        if scheduled_task_id and scheduler_lease_token:
+            try:
+                _record_scheduled_result(
+                    scheduled_task_id,
+                    False,
+                    {'status': 'error', 'message': str(e)[:4000]},
+                    scheduler_lease_token=scheduler_lease_token,
+                )
+            except Exception as schedule_error:
+                logger.error('更新 APP 套件调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
         # 释放设备
         try:

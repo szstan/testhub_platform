@@ -532,6 +532,8 @@ class PerfScheduledTask(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE',
                               verbose_name='任务状态', db_comment='任务状态')
     next_run_at = models.DateTimeField(null=True, blank=True, verbose_name='下次执行时间', db_comment='下次执行时间')
+    scheduler_lease_token = models.CharField(max_length=64, blank=True, default='', verbose_name='调度租约令牌', db_comment='调度租约令牌')
+    scheduler_lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='调度租约过期时间', db_comment='调度租约过期时间')
     last_run_at = models.DateTimeField(null=True, blank=True, verbose_name='上次执行时间', db_comment='上次执行时间')
     run_count = models.IntegerField(default=0, verbose_name='执行次数', db_comment='执行次数')
     success_count = models.IntegerField(default=0, verbose_name='成功次数', db_comment='成功次数')
@@ -585,30 +587,46 @@ class PerfScheduledTask(models.Model):
             return False
         return timezone.now() >= self.next_run_at
 
-    def mark_dispatched(self, error=''):
-        """调度器派发一次执行后调用（落库）。
+    def mark_dispatched(self, error='', scheduler_lease_token=''):
+        """Record one scheduler dispatch while fencing stale workers."""
+        from django.db import transaction
+        from apps.core.scheduler import ScheduleClaimLost, clear_claim, load_claimed_task
 
-        压测是异步长任务，调度器只知道「有没有成功拉起」，不知道压测结果，
-        所以这里只累加 run_count 并推进下次执行时间；
-        真正的 success_count / fail_count 由压测子进程收尾时回写
-        （见 services/executor._update_task_stats），避免两处重复计数。
-        派发阶段就失败（如前置校验不通过）的，直接计入失败。
-        """
+        if scheduler_lease_token:
+            with transaction.atomic():
+                task = load_claimed_task(
+                    type(self),
+                    self.pk,
+                    scheduler_lease_token,
+                    require_active=True,
+                )
+                return task._mark_dispatched_locked(error, scheduler_lease_token)
+        if self.scheduler_lease_token:
+            raise ScheduleClaimLost('scheduled task is owned by another worker')
+        return self._mark_dispatched_locked(error, '')
+
+    def _mark_dispatched_locked(self, error='', scheduler_lease_token=''):
+        """Apply dispatch counters; caller owns the row lock when fenced."""
+        from apps.core.scheduler import clear_claim
+
         self.run_count += 1
         self.last_run_at = timezone.now()
         if error:
             self.fail_count += 1
-            self.last_error = error[:2000]
+            self.last_error = str(error)[:2000]
 
         fields = ['run_count', 'last_run_at', 'fail_count', 'last_error',
                   'status', 'next_run_at', 'updated_at']
-        # ONCE 任务执行后自动暂停，避免下轮循环重复触发
         if self.trigger_type == 'ONCE':
             self.status = 'PAUSED'
             self.next_run_at = None
         else:
             self.calculate_next_run()
+        if scheduler_lease_token:
+            clear_claim(self, token=scheduler_lease_token)
+            fields.extend(['scheduler_lease_token', 'scheduler_lease_expires_at'])
         self.save(update_fields=fields)
+        return self
 
 
 class PerfEnvironment(models.Model):

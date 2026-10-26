@@ -16,7 +16,20 @@ class HealthEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
             'status': 'ok',
-            'checks': {'database': 'ok', 'cache': 'ok'},
+            'checks': {
+                'database': 'ok',
+                'cache': 'ok',
+                'worker': 'skipped',
+                'channel': 'skipped',
+                'migrations': 'skipped',
+                'frontend_assets': 'skipped',
+            },
+            'required': {
+                'worker': False,
+                'channel': False,
+                'migrations': False,
+                'frontend_assets': False,
+            },
         })
 
     @patch('apps.core.health.connection')
@@ -29,3 +42,13 @@ class HealthEndpointTests(TestCase):
         self.assertEqual(response.json()['status'], 'unready')
         self.assertEqual(response.json()['checks']['database'], 'error')
         self.assertEqual(response.json()['checks']['cache'], 'ok')
+
+    @patch('apps.core.health._check_worker', return_value='error')
+    def test_readiness_returns_503_when_required_worker_is_unavailable(self, worker):
+        with self.settings(READINESS_REQUIRE_WORKER=True):
+            response = self.client.get('/readiness/')
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()['status'], 'unready')
+        self.assertEqual(response.json()['checks']['worker'], 'error')
+        worker.assert_called_once_with()
