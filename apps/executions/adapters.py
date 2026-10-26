@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Optional
 from django.db import transaction
 from django.utils import timezone
 
+from .dispatch import CeleryExecutionDispatcher
 from .models import ExecutionArtifact, ExecutionAttempt, ExecutionJob, ExecutionRetryRequest, ExecutionStepResult
 from .result_events import redact_result_payload
 from .state_machine import (
@@ -179,6 +180,21 @@ class ExecutorAdapter:
             )
         if not job.project_id:
             raise AdapterError("Execution job must belong to a project")
+
+    def _resolve_dispatcher(self, dispatcher=None):
+        candidate = dispatcher if dispatcher is not None else getattr(self, 'dispatcher', None)
+        supports = getattr(candidate, 'supports', None)
+        if callable(supports):
+            try:
+                supported = supports(self.source_type)
+            except ValueError as exc:
+                raise AdapterConflict(f"Invalid dispatcher configuration: {exc}") from exc
+            if not supported:
+                return None
+        return candidate
+
+    def _has_dispatcher(self) -> bool:
+        return self._resolve_dispatcher() is not None
 
     def _schedule_retry_dispatch(self, request_id: int, dispatcher, worker: str = "") -> None:
         if dispatcher is None:
@@ -452,7 +468,7 @@ class ExecutorAdapter:
     def retry(self, job: ExecutionJob, *, reason: str = "retry requested", requested_by=None, automatic: bool = False) -> AdapterReceipt:
         """Queue a new attempt with an auditable reason and policy check."""
         self.validate(job)
-        if getattr(self, 'dispatcher', None) is None:
+        if self._resolve_dispatcher() is None:
             raise AdapterConflict(
                 f"No dispatcher is registered for source type {self.source_type}; retry cannot be queued"
             )
@@ -683,7 +699,7 @@ class ExecutorAdapter:
             decision = should_retry(locked_job, locked_attempt, automatic=True)
             retried = False
             retry_blocked = False
-            retry_dispatcher = getattr(self, 'dispatcher', None)
+            retry_dispatcher = self._resolve_dispatcher()
             if effective_status in _TERMINAL_FAILURE and decision.allowed and retry_dispatcher is not None:
                 policy = resolve_retry_policy(locked_job)
                 clear_final_for_retry(locked_job)
@@ -717,8 +733,8 @@ class ExecutorAdapter:
             else:
                 preserve_final_result(locked_job, locked_attempt, effective_status, result_payload, gate_result)
 
-        if retry_request_id and getattr(self, 'dispatcher', None) is not None:
-            self._schedule_retry_dispatch(retry_request_id, self.dispatcher)
+        if retry_request_id and self._resolve_dispatcher() is not None:
+            self._schedule_retry_dispatch(retry_request_id, self._resolve_dispatcher())
         return AdapterReceipt(
             job_id=locked_job.pk,
             attempt_id=locked_attempt.pk,
@@ -745,9 +761,12 @@ class SourceExecutorAdapter(ExecutorAdapter):
         self.canceller = canceller
 
     def submit(self, job, *, dispatcher=None, worker="", quarantine_override=False, override_reason="", requested_by=None):
+        resolved_dispatcher = self._resolve_dispatcher(dispatcher)
+        if resolved_dispatcher is not None and not job.source_id:
+            raise AdapterConflict(f"Unified execution source_id is required for source type {self.source_type}")
         return super().submit(
             job,
-            dispatcher=dispatcher or self.dispatcher,
+            dispatcher=resolved_dispatcher,
             worker=worker,
             quarantine_override=quarantine_override,
             override_reason=override_reason,
@@ -800,10 +819,10 @@ class ExecutorAdapterRegistry:
 
 DEFAULT_EXECUTOR_REGISTRY = ExecutorAdapterRegistry(
     [
-        ApiExecutorAdapter(),
-        UiExecutorAdapter(),
-        AppExecutorAdapter(),
-        PerformanceExecutorAdapter(),
+        ApiExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
+        UiExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
+        AppExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
+        PerformanceExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
     ]
 )
 
@@ -831,6 +850,7 @@ __all__ = [
     "AdapterReceipt",
     "ApiExecutorAdapter",
     "AppExecutorAdapter",
+    "CeleryExecutionDispatcher",
     "DEFAULT_EXECUTOR_REGISTRY",
     "ExecutorAdapter",
     "ExecutorAdapterRegistry",

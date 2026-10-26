@@ -95,6 +95,11 @@ WHEELHOUSE="/var/tmp/testhub-wheelhouse-${RELEASE}"
 python3.12 scripts/build_linux_wheelhouse.py \
   --output "$WHEELHOUSE" \
   --index-url "${APP_INDEX_URL:-https://pypi.org/simple}"
+python3.12 scripts/validate_wheelhouse_manifest.py \
+  --directory "$WHEELHOUSE" \
+  --requirements requirements-prod.txt \
+  --requirements requirements-app-optional.txt \
+  --requirements requirements-report-optional.txt
 ```
 
 候选环境必须使用 manifest 校验过的 wheelhouse，并保持与正式 venv 隔离：
@@ -103,6 +108,11 @@ python3.12 scripts/build_linux_wheelhouse.py \
 MIRROR="${TESTHUB_MIRROR:-/var/lib/testhub-mirror/testhub_platform/current}"
 test -d "$MIRROR"
 test -f "$MIRROR/manifest.json"
+python3.12 scripts/validate_wheelhouse_manifest.py \
+  --directory "$MIRROR" \
+  --requirements requirements-prod.txt \
+  --requirements requirements-app-optional.txt \
+  --requirements requirements-report-optional.txt
 CANDIDATE="/var/tmp/testhub-venv-${RELEASE}"
 python3.12 -m venv "$CANDIDATE"
 "$CANDIDATE/bin/python" -m pip install --no-index --no-cache-dir \

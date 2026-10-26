@@ -93,7 +93,7 @@ jobs:
 
       - name: Validate Linux dependency artifact builder
         run: |
-          python -m py_compile scripts/build_linux_wheelhouse.py
+          python -m py_compile scripts/build_linux_wheelhouse.py scripts/validate_wheelhouse_manifest.py
           python scripts/build_linux_wheelhouse.py --help
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
@@ -106,7 +106,11 @@ jobs:
             --requirements requirements-report-optional.txt
           test -s "$tmp_dir/manifest.json"
           test -s "$tmp_dir/manifest.sha256"
-          test -s "$tmp_dir/SHA256SUMS"
+          python scripts/validate_wheelhouse_manifest.py \
+            --directory "$tmp_dir" \
+            --requirements requirements-prod.txt \
+            --requirements requirements-app-optional.txt \
+            --requirements requirements-report-optional.txt
           touch "$tmp_dir/bad-1.0-py3-none-win_amd64.whl"
           if python scripts/build_linux_wheelhouse.py \
             --output "$tmp_dir" \

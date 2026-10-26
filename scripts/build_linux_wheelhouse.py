@@ -193,6 +193,7 @@ def write_manifest(
     index_url: str,
     source_packages: list[str],
     build_requirements: list[str],
+    extra_index_urls: list[str],
 ) -> None:
     artifacts = artifact_paths(output)
     manifest = {
@@ -202,6 +203,10 @@ def write_manifest(
             "platform": "linux-x86_64",
             "machine": platform.machine(),
             "libc": platform.libc_ver(),
+        },
+        "sources": {
+            "index_url": index_url,
+            "extra_index_urls": list(extra_index_urls),
         },
         "inputs": [
             {"name": requirement.name, "sha256": sha256_file(requirement)}
@@ -256,7 +261,14 @@ def main() -> int:
     if not args.manifest_only:
         run_pip_download(output, requirements, args.index_url, args.extra_index_url, args.source_package)
         run_build_download(output, args.index_url, args.extra_index_url, args.build_requirement)
-    write_manifest(output, requirements, args.index_url, args.source_package, args.build_requirement)
+    write_manifest(
+        output,
+        requirements,
+        args.index_url,
+        args.source_package,
+        args.build_requirement,
+        args.extra_index_url,
+    )
     return 0
 
 

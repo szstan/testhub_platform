@@ -40,6 +40,18 @@ python scripts/ci_schema_check.py
 
 当前 P0 迁移包含 testcases 0003、executions 0011/0012；目标 staging 已应用这些迁移并通过 `migrate --plan`。本地默认 MySQL 连接如果返回 `Access denied for user 'root'@'localhost'`，只表示目标数据库的已应用迁移历史没有在本机凭证下核对。
 
+## Unified execution dispatcher contract
+
+`ExecutionJob` is an executor-neutral record. A source adapter only dispatches when `EXECUTION_DISPATCH_ROUTES` contains a valid Celery task name for its `source_type`; the default is empty and therefore fail-closed. Configure routes with either a comma-separated value such as `api=workers.api_execute,ui=workers.ui_execute` or a settings mapping.
+
+The destination worker receives the durable contract:
+
+- positional arguments: `job_id`, `attempt_id`;
+- keyword arguments: `execution_job_id`, `attempt_id`, `source_type`, `source_id`, and `variant_id`;
+- Celery task id: `execution-<job_id>-<attempt_id>` or the variant suffix.
+
+The worker owns source-specific execution and must publish a result through the result-events contract. TestHub records the broker dispatch id and keeps project authorization, attempt state, cancellation and late-result fencing in the unified layer. A route is not considered available when it is absent or syntactically invalid, and a job without `source_id` cannot be dispatched. Retry routes remain separately controlled by `EXECUTION_RETRY_DISPATCH_ROUTES` and use the retry outbox contract.
+
 ## 重试、终态和质量门禁
 
 `ExecutionRetryPolicy` 按项目、profile、case 解析，第一次决策会保存到 `ExecutionJob.retry_policy_snapshot`。每个 attempt 记录 retry reason、policy、mode、decision 和 scheduled time。自动重试先在 job 锁内创建 `ExecutionRetryRequest` outbox；有 dispatcher 时在事务提交后继续 dispatch，没有 dispatcher 时由后续 worker 消费 queued outbox。

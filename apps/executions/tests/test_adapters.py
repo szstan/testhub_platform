@@ -1,4 +1,8 @@
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 import pytest
+from django.test import override_settings
 
 from apps.executions.adapters import (
     AdapterConflict,
@@ -9,6 +13,7 @@ from apps.executions.adapters import (
     UnsupportedExecutorError,
     get_executor_adapter,
 )
+from apps.executions.dispatch import CeleryExecutionDispatcher
 from apps.executions.models import ExecutionArtifact, ExecutionJob, ExecutionStepResult
 from apps.executions.state_machine import AttemptStatus, ExecutionStatus
 from apps.projects.models import Project
@@ -116,3 +121,26 @@ def test_default_registry_exposes_all_source_adapters():
     assert get_executor_adapter('performance').source_type == 'performance'
     with pytest.raises(UnsupportedExecutorError):
         get_executor_adapter('missing')
+
+    dispatcher = get_executor_adapter('api').dispatcher
+    assert isinstance(dispatcher, CeleryExecutionDispatcher)
+    with override_settings(EXECUTION_DISPATCH_ROUTES={'api': 'workers.api'}):
+        assert dispatcher.supports('api') is True
+        assert dispatcher.supports('ui') is False
+        job = SimpleNamespace(pk=10, source_type='api', source_id='suite-1')
+        attempt = SimpleNamespace(pk=20)
+        broker_result = Mock(id='celery-10-20')
+        with patch('apps.executions.dispatch.current_app.send_task', return_value=broker_result) as send_task:
+            assert dispatcher(job, attempt) == 'celery-10-20'
+        send_task.assert_called_once_with(
+            'workers.api',
+            args=[10, 20],
+            kwargs={
+                'execution_job_id': 10,
+                'attempt_id': 20,
+                'source_type': 'api',
+                'source_id': 'suite-1',
+                'variant_id': None,
+            },
+            task_id='execution-10-20',
+        )
