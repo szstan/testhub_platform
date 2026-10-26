@@ -1,3 +1,5 @@
+from unittest.mock import Mock, patch
+
 import pytest
 from django.test import override_settings
 from django.utils import timezone
@@ -19,6 +21,7 @@ from apps.executions.policies import (
     review_ai_suggestion,
 )
 from apps.executions.result_events import ResultEventIngestor
+from apps.executions.retry_outbox import dispatch_retry_request
 from apps.executions.state_machine import ExecutionStatus
 from apps.projects.models import Project
 from apps.quality_intelligence.models import (
@@ -124,6 +127,25 @@ def test_automatic_retry_is_dispatched_and_outboxed(governed_job):
     assert retry_request.status in {'queued', 'dispatched'}
     assert retry_request.to_attempt.attempt_number == 2
     assert job.retry_policy_snapshot['policy_id'] == retry_request.policy_id
+
+    retry_request.status = 'queued'
+    retry_request.save(update_fields=['status', 'updated_at'])
+    failed = dispatch_retry_request(retry_request.pk)
+    assert failed.status == 'failed'
+
+    retry_request.status = 'queued'
+    retry_request.save(update_fields=['status', 'updated_at'])
+    broker_result = Mock(id='governance-retry-task')
+    with override_settings(EXECUTION_RETRY_DISPATCH_ROUTES={'api': 'worker.retry'}):
+        with patch('apps.executions.retry_outbox.current_app.send_task', return_value=broker_result) as send_task:
+            dispatched = dispatch_retry_request(retry_request.pk)
+    assert dispatched.status == 'dispatched'
+    send_task.assert_called_once_with(
+        'worker.retry',
+        args=[job.pk, retry_request.to_attempt_id],
+        kwargs={'retry_request_id': retry_request.pk},
+        task_id=retry_request.idempotency_key,
+    )
 
 
 @pytest.mark.django_db
