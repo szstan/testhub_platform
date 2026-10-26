@@ -73,8 +73,8 @@ def test_automatic_retry_preserves_final_result_and_reason(governed_job):
         retryable_statuses=['failed'],
         created_by=owner,
     )
-    adapter = ApiExecutorAdapter()
-    first = adapter.submit(job, dispatcher=lambda _job, attempt: f'dispatch-{attempt.attempt_number}')
+    adapter = ApiExecutorAdapter(dispatcher=lambda _job, attempt: f'dispatch-{attempt.attempt_number}')
+    first = adapter.submit(job)
     attempt_one = job.attempts.get(pk=first.attempt_id)
     collected = adapter.collect_result(
         job,
@@ -89,7 +89,7 @@ def test_automatic_retry_preserves_final_result_and_reason(governed_job):
     assert attempt_one.is_final is False
     assert job.final_result == {}
 
-    second = adapter.submit(job, dispatcher=lambda _job, attempt: f'dispatch-{attempt.attempt_number}')
+    second = adapter.submit(job)
     assert second.attempt_id != attempt_one.pk
     attempt_two = job.attempts.get(pk=second.attempt_id)
     adapter.collect_result(job, attempt_two, {'status': 'passed', 'result': {'attempt': 2}})

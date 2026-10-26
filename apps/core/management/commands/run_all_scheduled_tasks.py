@@ -125,7 +125,7 @@ class Command(BaseCommand):
                 task = claim.task
                 try:
                     execution_log = TaskExecutionLog.objects.create(task_id=task.pk, status='PENDING')
-                    execute_scheduled_task.delay(task.pk, execution_log.pk, claim.token)
+                    execute_scheduled_task.delay(task.pk, execution_log.pk, claim.token, self.lease_seconds)
                     count += 1
                 except Exception as exc:  # broker unavailable: do not leave an invisible lease
                     logger.error('API task dispatch failed: %s', exc, exc_info=True)
@@ -147,7 +147,7 @@ class Command(BaseCommand):
                 if claim is None:
                     continue
                 try:
-                    execute_ui_scheduled_task.delay(claim.task.pk, claim.token)
+                    execute_ui_scheduled_task.delay(claim.task.pk, claim.token, self.lease_seconds)
                     count += 1
                 except Exception as exc:  # broker unavailable: release as a visible failure
                     logger.error('UI task dispatch failed: %s', exc, exc_info=True)
@@ -192,6 +192,7 @@ class Command(BaseCommand):
                             package_name=package_name,
                             scheduled_task_id=task.pk,
                             scheduler_lease_token=claim.token,
+                            lease_seconds=self.lease_seconds,
                         )
                     elif task.task_type == 'TEST_CASE' and task.test_case:
                         execution = AppTestExecution.objects.create(
@@ -205,6 +206,7 @@ class Command(BaseCommand):
                             package_name=package_name,
                             scheduled_task_id=task.pk,
                             scheduler_lease_token=claim.token,
+                            lease_seconds=self.lease_seconds,
                         )
                         execution.task_id = celery_task.id
                         execution.save(update_fields=['task_id'])

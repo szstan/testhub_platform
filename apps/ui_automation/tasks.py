@@ -8,7 +8,7 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from apps.core.scheduler import ScheduleClaimLost, clear_claim, load_claimed_task
+from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear_claim, load_claimed_task
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +142,22 @@ def _run_cases(task):
 
 
 @shared_task(bind=True, ignore_result=False)
-def execute_ui_scheduled_task(self, task_id, scheduler_lease_token=''):
+def execute_ui_scheduled_task(self, task_id, scheduler_lease_token='', lease_seconds=300):
     """Execute one UI scheduled task in a Celery worker."""
 
     task = None
+    heartbeat = None
     try:
+        from .models import UiScheduledTask
+
         task = _load_task(task_id, scheduler_lease_token)
+        if scheduler_lease_token:
+            heartbeat = ScheduleLeaseHeartbeat(
+                UiScheduledTask,
+                task_id,
+                scheduler_lease_token,
+                lease_seconds=lease_seconds,
+            ).start()
         if task.task_type == 'TEST_SUITE':
             success, result = _run_suite(task)
         elif task.task_type == 'TEST_CASE':
@@ -186,6 +196,9 @@ def execute_ui_scheduled_task(self, task_id, scheduler_lease_token=''):
             except Exception:  # noqa: BLE001 - notification cannot hide execution failure
                 logger.exception('UI scheduled task failure notification failed: task_id=%s', task_id)
         return {'task_id': task_id, 'success': False}
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
 
 
 __all__ = ['execute_ui_scheduled_task']

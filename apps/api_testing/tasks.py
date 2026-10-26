@@ -8,7 +8,7 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from apps.core.scheduler import ScheduleClaimLost, clear_claim, load_claimed_task
+from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear_claim, load_claimed_task
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +66,24 @@ def _finish_task(task_id, *, scheduler_lease_token, success, result=None, error_
 
 
 @shared_task(bind=True, ignore_result=False)
-def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_token=''):
+def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_token='', lease_seconds=300):
     """Execute one API scheduled task outside the web/scheduler process."""
 
-    from .models import TaskExecutionLog
+    from .models import ScheduledTask, TaskExecutionLog
     from .utils import execute_api_request, execute_test_suite
 
     log = TaskExecutionLog.objects.select_related('task').get(pk=execution_log_id)
     task = None
+    heartbeat = None
     try:
         task = _load_task(task_id, scheduler_lease_token)
+        if scheduler_lease_token:
+            heartbeat = ScheduleLeaseHeartbeat(
+                ScheduledTask,
+                task_id,
+                scheduler_lease_token,
+                lease_seconds=lease_seconds,
+            ).start()
         log.status = 'RUNNING'
         log.start_time = timezone.now()
         log.save(update_fields=['status', 'start_time'])
@@ -139,6 +147,9 @@ def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_toke
             except Exception:  # noqa: BLE001 - notification cannot hide execution failure
                 logger.exception('API scheduled task failure notification failed: task_id=%s', task_id)
         return {'task_id': task_id, 'execution_log_id': log.pk, 'success': False}
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
 
 
 __all__ = ['execute_scheduled_task']

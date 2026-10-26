@@ -452,6 +452,10 @@ class ExecutorAdapter:
     def retry(self, job: ExecutionJob, *, reason: str = "retry requested", requested_by=None, automatic: bool = False) -> AdapterReceipt:
         """Queue a new attempt with an auditable reason and policy check."""
         self.validate(job)
+        if getattr(self, 'dispatcher', None) is None:
+            raise AdapterConflict(
+                f"No dispatcher is registered for source type {self.source_type}; retry cannot be queued"
+            )
         with transaction.atomic():
             locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
             if locked_job.status not in _TERMINAL_FAILURE:
@@ -678,7 +682,9 @@ class ExecutorAdapter:
 
             decision = should_retry(locked_job, locked_attempt, automatic=True)
             retried = False
-            if effective_status in _TERMINAL_FAILURE and decision.allowed:
+            retry_blocked = False
+            retry_dispatcher = getattr(self, 'dispatcher', None)
+            if effective_status in _TERMINAL_FAILURE and decision.allowed and retry_dispatcher is not None:
                 policy = resolve_retry_policy(locked_job)
                 clear_final_for_retry(locked_job)
                 mark_retry_requested(
@@ -700,6 +706,14 @@ class ExecutorAdapter:
                 )
                 retry_request_id = retry_request.pk
                 retried = True
+            elif effective_status in _TERMINAL_FAILURE and decision.allowed:
+                retry_blocked = True
+                locked_job.error_type = ErrorType.CONFIGURATION
+                locked_job.error_message = (
+                    f"Automatic retry unavailable: no dispatcher is registered for source type {self.source_type}"
+                )
+                locked_job.save(update_fields=["error_type", "error_message", "updated_at"])
+                preserve_final_result(locked_job, locked_attempt, effective_status, result_payload, gate_result)
             else:
                 preserve_final_result(locked_job, locked_attempt, effective_status, result_payload, gate_result)
 
@@ -712,7 +726,13 @@ class ExecutorAdapter:
             status=locked_job.status,
             supported=True,
             message="result collected",
-            details={"steps": len(step_payloads), "artifacts": len(artifact_payloads), "quality_gate": gate_result, "automatic_retry": retried},
+            details={
+                "steps": len(step_payloads),
+                "artifacts": len(artifact_payloads),
+                "quality_gate": gate_result,
+                "automatic_retry": retried,
+                "automatic_retry_blocked": retry_blocked,
+            },
         )
 
 

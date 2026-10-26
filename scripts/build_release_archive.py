@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
+import json
 import subprocess
 import tarfile
 from pathlib import Path
@@ -28,20 +30,24 @@ EXCLUDED_PARTS = {
 EXCLUDED_ROOTS = {"backups", "logs", "media", "static_files", "wheels", "testhub-login-192-168-10-111.png", ".coverage", ".playwright-mcp"}
 
 
-def git_release() -> str:
+def git_commit() -> str:
     try:
         value = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=REPO_ROOT,
             text=True,
             encoding='utf-8',
             errors='replace',
         ).strip()
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise SystemExit(f"unable to determine git release: {exc}") from exc
+        raise SystemExit(f"unable to determine git commit: {exc}") from exc
     if not value:
-        raise SystemExit("git returned an empty release identifier")
+        raise SystemExit("git returned an empty commit identifier")
     return value
+
+
+def git_release() -> str:
+    return git_commit()[:7]
 
 
 def sha256(path: Path) -> str:
@@ -91,6 +97,39 @@ def tracked_executable_paths() -> set[str]:
     return executable_paths
 
 
+def build_release_manifest(release: str) -> dict:
+    requirement_entries = []
+    for path in sorted(REPO_ROOT.glob('requirements*.txt')):
+        if path.is_file():
+            requirement_entries.append({
+                'path': path.relative_to(REPO_ROOT).as_posix(),
+                'sha256': sha256(path),
+            })
+    frontend_index = REPO_ROOT / 'frontend' / 'dist' / 'index.html'
+    return {
+        'schema_version': 1,
+        'release': release,
+        'source_commit': git_commit(),
+        'requirements': requirement_entries,
+        'files': {
+            'frontend/dist/index.html': sha256(frontend_index),
+        },
+    }
+
+
+def add_release_manifest(archive: tarfile.TarFile, archive_root: str, release: str) -> None:
+    payload = json.dumps(
+        build_release_manifest(release),
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode('utf-8') + b'\n'
+    info = tarfile.TarInfo(name=f'{archive_root}/release-manifest.json')
+    info.mode = 0o644
+    info.size = len(payload)
+    archive.addfile(info, io.BytesIO(payload))
+
+
 def archive_mode(relative: Path, source: Path, executable_paths: set[str]) -> int:
     if relative.as_posix() in executable_paths or source.stat().st_mode & 0o111:
         return 0o755
@@ -122,6 +161,7 @@ def build_archive(output: Path, release: str) -> None:
             info.mode = archive_mode(relative, path, executable_paths)
             with path.open("rb") as handle:
                 archive.addfile(info, handle)
+        add_release_manifest(archive, archive_root, release)
 
     print(f"archive={output}")
     print(f"release={release}")

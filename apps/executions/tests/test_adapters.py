@@ -1,6 +1,7 @@
 import pytest
 
 from apps.executions.adapters import (
+    AdapterConflict,
     ApiExecutorAdapter,
     AppExecutorAdapter,
     PerformanceExecutorAdapter,
@@ -77,6 +78,8 @@ def test_adapter_without_dispatcher_fails_closed(adapter_job):
     assert receipt.supported is False
     assert receipt.status == ExecutionStatus.UNSUPPORTED
     assert adapter_job.status == ExecutionStatus.UNSUPPORTED
+    with pytest.raises(AdapterConflict, match='retry cannot be queued'):
+        ApiExecutorAdapter().retry(adapter_job)
 
 
 @pytest.mark.django_db

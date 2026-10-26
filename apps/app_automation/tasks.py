@@ -9,6 +9,7 @@ import logging
 import os
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from apps.core.scheduler import ScheduleLeaseHeartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +271,7 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
 
 
 @shared_task
-def execute_app_test_task(execution_id, package_name: str = None, scheduled_task_id: int = None, scheduler_lease_token: str = ''):
+def execute_app_test_task(execution_id, package_name: str = None, scheduled_task_id: int = None, scheduler_lease_token: str = '', lease_seconds: int = 300):
     """
     异步执行APP测试任务
     
@@ -280,12 +281,13 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
         scheduled_task_id: 可选的定时任务 ID（来自定时调度）
     """
     from django.conf import settings
-    from .models import AppTestExecution, AppDevice
+    from .models import AppTestExecution, AppDevice, AppScheduledTask
     from .executors.test_executor import AppTestExecutor
     
     execution = None
     device = None
     lock_acquired = False
+    heartbeat = None
     
     try:
         # 获取执行记录
@@ -300,6 +302,13 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
             app_package_id=test_case.app_package_id,
             test_case_id=test_case.id,
         )
+        if scheduled_task_id and scheduler_lease_token:
+            heartbeat = ScheduleLeaseHeartbeat(
+                AppScheduledTask,
+                scheduled_task_id,
+                scheduler_lease_token,
+                lease_seconds=lease_seconds,
+            ).start()
 
         # 更新状态为执行中
         execution.status = 'running'
@@ -450,6 +459,8 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
             except Exception as schedule_error:
                 logger.error('更新 APP 调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         # 7. 清理：释放设备
         try:
             if lock_acquired and device and execution and device.locked_by_id == execution.user_id:
@@ -460,7 +471,7 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
 
 
 @shared_task
-def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled_task_id=None, scheduler_lease_token=''):
+def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled_task_id=None, scheduler_lease_token='', lease_seconds: int = 300):
     """
     异步执行APP测试套件（顺序执行多个用例）
 
@@ -470,7 +481,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
         package_name: 可选的应用包名覆盖
         scheduled_task_id: 可选的定时任务 ID
     """
-    from .models import AppTestSuite, AppTestExecution, AppDevice
+    from .models import AppTestSuite, AppTestExecution, AppDevice, AppScheduledTask
     from .executors.test_executor import AppTestExecutor
 
     suite = None
@@ -478,6 +489,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
     lock_acquired = False
     passed = 0
     failed = 0
+    heartbeat = None
 
     try:
         suite = AppTestSuite.objects.get(id=suite_id)
@@ -501,6 +513,13 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             app_package_id=executions[0].test_case.app_package_id if executions[0].test_case else None,
             test_suite_id=suite.id,
         )
+        if scheduled_task_id and scheduler_lease_token:
+            heartbeat = ScheduleLeaseHeartbeat(
+                AppScheduledTask,
+                scheduled_task_id,
+                scheduler_lease_token,
+                lease_seconds=lease_seconds,
+            ).start()
 
         # 锁定设备
         with transaction.atomic():
@@ -671,6 +690,8 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             except Exception as schedule_error:
                 logger.error('更新 APP 套件调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         # 释放设备
         try:
             if device:

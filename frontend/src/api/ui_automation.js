@@ -305,51 +305,6 @@ export function abortTestExecution(id) {
   })
 }
 
-// 测试环境相关API
-
-// 获取测试环境列表
-export function getTestEnvironments(params) {
-  return request({
-    url: '/ui-automation/test-environments/',
-    method: 'get',
-    params
-  })
-}
-
-// 创建测试环境
-export function createTestEnvironment(data) {
-  return request({
-    url: '/ui-automation/test-environments/',
-    method: 'post',
-    data
-  })
-}
-
-// 获取测试环境详情
-export function getTestEnvironmentDetail(id) {
-  return request({
-    url: `/ui-automation/test-environments/${id}/`,
-    method: 'get'
-  })
-}
-
-// 更新测试环境
-export function updateTestEnvironment(id, data) {
-  return request({
-    url: `/ui-automation/test-environments/${id}/`,
-    method: 'patch',
-    data
-  })
-}
-
-// 删除测试环境
-export function deleteTestEnvironment(id) {
-  return request({
-    url: `/ui-automation/test-environments/${id}/`,
-    method: 'delete'
-  })
-}
-
 // 截图相关API
 
 // 获取截图列表
@@ -607,46 +562,6 @@ export function deleteScriptStep(id) {
   })
 }
 
-// 脚本元素使用情况API
-export function getScriptElementUsages(params) {
-  return request({
-    url: '/ui-automation/script-element-usages/',
-    method: 'get',
-    params
-  })
-}
-
-export function analyzeScriptElements(data) {
-  return request({
-    url: '/ui-automation/script-element-usages/analyze_script/',
-    method: 'post',
-    data
-  })
-}
-
-export function createScriptElementUsage(data) {
-  return request({
-    url: '/ui-automation/script-element-usages/',
-    method: 'post',
-    data
-  })
-}
-
-export function updateScriptElementUsage(id, data) {
-  return request({
-    url: `/ui-automation/script-element-usages/${id}/`,
-    method: 'patch',
-    data
-  })
-}
-
-export function deleteScriptElementUsage(id) {
-  return request({
-    url: `/ui-automation/script-element-usages/${id}/`,
-    method: 'delete'
-  })
-}
-
 // 测试用例相关API
 
 // 获取测试用例列表
@@ -834,59 +749,6 @@ export function runScheduledTask(id) {
   })
 }
 
-// ==================== 通知配置相关API ====================
-
-// 获取通知配置列表
-export function getNotificationConfigs(params) {
-  return request({
-    url: '/ui-automation/notification-configs/',
-    method: 'get',
-    params
-  })
-}
-
-// 创建通知配置
-export function createNotificationConfig(data) {
-  return request({
-    url: '/ui-automation/notification-configs/',
-    method: 'post',
-    data
-  })
-}
-
-// 获取通知配置详情
-export function getNotificationConfigDetail(id) {
-  return request({
-    url: `/ui-automation/notification-configs/${id}/`,
-    method: 'get'
-  })
-}
-
-// 更新通知配置
-export function updateNotificationConfig(id, data) {
-  return request({
-    url: `/ui-automation/notification-configs/${id}/`,
-    method: 'patch',
-    data
-  })
-}
-
-// 删除通知配置
-export function deleteNotificationConfig(id) {
-  return request({
-    url: `/ui-automation/notification-configs/${id}/`,
-    method: 'delete'
-  })
-}
-
-// 设置为默认配置
-export function setDefaultNotificationConfig(id) {
-  return request({
-    url: `/ui-automation/notification-configs/${id}/set_default/`,
-    method: 'post'
-  })
-}
-
 // ==================== 通知日志相关API ====================
 
 // 获取通知日志列表
@@ -903,35 +765,6 @@ export function retryNotification(id) {
   return request({
     url: `/ui-automation/notification-logs/${id}/retry/`,
     method: 'post'
-  })
-}
-
-// ==================== 任务通知设置相关API ====================
-
-// 获取任务通知设置
-export function getTaskNotificationSettings(params) {
-  return request({
-    url: '/ui-automation/task-notification-settings/',
-    method: 'get',
-    params
-  })
-}
-
-// 创建任务通知设置
-export function createTaskNotificationSetting(data) {
-  return request({
-    url: '/ui-automation/task-notification-settings/',
-    method: 'post',
-    data
-  })
-}
-
-// 更新任务通知设置
-export function updateTaskNotificationSetting(id, data) {
-  return request({
-    url: `/ui-automation/task-notification-settings/${id}/`,
-    method: 'patch',
-    data
   })
 }
 

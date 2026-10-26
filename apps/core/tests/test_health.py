@@ -5,7 +5,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.api_testing.models import ScheduledTask
-from apps.core.scheduler import ScheduleClaimLost, claim_due_task, load_claimed_task
+from apps.core.scheduler import ScheduleClaimLost, claim_due_task, load_claimed_task, renew_claim
 from apps.users.models import User
 
 
@@ -51,6 +51,8 @@ class HealthEndpointTests(TestCase):
         )
         first = claim_due_task(ScheduledTask, task.pk, due_field='next_run_time', now=now)
         self.assertIsNotNone(first)
+        renewed = renew_claim(ScheduledTask, task.pk, first.token, now=now + timedelta(seconds=1))
+        self.assertGreater(renewed.expires_at, now + timedelta(seconds=300))
         self.assertIsNone(claim_due_task(ScheduledTask, task.pk, due_field='next_run_time', now=now))
         self.assertEqual(load_claimed_task(ScheduledTask, task.pk, first.token, require_active=True).pk, task.pk)
         second = claim_due_task(
