@@ -15,6 +15,7 @@ from apps.executions.adapters import (
 )
 from apps.executions.dispatch import CeleryExecutionDispatcher
 from apps.executions.models import ExecutionArtifact, ExecutionJob, ExecutionStepResult
+from apps.executions.source_contract import SourceBindingError, parse_source_id
 from apps.executions.state_machine import AttemptStatus, ExecutionStatus
 from apps.projects.models import Project
 from apps.users.models import User
@@ -144,3 +145,9 @@ def test_default_registry_exposes_all_source_adapters():
             },
             task_id='execution-10-20',
         )
+
+    parsed = parse_source_id('api', 'api:suite:42')
+    assert parsed.kind == 'suite'
+    assert parsed.object_id == 42
+    with pytest.raises(SourceBindingError):
+        parse_source_id('ui', 'api:suite:42')

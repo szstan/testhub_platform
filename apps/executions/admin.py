@@ -1,5 +1,18 @@
 from django.contrib import admin
-from .models import TestPlan, TestRun, TestRunCase, TestRunCaseHistory
+
+from .models import ExecutionSourceBinding, TestPlan, TestRun, TestRunCase, TestRunCaseHistory
+
+
+@admin.register(ExecutionSourceBinding)
+class ExecutionSourceBindingAdmin(admin.ModelAdmin):
+    list_display = (
+        'project', 'source_type', 'source_id', 'source_project_id',
+        'enabled', 'created_by', 'updated_at',
+    )
+    list_filter = ('source_type', 'enabled', 'project')
+    search_fields = ('source_id', 'source_project_id')
+    readonly_fields = ('created_at', 'updated_at')
+
 
 @admin.register(TestPlan)
 class TestPlanAdmin(admin.ModelAdmin):
@@ -7,7 +20,8 @@ class TestPlanAdmin(admin.ModelAdmin):
     list_filter = ('is_active', 'created_at', 'version')
     search_fields = ('name', 'description')
     readonly_fields = ('created_at', 'updated_at')
-    filter_horizontal = ('projects', 'assignees')  # 为ManyToManyField添加更好的界面
+    filter_horizontal = ('projects', 'assignees')
+
 
 @admin.register(TestRun)
 class TestRunAdmin(admin.ModelAdmin):
@@ -16,12 +30,14 @@ class TestRunAdmin(admin.ModelAdmin):
     search_fields = ('name', 'description')
     readonly_fields = ('created_at', 'updated_at')
 
+
 @admin.register(TestRunCase)
 class TestRunCaseAdmin(admin.ModelAdmin):
     list_display = ('testcase', 'test_run', 'status', 'priority', 'executed_by', 'executed_at')
     list_filter = ('status', 'priority', 'executed_at')
     search_fields = ('testcase__title', 'actual_result', 'comments')
     readonly_fields = ('created_at', 'updated_at')
+
 
 @admin.register(TestRunCaseHistory)
 class TestRunCaseHistoryAdmin(admin.ModelAdmin):

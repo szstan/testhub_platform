@@ -588,6 +588,51 @@ class ExecutionJob(models.Model):
             return attempt, created
 
 
+class ExecutionSourceBinding(models.Model):
+    """Explicit project-scoped binding from a unified source to a legacy runner."""
+
+    SOURCE_TYPE_CHOICES = (
+        ('api', 'API'),
+        ('ui', 'UI'),
+        ('app', 'APP'),
+        ('performance', 'Performance'),
+    )
+
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name='execution_source_bindings',
+        verbose_name='统一项目',
+    )
+    source_type = models.CharField(max_length=32, choices=SOURCE_TYPE_CHOICES)
+    source_id = models.CharField(max_length=255)
+    source_project_id = models.CharField(max_length=255, blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+    enabled = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='execution_source_bindings_created',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'execution_source_bindings'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('project', 'source_type', 'source_id'),
+                name='execution_binding_project_source_uniq',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('source_type', 'source_id')),
+            models.Index(fields=('project', 'enabled')),
+        ]
+
+
 class ExecutionAttempt(models.Model):
     """One retryable execution attempt for a job."""
 
