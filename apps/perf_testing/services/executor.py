@@ -924,6 +924,52 @@ def _db_sample_interval(planned_duration, sample_interval):
     return max(target, sample_interval)
 
 
+def _publish_unified_completion(execution):
+    """Bridge a terminal performance execution back to a unified attempt."""
+    unified = dict((execution.script_ref or {}).get('unified_execution') or {})
+    job_id = unified.get('job_id')
+    attempt_id = unified.get('attempt_id')
+    if not job_id or not attempt_id:
+        return
+    try:
+        from apps.executions.models import ExecutionAttempt, ExecutionJob
+        from apps.executions.result_events import ResultEventIngestor
+
+        job = ExecutionJob.objects.get(pk=job_id)
+        attempt = ExecutionAttempt.objects.get(pk=attempt_id, job=job)
+        if execution.status == 'STOPPED':
+            target = 'cancelled'
+            error_type = 'cancelled'
+        elif execution.status == 'COMPLETED' and execution.sla_result != 'FAILED':
+            target = 'passed'
+            error_type = ''
+        else:
+            target = 'failed'
+            error_type = 'assertion' if execution.sla_result == 'FAILED' else 'infrastructure'
+        ResultEventIngestor.ingest(
+            job,
+            'run_finished',
+            {
+                'attempt': attempt.attempt_number,
+                'status': target,
+                'result': {
+                    'performance_execution_id': execution.pk,
+                    'execution_no': execution.execution_no,
+                    'status': execution.status,
+                    'summary': execution.summary or {},
+                    'sla_result': execution.sla_result,
+                    'verdict': execution.verdict,
+                    'report_url': execution.report_url,
+                },
+                'error_type': error_type,
+                'error_message': execution.error_message or '',
+            },
+            idempotency_key=f'performance:{execution.pk}:finished',
+        )
+    except Exception:  # noqa: BLE001 - source completion must not break perf finalization
+        logger.exception('unified performance completion callback failed: execution=%s', execution.pk)
+
+
 def run_execution(execution_id, stdout=None):
     """子进程主逻辑。异常一律落到 FAILED，绝不留下 RUNNING 悬挂记录。"""
     from ..models import PerfExecution, PerfMetricSample, PerfRequestStat
@@ -1155,6 +1201,7 @@ def run_execution(execution_id, stdout=None):
     # 紧跟终态回写任务计数：报告生成可能耗时数秒，放在其后会让
     # 「执行已结束但任务统计还是旧值」的窗口肉眼可见
     _update_task_stats(execution)
+    _publish_unified_completion(execution)
 
     # 报告生成失败不应改变执行结论
     try:

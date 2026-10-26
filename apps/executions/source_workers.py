@@ -327,20 +327,50 @@ def execute_app_source(self, job_id, attempt_id, execution_job_id=None, source_t
 
 @shared_task(bind=True, ignore_result=False)
 def execute_performance_source(self, job_id, attempt_id, execution_job_id=None, source_type='performance', source_id='', variant_id=None):
-    """Fail closed until performance completion callbacks are source-bound."""
+    """Start a bound performance scenario; the child publishes final completion."""
 
     del execution_job_id, source_type, source_id, variant_id
     with _job_attempt(job_id, attempt_id) as (job, attempt):
         try:
+            from apps.perf_testing.models import PerfScenario
+            from apps.perf_testing.services import executor
+
             reference, binding = resolve_source_binding(job)
-            if reference.source_type != 'performance':
-                raise SourceBindingError('performance worker received a non-performance source')
-            if reference.kind != 'scenario':
-                raise SourceBindingError('performance source must be a scenario')
+            if reference.source_type != 'performance' or reference.kind != 'scenario':
+                raise SourceBindingError('performance worker received an invalid source')
             if (binding.metadata or {}).get('approved') is not True:
                 raise SourceBindingError('performance unified execution requires an approved source binding')
-            raise SourceBindingError('performance completion callback contract is not configured')
-        except Exception as exc:  # noqa: BLE001 - explicit unsupported/configuration result
+            scenario = PerfScenario.objects.select_related('project').filter(pk=reference.object_id).first()
+            if scenario is None:
+                raise SourceBindingError(f'performance source {reference.canonical!r} was not found')
+            _binding_project_id(binding, scenario)
+            actor = job.requested_by or binding.created_by
+            if actor is None:
+                raise SourceBindingError('unified performance execution requires an execution user')
+            if not _start(job, attempt):
+                return {'job_id': job.pk, 'attempt_id': attempt.pk, 'status': 'cancelled'}
+            execution, check = executor.start_execution(
+                scenario,
+                user=actor,
+                trigger_type='API',
+                script_ref={
+                    'unified_execution': {
+                        'job_id': job.pk,
+                        'attempt_id': attempt.pk,
+                    },
+                },
+            )
+            if execution is None:
+                raise SourceBindingError(
+                    'performance preflight failed: ' + '; '.join((check or {}).get('errors') or [])
+                )
+            return {
+                'job_id': job.pk,
+                'attempt_id': attempt.pk,
+                'status': 'started',
+                'performance_execution_id': execution.pk,
+            }
+        except Exception as exc:  # noqa: BLE001 - explicit configuration/infrastructure result
             logger.warning('unified performance execution unavailable: job=%s attempt=%s error=%s', job_id, attempt_id, exc)
             try:
                 _finish(job, attempt, status='failed', error_type='configuration', error_message=str(exc))
