@@ -59,10 +59,10 @@ if [ -x "$REPO_ROOT/venv-automation/bin/python" ]; then
     if id testhub >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
         runuser -u testhub -- "$REPO_ROOT/venv-automation/bin/python" \
             scripts/validate_runtime_dependencies.py \
-            --requirements requirements-prod.txt requirements-app-optional.txt requirements-report-optional.txt
+            --requirements requirements-prod.txt requirements-app-optional.txt requirements-report-optional.txt requirements-ui-optional.txt
     else
         "$REPO_ROOT/venv-automation/bin/python" scripts/validate_runtime_dependencies.py \
-            --requirements requirements-prod.txt requirements-app-optional.txt requirements-report-optional.txt
+            --requirements requirements-prod.txt requirements-app-optional.txt requirements-report-optional.txt requirements-ui-optional.txt
     fi
 fi
 migration_plan="$(run_python manage.py migrate --plan 2>&1)" || fail "migration plan failed"
