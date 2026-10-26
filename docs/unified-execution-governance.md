@@ -47,7 +47,7 @@ python scripts/ci_schema_check.py
 The destination worker receives the durable contract:
 
 - positional arguments: `job_id`, `attempt_id`;
-- keyword arguments: `execution_job_id`, `attempt_id`, `source_type`, `source_id`, and `variant_id`;
+- keyword arguments: `execution_job_id`, `source_type`, `source_id`, and `variant_id`;
 - Celery task id: `execution-<job_id>-<attempt_id>` or the variant suffix.
 
 The worker owns source-specific execution and must publish a result through the result-events contract. TestHub records the broker dispatch id and keeps project authorization, attempt state, cancellation and late-result fencing in the unified layer. A route is not considered available when it is absent or syntactically invalid, and a job without `source_id` cannot be dispatched. Source IDs use typed forms such as `api:suite:<id>`, `api:request:<id>`, `ui:suite:<id>`, `ui:case:<id>`, `app:suite:<id>`, `app:case:<id>` and `performance:scenario:<id>`. Every source must have an enabled `ExecutionSourceBinding` for the same unified project; the binding records the legacy source project and, for APP, approved capability/lease metadata. Retry routes remain separately controlled by `EXECUTION_RETRY_DISPATCH_ROUTES` and use the retry outbox contract.

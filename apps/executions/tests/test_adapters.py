@@ -138,7 +138,6 @@ def test_default_registry_exposes_all_source_adapters():
             args=[10, 20],
             kwargs={
                 'execution_job_id': 10,
-                'attempt_id': 20,
                 'source_type': 'api',
                 'source_id': 'suite-1',
                 'variant_id': None,

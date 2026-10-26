@@ -70,7 +70,6 @@ class CeleryExecutionDispatcher:
             args=[job.pk, attempt.pk],
             kwargs={
                 "execution_job_id": job.pk,
-                "attempt_id": attempt.pk,
                 "source_type": source_type,
                 "source_id": str(job.source_id),
                 "variant_id": variant_id,
