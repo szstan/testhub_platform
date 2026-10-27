@@ -110,5 +110,6 @@ Dockerfile*
 docker-compose*.yml
 .dockerignore
 nginx.conf
+!staging-nginx/nginx.conf
 Makefile
 build-multiplatform.sh

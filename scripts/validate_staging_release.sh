@@ -36,7 +36,9 @@ run_python() {
 cd "$REPO_ROOT"
 require_file "frontend/dist/index.html"
 require_file "release-manifest.json"
+require_file "staging-nginx/nginx.conf"
 run_python scripts/validate_release_manifest.py --repo-root "$REPO_ROOT"
+/usr/sbin/nginx -t -c "$REPO_ROOT/staging-nginx/nginx.conf" -p "$REPO_ROOT/staging-nginx/"
 
 selinux_mode="$(getenforce 2>/dev/null || true)"
 if [ "$selinux_mode" = "Enforcing" ]; then

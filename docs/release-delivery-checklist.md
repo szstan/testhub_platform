@@ -39,7 +39,7 @@ python scripts/validate_wheelhouse_manifest.py \
 ## 切换顺序
 
 1. 冻结 release commit，构建 archive 和 manifest。
-2. 在候选目录解压 archive，继承上一版本的 `.env`、`logs`、`media`、`static_files`、`staging-nginx` 和两个 venv。
+2. 在候选目录解压 archive，继承上一版本的 `.env`、`logs`、`media`、`static_files` 和两个 venv；`staging-nginx/nginx.conf` 使用 release archive 内的版本，不从旧 rollback 继承。
 3. 校验 release manifest、requirements hash、runtime dependency versions 和 wheelhouse manifest。
 4. 以 `testhub` 身份运行 `manage.py check`、`migrate --plan`；确认 migration plan 后应用 migration。
 5. 停止 backend、Celery 和 scheduler，保留上一版本 rollback 目录，然后原子切换候选目录。
