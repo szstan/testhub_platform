@@ -970,6 +970,21 @@ def _publish_unified_completion(execution):
         logger.exception('unified performance completion callback failed: execution=%s', execution.pk)
 
 
+def reconcile_unified_completions(limit=100):
+    """Retry terminal performance callbacks that previously failed to persist."""
+    from ..models import PerfExecution
+
+    candidates = PerfExecution.objects.filter(
+        status__in=PerfExecution.FINAL_STATUSES,
+    ).order_by('-updated_at')[:max(int(limit), 1)]
+    attempted = 0
+    for execution in candidates:
+        if (execution.script_ref or {}).get('unified_execution'):
+            _publish_unified_completion(execution)
+            attempted += 1
+    return attempted
+
+
 def run_execution(execution_id, stdout=None):
     """子进程主逻辑。异常一律落到 FAILED，绝不留下 RUNNING 悬挂记录。"""
     from ..models import PerfExecution, PerfMetricSample, PerfRequestStat

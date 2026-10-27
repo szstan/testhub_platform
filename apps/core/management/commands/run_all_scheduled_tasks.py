@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from apps.core.scheduler import ScheduleClaimLost, clear_claim, claim_due_task, load_claimed_task
 from apps.executions.retry_outbox import consume_retry_outbox
+from apps.perf_testing.services.executor import reconcile_unified_completions
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class Command(BaseCommand):
                 now = timezone.localtime(timezone.now())
                 self.stdout.write(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开始检查任务...")
                 retry_count = self.consume_retry_outbox()
+                self.reconcile_performance_callbacks()
                 counts = (
                     self.schedule_api_tasks(),
                     self.schedule_ui_tasks(),
@@ -71,6 +73,16 @@ class Command(BaseCommand):
                 if run_once:
                     break
                 time.sleep(interval)
+
+    def reconcile_performance_callbacks(self):
+        try:
+            reconciled = reconcile_unified_completions(limit=100)
+            if reconciled:
+                logger.info('performance unified completion callbacks retried: %s', reconciled)
+            return reconciled
+        except Exception as exc:  # noqa: BLE001 - scheduler loop remains available
+            logger.error('performance unified completion reconciliation failed: %s', exc, exc_info=True)
+            return 0
 
     def consume_retry_outbox(self):
         try:

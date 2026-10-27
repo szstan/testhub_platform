@@ -294,6 +294,9 @@ class ExecutorAdapter:
                     dispatch_id = str(dispatch_result or '')
                     variant.dispatch_id = dispatch_id
                     variant.save(update_fields=['dispatch_id', 'updated_at'])
+                if dispatch_id:
+                    attempt.dispatch_id = str(dispatch_id)
+                    attempt.save(update_fields=['dispatch_id', 'updated_at'])
                 dispatch_ids.append(dispatch_id)
             except Exception as exc:  # noqa: BLE001 - preserve per-variant failure
                 self.collect_variant_result(
@@ -383,6 +386,8 @@ class ExecutorAdapter:
 
         try:
             dispatch_id = dispatcher(locked_job, attempt)
+            attempt.dispatch_id = str(dispatch_id or '')
+            attempt.save(update_fields=['dispatch_id', 'updated_at'])
         except Exception as exc:  # noqa: BLE001 - adapter boundary records failure
             message = str(exc)[:4000]
             attempt.error_type = ErrorType.INFRASTRUCTURE

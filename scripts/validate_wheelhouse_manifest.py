@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from build_linux_wheelhouse import ARTIFACT_SUFFIXES, FORBIDDEN_MARKERS, METADATA_FILES, sha256_file
 
@@ -24,11 +25,16 @@ def validate(directory: Path, requirement_paths: list[Path]) -> tuple[int, str]:
             raise ValueError(f"missing wheelhouse metadata: {path.name}")
 
     manifest_hash = sha256_file(manifest_path)
-    expected_manifest_hash = manifest_sha_path.read_text(encoding="ascii").strip().split()[0]
+    manifest_sha_text = manifest_sha_path.read_text(encoding="ascii").strip().split()
+    if not manifest_sha_text:
+        raise ValueError("manifest.sha256 is empty")
+    expected_manifest_hash = manifest_sha_text[0]
     if manifest_hash != expected_manifest_hash:
         raise ValueError("manifest.sha256 does not match manifest.json")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("wheelhouse manifest must be a JSON object")
     if manifest.get("schema_version") != 1:
         raise ValueError("unsupported wheelhouse manifest schema")
     target = manifest.get("target") or {}
@@ -84,14 +90,19 @@ def validate(directory: Path, requirement_paths: list[Path]) -> tuple[int, str]:
             raise ValueError(f"requirements hash mismatch: {requirement.name}")
 
     sources = manifest.get("sources") or {}
+    if not isinstance(sources, dict):
+        raise ValueError("wheelhouse manifest sources must be an object")
     index_url = str(sources.get("index_url") or "")
-    if not index_url.startswith(("http://", "https://")):
-        raise ValueError("wheelhouse manifest has no valid index_url provenance")
     extra_index_urls = sources.get("extra_index_urls") or []
     if not isinstance(extra_index_urls, list):
         raise ValueError("wheelhouse manifest extra_index_urls must be a list")
-    if any(any(token in str(url) for token in ("@", "?", "#")) for url in [index_url, *extra_index_urls]):
-        raise ValueError("wheelhouse manifest contains unsafe index URL provenance")
+    for raw_url in [index_url, *extra_index_urls]:
+        parsed = urlsplit(str(raw_url))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("wheelhouse manifest has an invalid index URL provenance")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("wheelhouse manifest contains unsafe index URL provenance")
+
 
     return len(artifacts), manifest_hash
 

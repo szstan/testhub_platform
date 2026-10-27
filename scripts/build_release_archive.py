@@ -160,11 +160,14 @@ def build_archive(output: Path, release: str) -> None:
             info = archive.gettarinfo(str(path), arcname=Path(archive_root) / relative)
             info.mode = archive_mode(relative, path, executable_paths)
             with path.open("rb") as handle:
-                payload = handle.read()
-            if payload.startswith(b'#!'):
-                payload = payload.replace(b'\r\n', b'\n')
-                info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+                prefix = handle.read(2)
+                handle.seek(0)
+                if prefix == b'#!':
+                    payload = handle.read().replace(b'\r\n', b'\n')
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                else:
+                    archive.addfile(info, handle)
         add_release_manifest(archive, archive_root, release)
 
     print(f"archive={output}")

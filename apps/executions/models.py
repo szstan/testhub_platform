@@ -697,6 +697,9 @@ class ExecutionAttempt(models.Model):
         verbose_name='错误类型',
     )
     error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
+    dispatch_id = models.CharField(max_length=255, blank=True, default='', verbose_name='调度标识')
+    worker_claim_id = models.CharField(max_length=255, blank=True, default='', verbose_name='worker claim')
+    worker_claimed_at = models.DateTimeField(null=True, blank=True, verbose_name='worker claim 时间')
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')

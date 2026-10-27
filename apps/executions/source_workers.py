@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from celery import shared_task
 from django.db import transaction
+from django.utils import timezone
 
 from .models import ExecutionAttempt, ExecutionJob
 from .result_events import ResultEventIngestor
@@ -41,7 +42,24 @@ def _event(job, event_type, payload, key):
     return ResultEventIngestor.ingest(job, event_type, payload, idempotency_key=key)
 
 
-def _start(job, attempt):
+def _claim_attempt(job_id, attempt_id, task_id):
+    claim_id = str(task_id or '').strip() or f'worker:{attempt_id}'
+    with transaction.atomic():
+        locked_job = ExecutionJob.objects.select_for_update().get(pk=job_id)
+        locked_attempt = ExecutionAttempt.objects.select_for_update().get(pk=attempt_id, job_id=job_id)
+        if locked_job.final_attempt_id or locked_attempt.is_terminal:
+            return False
+        if locked_attempt.worker_claim_id:
+            return False
+        if locked_attempt.dispatch_id and task_id and locked_attempt.dispatch_id != str(task_id):
+            raise SourceBindingError('worker task id does not match the fenced dispatch id')
+        locked_attempt.worker_claim_id = claim_id
+        locked_attempt.worker_claimed_at = timezone.now()
+        locked_attempt.save(update_fields=['worker_claim_id', 'worker_claimed_at', 'updated_at'])
+        return True
+
+
+def _start(job, attempt, task_id=''):
     if job.status == ExecutionStatus.CANCEL_REQUESTED:
         _event(
             job,
@@ -49,6 +67,8 @@ def _start(job, attempt):
             {'attempt': attempt.attempt_number, 'status': 'cancelled', 'error_type': 'cancelled'},
             f'worker:{attempt.pk}:cancelled',
         )
+        return False
+    if not _claim_attempt(job.pk, attempt.pk, task_id):
         return False
     _event(job, 'run_started', {'attempt': attempt.attempt_number}, f'worker:{attempt.pk}:started')
     return True
@@ -113,7 +133,7 @@ def execute_api_source(self, job_id, attempt_id, execution_job_id=None, source_t
             actor = job.requested_by or binding.created_by
             if actor is None:
                 raise SourceBindingError('unified execution requires a source execution user')
-            if not _start(job, attempt):
+            if not _start(job, attempt, getattr(getattr(self, 'request', None), 'id', '')):
                 return {'job_id': job.pk, 'attempt_id': attempt.pk, 'status': 'cancelled'}
             success, result = _api_execute(source, reference, actor)
             _finish(job, attempt, status='passed' if success else 'failed', result=result)
@@ -147,38 +167,34 @@ def _ui_execute(source, reference, binding, actor, metadata):
     engine = str(metadata.get('engine') or 'playwright')
     browser = str(metadata.get('browser') or 'chrome')
     headless = bool(metadata.get('headless', False))
-    temporary_suite = None
     suite = source
     if reference.kind == 'case':
-        temporary_suite = TestSuite.objects.create(
+        # Preserve this temporary suite because TestExecutor creates audit rows
+        # with a cascading FK to the suite.
+        suite = TestSuite.objects.create(
             project=source.project,
             name=f'[unified:{source.pk}] {source.name}',
         )
-        temporary_suite.test_cases.add(source)
-        suite = temporary_suite
-    try:
-        suite.execution_status = 'running'
-        suite.save(update_fields=['execution_status', 'updated_at'])
-        TestExecutor(
-            test_suite=suite,
-            engine=engine,
-            browser=browser,
-            headless=headless,
-            executed_by=actor,
-        ).run()
-        suite.refresh_from_db()
-        success = suite.execution_status == 'passed'
-        return success, {
-            'status': 'passed' if success else 'failed',
-            'test_case_count': suite.suite_test_cases.count(),
-            'passed_count': suite.passed_count,
-            'failed_count': suite.failed_count,
-            'engine': engine,
-            'browser': browser,
-        }
-    finally:
-        if temporary_suite is not None:
-            temporary_suite.delete()
+        suite.test_cases.add(source)
+    suite.execution_status = 'running'
+    suite.save(update_fields=['execution_status', 'updated_at'])
+    TestExecutor(
+        test_suite=suite,
+        engine=engine,
+        browser=browser,
+        headless=headless,
+        executed_by=actor,
+    ).run()
+    suite.refresh_from_db()
+    success = suite.execution_status == 'passed'
+    return success, {
+        'status': 'passed' if success else 'failed',
+        'test_case_count': suite.suite_test_cases.count(),
+        'passed_count': suite.passed_count,
+        'failed_count': suite.failed_count,
+        'engine': engine,
+        'browser': browser,
+    }
 
 
 @shared_task(bind=True, ignore_result=False)
@@ -195,7 +211,7 @@ def execute_ui_source(self, job_id, attempt_id, execution_job_id=None, source_ty
             actor = job.requested_by or binding.created_by
             if actor is None:
                 raise SourceBindingError('unified execution requires a source execution user')
-            if not _start(job, attempt):
+            if not _start(job, attempt, getattr(getattr(self, 'request', None), 'id', '')):
                 return {'job_id': job.pk, 'attempt_id': attempt.pk, 'status': 'cancelled'}
             success, result = _ui_execute(source, reference, binding, actor, job.environment_snapshot or {})
             _finish(job, attempt, status='passed' if success else 'failed', result=result)
@@ -267,10 +283,14 @@ def _app_execute(source, reference, binding, actor):
             cases = list(source.suite_cases.select_related('test_case__app_package').all())
             if not cases:
                 raise SourceBindingError('APP suite has no test cases')
-            package_name = (
-                cases[0].test_case.app_package.package_name
-                if cases[0].test_case.app_package else ''
-            )
+            package_names = {
+                item.test_case.app_package.package_name
+                for item in cases
+                if item.test_case.app_package
+            }
+            if len(package_names) > 1:
+                raise SourceBindingError('APP suite contains multiple app packages')
+            package_name = next(iter(package_names), '')
             executions = [AppTestExecution.objects.create(
                 test_case=item.test_case,
                 test_suite=source,
@@ -311,7 +331,7 @@ def execute_app_source(self, job_id, attempt_id, execution_job_id=None, source_t
             actor = job.requested_by or binding.created_by
             if actor is None:
                 raise SourceBindingError('unified APP execution requires an execution user')
-            if not _start(job, attempt):
+            if not _start(job, attempt, getattr(getattr(self, 'request', None), 'id', '')):
                 return {'job_id': job.pk, 'attempt_id': attempt.pk, 'status': 'cancelled'}
             success, result = _app_execute(source, reference, binding, actor)
             _finish(job, attempt, status='passed' if success else 'failed', result=result)
@@ -347,7 +367,7 @@ def execute_performance_source(self, job_id, attempt_id, execution_job_id=None, 
             actor = job.requested_by or binding.created_by
             if actor is None:
                 raise SourceBindingError('unified performance execution requires an execution user')
-            if not _start(job, attempt):
+            if not _start(job, attempt, getattr(getattr(self, 'request', None), 'id', '')):
                 return {'job_id': job.pk, 'attempt_id': attempt.pk, 'status': 'cancelled'}
             execution, check = executor.start_execution(
                 scenario,
