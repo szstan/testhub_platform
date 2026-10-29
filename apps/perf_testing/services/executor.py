@@ -21,6 +21,7 @@ import time
 from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import close_old_connections, connection
 from django.utils import timezone
 
@@ -924,6 +925,20 @@ def _db_sample_interval(planned_duration, sample_interval):
     return max(target, sample_interval)
 
 
+def _mark_unified_callback_orphaned(execution, reason):
+    script_ref = dict(execution.script_ref or {})
+    unified = dict(script_ref.get('unified_execution') or {})
+    if unified.get('callback_state') == 'orphaned':
+        return
+    unified.update({
+        'callback_state': 'orphaned',
+        'callback_error': reason,
+    })
+    script_ref['unified_execution'] = unified
+    execution.script_ref = script_ref
+    execution.save(update_fields=['script_ref'])
+
+
 def _publish_unified_completion(execution):
     """Bridge a terminal performance execution back to a unified attempt."""
     unified = dict((execution.script_ref or {}).get('unified_execution') or {})
@@ -966,8 +981,18 @@ def _publish_unified_completion(execution):
             },
             idempotency_key=f'performance:{execution.pk}:finished',
         )
+    except ObjectDoesNotExist as exc:
+        _mark_unified_callback_orphaned(execution, 'unified job or attempt no longer exists')
+        logger.warning(
+            'unified performance completion skipped for orphaned callback: execution=%s (%s)',
+            execution.pk,
+            exc.__class__.__name__,
+        )
+        return False
     except Exception:  # noqa: BLE001 - source completion must not break perf finalization
         logger.exception('unified performance completion callback failed: execution=%s', execution.pk)
+        return False
+    return True
 
 
 def reconcile_unified_completions(limit=100):
@@ -979,8 +1004,10 @@ def reconcile_unified_completions(limit=100):
     ).order_by('-created_at')[:max(int(limit), 1)]
     attempted = 0
     for execution in candidates:
-        if (execution.script_ref or {}).get('unified_execution'):
-            _publish_unified_completion(execution)
+        unified = dict((execution.script_ref or {}).get('unified_execution') or {})
+        if unified.get('callback_state') == 'orphaned':
+            continue
+        if _publish_unified_completion(execution):
             attempted += 1
     return attempted
 
