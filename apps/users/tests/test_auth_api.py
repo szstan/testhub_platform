@@ -266,3 +266,19 @@ def test_refresh_uses_httponly_cookie_without_returning_refresh_token(api_client
     assert 'access' in refresh_response.json()
     assert 'refresh' not in refresh_response.json()
     assert refresh_response.cookies['testhub_refresh']['httponly'] is True
+
+
+def test_refresh_clears_cookie_when_refresh_user_no_longer_exists(api_client, active_user):
+    login_response = api_client.post(
+        '/api/auth/login/',
+        {'username': active_user.username, 'password': 'StrongPass123'},
+        format='json',
+    )
+    api_client.cookies.update(login_response.cookies)
+    active_user.delete()
+
+    refresh_response = api_client.post('/api/auth/token/refresh/', {}, format='json')
+
+    assert refresh_response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert refresh_response.json()['detail'] == 'refresh token invalid'
+    assert refresh_response.cookies['testhub_refresh']['max-age'] == 0
