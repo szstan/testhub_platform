@@ -976,7 +976,7 @@ def reconcile_unified_completions(limit=100):
 
     candidates = PerfExecution.objects.filter(
         status__in=PerfExecution.FINAL_STATUSES,
-    ).order_by('-updated_at')[:max(int(limit), 1)]
+    ).order_by('-created_at')[:max(int(limit), 1)]
     attempted = 0
     for execution in candidates:
         if (execution.script_ref or {}).get('unified_execution'):
