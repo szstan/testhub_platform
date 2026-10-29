@@ -416,6 +416,11 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', 
 # An empty default is fail-closed: the API reports unsupported until a
 # source-specific worker task contract is explicitly deployed.
 EXECUTION_DISPATCH_ROUTES = config('EXECUTION_DISPATCH_ROUTES', default='')
+EXECUTION_SCALE_WARNING_JOBS = config('EXECUTION_SCALE_WARNING_JOBS', default=100000, cast=int)
+EXECUTION_SCALE_WARNING_ARTIFACTS = config('EXECUTION_SCALE_WARNING_ARTIFACTS', default=100000, cast=int)
+EXECUTION_SCALE_WARNING_ARTIFACT_BYTES = config('EXECUTION_SCALE_WARNING_ARTIFACT_BYTES', default=107374182400, cast=int)
+QI_SCALE_WARNING_RUNS = config('QI_SCALE_WARNING_RUNS', default=100000, cast=int)
+QI_SCALE_WARNING_EVIDENCE = config('QI_SCALE_WARNING_EVIDENCE', default=250000, cast=int)
 # Durable unified-execution retry routes. Format: ``api=package.task,ui=package.task``.
 # An empty default is fail-closed: the outbox consumer marks unsupported rows
 # failed instead of claiming that a retry was dispatched.

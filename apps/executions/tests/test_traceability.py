@@ -5,6 +5,8 @@ from apps.defects.models import Defect
 from apps.executions.models import (
     ExecutionBuild,
     ExecutionJob,
+    ExecutionAttempt,
+    ExecutionStepResult,
     ExecutionRequirementLink,
     RequirementTestCaseLink as RequirementTestCaseLinkModel,
     TestCaseDefectLink as CaseDefectLinkModel,
@@ -118,7 +120,26 @@ def test_traceability_links_and_coverage_are_project_scoped(traceability_data):
     assert coverage.status_code == 200
     assert coverage.data['total_requirements'] == 1
     assert coverage.data['covered_requirements'] == 1
+    assert coverage.data['linked_requirements'] == 1
+    assert coverage.data['executed_requirements'] == 0
+    assert coverage.data['passed_requirements'] == 0
     assert coverage.data['coverage_rate'] == 100.0
+
+    attempt = ExecutionAttempt.objects.create(
+        job=data['job'],
+        status='passed',
+        attempt_number=1,
+        is_final=True,
+    )
+    ExecutionStepResult.objects.create(
+        attempt=attempt,
+        case_key=data['testcase'].external_ref,
+        step_key='test',
+        status='passed',
+    )
+    executed_coverage = client.get(f"/api/executions/builds/coverage/?project={data['project'].id}")
+    assert executed_coverage.data['executed_requirements'] == 1
+    assert executed_coverage.data['passed_requirements'] == 1
 
     client.force_authenticate(user=data['outsider'])
     assert client.get('/api/executions/builds/').data['count'] == 0

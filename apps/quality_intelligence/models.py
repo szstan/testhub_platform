@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import models
 
+from apps.projects.models import Project
+
 
 class QualitySourceType(models.TextChoices):
     API = 'API', 'API'
@@ -230,6 +232,7 @@ class QualityEvidence(models.Model):
         ]
         indexes = [
             models.Index(fields=['run', 'evidence_type'], name='qi_evidence_run_type_idx'),
+            models.Index(fields=['availability', 'mime_type', '-created_at'], name='qi_evidence_avail_mime_idx'),
         ]
 
 
@@ -243,6 +246,7 @@ class QualityFailure(models.Model):
         related_name='failures',
     )
     dedupe_key = models.CharField(max_length=512, unique=True)
+    cluster_key = models.CharField(max_length=128, blank=True, default='', db_index=True)
     taxonomy_code = models.CharField(max_length=32, choices=QualityFailureCategory.choices)
     subtype = models.CharField(max_length=64, blank=True, default='')
     phase = models.CharField(max_length=64, blank=True, default='')
@@ -281,6 +285,100 @@ class QualityFailure(models.Model):
         indexes = [
             models.Index(fields=['taxonomy_code', '-created_at'], name='qi_failure_tax_created_idx'),
             models.Index(fields=['signature', '-created_at'], name='qi_failure_sig_created_idx'),
+            models.Index(fields=['cluster_key', '-created_at'], name='qi_failure_cluster_idx'),
+        ]
+
+
+class QualityFailureCluster(models.Model):
+    """Cross-run deterministic failure cluster with human-owned remediation links."""
+
+    cluster_key = models.CharField(max_length=128, unique=True)
+    source_type = models.CharField(max_length=16)
+    project_type = models.CharField(max_length=64)
+    project_id = models.CharField(max_length=128)
+    test_key = models.CharField(max_length=255, blank=True, default='')
+    environment_fingerprint = models.CharField(max_length=128, default='unknown')
+    signature = models.CharField(max_length=128)
+    taxonomy_code = models.CharField(max_length=32, choices=QualityFailureCategory.choices, default=QualityFailureCategory.UNKNOWN)
+    subtype = models.CharField(max_length=64, blank=True, default='')
+    mapped_project = models.ForeignKey(
+        Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quality_failure_clusters_projected',
+    )
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='owned_quality_failure_clusters',
+    )
+    defect = models.ForeignKey(
+        'defects.Defect',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quality_failure_clusters',
+    )
+    external_provider = models.CharField(max_length=32, blank=True, default='')
+    external_key = models.CharField(max_length=255, blank=True, default='')
+    external_url = models.URLField(blank=True, default='')
+    first_seen_at = models.DateTimeField(null=True, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    occurrence_count = models.PositiveIntegerField(default=0)
+    last_failure_run = models.ForeignKey(
+        QualityRun,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='last_failure_clusters',
+    )
+    last_fixed_run = models.ForeignKey(
+        QualityRun,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='fixed_failure_clusters',
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'quality_failure_clusters'
+        ordering = ['-last_seen_at', '-created_at']
+        indexes = [
+            models.Index(fields=['source_type', 'project_type', 'project_id', '-last_seen_at'], name='qi_cluster_project_seen_idx'),
+            models.Index(fields=['signature', '-last_seen_at'], name='qi_cluster_signature_seen_idx'),
+            models.Index(fields=['owner', 'resolved_at'], name='qi_cluster_owner_resolved_idx'),
+        ]
+
+
+class QualityFailureClusterAudit(models.Model):
+    """Append-only audit for owner and defect changes on a failure cluster."""
+
+    cluster = models.ForeignKey(QualityFailureCluster, on_delete=models.CASCADE, related_name='audits')
+    action = models.CharField(max_length=32)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quality_failure_cluster_audits',
+    )
+    previous_value = models.JSONField(default=dict, blank=True)
+    new_value = models.JSONField(default=dict, blank=True)
+    note = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'quality_failure_cluster_audits'
+        ordering = ['-created_at', '-id']
+        indexes = [
+            models.Index(fields=['cluster', '-created_at'], name='qi_cluster_audit_idx'),
         ]
 
 

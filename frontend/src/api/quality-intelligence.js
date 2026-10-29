@@ -53,6 +53,32 @@ export function reviewQualityFailure(id, data) {
   return request({ url: `${baseUrl}/failures/${id}/review/`, method: 'patch', data })
 }
 
+export function getQualityFailureClusters(params) {
+  return list('failure-clusters', params)
+}
+
+export function mapQualityFailureClusterProject(id, data) {
+  return request({ url: `${baseUrl}/failure-clusters/${id}/map-project/`, method: 'post', data })
+}
+
+export function assignQualityFailureCluster(id, data) {
+  return request({ url: `${baseUrl}/failure-clusters/${id}/owner/`, method: 'patch', data })
+}
+
+
+export function createQualityFailureDefect(id, data = {}) {
+  return request({ url: `${baseUrl}/failure-clusters/${id}/create-defect/`, method: 'post', data })
+}
+
+export function linkQualityFailureDefect(id, data) {
+  return request({ url: `${baseUrl}/failure-clusters/${id}/link-defect/`, method: 'post', data })
+}
+
+export function linkQualityFailureExternal(id, data) {
+  return request({ url: `${baseUrl}/failure-clusters/${id}/link-external/`, method: 'post', data })
+}
+
+
 export function getQualityProfiles(params) {
   return list('profiles', params)
 }

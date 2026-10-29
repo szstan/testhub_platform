@@ -1,5 +1,11 @@
 import api from '@/utils/api'
 
+export const listExecutionSourceBindings = (params = {}) => api.get('/executions/source-bindings/', { params })
+export const createExecutionSourceBinding = (data) => api.post('/executions/source-bindings/', data)
+export const updateExecutionSourceBinding = (id, data) => api.patch(`/executions/source-bindings/${id}/`, data)
+export const disableExecutionSourceBinding = (id) => api.post(`/executions/source-bindings/${id}/disable/`)
+export const getExecutionMetrics = (params = {}) => api.get('/executions/metrics/', { params })
+export const getExecutionEvidenceExplorer = (params = {}) => api.get('/executions/evidence-explorer/', { params })
 export const listExecutionJobs = (params = {}) => api.get('/executions/jobs/', { params })
 export const importExecutionResults = (formData) => api.post('/executions/import-results/', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
 export const compareExecutionJobs = (jobId, baselineJobId) => api.post(`/executions/jobs/${jobId}/compare/`, { baseline_job_id: baselineJobId })
@@ -12,7 +18,7 @@ export const listExecutionGateEvaluations = (params = {}) => api.get('/execution
 export const listExecutionAISuggestions = (params = {}) => api.get('/executions/ai-suggestions/', { params })
 export const dispatchExecutionJob = (id, worker = '') => api.post(`/executions/jobs/${id}/dispatch/`, { worker })
 export const listExecutionBuilds = (params = {}) => api.get('/executions/builds/', { params })
-export const getExecutionCoverage = (project) => api.get('/executions/builds/coverage/', { params: { project } })
+export const getExecutionCoverage = (project, version = '') => api.get('/executions/builds/coverage/', { params: { project, version: version || undefined } })
 export const listExecutionProfiles = (params = {}) => api.get('/executions/profiles/', { params })
 export const createExecutionProfile = (data) => api.post('/executions/profiles/', data)
 export const updateExecutionProfile = (id, data) => api.patch(`/executions/profiles/${id}/`, data)

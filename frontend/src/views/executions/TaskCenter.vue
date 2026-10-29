@@ -11,6 +11,12 @@
       <el-button type="primary" @click="router.push({ name: 'ExecutionQualityLoop' })">
         {{ $t('execution.qualityLoop.nav') }}
       </el-button>
+      <el-button @click="router.push({ name: 'ExecutionEvidenceExplorer' })">
+        {{ $t('menu.evidenceExplorer') }}
+      </el-button>
+      <el-button @click="router.push({ name: 'ExecutionSourceBindings' })">
+        {{ $t('menu.sourceBindings') }}
+      </el-button>
       <el-button :icon="Refresh" :loading="loading" @click="loadJobs">
         {{ $t('common.refresh') }}
       </el-button>
@@ -52,6 +58,11 @@
           <template #default="scope">
             <el-tag size="small" effect="plain">{{ sourceLabel(scope.row.source_type) }}</el-tag>
             <span class="source-id">{{ scope.row.source_id || '-' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column :label="$t('execution.taskCenter.executorStatus')" width="140">
+          <template #default="scope">
+            <el-tag size="small" :type="statusType(scope.row.executor_status)">{{ scope.row.executor_status || '-' }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="build_reference" :label="$t('execution.taskCenter.build')" min-width="150" show-overflow-tooltip />
@@ -118,6 +129,9 @@
           <el-descriptions-item label="ID">{{ timeline.job.id }}</el-descriptions-item>
           <el-descriptions-item :label="$t('execution.taskCenter.source')">{{ sourceLabel(timeline.job.source_type) }}</el-descriptions-item>
           <el-descriptions-item :label="$t('execution.taskCenter.finalStatus')">{{ statusLabel(timeline.job.final_status || timeline.job.status) }}</el-descriptions-item>
+          <el-descriptions-item :label="$t('execution.taskCenter.executorStatus')">{{ timeline.job.executor_status || '-' }}</el-descriptions-item>
+          <el-descriptions-item :label="$t('execution.taskCenter.bindingStatus')">{{ timeline.job.source_binding_status || '-' }}</el-descriptions-item>
+          <el-descriptions-item :label="$t('execution.taskCenter.policyVersion')">{{ timeline.job.quality_gate_result?.policy_version || '-' }}</el-descriptions-item>
           <el-descriptions-item :label="$t('execution.taskCenter.qualityGate')">
             <el-tag v-if="timeline.job.quality_gate_result?.configured" size="small" :type="timeline.job.quality_gate_result.passed ? 'success' : 'danger'">
               {{ timeline.job.quality_gate_result.passed ? $t('execution.taskCenter.gatePassed') : $t('execution.taskCenter.gateFailed') }}

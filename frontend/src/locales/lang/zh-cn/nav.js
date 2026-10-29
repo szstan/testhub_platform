@@ -36,7 +36,9 @@ export default {
     taskCenter: '统一任务中心',
     traceability: '质量追踪',
     ciProfiles: 'CI执行配置',
+    sourceBindings: '执行 Source 绑定',
     datasetsPlugins: '数据集与插件',
+    evidenceExplorer: '证据探索器',
     testReport: '测试报告',
 
     // 接口测试
@@ -109,6 +111,7 @@ export default {
     qualityDashboard: '质量看板',
     qualityRuns: '质量运行',
     qualityFailures: '失败探索',
+    qualityClusters: '失败责任闭环',
     qualityProfiles: '测试画像与隔离',
     qualityBaselines: '质量基线',
 

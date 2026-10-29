@@ -15,6 +15,8 @@ from apps.quality_intelligence.models import (
     QualityEvidence,
     QualityEvidenceType,
     QualityFailure,
+    QualityFailureCluster,
+    QualityFailureClusterAudit,
     QualityFailureReviewAudit,
     QualityFailureCategory,
     QualityMetricObservation,
@@ -151,6 +153,43 @@ class QualityEvidenceSerializer(PublicModelSerializer):
         result["snippet"] = _safe_text(result.get("snippet", ""))
         result["source_uri"] = safe_reference(result.get("source_uri", ""))
         result["provenance"] = _public_payload(result.get("provenance", {}))
+        return result
+
+
+class QualityFailureClusterSerializer(PublicModelSerializer):
+    class Meta:
+        model = QualityFailureCluster
+        fields = (
+            'id', 'cluster_key', 'mapped_project', 'source_type', 'project_type', 'project_id',
+            'test_key', 'environment_fingerprint', 'signature', 'taxonomy_code',
+            'subtype', 'owner', 'defect', 'external_provider', 'external_key',
+            'external_url', 'first_seen_at', 'last_seen_at', 'occurrence_count',
+            'last_failure_run', 'last_fixed_run', 'resolved_at', 'metadata',
+            'created_at', 'updated_at', 'classification_mode',
+        )
+        read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result['metadata'] = _public_payload(result.get('metadata', {}))
+        result['external_url'] = safe_reference(result.get('external_url', ''))
+        return result
+
+
+class QualityFailureClusterAuditSerializer(PublicModelSerializer):
+    class Meta:
+        model = QualityFailureClusterAudit
+        fields = (
+            'id', 'cluster', 'action', 'actor', 'previous_value', 'new_value',
+            'note', 'created_at', 'classification_mode',
+        )
+        read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result['previous_value'] = _public_payload(result.get('previous_value', {}))
+        result['new_value'] = _public_payload(result.get('new_value', {}))
+        result['note'] = _safe_text(result.get('note', ''))
         return result
 
 

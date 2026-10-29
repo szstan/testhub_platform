@@ -31,6 +31,7 @@ from apps.quality_intelligence.models import (
     QualityRunStatus,
     QualityTestProfile,
 )
+from apps.quality_intelligence.services.clusters import failure_cluster_key, sync_failure_clusters
 from apps.quality_intelligence.services.flakiness import (
     DEFAULT_WINDOW_SIZE,
     MIN_ELIGIBLE_ATTEMPTS,
@@ -382,6 +383,18 @@ def _persist_failures(run: QualityRun, raw_failures: Iterable[Any], item_map: Ma
         dedupe_key = signature(
             "quality-failure", source_type, execution_id, str(item_key or ""), signature_value
         )
+        test_key = str(getattr(item, 'test_key', '') or '')
+        environment_fingerprint = str(
+            getattr(item, 'environment_fingerprint', '') or run.environment_fingerprint or 'unknown'
+        )
+        cluster_key = failure_cluster_key(
+            source_type=source_type,
+            project_type=run.project_type,
+            project_id=run.project_id,
+            test_key=test_key,
+            environment_fingerprint=environment_fingerprint,
+            signature=signature_value,
+        )
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
@@ -394,6 +407,7 @@ def _persist_failures(run: QualityRun, raw_failures: Iterable[Any], item_map: Ma
             run=run,
             item=item,
             dedupe_key=dedupe_key,
+            cluster_key=cluster_key,
             taxonomy_code=category,
             subtype=text(_field(raw, "subtype", ""), 64),
             phase=text(_field(raw, "phase", ""), 64),
@@ -629,6 +643,7 @@ def ingest_source(
         _persist_evidence(run, raw_evidence, item_map)
         _persist_failures(run, raw_failures, item_map, source_key, execution_key)
         _persist_metrics(run, raw_metrics, item_map, profiles)
+        sync_failure_clusters(run)
 
     return IngestionResult(
         source_type=source_key,

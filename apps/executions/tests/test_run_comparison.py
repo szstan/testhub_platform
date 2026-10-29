@@ -41,5 +41,7 @@ def test_run_diff_and_release_gate_detect_new_failure():
     gate = evaluate_release_gate(current.job, baseline=baseline.job, evaluated_by=user)
     assert gate['passed'] is False
     assert gate['exit_code'] == 1
+    assert gate['policy_version'].startswith('gate-')
+    assert gate['policy_snapshot']['thresholds']['max_failed'] == 0
     assert any(item['metric'] == 'failed' for item in gate['failures'])
-    assert ExecutionQualityGateEvaluation.objects.filter(job=current.job, stage='release', passed=False).exists()
+    assert ExecutionQualityGateEvaluation.objects.filter(job=current.job, stage='release', passed=False, policy_version=gate['policy_version']).exists()

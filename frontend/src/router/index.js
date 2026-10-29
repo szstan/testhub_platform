@@ -157,9 +157,19 @@ const routes = [
                 component: () => import('@/views/executions/TraceabilityView.vue')
             },
             {
+                path: 'source-bindings',
+                name: 'ExecutionSourceBindings',
+                component: () => import('@/views/executions/SourceBindings.vue')
+            },
+            {
                 path: 'ci-profiles',
                 name: 'CIExecutionProfiles',
                 component: () => import('@/views/executions/CIProfiles.vue')
+            },
+            {
+                path: 'evidence',
+                name: 'ExecutionEvidenceExplorer',
+                component: () => import('@/views/executions/EvidenceExplorer.vue')
             },
             {
                 path: 'datasets-plugins',
@@ -697,6 +707,11 @@ const routes = [
                 path: 'failures',
                 name: 'QualityFailures',
                 component: () => import('@/views/quality-intelligence/FailureExplorer.vue')
+            },
+            {
+                path: 'failure-clusters',
+                name: 'QualityFailureClusters',
+                component: () => import('@/views/quality-intelligence/FailureClusters.vue')
             },
             {
                 path: 'profiles',

@@ -6,6 +6,8 @@ from .views import (
     ComparisonViewSet,
     EvidenceViewSet,
     FailureViewSet,
+    FailureClusterViewSet,
+    FailureClusterAuditViewSet,
     FailureReviewAuditViewSet,
     IngestView,
     ItemViewSet,
@@ -25,6 +27,8 @@ router.register(r"runs", RunViewSet, basename="quality-run")
 router.register(r"items", ItemViewSet, basename="quality-item")
 router.register(r"evidence", EvidenceViewSet, basename="quality-evidence")
 router.register(r"failures", FailureViewSet, basename="quality-failure")
+router.register(r"failure-clusters", FailureClusterViewSet, basename="quality-failure-cluster")
+router.register(r"failure-cluster-audits", FailureClusterAuditViewSet, basename="quality-failure-cluster-audit")
 router.register(r"failure-review-audits", FailureReviewAuditViewSet, basename="quality-failure-review-audit")
 router.register(r"profiles", ProfileViewSet, basename="quality-profile")
 router.register(r"quarantines", QuarantineViewSet, basename="quality-quarantine")

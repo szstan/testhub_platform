@@ -6,8 +6,9 @@ import logging
 from collections import defaultdict
 from typing import Any
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -18,6 +19,8 @@ from rest_framework.views import APIView
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
 
+from apps.defects.models import Defect
+from apps.projects.models import Project
 from apps.quality_intelligence.adapters.base import (
     AdapterError,
     SourceNotFoundError,
@@ -29,6 +32,8 @@ from apps.quality_intelligence.models import (
     QualityComparison,
     QualityEvidence,
     QualityFailure,
+    QualityFailureCluster,
+    QualityFailureClusterAudit,
     QualityFailureReviewAudit,
     QualityMetricObservation,
     QualityQuarantine,
@@ -55,6 +60,8 @@ from apps.quality_intelligence.serializers import (
     QualityComparisonSerializer,
     QualityEvidenceSerializer,
     QualityFailureSerializer,
+    QualityFailureClusterAuditSerializer,
+    QualityFailureClusterSerializer,
     QualityFailureReviewAuditSerializer,
     QualityMetricObservationSerializer,
     QualityQuarantineSerializer,
@@ -126,6 +133,45 @@ def _baseline_queryset(user):
 
 def _comparison_queryset(user):
     return QualityComparison.objects.filter(run__in=_run_queryset(user)).select_related("run", "baseline", "profile")
+
+
+def _cluster_queryset(user):
+    queryset = QualityFailureCluster.objects.all().select_related('owner', 'defect', 'last_failure_run', 'last_fixed_run')
+    if is_privileged(user):
+        return queryset
+    visible_quality = quality_project_filter(queryset, user).values('pk')
+    global_project_ids = Project.objects.filter(Q(owner=user) | Q(members=user)).values('pk')
+    return queryset.filter(
+        Q(pk__in=visible_quality)
+        | Q(project_type__in=['PROJECT', 'EXECUTION'], project_id__in=global_project_ids)
+    ).distinct()
+
+
+
+def _cluster_project(cluster, user):
+    if cluster.mapped_project_id:
+        if is_privileged(user):
+            return cluster.mapped_project
+        if cluster.mapped_project.owner_id == getattr(user, 'pk', None) or cluster.mapped_project.members.filter(pk=user.pk).exists():
+            return cluster.mapped_project
+        return None
+    if cluster.project_type not in {'PROJECT', 'EXECUTION'}:
+        return None
+    queryset = Project.objects.filter(pk=cluster.project_id)
+    if is_privileged(user):
+        return queryset.first()
+    return queryset.filter(Q(owner=user) | Q(members=user)).distinct().first()
+
+
+def _record_cluster_audit(cluster, action, actor, previous, current, note=''):
+    return QualityFailureClusterAudit.objects.create(
+        cluster=cluster,
+        action=action,
+        actor=actor,
+        previous_value=redact_payload(previous or {}),
+        new_value=redact_payload(current or {}),
+        note=bound_text(redact_text(note, max_length=4096), 4096),
+    )
 
 
 def _paginate(view, queryset, serializer_class):
@@ -373,6 +419,141 @@ class FailureReviewAuditViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin
         return QualityFailureReviewAudit.objects.filter(
             failure__run__in=_run_queryset(self.request.user)
         ).select_related("failure", "actor").order_by("-created_at")
+
+
+class FailureClusterViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
+    serializer_class = QualityFailureClusterSerializer
+    pagination_class = QualityPagination
+    http_method_names = ['get', 'head', 'options', 'patch', 'post']
+
+    def get_queryset(self):
+        queryset = _cluster_queryset(self.request.user).order_by('-last_seen_at', '-created_at')
+        return apply_quality_filters(queryset, self.request.query_params, date_field='last_seen_at')
+
+    def _save_audit(self, cluster, action, previous, current, note=''):
+        _record_cluster_audit(cluster, action, self.request.user, previous, current, note)
+
+    @action(detail=True, methods=['post'], url_path='map-project')
+    def map_project(self, request, pk=None):
+        cluster = self.get_object()
+        project = Project.objects.filter(pk=request.data.get('project_id')).first()
+        if project is None or (not is_privileged(request.user) and not (project.owner_id == request.user.pk or project.members.filter(pk=request.user.pk).exists())):
+            return _error('PROJECT_FORBIDDEN', 'project is not accessible', status.HTTP_404_NOT_FOUND)
+        previous = {'project_id': cluster.project_id}
+        cluster.mapped_project = project
+        cluster.save(update_fields=['mapped_project', 'updated_at'])
+        _record_cluster_audit(cluster, 'PROJECT_MAPPED', request.user, previous, {'project_id': project.pk})
+        return Response(QualityFailureClusterSerializer(cluster).data)
+
+    @action(detail=True, methods=['patch', 'post'], url_path='owner')
+    def owner(self, request, pk=None):
+        cluster = self.get_object()
+        owner_id = request.data.get('owner_id')
+        owner = None
+        if owner_id not in (None, ''):
+            owner = get_user_model().objects.filter(pk=owner_id).first()
+            if owner is None:
+                return _error('OWNER_NOT_FOUND', 'owner not found', status.HTTP_404_NOT_FOUND)
+            project = _cluster_project(cluster, request.user)
+            if project is None:
+                if not is_privileged(request.user) and owner.pk != request.user.pk:
+                    return _error('OWNER_FORBIDDEN', 'owner must be the current user for this source project', status.HTTP_403_FORBIDDEN)
+            elif not is_privileged(request.user) and not (
+                project.owner_id == owner.pk or project.members.filter(pk=owner.pk).exists()
+            ):
+                return _error('OWNER_FORBIDDEN', 'owner is not a member of the cluster project', status.HTTP_403_FORBIDDEN)
+        previous = {'owner_id': cluster.owner_id}
+        cluster.owner = owner
+        cluster.save(update_fields=['owner', 'updated_at'])
+        self._save_audit(cluster, 'OWNER_CHANGED', previous, {'owner_id': cluster.owner_id})
+        return Response(QualityFailureClusterSerializer(cluster).data)
+
+    @action(detail=True, methods=['post'], url_path='link-defect')
+    def link_defect(self, request, pk=None):
+        cluster = self.get_object()
+        project = _cluster_project(cluster, request.user)
+        if project is None:
+            return _error('DEFECT_LINK_UNSUPPORTED', 'cluster source is not mapped to a TestHub project', status.HTTP_400_BAD_REQUEST)
+        defect = Defect.objects.filter(pk=request.data.get('defect_id'), project=project).first()
+        if defect is None:
+            return _error('DEFECT_NOT_FOUND', 'defect not found in the cluster project', status.HTTP_404_NOT_FOUND)
+        previous = {'defect_id': cluster.defect_id}
+        cluster.defect = defect
+        cluster.external_provider = defect.external_provider or cluster.external_provider
+        cluster.external_key = defect.external_key or cluster.external_key
+        cluster.external_url = defect.external_url or cluster.external_url
+        cluster.save(update_fields=['defect', 'external_provider', 'external_key', 'external_url', 'updated_at'])
+        self._save_audit(cluster, 'DEFECT_LINKED', previous, {'defect_id': defect.pk})
+        return Response(QualityFailureClusterSerializer(cluster).data)
+
+    @action(detail=True, methods=['post'], url_path='create-defect')
+    def create_defect(self, request, pk=None):
+        cluster = self.get_object()
+        if cluster.defect_id:
+            return Response(QualityFailureClusterSerializer(cluster).data)
+        project = _cluster_project(cluster, request.user)
+        if project is None:
+            return _error('DEFECT_CREATE_UNSUPPORTED', 'cluster source is not mapped to a TestHub project', status.HTTP_400_BAD_REQUEST)
+        title = bound_text(redact_text(request.data.get('title') or f'Automated failure: {cluster.signature}', max_length=300), 300)
+        description = bound_text(redact_text(request.data.get('description') or cluster.metadata.get('last_message', ''), max_length=10000), 10000)
+        source = {
+            'API': 'api_testing',
+            'UI': 'ui_automation',
+            'APP': 'app_automation',
+            'PERF': 'manual',
+            'EXECUTION': 'api_testing',
+        }.get(cluster.source_type, 'manual')
+        defect = Defect.objects.create(
+            title=title,
+            description=description,
+            actual_result=description,
+            project=project,
+            reporter=request.user,
+            assignee=cluster.owner,
+            source=source,
+            defect_type='performance' if cluster.taxonomy_code == 'PERFORMANCE' else 'functional',
+        )
+        cluster.defect = defect
+        cluster.save(update_fields=['defect', 'updated_at'])
+        self._save_audit(cluster, 'DEFECT_CREATED', {}, {'defect_id': defect.pk}, note='human-confirmed cluster action')
+        return Response(QualityFailureClusterSerializer(cluster).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='link-external')
+    def link_external(self, request, pk=None):
+        cluster = self.get_object()
+        provider = bound_text(redact_text(request.data.get('provider', ''), max_length=32), 32)
+        key = bound_text(redact_text(request.data.get('key', ''), max_length=255), 255)
+        url = safe_reference(request.data.get('url', ''))
+        if not provider or not key:
+            return _error('EXTERNAL_LINK_INVALID', 'provider and key are required', status.HTTP_400_BAD_REQUEST)
+        previous = {
+            'external_provider': cluster.external_provider,
+            'external_key': cluster.external_key,
+            'external_url': cluster.external_url,
+        }
+        cluster.external_provider = provider
+        cluster.external_key = key
+        cluster.external_url = url
+        cluster.save(update_fields=['external_provider', 'external_key', 'external_url', 'updated_at'])
+        self._save_audit(cluster, 'EXTERNAL_LINKED', previous, {
+            'external_provider': provider,
+            'external_key': key,
+            'external_url': url,
+        })
+        return Response(QualityFailureClusterSerializer(cluster).data)
+
+
+class FailureClusterAuditViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
+    serializer_class = QualityFailureClusterAuditSerializer
+    pagination_class = QualityPagination
+    http_method_names = ['get', 'head', 'options']
+
+    def get_queryset(self):
+        return QualityFailureClusterAudit.objects.filter(
+            cluster__in=_cluster_queryset(self.request.user)
+        ).select_related('cluster', 'actor').order_by('-created_at')
 
 
 class ProfileViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):

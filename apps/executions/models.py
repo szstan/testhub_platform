@@ -926,6 +926,12 @@ class ExecutionStepResult(models.Model):
                 name='execution_step_attempt_idempotency_uniq',
             ),
         ]
+        indexes = [
+            models.Index(
+                fields=('attempt', 'case_key', 'status', '-created_at'),
+                name='exec_step_case_status_idx',
+            ),
+        ]
 
     def transition_to(self, new_status, *, save=True):
         target = validate_transition(self.status, new_status, STEP_TRANSITIONS)
@@ -1012,6 +1018,10 @@ class ExecutionArtifact(models.Model):
     class Meta:
         db_table = 'execution_artifacts'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=('retention_until', 'created_at'), name='exec_artifact_retention_idx'),
+            models.Index(fields=('job', '-created_at'), name='exec_artifact_job_created_idx'),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=('attempt', 'uri_hash'),
@@ -1322,6 +1332,62 @@ class ExecutionProfile(models.Model):
         return f'{self.project_id}:{self.name}'
 
 
+
+
+NOTIFICATION_EVENT_CHOICES = (
+    ('gate_failed', 'Release gate failed'),
+    ('integration_failed', 'Integration health failed'),
+    ('failure_reopened', 'Failure cluster repeated'),
+    ('quarantine_expiring', 'Quarantine expiring'),
+)
+
+
+class ExecutionNotificationSubscription(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='execution_notification_subscriptions')
+    channel = models.ForeignKey('monitor.NotificationChannel', on_delete=models.CASCADE, related_name='execution_subscriptions')
+    event_type = models.CharField(max_length=32, choices=NOTIFICATION_EVENT_CHOICES)
+    enabled = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='execution_notification_subscriptions_created')
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'execution_notification_subscriptions'
+        constraints = [
+            models.UniqueConstraint(fields=('project', 'channel', 'event_type'), name='execution_notification_subscription_uniq'),
+        ]
+        indexes = [
+            models.Index(fields=('project', 'event_type', 'enabled'), name='exec_notify_sub_proj_idx'),
+        ]
+
+
+class ExecutionNotificationEvent(models.Model):
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('sent', 'Sent'),
+        ('failed', 'Failed'),
+    )
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='execution_notification_events')
+    subscription = models.ForeignKey(ExecutionNotificationSubscription, on_delete=models.CASCADE, related_name='events')
+    event_key = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=32, choices=NOTIFICATION_EVENT_CHOICES)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='pending')
+    payload = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+    sent_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'execution_notification_events'
+        constraints = [
+            models.UniqueConstraint(fields=('subscription', 'event_key'), name='execution_notification_event_uniq'),
+        ]
+        indexes = [
+            models.Index(fields=('project', 'event_type', '-created_at'), name='execution_notify_event_idx'),
+        ]
+
+
 class ExecutionRetryPolicy(models.Model):
     """Project/profile/case retry policy resolved before a new attempt."""
 
@@ -1405,6 +1471,8 @@ class ExecutionQualityGateEvaluation(models.Model):
     passed = models.BooleanField(default=False)
     summary = models.JSONField(default=dict, blank=True)
     failures = models.JSONField(default=list, blank=True)
+    policy_version = models.CharField(max_length=128, blank=True, default='')
+    policy_snapshot = models.JSONField(default=dict, blank=True)
     reason = models.CharField(max_length=255, blank=True, default='')
     evaluated_by = models.ForeignKey(
         User,

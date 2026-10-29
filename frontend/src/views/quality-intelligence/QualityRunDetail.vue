@@ -13,6 +13,7 @@
         <el-tag v-if="run" :type="statusType(run.quality_status)" size="large">{{ statusLabel(run.quality_status) }}</el-tag>
         <el-button :icon="Refresh" :loading="loading" @click="loadDetail">{{ t('qualityIntelligence.actions.refresh') }}</el-button>
         <el-button type="primary" :icon="RefreshRight" :loading="recomputing" @click="recompute">{{ t('qualityIntelligence.actions.recompute') }}</el-button>
+        <el-button @click="router.push({ name: 'ExecutionEvidenceExplorer', query: { quality_run: route.params.id } })">{{ t('menu.evidenceExplorer') }}</el-button>
       </div>
     </div>
 

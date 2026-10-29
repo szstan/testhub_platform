@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -25,6 +27,8 @@ from .state_machine import (
     StepStatus,
 )
 from .policies import apply_quality_gate, clear_final_for_retry, create_retry_request, mark_retry_requested, preserve_final_result, resolve_retry_policy, should_retry, sync_quality_result
+
+logger = logging.getLogger(__name__)
 
 _SECRET_KEY = re.compile(r"(token|secret|password|api[_-]?key|authorization|cookie|private[_-]?key)", re.I)
 _TERMINAL_JOB = {
@@ -301,6 +305,12 @@ class ResultEventIngestor:
         else:
             preserve_final_result(job, attempt, target, result, gate_result)
         ResultEventIngestor._sync_legacy_report(job, payload)
+        if getattr(settings, 'QUALITY_INTELLIGENCE_ENABLED', False):
+            try:
+                from apps.quality_intelligence.services.clusters import sync_execution_job_clusters
+                sync_execution_job_clusters(job)
+            except Exception:  # noqa: BLE001 - quality projection must not break execution finalization
+                logger.exception('execution failure cluster projection failed: job=%s', job.pk)
 
 
     @staticmethod

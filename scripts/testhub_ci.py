@@ -2,7 +2,7 @@
 """Small CI client for TestHub execution jobs.
 
 Examples:
-  python scripts/testhub_ci.py --base-url http://testhub trigger --project-id 7 --source-id checkout --token "$TESTHUB_TOKEN"
+  python scripts/testhub_ci.py --base-url http://testhub trigger --project-id 7 --source-type api --source-id api:suite:42 --token "$TESTHUB_TOKEN"
   python scripts/testhub_ci.py --base-url http://testhub import-results --project-id 7 --format junit --external-run-id "$GITHUB_RUN_ID" --file test-results.xml
   python scripts/testhub_ci.py --base-url http://testhub release-gate --job-id 42 --baseline-job-id 41
   python scripts/testhub_ci.py --base-url http://testhub wait --job-id 42
@@ -33,10 +33,11 @@ def parser() -> argparse.ArgumentParser:
 
     trigger = sub.add_parser("trigger")
     trigger.add_argument("--project-id", type=int, required=True)
-    trigger.add_argument("--source-type", default="ci")
+    trigger.add_argument("--source-type", default="api", choices=("api", "ui", "app", "performance", "ci"))
     trigger.add_argument("--source-id", required=True)
     trigger.add_argument("--build-reference", default="")
     trigger.add_argument("--idempotency-key", default="")
+    trigger.add_argument("--no-dispatch", action="store_true", help="Create the job without calling the dispatch endpoint")
 
     result = sub.add_parser("import-results")
     result.add_argument("--project-id", type=int, required=True)
@@ -50,6 +51,7 @@ def parser() -> argparse.ArgumentParser:
     gate.add_argument("--baseline-job-id", type=int)
     gate.add_argument("--max-failed", type=int, default=0)
     gate.add_argument("--max-unmatched", type=int, default=0)
+    gate.add_argument("--metric-thresholds", default="", help="JSON metric threshold rules, e.g. '{\"p95\":{\"max\":500}}'")
 
     wait = sub.add_parser("wait")
     wait.add_argument("--job-id", type=int, required=True)
@@ -98,11 +100,27 @@ def main() -> int:
             "build_reference": args.build_reference,
         }
         key = args.idempotency_key or f"ci-trigger:{args.source_id}:{uuid.uuid4().hex}"
-        status_code, _ = request_json(
+        status_code, body = request_json(
             "POST", url(base_url, "/api/executions/jobs/"), token=args.token,
             timeout=args.timeout, json=payload, extra_headers={"Idempotency-Key": key},
         )
-        return 0 if status_code < 300 else 2
+        if status_code >= 300:
+            return 2
+        if args.no_dispatch:
+            return 0
+        job_id = body.get("id") or body.get("job_id") if isinstance(body, dict) else None
+        if not job_id:
+            print("trigger response did not include a job id", file=sys.stderr)
+            return 2
+        dispatch_status, dispatch_body = request_json(
+            "POST", url(base_url, f"/api/executions/jobs/{job_id}/dispatch/"),
+            token=args.token, timeout=args.timeout, json={},
+        )
+        if dispatch_status >= 300:
+            message = dispatch_body.get("detail") if isinstance(dispatch_body, dict) else "dispatch failed"
+            print(f"dispatch failed: {message}", file=sys.stderr)
+            return 2
+        return 0
 
     if args.command == "import-results":
         if not args.file.is_file():
@@ -130,6 +148,16 @@ def main() -> int:
 
     if args.command == "release-gate":
         payload = {"max_failed": args.max_failed, "max_unmatched": args.max_unmatched}
+        if args.metric_thresholds:
+            try:
+                metric_thresholds = json.loads(args.metric_thresholds)
+            except ValueError:
+                print("--metric-thresholds must be valid JSON", file=sys.stderr)
+                return 2
+            if not isinstance(metric_thresholds, dict):
+                print("--metric-thresholds must be a JSON object", file=sys.stderr)
+                return 2
+            payload["metric_thresholds"] = metric_thresholds
         if args.baseline_job_id:
             payload["baseline_job_id"] = args.baseline_job_id
         status_code, body = request_json(

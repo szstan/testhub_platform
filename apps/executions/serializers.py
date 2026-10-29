@@ -14,10 +14,13 @@ from .models import (
     ExecutionFixture,
     ExecutionJob,
     ExecutionJobVariant,
+    ExecutionNotificationEvent,
+    ExecutionNotificationSubscription,
     ExecutionPluginManifest,
     ExecutionProfile,
     ExecutionQualityGateEvaluation,
     ExecutionRetryPolicy,
+    ExecutionSourceBinding,
     ExecutionFailureReview,
     ExecutionAISuggestion,
     ExecutionAISuggestionAudit,
@@ -59,6 +62,82 @@ def _project_from_requirement(requirement):
     return requirement.analysis.document.project_id
 
 
+class ExecutionSourceBindingSerializer(serializers.ModelSerializer):
+    created_by = UserSimpleSerializer(read_only=True)
+    source_reference = serializers.SerializerMethodField()
+    route_configured = serializers.SerializerMethodField()
+    executor_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ExecutionSourceBinding
+        fields = (
+            'id', 'project', 'source_type', 'source_id', 'source_project_id',
+            'metadata', 'enabled', 'created_by', 'created_at', 'updated_at',
+            'source_reference', 'route_configured', 'executor_status',
+        )
+        read_only_fields = (
+            'id', 'created_by', 'created_at', 'updated_at',
+            'source_reference', 'route_configured', 'executor_status',
+        )
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        source_type = attrs.get('source_type', getattr(self.instance, 'source_type', ''))
+        source_id = attrs.get('source_id', getattr(self.instance, 'source_id', ''))
+        source_project_id = str(
+            attrs.get('source_project_id', getattr(self.instance, 'source_project_id', '')) or ''
+        ).strip()
+        metadata = attrs.get('metadata', getattr(self.instance, 'metadata', {}) or {})
+        if project is None or not accessible_execution_projects(user).filter(pk=project.pk).exists():
+            raise PermissionDenied('没有权限管理该项目的执行 source binding')
+        if not source_project_id:
+            raise serializers.ValidationError({'source_project_id': 'source_project_id 不能为空'})
+        if not isinstance(metadata, dict):
+            raise serializers.ValidationError({'metadata': 'metadata 必须是对象'})
+        try:
+            from .source_contract import parse_source_id
+            parse_source_id(source_type, source_id)
+        except Exception as exc:
+            raise serializers.ValidationError({'source_id': str(exc)}) from exc
+        return attrs
+
+    def get_source_reference(self, obj):
+        try:
+            from .source_contract import parse_source_id
+            reference = parse_source_id(obj.source_type, obj.source_id)
+            return {
+                'source_type': reference.source_type,
+                'kind': reference.kind,
+                'object_id': reference.object_id,
+                'canonical': reference.canonical,
+            }
+        except Exception:
+            return None
+
+    def get_route_configured(self, obj):
+        from .adapters import get_executor_adapter, UnsupportedExecutorError
+        try:
+            adapter = get_executor_adapter(obj.source_type)
+        except UnsupportedExecutorError:
+            return False
+        dispatcher = getattr(adapter, 'dispatcher', None)
+        supports = getattr(dispatcher, 'supports', None)
+        return bool(callable(supports) and supports(obj.source_type))
+
+    def get_executor_status(self, obj):
+        if not self.get_route_configured(obj):
+            return 'unsupported'
+        return 'ready' if obj.enabled else 'disabled_binding'
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        from .result_events import redact_result_payload
+        result['metadata'] = redact_result_payload(result.get('metadata') or {})
+        return result
+
+
 class ExecutionAttemptSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExecutionAttempt
@@ -97,6 +176,14 @@ class ExecutionArtifactSerializer(serializers.ModelSerializer):
             'retention_until', 'metadata', 'created_at', 'updated_at',
         )
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        from apps.quality_intelligence.adapters.base import safe_reference
+        from .result_events import redact_result_payload
+        result['uri'] = safe_reference(result.get('uri', ''))
+        result['metadata'] = redact_result_payload(result.get('metadata') or {})
+        return result
 
 
 class ExecutionDatasetSerializer(serializers.ModelSerializer):
@@ -142,6 +229,42 @@ class ExecutionFixtureSerializer(serializers.ModelSerializer):
         model = ExecutionFixture
         fields = '__all__'
         read_only_fields = ('id', 'created_by', 'created_at', 'cleaned_at', 'status', 'cleanup_error')
+
+
+class ExecutionNotificationSubscriptionSerializer(serializers.ModelSerializer):
+    created_by = UserSimpleSerializer(read_only=True)
+
+    class Meta:
+        model = ExecutionNotificationSubscription
+        fields = '__all__'
+        read_only_fields = ('id', 'created_by', 'created_at', 'updated_at')
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        channel = attrs.get('channel', getattr(self.instance, 'channel', None))
+        if project is None or not accessible_execution_projects(user).filter(pk=project.pk).exists():
+            raise PermissionDenied('没有权限管理该项目的通知订阅')
+        if channel is None:
+            raise serializers.ValidationError({'channel': '通知渠道不能为空'})
+        if not (getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False)) and channel.created_by_id not in {None, getattr(user, 'pk', None)}:
+            raise PermissionDenied('没有权限使用该通知渠道')
+        return attrs
+
+
+class ExecutionNotificationEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExecutionNotificationEvent
+        fields = '__all__'
+        read_only_fields = fields
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        from .result_events import redact_result_payload
+        result['payload'] = redact_result_payload(result.get('payload') or {})
+        result['error_message'] = str(result.get('error_message') or '')[:1000]
+        return result
 
 
 class ExecutionPluginManifestSerializer(serializers.ModelSerializer):
@@ -191,7 +314,7 @@ class ExecutionQualityGateEvaluationSerializer(serializers.ModelSerializer):
         model = ExecutionQualityGateEvaluation
         fields = (
             'id', 'attempt', 'evaluation_key', 'job', 'profile', 'stage', 'passed',
-            'summary', 'failures', 'reason', 'evaluated_by', 'created_at',
+            'summary', 'failures', 'policy_version', 'policy_snapshot', 'reason', 'evaluated_by', 'created_at',
         )
         read_only_fields = fields
 
@@ -298,6 +421,7 @@ class ExecutionJobSerializer(serializers.ModelSerializer):
     variants = ExecutionJobVariantSerializer(many=True, read_only=True)
     executor_status = serializers.SerializerMethodField()
     execution_supported = serializers.SerializerMethodField()
+    source_binding_status = serializers.SerializerMethodField()
     attempts_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -310,26 +434,53 @@ class ExecutionJobSerializer(serializers.ModelSerializer):
             'error_type', 'error_message', 'idempotency_key',
             'queued_at', 'started_at', 'finished_at', 'cancelled_at',
             'created_at', 'updated_at', 'executor_status',
-            'execution_supported', 'attempts_count',
+            'execution_supported', 'source_binding_status', 'attempts_count',
         )
         read_only_fields = (
             'id', 'dataset_snapshot', 'variants', 'status', 'cancel_reason', 'attempt', 'worker', 'requested_by',
             'result', 'final_result', 'final_attempt', 'final_status', 'quality_gate_result', 'retry_policy_snapshot', 'finalized_at',
             'error_type', 'error_message', 'queued_at', 'started_at',
             'finished_at', 'cancelled_at', 'created_at', 'updated_at',
-            'executor_status', 'execution_supported', 'attempts_count',
+            'executor_status', 'execution_supported', 'source_binding_status', 'attempts_count',
         )
         extra_kwargs = {
             'idempotency_key': {'required': False, 'allow_blank': False},
         }
 
     def get_executor_status(self, obj):
-        # No executor is connected in this additive foundation.  Keep this
-        # explicit so clients do not interpret pending as actively dispatched.
-        return 'unsupported'
+        from .adapters import get_executor_adapter, UnsupportedExecutorError
+        try:
+            adapter = get_executor_adapter(obj.source_type)
+        except UnsupportedExecutorError:
+            return 'unsupported'
+        dispatcher = getattr(adapter, 'dispatcher', None)
+        supports = getattr(dispatcher, 'supports', None)
+        if not callable(supports) or not supports(obj.source_type):
+            return 'unsupported'
+        binding_status = self.get_source_binding_status(obj)
+        if binding_status in {'missing', 'invalid', 'disabled'}:
+            return f'{binding_status}_binding'
+        return 'ready'
+
+    def get_source_binding_status(self, obj):
+        if obj.source_type not in {'api', 'ui', 'app', 'performance'}:
+            return 'not_required'
+        try:
+            from .source_contract import parse_source_id
+            reference = parse_source_id(obj.source_type, obj.source_id)
+        except Exception:
+            return 'invalid'
+        binding = ExecutionSourceBinding.objects.filter(
+            project_id=obj.project_id,
+            source_type=reference.source_type,
+            source_id=reference.canonical,
+        ).only('enabled').first()
+        if binding is None:
+            return 'missing'
+        return 'ready' if binding.enabled else 'disabled'
 
     def get_execution_supported(self, obj):
-        return False
+        return self.get_executor_status(obj) == 'ready'
 
     def get_attempts_count(self, obj):
         return obj.attempts.count()

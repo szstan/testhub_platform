@@ -4,6 +4,7 @@ from datetime import timedelta
 from io import StringIO
 
 from django.core.management import call_command
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -11,6 +12,7 @@ from apps.executions.models import ExecutionArtifact, ExecutionEvent, ExecutionJ
 from apps.executions.result_events import ResultEventIngestor
 from apps.executions.state_machine import ExecutionStatus
 from apps.projects.models import Project
+from apps.quality_intelligence.models import QualityFailureCluster
 from apps.reports.models import TestReport as LegacyReport
 from apps.users.models import User
 
@@ -60,8 +62,43 @@ def test_result_events_are_idempotent_redacted_and_terminal(result_job):
     assert finished.status == ExecutionStatus.PASSED
     assert job.status == ExecutionStatus.PASSED
     report = LegacyReport.objects.get(execution_job=job)
-
     assert report.summary == {'passed': 1}
+
+
+@pytest.mark.django_db
+def test_final_failure_event_projects_cluster_when_quality_is_enabled(result_job):
+    _owner, _outsider, _project, job = result_job
+    with override_settings(QUALITY_INTELLIGENCE_ENABLED=True):
+        ResultEventIngestor.ingest(
+            job,
+            'run_started',
+            {'attempt': 1},
+            idempotency_key='cluster-start',
+        )
+        ResultEventIngestor.ingest(
+            job,
+            'step_finished',
+            {
+                'attempt': 1,
+                'case_key': 'checkout.login',
+                'step_key': 'test',
+                'status': 'failed',
+                'error_type': 'assertion',
+                'error_message': 'expected 200 actual 500',
+            },
+            idempotency_key='cluster-step',
+        )
+        ResultEventIngestor.ingest(
+            job,
+            'run_finished',
+            {'attempt': 1, 'status': 'failed', 'error_message': 'failed'},
+            idempotency_key='cluster-finish',
+        )
+    assert QualityFailureCluster.objects.filter(
+        source_type='EXECUTION',
+        project_id=str(job.project_id),
+        test_key='checkout.login',
+    ).exists()
 
 
 @pytest.mark.django_db

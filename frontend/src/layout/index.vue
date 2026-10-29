@@ -56,9 +56,17 @@
               <el-icon><Connection /></el-icon>
               <span>{{ $t('menu.traceability') }}</span>
             </el-menu-item>
+            <el-menu-item index="/ai-generation/source-bindings">
+              <el-icon><Connection /></el-icon>
+              <span>{{ $t('menu.sourceBindings') }}</span>
+            </el-menu-item>
             <el-menu-item index="/ai-generation/ci-profiles">
               <el-icon><Setting /></el-icon>
               <span>{{ $t('menu.ciProfiles') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-generation/evidence">
+              <el-icon><Document /></el-icon>
+              <span>{{ $t('menu.evidenceExplorer') }}</span>
             </el-menu-item>
             <el-menu-item index="/ai-generation/datasets-plugins">
               <el-icon><Collection /></el-icon>
@@ -386,6 +394,10 @@
               <el-icon><Warning /></el-icon>
               <span>{{ $t('menu.qualityFailures') }}</span>
             </el-menu-item>
+            <el-menu-item index="/quality-intelligence/failure-clusters">
+              <el-icon><Tickets /></el-icon>
+              <span>{{ $t('menu.qualityClusters') }}</span>
+            </el-menu-item>
             <el-menu-item index="/quality-intelligence/profiles">
               <el-icon><Aim /></el-icon>
               <span>{{ $t('menu.qualityProfiles') }}</span>
@@ -563,7 +575,9 @@ const breadcrumbTitle = computed(() => {
     '/ai-generation/executions': t('menu.executionRecords'),
     '/ai-generation/task-center': t('menu.taskCenter'),
     '/ai-generation/traceability': t('menu.traceability'),
+    '/ai-generation/source-bindings': t('menu.sourceBindings'),
     '/ai-generation/ci-profiles': t('menu.ciProfiles'),
+    '/ai-generation/evidence': t('menu.evidenceExplorer'),
     '/ai-generation/datasets-plugins': t('menu.datasetsPlugins'),
     '/ai-generation/reports': t('menu.testReport'),
 
@@ -637,6 +651,7 @@ const breadcrumbTitle = computed(() => {
     '/quality-intelligence/dashboard': t('menu.qualityDashboard'),
     '/quality-intelligence/runs': t('menu.qualityRuns'),
     '/quality-intelligence/failures': t('menu.qualityFailures'),
+    '/quality-intelligence/failure-clusters': t('menu.qualityClusters'),
     '/quality-intelligence/profiles': t('menu.qualityProfiles'),
     '/quality-intelligence/baselines': t('menu.qualityBaselines'),
 

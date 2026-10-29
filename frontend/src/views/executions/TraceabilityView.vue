@@ -13,13 +13,18 @@
         <el-form-item :label="$t('execution.traceability.projectId')">
           <el-input-number v-model="projectId" :min="1" :controls="false" />
         </el-form-item>
+        <el-form-item :label="$t('execution.traceability.versionId')">
+          <el-input-number v-model="versionId" :min="1" :controls="false" />
+        </el-form-item>
       </el-form>
     </el-card>
 
     <el-row :gutter="16" v-loading="loading" class="summary-row">
-      <el-col :span="8"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.totalRequirements') }}</span><strong>{{ coverage.total_requirements }}</strong></div></el-card></el-col>
-      <el-col :span="8"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.coveredRequirements') }}</span><strong>{{ coverage.covered_requirements }}</strong></div></el-card></el-col>
-      <el-col :span="8"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.coverageRate') }}</span><strong>{{ coverage.coverage_rate }}%</strong></div></el-card></el-col>
+      <el-col :xs="12" :md="4"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.totalRequirements') }}</span><strong>{{ coverage.total_requirements }}</strong></div></el-card></el-col>
+      <el-col :xs="12" :md="4"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.linkedRequirements') }}</span><strong>{{ coverage.linked_requirements }}</strong></div></el-card></el-col>
+      <el-col :xs="12" :md="4"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.executedRequirements') }}</span><strong>{{ coverage.executed_requirements }}</strong></div></el-card></el-col>
+      <el-col :xs="12" :md="4"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.passedRequirements') }}</span><strong>{{ coverage.passed_requirements }}</strong></div></el-card></el-col>
+      <el-col :xs="12" :md="4"><el-card shadow="never"><div class="metric"><span>{{ $t('execution.traceability.unexecutedRequirements') }}</span><strong>{{ coverage.unexecuted_requirements?.length || 0 }}</strong></div></el-card></el-col>
     </el-row>
 
     <el-card shadow="never">
@@ -45,9 +50,10 @@ import api from '@/utils/api'
 import { getExecutionCoverage, listExecutionBuilds } from '@/api/executions'
 
 const projectId = ref(null)
+const versionId = ref(null)
 const loading = ref(false)
 const builds = ref([])
-const coverage = ref({ total_requirements: 0, covered_requirements: 0, coverage_rate: 0 })
+const coverage = ref({ total_requirements: 0, covered_requirements: 0, linked_requirements: 0, executed_requirements: 0, passed_requirements: 0, unexecuted_requirements: [], coverage_rate: 0 })
 
 const loadTraceability = async () => {
   if (!projectId.value) {
@@ -58,7 +64,7 @@ const loadTraceability = async () => {
   try {
     const [buildResponse, coverageResponse] = await Promise.all([
       listExecutionBuilds({ project: projectId.value, ordering: '-created_at' }),
-      getExecutionCoverage(projectId.value),
+      getExecutionCoverage(projectId.value, versionId.value),
     ])
     const buildData = buildResponse.data || {}
     builds.value = buildData.results || (Array.isArray(buildData) ? buildData : [])

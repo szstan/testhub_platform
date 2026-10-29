@@ -36,7 +36,9 @@ export default {
     taskCenter: 'Unified Task Center',
     traceability: 'Quality Traceability',
     ciProfiles: 'CI Profiles',
+    sourceBindings: 'Execution Source Bindings',
     datasetsPlugins: 'Datasets & Plugins',
+    evidenceExplorer: 'Evidence Explorer',
     testReport: 'Test Report',
 
     // API Testing
@@ -109,6 +111,7 @@ export default {
     qualityDashboard: 'Quality Dashboard',
     qualityRuns: 'Quality Runs',
     qualityFailures: 'Failure Explorer',
+    qualityClusters: 'Failure Ownership',
     qualityProfiles: 'Test Profiles',
     qualityBaselines: 'Quality Baselines',
 

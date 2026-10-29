@@ -1,3 +1,5 @@
+from unittest.mock import Mock, patch
+
 import pytest
 from rest_framework.test import APIClient
 
@@ -37,7 +39,33 @@ def _document(include_orders=False):
 
 
 @pytest.mark.django_db
-def test_api_notification_setting_rejects_cross_tenant_config_and_redacts_secrets():
+def test_openapi_contract_execute_runs_bounded_cases_and_writes_steps():
+    user = User.objects.create_user(username='contract-runner-owner', password='pass')
+    project = Project.objects.create(name='Contract Runner Project', owner=user)
+    spec = OpenApiContractSpec.objects.create(
+        project=project,
+        name='runner-api',
+        version='1',
+        document={**_document(), 'servers': [{'url': 'https://api.example.test'}]},
+        document_hash='hash',
+        created_by=user,
+    )
+    job = ExecutionJob.objects.create(project=project, source_type='api', source_id='api:suite:1', requested_by=user)
+    response = Mock(status_code=200)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    with patch('apps.api_testing.contract_runner.requests.request', return_value=response) as request_mock:
+        result = client.post(
+            f'/api/api-testing/openapi-contracts/{spec.pk}/execute/',
+            {'job_id': job.pk, 'kinds': ['positive'], 'limit': 1},
+            format='json',
+        )
+    assert result.status_code == 201, result.data
+    assert result.data['status'] == 'passed'
+    assert result.data['results'][0]['case_kind'] == 'positive'
+    assert request_mock.called
+    assert ExecutionStepResult.objects.filter(attempt__job=job, step_key='contract:positive').exists()
+
     owner = User.objects.create_user(username='notification-owner', password='pass')
     foreign = User.objects.create_user(username='notification-foreign', password='pass')
     project = ApiProject.objects.create(
@@ -137,3 +165,76 @@ def test_openapi_contract_api_is_project_scoped():
     assert materialized.status_code == 200
     assert materialized.data['total'] == 1
     assert materialized.data['created'][0]['external_ref'] == 'openapi:listUsers:positive'
+
+
+@pytest.mark.django_db
+def test_openapi_contract_record_results_normalizes_case_kinds_and_coverage():
+    user = User.objects.create_user(username='contract-run-owner', password='pass')
+    project = Project.objects.create(name='Contract Run Project', owner=user)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    spec_response = client.post('/api/api-testing/openapi-contracts/', {
+        'project': project.id,
+        'name': 'secured-api',
+        'version': '2',
+        'document': _document(include_orders=True),
+    }, format='json')
+    assert spec_response.status_code == 201, spec_response.data
+    spec_id = spec_response.data['id']
+    job = ExecutionJob.objects.create(
+        project=project,
+        source_type='api',
+        source_id='api:suite:99',
+        requested_by=user,
+    )
+
+    results = [
+        {'operation_key': 'createOrder', 'case_kind': 'positive', 'status': 'passed'},
+        {'operation_key': 'createOrder', 'case_kind': 'negative', 'status': 'failed', 'error_message': 'schema rejected'},
+        {'operation_key': 'createOrder', 'case_kind': 'security', 'status': 'passed'},
+    ]
+    response = client.post(
+        f'/api/api-testing/openapi-contracts/{spec_id}/record-results/',
+        {'job_id': job.id, 'results': results},
+        format='json',
+    )
+    assert response.status_code == 201, response.data
+    assert response.data['created_results'] == 3
+    assert response.data['coverage']['by_kind']['positive']['covered'] == 1
+    assert response.data['coverage']['by_kind']['negative']['covered'] == 0
+    assert response.data['coverage']['by_kind']['security']['covered'] == 1
+    assert ExecutionStepResult.objects.filter(attempt__job=job, step_key='contract:positive').exists()
+    assert ExecutionStepResult.objects.filter(attempt__job=job, case_key__startswith='openapi:').count() == 3
+
+
+@pytest.mark.django_db
+def test_openapi_contract_record_results_rejects_foreign_job():
+    owner = User.objects.create_user(username='contract-foreign-owner', password='pass')
+    foreign = User.objects.create_user(username='contract-foreign-user', password='pass')
+    project = Project.objects.create(name='Contract Owner Project', owner=owner)
+    foreign_project = Project.objects.create(name='Contract Foreign Project', owner=foreign)
+    spec = OpenApiContractSpec.objects.create(
+        project=project,
+        name='api',
+        version='1',
+        document=_document(),
+        document_hash='hash',
+        created_by=owner,
+    )
+    foreign_job = ExecutionJob.objects.create(
+        project=foreign_project,
+        source_type='api',
+        source_id='api:suite:100',
+        requested_by=foreign,
+    )
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    response = client.post(
+        f'/api/api-testing/openapi-contracts/{spec.pk}/record-results/',
+        {
+            'job_id': foreign_job.id,
+            'results': [{'operation_key': 'listUsers', 'case_kind': 'positive', 'status': 'passed'}],
+        },
+        format='json',
+    )
+    assert response.status_code == 404
