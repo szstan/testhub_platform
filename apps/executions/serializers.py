@@ -164,7 +164,11 @@ class ExecutionStepResultSerializer(serializers.ModelSerializer):
             'result', 'error_type', 'error_message', 'duration_ms', 'started_at',
             'finished_at', 'created_at', 'updated_at',
         )
-        read_only_fields = fields
+        read_only_fields = (
+            'id', 'attempt', 'case_key', 'step_key', 'idempotency_key', 'status',
+            'result', 'error_type', 'error_message', 'duration_ms', 'started_at',
+            'finished_at', 'created_at', 'updated_at',
+        )
 
 
 class ExecutionArtifactSerializer(serializers.ModelSerializer):
@@ -257,7 +261,10 @@ class ExecutionNotificationEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExecutionNotificationEvent
         fields = '__all__'
-        read_only_fields = fields
+        read_only_fields = (
+            'id', 'project', 'subscription', 'event_key', 'event_type', 'status',
+            'payload', 'error_message', 'sent_at', 'created_at',
+        )
 
     def to_representation(self, instance):
         result = super().to_representation(instance)
@@ -310,6 +317,9 @@ class ExecutionRetryPolicySerializer(serializers.ModelSerializer):
 
 
 class ExecutionQualityGateEvaluationSerializer(serializers.ModelSerializer):
+    policy_version = serializers.CharField(read_only=True, required=False)
+    policy_snapshot = serializers.JSONField(read_only=True, required=False)
+
     class Meta:
         model = ExecutionQualityGateEvaluation
         fields = (
@@ -421,7 +431,7 @@ class ExecutionJobSerializer(serializers.ModelSerializer):
     variants = ExecutionJobVariantSerializer(many=True, read_only=True)
     executor_status = serializers.SerializerMethodField()
     execution_supported = serializers.SerializerMethodField()
-    source_binding_status = serializers.SerializerMethodField()
+    source_binding_status = serializers.SerializerMethodField(required=False)
     attempts_count = serializers.SerializerMethodField()
 
     class Meta:

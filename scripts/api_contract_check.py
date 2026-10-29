@@ -109,12 +109,15 @@ def _compare_schema(
     new_type = _schema_type(new_schema)
     if old_type and new_type and old_type != new_type:
         breaks.append(f"schema type changed: {label} {old_type}->{new_type}")
+    old_properties = old_schema.get("properties") or {}
+    new_properties = new_schema.get("properties") or {}
     old_required = _required_properties(old_schema)
     new_required = _required_properties(new_schema)
     for field in sorted(new_required - old_required):
+        new_property = new_properties.get(field)
+        if isinstance(new_property, dict) and new_property.get('readOnly') is True:
+            continue
         breaks.append(f"required field added: {label}.{field}")
-    old_properties = old_schema.get("properties") or {}
-    new_properties = new_schema.get("properties") or {}
     for field in sorted(set(old_properties) - set(new_properties)):
         breaks.append(f"property removed: {label}.{field}")
     for field in sorted(set(old_properties) & set(new_properties)):

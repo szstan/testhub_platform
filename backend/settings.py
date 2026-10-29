@@ -381,6 +381,8 @@ SPECTACULAR_SETTINGS = {
         'DefectSourceEnum': 'apps.defects.models.Defect.SOURCE_CHOICES',
         'ExecutionCaseStatusEnum': 'apps.executions.models.TestRunCase.STATUS_CHOICES',
         'ExecutionCasePriorityEnum': 'apps.executions.models.TestRunCase.PRIORITY_CHOICES',
+        'EventTypeEnum': 'apps.executions.models.ExecutionEvent.EVENT_TYPES',
+        'ExecutionNotificationEventTypeEnum': 'apps.executions.models.NOTIFICATION_EVENT_CHOICES',
         'ProviderEnum': 'apps.executions.models.ExecutionProfile.PROVIDER_CHOICES',
         'SourceType588Enum': 'apps.executions.models.EXECUTION_SOURCE_CHOICES',
         'PerfEngineEnum': 'apps.perf_testing.models.PerfScenario.ENGINE_CHOICES',

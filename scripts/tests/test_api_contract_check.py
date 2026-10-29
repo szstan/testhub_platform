@@ -19,6 +19,32 @@ def test_openapi_contract_allows_additive_path_and_property():
     assert find_breaking_changes(previous, current) == []
 
 
+def test_openapi_contract_allows_new_required_read_only_response_property():
+    previous = {
+        'components': {'schemas': {
+            'Item': {
+                'type': 'object',
+                'properties': {'name': {'type': 'string'}},
+                'required': ['name'],
+            },
+        }},
+    }
+    current = {
+        'components': {'schemas': {
+            'Item': {
+                'type': 'object',
+                'properties': {
+                    'name': {'type': 'string'},
+                    'status': {'type': 'string', 'readOnly': True},
+                },
+                'required': ['name', 'status'],
+            },
+        }},
+    }
+
+    assert find_breaking_changes(previous, current) == []
+
+
 def test_openapi_contract_detects_required_and_removed_changes():
     previous = {
         'paths': {'/api/items/': {'get': {'responses': {'200': {}, '404': {}}}}},
