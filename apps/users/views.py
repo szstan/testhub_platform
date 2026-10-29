@@ -18,6 +18,7 @@ from .serializers import (
 
 # JWT 相关导入
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.views import TokenRefreshView
 
 REFRESH_COOKIE_NAME = 'testhub_refresh'
@@ -47,7 +48,12 @@ class CookieTokenRefreshView(TokenRefreshView):
         if not data.get('refresh'):
             data['refresh'] = request.COOKIES.get(REFRESH_COOKIE_NAME, '')
         serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except (User.DoesNotExist, TokenError):
+            response = Response({'detail': 'refresh token invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+            _clear_refresh_cookie(response)
+            return response
         payload = dict(serializer.validated_data)
         refresh = payload.pop('refresh', None)
         response = Response(payload, status=status.HTTP_200_OK)
