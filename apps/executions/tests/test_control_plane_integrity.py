@@ -173,13 +173,15 @@ def test_failure_analysis_get_performs_no_cluster_projection_or_database_write(c
 def test_metrics_aggregate_without_loading_job_history_or_large_json(control):
     project = control['project']
     blob = 'unused-result-data' * 1000
-    jobs = ExecutionJob.objects.bulk_create([
+    ExecutionJob.objects.bulk_create([
         ExecutionJob(
             project=project, source_type='ci', source_id=f'ci-{index}',
             result={'unmatched': index % 2, 'unused_blob': blob},
             environment_snapshot={'unused': blob}, final_result={'unused': blob},
         ) for index in range(240)
     ])
+    # Re-read parent PKs on databases without bulk INSERT RETURNING support.
+    jobs = list(ExecutionJob.objects.filter(project=project).order_by('pk')[:3])
     for index in range(3):
         ExecutionQualityGateEvaluation.objects.create(job=jobs[index], stage='release', passed=index < 2)
         ExecutionFailureReview.objects.create(
@@ -217,10 +219,11 @@ def test_paginated_job_list_batches_attempt_counts_and_binding_lookups(control):
     ExecutionSourceBinding.objects.create(
         project=project, source_type='api', source_id='api:suite:42', source_project_id='native-api',
     )
-    jobs = ExecutionJob.objects.bulk_create([
+    ExecutionJob.objects.bulk_create([
         ExecutionJob(project=project, source_type='api', source_id='api:suite:42')
         for _ in range(20)
     ])
+    jobs = ExecutionJob.objects.filter(project=project).order_by('pk')
     for job in jobs:
         ExecutionAttempt.objects.create(job=job, attempt_number=1)
     with override_settings(EXECUTION_DISPATCH_ROUTES={'api': 'apps.executions.tasks.execute_api_source'}):

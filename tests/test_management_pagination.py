@@ -29,11 +29,13 @@ def test_management_lists_respect_requested_page_size_and_stable_page_boundaries
             for index in range(31)
         ])
         endpoint = '/api/executions/plugins/'
+    # MySQL and SQLite before 3.35 do not populate bulk-created object PKs.
+    expected_ids = list(type(rows[0]).objects.filter(project=project).order_by('id').values_list('id', flat=True))
     client = APIClient()
     client.force_authenticate(user=owner)
     first = client.get(endpoint, {'page': 1, 'page_size': 30, 'ordering': 'id'})
     second = client.get(endpoint, {'page': 2, 'page_size': 30, 'ordering': 'id'})
     assert first.status_code == second.status_code == 200
     assert first.data['count'] == second.data['count'] == 31
-    assert [row['id'] for row in first.data['results']] == [row.pk for row in rows[:30]]
-    assert [row['id'] for row in second.data['results']] == [rows[-1].pk]
+    assert [row['id'] for row in first.data['results']] == expected_ids[:30]
+    assert [row['id'] for row in second.data['results']] == expected_ids[-1:]
