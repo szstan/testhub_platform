@@ -99,7 +99,10 @@ def _api_execute(source, reference, actor, payload=None, cancel_check=None):
         success = bool(result and result.get('success')) and not int(result.get('failed_count') or 0)
     else:
         result = execute_api_request(source, None, actor, **kwargs)
-        success = bool(result and result.get('success'))
+        success = bool(result and result.get('success')) and all(
+            assertion.get('passed', True)
+            for assertion in (result or {}).get('assertions_results') or []
+        )
     return success, result or {}
 
 

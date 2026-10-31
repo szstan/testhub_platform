@@ -59,6 +59,8 @@ The worker owns source-specific execution and must publish a result through the 
 
 Binding 创建和 PATCH 会按有效字段验证真实 API/UI/APP/PERF 来源对象、原生项目以及调用者的 owner/member/admin 权限；worker 在执行边界重新检查活动账号和原生项目权限。统一 Project 与四种原生项目是独立命名空间，相等的数字 ID 不构成授权。APP 的批准、capabilities、lease 配置以及已批准 binding 的来源/项目范围变更或重新启用，要求特权用户操作。设备 generation `0` 是合法世代，执行记录会携带世代并进行 compare-and-release。
 
+独立 `api:request:<id>` 的统一终态同时检查 HTTP 执行是否完成和配置断言是否全部通过，与 API suite 的断言判定一致。原生结果的 `success` 只表示收到了响应，因此即使 `success=true`，失败的 `assertions_results` 也会使统一任务失败。未配置断言时不额外要求响应为 2xx，原生 HTTP 状态码和断言明细仍保留在最终结果中。
+
 ## 重试、终态和质量门禁
 
 `ExecutionRetryPolicy` 按项目、profile、case 解析，第一次决策会保存到 `ExecutionJob.retry_policy_snapshot`。每个 attempt 记录 retry reason、policy、mode、decision 和 scheduled time。自动重试先在 job 锁内创建 `ExecutionRetryRequest` outbox；有 dispatcher 时在事务提交后继续 dispatch，没有 dispatcher 时由后续 worker 消费 queued outbox。
