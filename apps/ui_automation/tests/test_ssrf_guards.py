@@ -9,6 +9,11 @@ from apps.ui_automation.selenium_engine import SeleniumTestEngine
 from apps.ui_automation.serializers import UiProjectCreateSerializer
 
 
+@pytest.fixture
+def anyio_backend():
+    return 'asyncio'
+
+
 class _AsyncPage:
     def __init__(self):
         self.urls = []
@@ -49,7 +54,7 @@ def test_ui_project_serializer_allows_public_base_url(monkeypatch):
         assert serializer.validate_base_url('https://public.example.test') == 'https://public.example.test'
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_playwright_navigation_rejects_private_target():
     engine = PlaywrightTestEngine()
     engine.page = _AsyncPage()
@@ -60,7 +65,7 @@ async def test_playwright_navigation_rejects_private_target():
     assert engine.page.urls == []
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_playwright_navigation_allows_public_target(monkeypatch):
     _public_dns(monkeypatch)
     engine = PlaywrightTestEngine()

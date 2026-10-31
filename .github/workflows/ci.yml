@@ -62,7 +62,9 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: requirements-prod.txt
+          cache-dependency-path: |
+            requirements-prod.txt
+            requirements-ui-optional.txt
 
       - name: Install backend dependencies
         run: python -m pip install -r requirements-prod.txt
@@ -72,6 +74,12 @@ jobs:
 
       - name: Validate web runtime boundary
         run: python scripts/validate_linux_runtime.py --profile web --repo-root "$PWD"
+
+      - name: Install optional UI dependencies for broad regression tests
+        run: python -m pip install -r requirements-ui-optional.txt
+
+      - name: Validate pinned broad regression dependencies
+        run: python scripts/validate_runtime_dependencies.py --requirements requirements-prod.txt requirements-ui-optional.txt
 
       - name: Run backend regression tests
         env:
