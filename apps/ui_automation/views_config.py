@@ -1,4 +1,5 @@
 from rest_framework import viewsets, status
+from apps.core.http_transport import guarded_post
 from rest_framework.decorators import action
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
@@ -12,6 +13,14 @@ import os
 import json
 import logging
 from urllib.parse import urlparse
+
+from .schema import (
+    UiEnvironmentAuthErrorResponseSerializer,
+    UiEnvironmentCheckResponseSerializer,
+    UiEnvironmentErrorResponseSerializer,
+    UiEnvironmentInstallDriverRequestSerializer,
+    UiEnvironmentInstallDriverSuccessResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,13 @@ class EnvironmentConfigViewSet(viewsets.ViewSet):
             return [IsAdminUser()]
         return super().get_permissions()
 
+    @extend_schema(
+        operation_id='ui_environment_check',
+        responses={
+            200: UiEnvironmentCheckResponseSerializer,
+            401: UiEnvironmentAuthErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def check_environment(self, request):
         """
@@ -205,6 +221,17 @@ class EnvironmentConfigViewSet(viewsets.ViewSet):
             'playwright_browsers': playwright_results
         })
 
+    @extend_schema(
+        operation_id='ui_environment_install_driver',
+        request=UiEnvironmentInstallDriverRequestSerializer,
+        responses={
+            200: UiEnvironmentInstallDriverSuccessResponseSerializer,
+            400: UiEnvironmentErrorResponseSerializer,
+            401: UiEnvironmentAuthErrorResponseSerializer,
+            403: UiEnvironmentAuthErrorResponseSerializer,
+            500: UiEnvironmentErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['post'])
     def install_driver(self, request):
         """
@@ -455,7 +482,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式预览 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
+            response = guarded_post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False, allow_private=False)
 
             logger.info(f"AI智能模式预览 - 收到响应: status_code={response.status_code}")
 
@@ -539,7 +566,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
 
             logger.info(f"AI智能模式 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False)
+            response = guarded_post(url, headers=headers, json=data, timeout=(10, 60), allow_redirects=False, allow_private=False)
 
             logger.info(f"AI智能模式 - 收到响应: status_code={response.status_code}")
 

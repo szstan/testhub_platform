@@ -1,9 +1,15 @@
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from drf_spectacular.utils import extend_schema
 from django.db import models
+from . import schema as schema
 from .models import Project
 
+@extend_schema(responses={
+    200: schema.ProjectsUserDropdownResponseSerializer,
+    401: schema.ProjectsAuthFailureResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def user_projects_list(request):

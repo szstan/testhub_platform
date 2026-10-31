@@ -9,7 +9,10 @@ import logging
 import os
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from apps.core.scheduler import ScheduleLeaseHeartbeat
+from apps.core.cancellation import combine_cancel_checks
+from apps.core.http_transport import guarded_post
+from apps.core.scheduler import ScheduleLeaseHeartbeat, load_claimed_task
+
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +176,8 @@ def _send_app_webhook_notification(task, detail_content, status_text):
             continue
 
         try:
-            resp = requests.post(webhook_url, json=message_data, headers={'Content-Type': 'application/json'}, timeout=10)
+            resp = guarded_post(webhook_url, json=message_data, headers={'Content-Type': 'application/json'}, timeout=10,
+                                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)))
             log_status = 'success' if resp.status_code == 200 else 'failed'
             AppNotificationLog.objects.create(
                 task=task, task_name=task.name, task_type=task.task_type,
@@ -271,7 +275,16 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
 
 
 @shared_task
-def execute_app_test_task(execution_id, package_name: str = None, scheduled_task_id: int = None, scheduler_lease_token: str = '', lease_seconds: int = 300):
+def execute_app_test_task(
+    execution_id,
+    package_name: str = None,
+    scheduled_task_id: int = None,
+    scheduler_lease_token: str = '',
+    lease_seconds: int = 300,
+    lease_generation: int = None,
+    release_device_lease: bool = True,
+    cancel_check=None,
+):
     """
     异步执行APP测试任务
     
@@ -282,17 +295,29 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
     """
     from django.conf import settings
     from .models import AppTestExecution, AppDevice, AppScheduledTask
+    from .device_pool import (
+        DeviceLeaseError,
+        DeviceLeaseHeartbeat,
+        assert_device_execution_lease,
+        release_device_execution_lease,
+    )
     from .executors.test_executor import AppTestExecutor
     
     execution = None
     device = None
-    lock_acquired = False
+    bound_generation = lease_generation
+    unified_cancel_check = cancel_check
     heartbeat = None
+    device_heartbeat = None
     
     try:
         # 获取执行记录
-        execution = AppTestExecution.objects.get(id=execution_id)
+        execution = AppTestExecution.objects.select_related('device', 'user', 'test_case').get(id=execution_id)
         test_case = execution.test_case
+        if lease_generation is not None and execution.device_lease_generation != lease_generation:
+            raise DeviceLeaseError('入队设备租约世代与执行记录不匹配')
+        if bound_generation is None:
+            bound_generation = execution.device_lease_generation
         
         device = execution.device
         _assert_scheduled_task_scope(
@@ -303,6 +328,9 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
             test_case_id=test_case.id,
         )
         if scheduled_task_id and scheduler_lease_token:
+            load_claimed_task(
+                AppScheduledTask, scheduled_task_id, scheduler_lease_token, require_active=True
+            )
             heartbeat = ScheduleLeaseHeartbeat(
                 AppScheduledTask,
                 scheduled_task_id,
@@ -310,28 +338,33 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
                 lease_seconds=lease_seconds,
             ).start()
 
-        # 更新状态为执行中
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=execution.device_id)
+            assert_device_execution_lease(
+                device.pk, execution.user, bound_generation, execution_id=execution.pk
+            )
+        device_heartbeat = DeviceLeaseHeartbeat(
+            device.pk,
+            execution.user,
+            bound_generation,
+            execution_id=execution.pk,
+            lease_seconds=lease_seconds,
+        ).start()
+        cancel_checks = [device_heartbeat.raise_if_lost]
+        if unified_cancel_check is not None:
+            cancel_checks.append(unified_cancel_check)
+        if heartbeat is not None:
+            cancel_checks.append(heartbeat.raise_if_lost)
+        cancel_check = combine_cancel_checks(*cancel_checks)
+        cancel_check()
+
         execution.status = 'running'
         execution.started_at = timezone.now()
         execution.progress = 0
         execution.save()
         send_execution_update(execution_id, status='running', progress=0, message='任务开始执行')
-        
         logger.info(f"开始执行APP测试: {test_case.name}")
         
-        # 1. 检查并锁定设备
-        with transaction.atomic():
-            device = AppDevice.objects.select_for_update().get(pk=execution.device_id)
-            if device.status == 'locked' and device.locked_by_id != execution.user_id:
-                raise RuntimeError(f"设备 {device.device_id} 已被其他用户锁定")
-            if device.status != 'locked':
-                device.lock(execution.user)
-                lock_acquired = True
-
-        logger.info(f"设备已锁定: {device.device_id}")
-        
-        # 2. 由 pytest + allure 插件执行测试
-        # 进度分配：0~10% 环境准备，10~90% 步骤执行（由子进程内回调动态更新），90~100% 报告生成
         execution.progress = 10
         execution.save()
         send_execution_update(execution_id, status='running', progress=10, message='正在准备测试环境')
@@ -348,7 +381,9 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
             package_name=final_package_name,
             execution_id=execution_id,
             username=execution.user.username if execution.user else 'unknown',
+            cancel_check=cancel_check,
         )
+        cancel_check()
         
         # 从数据库重新读取最新进度（子进程中的回调可能已经更新过）
         execution.refresh_from_db()
@@ -459,19 +494,29 @@ def execute_app_test_task(execution_id, package_name: str = None, scheduled_task
             except Exception as schedule_error:
                 logger.error('更新 APP 调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
+        if device_heartbeat is not None:
+            device_heartbeat.stop()
         if heartbeat is not None:
             heartbeat.stop()
-        # 7. 清理：释放设备
-        try:
-            if lock_acquired and device and execution and device.locked_by_id == execution.user_id:
-                device.unlock()
-                logger.info(f"设备已释放: {device.device_id}")
-        except Exception as e:
-            logger.error(f"释放设备失败: {str(e)}")
+        if release_device_lease and scheduled_task_id and device and execution and execution.user:
+            try:
+                release_device_execution_lease(device.pk, execution.user, bound_generation)
+            except Exception as e:
+                logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
 
 
 @shared_task
-def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled_task_id=None, scheduler_lease_token='', lease_seconds: int = 300):
+def execute_app_suite_task(
+    suite_id,
+    execution_ids,
+    package_name=None,
+    scheduled_task_id=None,
+    scheduler_lease_token='',
+    lease_seconds: int = 300,
+    lease_generation: int = None,
+    release_device_lease: bool = True,
+    cancel_check=None,
+):
     """
     异步执行APP测试套件（顺序执行多个用例）
 
@@ -482,14 +527,24 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
         scheduled_task_id: 可选的定时任务 ID
     """
     from .models import AppTestSuite, AppTestExecution, AppDevice, AppScheduledTask
+    from .device_pool import (
+        DeviceLeaseError,
+        DeviceLeaseHeartbeat,
+        assert_device_execution_lease,
+        release_device_execution_lease,
+    )
     from .executors.test_executor import AppTestExecutor
 
     suite = None
     device = None
-    lock_acquired = False
+    user = None
+    bound_generation = lease_generation
+    unified_cancel_check = cancel_check
     passed = 0
     failed = 0
     heartbeat = None
+    device_heartbeat = None
+    executions = []
 
     try:
         suite = AppTestSuite.objects.get(id=suite_id)
@@ -506,6 +561,21 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             logger.error(f"套件 {suite_id} 未找到执行记录")
             return
 
+        generations = {item.device_lease_generation for item in executions}
+        if lease_generation is not None:
+            bound_generation = lease_generation
+        elif len(generations) == 1:
+            bound_generation = next(iter(generations))
+        else:
+            raise DeviceLeaseError('套件执行记录的设备租约世代不一致')
+        if any(
+            item.device_id != executions[0].device_id
+            or item.user_id != executions[0].user_id
+            or item.device_lease_generation != bound_generation
+            for item in executions
+        ):
+            raise DeviceLeaseError('套件执行记录未绑定到同一设备租约')
+
         _assert_scheduled_task_scope(
             scheduled_task_id=scheduled_task_id,
             project_id=suite.project_id,
@@ -514,6 +584,9 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             test_suite_id=suite.id,
         )
         if scheduled_task_id and scheduler_lease_token:
+            load_claimed_task(
+                AppScheduledTask, scheduled_task_id, scheduler_lease_token, require_active=True
+            )
             heartbeat = ScheduleLeaseHeartbeat(
                 AppScheduledTask,
                 scheduled_task_id,
@@ -521,18 +594,30 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
                 lease_seconds=lease_seconds,
             ).start()
 
-        # 锁定设备
+        user = executions[0].user
         with transaction.atomic():
             device = AppDevice.objects.select_for_update().get(pk=executions[0].device_id)
-            user = executions[0].user
-            if device.status == 'locked' and device.locked_by_id != user.id:
-                raise RuntimeError(f"设备 {device.device_id} 已被其他用户锁定")
-            if device.status != 'locked':
-                device.lock(user)
-                lock_acquired = True
+            assert_device_execution_lease(
+                device.pk, user, bound_generation, execution_id=executions[0].pk
+            )
+        device_heartbeat = DeviceLeaseHeartbeat(
+            device.pk,
+            user,
+            bound_generation,
+            execution_id=executions[0].pk,
+            lease_seconds=lease_seconds,
+        ).start()
+        cancel_checks = [device_heartbeat.raise_if_lost]
+        if unified_cancel_check is not None:
+            cancel_checks.append(unified_cancel_check)
+        if heartbeat is not None:
+            cancel_checks.append(heartbeat.raise_if_lost)
+        cancel_check = combine_cancel_checks(*cancel_checks)
+        cancel_check()
         logger.info(f"套件执行开始: {suite.name}, 设备: {device.device_id}, 共 {len(executions)} 个用例")
 
         for idx, execution in enumerate(executions):
+            cancel_check()
             test_case = execution.test_case
             if not test_case:
                 execution.status = 'error'
@@ -574,7 +659,9 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
                     package_name=final_pkg,
                     execution_id=execution.id,
                     username=execution.user.username if execution.user else 'unknown',
+                    cancel_check=cancel_check,
                 )
+                cancel_check()
 
                 execution.refresh_from_db()
 
@@ -616,6 +703,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
                 logger.info(f"用例 {test_case.name} 执行完成: status={execution.status}, result={execution.result}")
 
             except Exception as e:
+                cancel_check()
                 logger.error(f"用例 {test_case.name} 执行失败: {str(e)}", exc_info=True)
                 execution.status = 'error'
                 execution.result = None
@@ -633,6 +721,7 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
                     result=None,
                 )
 
+        cancel_check()
         # 更新套件统计
         suite.execution_status = 'completed'
         if passed == 0 and failed == 0:
@@ -671,6 +760,11 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
         logger.error(f"测试套件不存在: {suite_id}")
     except Exception as e:
         logger.error(f"执行套件失败: {str(e)}", exc_info=True)
+        # Cancellation must settle the interrupted case and cases that were
+        # never started; a stale running row must not survive lease loss.
+        AppTestExecution.objects.filter(
+            pk__in=[item.pk for item in executions], status__in=['pending', 'running']
+        ).update(status='error', result=None, error_message=str(e)[:4000], finished_at=timezone.now())
         if suite:
             suite.execution_status = 'error'
             suite.execution_result = None
@@ -690,17 +784,15 @@ def execute_app_suite_task(suite_id, execution_ids, package_name=None, scheduled
             except Exception as schedule_error:
                 logger.error('更新 APP 套件调度失败状态失败: %s', schedule_error, exc_info=True)
     finally:
+        if device_heartbeat is not None:
+            device_heartbeat.stop()
         if heartbeat is not None:
             heartbeat.stop()
-        # 释放设备
-        try:
-            if device:
-                device.refresh_from_db()
-                if lock_acquired and device.locked_by_id == user.id:
-                    device.unlock()
-                    logger.info(f"设备已释放: {device.device_id}")
-        except Exception as e:
-            logger.error(f"释放设备失败: {str(e)}")
+        if release_device_lease and scheduled_task_id and device and user:
+            try:
+                release_device_execution_lease(device.pk, user, bound_generation)
+            except Exception as e:
+                logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
 
 
 @shared_task
@@ -708,18 +800,10 @@ def check_and_release_expired_devices():
     """
     检查并释放过期锁定的设备
     """
-    from .models import AppDevice
+    from .device_pool import reap_expired_device_leases
     
     try:
-        devices = AppDevice.objects.filter(status='locked')
-        released_count = 0
-        
-        for device in devices:
-            if device.is_lock_expired():
-                device.unlock()
-                released_count += 1
-                logger.info(f"释放过期锁定的设备: {device.device_id}")
-        
+        released_count = reap_expired_device_leases()
         logger.info(f"检查设备锁定完成，释放 {released_count} 个设备")
         
     except Exception as e:

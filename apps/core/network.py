@@ -26,20 +26,45 @@ def _is_restricted_address(address: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def _resolve_addresses(hostname: str, port: int):
-    try:
-        infos = socket.getaddrinfo(
-            hostname,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-        )
-    except OSError as exc:
-        raise UnsafeOutboundURL('目标主机无法解析') from exc
+def resolve_outbound_addresses(
+    hostname: str,
+    port: int,
+    *,
+    allow_private: bool = False,
+) -> tuple[str, ...]:
+    """Resolve a host to numeric addresses and reject restricted DNS answers."""
+    hostname = str(hostname or '').strip().strip('[]').rstrip('.')
+    if not hostname:
+        raise UnsafeOutboundURL('目标主机格式非法')
 
-    addresses = {item[4][0] for item in infos if item and item[4]}
-    if not addresses:
-        raise UnsafeOutboundURL('目标主机无法解析')
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        addresses = (str(literal),)
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                port,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise UnsafeOutboundURL('目标主机无法解析') from exc
+
+        addresses = tuple(dict.fromkeys(
+            str(item[4][0]) for item in infos if item and item[4]
+        ))
+        if not addresses:
+            raise UnsafeOutboundURL('目标主机无法解析')
+
+    if not allow_private:
+        for address in addresses:
+            if _is_restricted_address(address):
+                raise UnsafeOutboundURL('目标地址属于受限网络')
     return addresses
 
 
@@ -70,29 +95,16 @@ def validate_outbound_url(url: str, *, allow_private: bool = False) -> str:
         raise UnsafeOutboundURL('URL 不允许包含认证信息')
 
     try:
-        port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == 'https' else 80
     except ValueError as exc:
         raise UnsafeOutboundURL('URL 端口无效') from exc
     if not 1 <= port <= 65535:
         raise UnsafeOutboundURL('URL 端口无效')
 
     if not allow_private:
-        hostname = hostname.rstrip('.')
-        if not hostname:
-            raise UnsafeOutboundURL('目标主机格式非法')
-        # Check literals before DNS as well; getaddrinfo behaviour differs by OS
-        # for unusual IPv4/IPv6 spellings.
-        try:
-            literal = ipaddress.ip_address(hostname.strip('[]'))
-        except ValueError:
-            literal = None
-        if literal is not None:
-            addresses = {str(literal)}
-        else:
-            addresses = _resolve_addresses(hostname, port)
-        for address in addresses:
-            if _is_restricted_address(address):
-                raise UnsafeOutboundURL('目标地址属于受限网络')
+        resolve_outbound_addresses(hostname, port)
 
     return parsed.geturl()
 

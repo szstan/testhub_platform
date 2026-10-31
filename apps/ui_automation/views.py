@@ -9,8 +9,10 @@ from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
+from drf_spectacular.utils import extend_schema
 from django.db import models
 from django.utils import timezone
+from apps.core.http_transport import guarded_post
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from apps.quality_intelligence.services.redaction import redact_payload
 from urllib.parse import urlparse
@@ -49,10 +51,42 @@ from .serializers import (
     AICaseSerializer, AIExecutionRecordSerializer
 )
 from .operation_logger import log_operation
+from .evidence import from_file, project_screenshots
 from .access import accessible_projects, is_ui_admin, selenium_compatibility_enabled
+from .schema import UiDashboardAuthErrorResponseSerializer, UiDashboardStatsResponseSerializer
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _append_ai_gif_evidence(execution_record, gif_path):
+    captured_at = getattr(execution_record, 'end_time', None) or timezone.now()
+    captured_at = captured_at.isoformat() if hasattr(captured_at, 'isoformat') else str(captured_at)
+    execution_id = getattr(execution_record, 'pk', None) or getattr(execution_record, 'id', None)
+    metadata = {
+        'producer': 'ui_ai_execution.gif',
+        'execution_id': str(execution_id or ''),
+        'item_id': str(getattr(execution_record, 'ai_case_id', None) or ''),
+        'step_number': None,
+        'captured_at': captured_at,
+    }
+    reference = from_file(
+        gif_path,
+        evidence_type='RECORDING',
+        mime_type='image/gif',
+        metadata=metadata,
+    ).to_contract()
+    sequence = getattr(execution_record, 'screenshots_sequence', None)
+    if not isinstance(sequence, list):
+        sequence = []
+    execution_record.screenshots_sequence = [
+        *sequence,
+        {
+            'evidence_reference': reference,
+            'description': 'AI execution recording',
+            'timestamp': captured_at,
+        },
+    ]
 
 
 def extract_step_info(s, step_index):
@@ -1848,7 +1882,12 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             execution.execution_logs = json.dumps(step_results, ensure_ascii=False)
             execution.execution_time = total_time
             execution.finished_at = timezone.now()
-            execution.screenshots = screenshots
+            execution.screenshots = project_screenshots(
+                screenshots,
+                producer='ui_views.run_case',
+                execution_id=execution.id,
+                item_id=execution.test_case_id,
+            )
             execution.save()
             logger.info(f"[调试] 执行结果已保存: execution.status = {execution.status}")
 
@@ -2469,7 +2508,12 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                                 execution.error_message = execution_result['error_message'] or ''
                                 execution.execution_logs = json.dumps(step_results, ensure_ascii=False)
                                 execution.execution_time = total_time
-                                execution.screenshots = screenshots
+                                execution.screenshots = project_screenshots(
+                                    screenshots,
+                                    producer='ui_views.run_suite_case',
+                                    execution_id=execution.id,
+                                    item_id=execution.test_case_id,
+                                )
                                 execution.finished_at = timezone.now()
                                 execution.save()
 
@@ -2750,8 +2794,9 @@ class UiScheduledTaskViewSet(viewsets.ModelViewSet):
                 # 发送webhook请求
                 try:
                     logger.info("发送通知到 %s webhook host=%s", bot_type, urlparse(webhook_url).hostname)
-                    response = requests.post(
+                    response = guarded_post(
                         webhook_url,
+                        allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
                         json=message_data,
                         headers={'Content-Type': 'application/json'},
                         timeout=10,
@@ -3234,6 +3279,7 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 # 保存相对路径到数据库（使用正斜杠，确保跨平台兼容）
                 relative_path = f'media/ai_recording/{new_gif_filename}'
                 execution_record.gif_path = relative_path
+                _append_ai_gif_evidence(execution_record, new_gif_path)
 
                 logger.info(f"✅ GIF recording saved to: {relative_path}")
             else:
@@ -3821,6 +3867,7 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
                 # 保存相对路径到数据库（使用正斜杠，确保跨平台兼容）
                 relative_path = f'media/ai_recording/{new_gif_filename}'
                 execution_record.gif_path = relative_path
+                _append_ai_gif_evidence(execution_record, new_gif_path)
 
                 logger.info(f"✅ GIF recording saved to: {relative_path}")
             else:
@@ -3969,6 +4016,13 @@ class UiDashboardViewSet(viewsets.ViewSet):
     """UI自动化仪表盘视图集"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='ui_dashboard_stats',
+        responses={
+            200: UiDashboardStatsResponseSerializer,
+            401: UiDashboardAuthErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """获取仪表盘统计数据"""

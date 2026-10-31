@@ -9,6 +9,8 @@ REPO_ROOT="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 BACKEND_URL="${STAGING_BACKEND_URL:-http://127.0.0.1:18002}"
 FRONTEND_URL="${STAGING_FRONTEND_URL:-http://127.0.0.1:18003}"
+NGINX_BIN="${STAGING_NGINX_BIN:-/usr/sbin/nginx}"
+NGINX_CONFIG="${STAGING_NGINX_CONFIG:-$REPO_ROOT/staging-nginx/nginx.conf}"
 
 fail() {
     echo "staging release validation failed: $*" >&2
@@ -36,9 +38,13 @@ run_python() {
 cd "$REPO_ROOT"
 require_file "frontend/dist/index.html"
 require_file "release-manifest.json"
-require_file "staging-nginx/nginx.conf"
-run_python scripts/validate_release_manifest.py --repo-root "$REPO_ROOT"
-/usr/sbin/nginx -t -c "$REPO_ROOT/staging-nginx/nginx.conf" -p "$REPO_ROOT/staging-nginx/"
+require_file "$NGINX_CONFIG"
+manifest_args=(--repo-root "$REPO_ROOT")
+if [ "${TESTHUB_ALLOW_LEGACY_RELEASE_MANIFEST:-0}" = "1" ]; then
+    manifest_args+=(--allow-legacy)
+fi
+run_python scripts/validate_release_manifest.py "${manifest_args[@]}"
+"$NGINX_BIN" -t -c "$NGINX_CONFIG" -p "$(dirname -- "$NGINX_CONFIG")/"
 
 selinux_mode="$(getenforce 2>/dev/null || true)"
 if [ "$selinux_mode" = "Enforcing" ]; then

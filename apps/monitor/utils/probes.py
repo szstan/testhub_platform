@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
+from apps.core.http_transport import guarded_get, guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from django.conf import settings
 from jsonpath_ng import parse as jsonpath_parse
@@ -462,7 +463,8 @@ def _login(login_cfg, target_method=None, target_host=None, target_port=None, ta
 
     t0 = time.monotonic()
     try:
-        resp = requests.request(method, login_url, json=body, timeout=timeout,
+        resp = guarded_request(method, login_url, json=body, timeout=timeout,
+                                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
                                 verify=True, allow_redirects=False)
         ms = int((time.monotonic() - t0) * 1000)
         data = _safe_json_dict(resp)
@@ -592,7 +594,8 @@ def probe_http(target, cfg):
 
     t0 = time.monotonic()
     try:
-        resp = requests.request(method, url, headers=headers, params=params,
+        resp = guarded_request(method, url, headers=headers, params=params,
+                                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
                                 timeout=timeout, verify=True, allow_redirects=False, **req_kw)
         ms = int((time.monotonic() - t0) * 1000)
         if check_type == "json_code":
@@ -673,7 +676,8 @@ def probe_online(target, cfg):
 
     t0 = time.monotonic()
     try:
-        resp = requests.request(method, url, json=payload, headers=headers,
+        resp = guarded_request(method, url, json=payload, headers=headers,
+                                allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
                                 timeout=timeout, verify=True, allow_redirects=False)
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code != 200:
@@ -724,7 +728,8 @@ def probe_docker(target, cfg):
 
     t0 = time.monotonic()
     try:
-        resp = requests.get(url, timeout=timeout, verify=True, allow_redirects=False)
+        resp = guarded_get(url, timeout=timeout, verify=True, allow_redirects=False,
+                           allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)))
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code != 200:
             return ProbeResult(False, f"Docker API HTTP {resp.status_code}", ms, resp.status_code,

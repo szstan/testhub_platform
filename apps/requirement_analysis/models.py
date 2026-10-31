@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from django.conf import settings
+from apps.core.http_transport import outbound_httpx_options
 from apps.core.network import validate_outbound_url
 from apps.users.models import User
 from apps.projects.models import Project
@@ -510,7 +511,7 @@ class AIModelService:
                 write=60.0,  # 写入超时：60秒
                 pool=60.0  # 连接池超时：60秒
             )
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False, **outbound_httpx_options(bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))) as client:
                 logger.info(f"发送POST请求到: {url}")
                 response = await client.post(
                     url,
@@ -558,7 +559,7 @@ class AIModelService:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False, **outbound_httpx_options(bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))) as client:
                 logger.info(f"获取模型列表，URL: {url}")
                 response = await client.get(url, headers=headers)
 
@@ -668,7 +669,7 @@ class AIModelService:
                     write=60.0,  # 写入超时：60秒
                     pool=60.0  # 连接池超时：60秒
                 )
-                async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False) as client:
+                async with httpx.AsyncClient(timeout=timeout_config, http2=False, follow_redirects=False, **outbound_httpx_options(bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))) as client:
                     async with client.stream('POST', url, headers=headers, json=data) as response:
                         if response.status_code != 200:
                             error_detail = await response.aread()

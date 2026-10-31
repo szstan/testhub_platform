@@ -2,13 +2,32 @@
 
 本清单用于把已经通过 CI 和 staging 的 release 交付到正式环境。发布必须使用仓库生成的 archive、release manifest 和已校验的 Linux wheelhouse；生产运行目录不直接从工作树复制。
 
+## Strict release archive (manifest v2)
+
+正式交付默认要求 manifest v2。它记录完整 archive 文件清单、对应 Git commit/tree 证明，以及 `frontend/dist/build-receipt.json`；校验会确认 receipt 与 source commit/tree 和实际前端产物一致。正式 archive 必须从 clean checkout 构建。Vite 可为本地 dirty 开发构建生成 receipt，但 archive builder 会拒绝 dirty source、过期 receipt 或与 archive/source 不匹配的 receipt。
+
+```bash
+test -z "$(git status --porcelain)"
+npm --prefix frontend ci
+npm --prefix frontend run build
+python scripts/build_release_archive.py \
+  --output "testhub-platform-${RELEASE_ID}.tar.gz" \
+  --release "${RELEASE_ID}"
+python scripts/validate_release_manifest.py \
+  --archive "testhub-platform-${RELEASE_ID}.tar.gz" \
+  --release "${RELEASE_ID}"
+```
+
+Legacy v1 校验仅为明确的过渡兼容路径：使用 `--allow-legacy` 时只获得部分完整性检查，不具备完整 inventory、Git commit/tree 或 frontend build receipt 的严格 source proof；不得据此声明严格来源验证或 v2 release 已通过。
+
+
 ## 发布包
 
 交付包应同时保留以下证据：
 
-- Git commit SHA 和 release identifier；
+- Git commit SHA、Git tree 和 release identifier；
 - `testhub-platform-<release>.tar.gz` 及 SHA256；
-- archive 内的 `release-manifest.json`；
+- archive 内的 v2 `release-manifest.json`、完整 inventory 和 `frontend/dist/build-receipt.json`；
 - wheelhouse `manifest.json`、`manifest.sha256` 和 `SHA256SUMS`；
 - requirements-prod、APP、report、UI optional 四份文件的 hash；
 - migration plan/apply 输出；
@@ -39,7 +58,7 @@ python scripts/validate_wheelhouse_manifest.py \
 ## 切换顺序
 
 1. 冻结 release commit，构建 archive 和 manifest。
-2. 在候选目录解压 archive，继承上一版本的 `.env`、`logs`、`media`、`static_files` 和两个 venv；`staging-nginx/nginx.conf` 使用 release archive 内的版本，不从旧 rollback 继承。
+2. 在候选目录解压 archive，继承上一版本 `.env`、`logs`、`media`、`static_files` 和两个 venv；保留其原有服务账号 ownership，不对 release/runtime 目录做递归 `chown`，也不改动 MySQL 数据目录。`staging-nginx/nginx.conf` 使用 release archive 内的版本，不从旧 rollback 继承。
 3. 校验 release manifest、requirements hash、runtime dependency versions 和 wheelhouse manifest。
 4. 以 `testhub` 身份运行 `manage.py check`、`migrate --plan`；确认 migration plan 后应用 migration。
 5. 停止 backend、Celery 和 scheduler，保留上一版本 rollback 目录，然后原子切换候选目录。
@@ -47,6 +66,26 @@ python scripts/validate_wheelhouse_manifest.py \
 7. 运行 `scripts/validate_staging_release.sh`，确认 readiness 的 database、cache、worker、channel、migrations、frontend_assets 全部 `ok`。
 8. 运行 strict pilot，要求 `max_unmatched=0`。
 9. 保留 release、manifest、日志、readiness、pilot 和 rollback 证据。
+
+## Candidate Nginx validation
+
+The staging validator selects its binary with `STAGING_NGINX_BIN` (default `/usr/sbin/nginx`) and its config with `STAGING_NGINX_CONFIG` (default `$REPO_ROOT/staging-nginx/nginx.conf`). It runs `nginx -t -c "$STAGING_NGINX_CONFIG" -p "$(dirname "$STAGING_NGINX_CONFIG")/"`; `-c` parses the supplied main config and does not merge the host `/etc/nginx/nginx.conf` or its `conf.d` server blocks, except for files explicitly included by that candidate config.
+
+For a candidate tree, point `STAGING_NGINX_CONFIG` at a temporary copy of the candidate config. That copy must use the candidate's actual `frontend/dist` asset root, candidate listen address/port, API `proxy_pass` backend, and candidate-specific PID/log paths. The checked-in config's canonical `/opt/testhub_platform` paths and `18003`/`18002` ports are not automatically rewritten by the validator. `STAGING_FRONTEND_URL` and `STAGING_BACKEND_URL` select the validator's HTTP probes only; they do not change Nginx directives. Defaults are `http://127.0.0.1:18003` and `http://127.0.0.1:18002`, respectively, so set them to the candidate's actual frontend/backend endpoints.
+
+Example for an already deployed candidate at `/srv/testhub/candidate`:
+
+```bash
+STAGING_NGINX_BIN=/usr/sbin/nginx STAGING_NGINX_CONFIG=/var/tmp/testhub-candidate-nginx.conf STAGING_FRONTEND_URL=http://127.0.0.1:28003 STAGING_BACKEND_URL=http://127.0.0.1:28002 bash scripts/validate_staging_release.sh /srv/testhub/candidate
+```
+
+`TESTHUB_ALLOW_LEGACY_RELEASE_MANIFEST=1` explicitly enables legacy v1 compatibility in this validator. Its result is partial integrity only, not strict source provenance; leave it unset for normal v2 validation. Do not start or reload Nginx as part of config-only candidate validation.
+
+The canonical staging config denies `/media/` with a `^~` location. Private media stays behind authenticated API actions; never add a public `MEDIA_ROOT` alias.
+
+## Frontend deployment boundary
+
+`frontend/deploy.sh build` stages `dist` below `frontend/` so the final rename stays on one filesystem. Before promotion it sets artifact directories to `0755` and files to `0644`; after promotion it applies `restorecon` at the canonical `dist` path and verifies Nginx traversal/read access. Artifact discovery failures and per-path access failures propagate through checked `find -exec` status. Build, validation, or rename failures preserve/restore the prior `dist`. This frontend-only operation does not change ownership or contents of `.env`, backend runtime directories, or MySQL data.
 
 ## Unified execution route gate
 

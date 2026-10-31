@@ -146,6 +146,59 @@ def _compare_schema(
                 _compare_schema(old_part, new_parts[index], f"{label}.{keyword}[{index}]", breaks, seen, old_document, new_document)
 
 
+def _operation_parameter_details(operation: Any, inherited: Any = None, document: dict[str, Any] | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for parameter in (inherited or []) + ((operation or {}).get("parameters") or []):
+        parameter = _resolve_ref(parameter, document)
+        if not isinstance(parameter, dict):
+            continue
+        key = (str(parameter.get("in", "")), str(parameter.get("name", "")))
+        result[key] = parameter
+    return result
+
+
+def _content_schemas(content: Any) -> dict[str, Any]:
+    if not isinstance(content, dict):
+        return {}
+    return {
+        str(media_type): media.get('schema')
+        for media_type, media in content.items()
+        if isinstance(media, dict) and media.get('schema') is not None
+    }
+
+
+def _compare_content_schemas(
+    old_content: Any,
+    new_content: Any,
+    label: str,
+    breaks: list[str],
+    old_document: dict[str, Any],
+    new_document: dict[str, Any],
+) -> None:
+    old_schemas = _content_schemas(old_content)
+    new_schemas = _content_schemas(new_content)
+    for media_type, old_schema in sorted(old_schemas.items()):
+        if media_type not in new_schemas:
+            breaks.append(f"media type removed: {label} {media_type}")
+            continue
+        _compare_schema(
+            old_schema,
+            new_schemas[media_type],
+            f"{label} {media_type}",
+            breaks,
+            set(),
+            old_document,
+            new_document,
+        )
+
+
+def _parameter_schema(parameter: dict[str, Any]) -> Any:
+    if parameter.get('schema') is not None:
+        return parameter['schema']
+    schemas = _content_schemas(parameter.get('content'))
+    return next(iter(schemas.values()), None)
+
+
 def _component_breaks(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
     breaks: list[str] = []
     old_components = (previous.get("components") or {}).get("schemas") or {}
@@ -178,16 +231,54 @@ def find_breaking_changes(previous: dict[str, Any], current: dict[str, Any]) -> 
             old_operation = old_item[method]
             new_operation = new_item[method]
             label = f"{method.upper()} {path}"
-            old_params = _operation_parameters(old_operation, old_item.get("parameters"))
-            new_params = _operation_parameters(new_operation, new_item.get("parameters"))
+            old_parameters = _operation_parameter_details(old_operation, old_item.get("parameters"), previous)
+            new_parameters = _operation_parameter_details(new_operation, new_item.get("parameters"), current)
+            old_params = {key: bool(value.get('required')) for key, value in old_parameters.items()}
+            new_params = {key: bool(value.get('required')) for key, value in new_parameters.items()}
             for parameter, required in sorted(new_params.items()):
                 if required and not old_params.get(parameter, False):
                     breaks.append(f"required parameter added: {label} {parameter[0]}:{parameter[1]}")
-            if _request_body_required(new_operation) and not _request_body_required(old_operation):
+            for parameter in sorted(set(old_parameters) & set(new_parameters)):
+                old_schema = _parameter_schema(old_parameters[parameter])
+                new_schema = _parameter_schema(new_parameters[parameter])
+                if old_schema is not None and new_schema is not None:
+                    _compare_schema(
+                        old_schema,
+                        new_schema,
+                        f"{label} parameter {parameter[0]}:{parameter[1]}",
+                        breaks,
+                        set(),
+                        previous,
+                        current,
+                    )
+            old_body = _resolve_ref(old_operation.get("requestBody") or {}, previous)
+            new_body = _resolve_ref(new_operation.get("requestBody") or {}, current)
+            if bool(new_body.get('required')) and not bool(old_body.get('required')):
                 breaks.append(f"request body became required: {label}")
+            _compare_content_schemas(
+                old_body.get('content'),
+                new_body.get('content'),
+                f"{label} request body",
+                breaks,
+                previous,
+                current,
+            )
+            old_responses = old_operation.get('responses') or {}
+            new_responses = new_operation.get('responses') or {}
             removed_codes = _response_codes(old_operation) - _response_codes(new_operation)
             for code in sorted(removed_codes):
                 breaks.append(f"response status removed: {label} {code}")
+            for code in sorted(set(old_responses) & set(new_responses)):
+                old_response = _resolve_ref(old_responses[code], previous)
+                new_response = _resolve_ref(new_responses[code], current)
+                _compare_content_schemas(
+                    old_response.get('content') if isinstance(old_response, dict) else None,
+                    new_response.get('content') if isinstance(new_response, dict) else None,
+                    f"{label} response {code}",
+                    breaks,
+                    previous,
+                    current,
+                )
     breaks.extend(_component_breaks(previous, current))
     return sorted(set(breaks))
 

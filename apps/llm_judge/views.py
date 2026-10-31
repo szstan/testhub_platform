@@ -22,12 +22,30 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser, SAFE_METHODS, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiParameter, OpenApiResponse, PolymorphicProxySerializer, extend_schema,
+)
 
 from .filters import JudgeRecordFilter
 from .models import JudgeBatch, JudgeRecord, Rubric
 from .serializers import (
     JudgeBatchRequestSerializer, JudgeBatchSerializer, JudgeRecordSerializer,
     JudgeSingleRequestSerializer, RubricCreateSerializer, RubricSerializer,
+)
+from .schema import (
+    JudgeAuthErrorResponseSerializer,
+    JudgeBatchUploadResponseSerializer,
+    JudgeDashboardStatsResponseSerializer,
+    JudgeRequestParseErrorResponseSerializer,
+    JudgeScoringServiceErrorResponseSerializer,
+    JudgeSimpleErrorResponseSerializer,
+    JudgeUploadErrorResponseSerializer,
+    JudgeServiceConfigResponseSerializer,
+    JudgeServiceConnectionTestResponseSerializer,
+    JudgeSingleResponseSerializer,
+    JudgeSingleValidationErrorResponseSerializer,
+    JudgeUploadRequestSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -398,15 +416,42 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
 
 
 class JudgeSingleView(APIView):
-    """单条评分（同步）：Django 进程内直接调 JudgeService。"""
+    """Score one request using a rubric visible to the current user."""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='llm_judge_score_single',
+        request=JudgeSingleRequestSerializer,
+        description=(
+            'Score one question and answer. A supplied rubric must be active and visible to '
+            'the caller: non-staff users may select only active default rubrics; staff may '
+            'select any active rubric. Omitting rubric uses the configured default.'
+        ),
+        responses={
+            200: JudgeSingleResponseSerializer,
+            400: OpenApiResponse(response=PolymorphicProxySerializer(
+                component_name='JudgeSingleBadRequest',
+                serializers=[JudgeSimpleErrorResponseSerializer,
+                             JudgeSingleValidationErrorResponseSerializer,
+                             JudgeRequestParseErrorResponseSerializer],
+                resource_type_field_name=None,
+            )),
+            401: JudgeAuthErrorResponseSerializer,
+            403: JudgeAuthErrorResponseSerializer,
+            503: JudgeScoringServiceErrorResponseSerializer,
+        },
+    )
     def post(self, request):
         serializer = JudgeSingleRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        if data.get('rubric') and not Rubric.objects.filter(pk=data['rubric'], is_active=True).exists():
-            return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
+        rubric_id = data.get('rubric')
+        if rubric_id:
+            rubric_queryset = Rubric.objects.filter(is_active=True)
+            if not (request.user.is_staff or request.user.is_superuser):
+                rubric_queryset = rubric_queryset.filter(is_default=True)
+            if not rubric_queryset.filter(pk=rubric_id).exists():
+                return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
 
         from .service import JudgeService
         service = JudgeService()
@@ -426,6 +471,28 @@ class DashboardStatsView(APIView):
     """Dashboard 聚合统计。"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='llm_judge_dashboard_stats',
+        parameters=[
+            OpenApiParameter(
+                'days', type=OpenApiTypes.INT, default=7,
+                description=(
+                    'Window size (default 7); values below 1 are clamped to 1 and values above '
+                    '365 are clamped to 365. Non-integers return 400.'
+                ),
+            ),
+            OpenApiParameter(
+                'rubric', type=OpenApiTypes.INT,
+                description='Optional rubric ID filter.',
+            ),
+        ],
+        responses={
+            200: JudgeDashboardStatsResponseSerializer,
+            400: JudgeSimpleErrorResponseSerializer,
+            401: JudgeAuthErrorResponseSerializer,
+            403: JudgeAuthErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         try:
             days = int(request.query_params.get('days', 7))
@@ -487,6 +554,15 @@ class JudgeServiceConfigView(APIView):
     """评分服务配置：连通性测试。"""
     permission_classes = [IsAdminUser]
 
+    @extend_schema(
+        operation_id='llm_judge_service_config_read',
+        request=None,
+        responses={
+            200: JudgeServiceConfigResponseSerializer,
+            401: JudgeAuthErrorResponseSerializer,
+            403: JudgeAuthErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         return Response({
             'judge_model': getattr(settings, 'JUDGE_MODEL', 'deepseek-chat'),
@@ -497,6 +573,16 @@ class JudgeServiceConfigView(APIView):
             'has_api_key': bool(getattr(settings, 'OPENAI_API_KEY', '')),
         })
 
+    @extend_schema(
+        operation_id='llm_judge_service_config_test',
+        request=None,
+        responses={
+            200: JudgeServiceConnectionTestResponseSerializer,
+            401: JudgeAuthErrorResponseSerializer,
+            403: JudgeAuthErrorResponseSerializer,
+            503: JudgeServiceConnectionTestResponseSerializer,
+        },
+    )
     def post(self, request):
         """测试 LLM 连通性。"""
         try:
@@ -694,6 +780,21 @@ class BatchFileUploadView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
+    @extend_schema(
+        operation_id='llm_judge_batch_file_upload',
+        request={'multipart/form-data': JudgeUploadRequestSerializer},
+        responses={
+            200: JudgeBatchUploadResponseSerializer,
+            400: OpenApiResponse(response=PolymorphicProxySerializer(
+                component_name='JudgeBatchUploadBadRequest',
+                serializers=[JudgeUploadErrorResponseSerializer,
+                             JudgeRequestParseErrorResponseSerializer],
+                resource_type_field_name=None,
+            )),
+            401: JudgeAuthErrorResponseSerializer,
+            403: JudgeAuthErrorResponseSerializer,
+        },
+    )
     def post(self, request):
         file = request.FILES.get('file')
         if not file:
@@ -724,6 +825,24 @@ class BatchTemplateDownloadView(APIView):
     """下载批量用例模板文件（CSV/XLSX/TXT）。模板不含用户数据，允许匿名下载。"""
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        operation_id='llm_judge_batch_template_download',
+        parameters=[
+            OpenApiParameter(
+                'tpl', type=OpenApiTypes.STR, enum=('csv', 'xlsx', 'txt'),
+                description='Template format; takes precedence over format.',
+            ),
+            OpenApiParameter(
+                'format', type=OpenApiTypes.STR, enum=('csv', 'xlsx', 'txt'),
+                description='Fallback template format; defaults to csv.',
+            ),
+        ],
+        responses={
+            (200, 'text/csv'): OpenApiTypes.BINARY,
+            (200, 'text/plain'): OpenApiTypes.BINARY,
+            (200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'): OpenApiTypes.BINARY,
+        },
+    )
     def get(self, request):
         kind = (request.query_params.get('tpl') or request.query_params.get('format') or 'csv').lower()
         if kind not in {'csv', 'xlsx', 'txt'}:

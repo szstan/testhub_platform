@@ -16,6 +16,7 @@ from django.utils import timezone
 from .models import ExecutionBuild, ExecutionJob, ExecutionProfile, WebhookEvent
 from .result_events import redact_result_payload
 from .policies import apply_quality_gate
+from .gate_policy import evaluate_metric_rules, normalize_metric_rules
 
 
 class WebhookVerificationError(ValueError):
@@ -179,51 +180,17 @@ def process_webhook(profile: ExecutionProfile, provider: str, event_id: str, pay
     return WebhookReceipt(event.pk, True, job.pk, event.status)
 
 
-def quality_gate_result(profile: ExecutionProfile, summary: Mapping[str, Any]) -> dict[str, Any]:
-    """Evaluate configured thresholds deterministically and fail closed.
-
-    An absent profile or empty gate is intentionally compatible with the
-    original helper. Once a gate is configured, malformed rules, missing
-    metrics, and non-numeric values become explicit failures instead of being
-    silently ignored.
-    """
-    gate = getattr(profile, 'quality_gate', {}) or {}
-    if not isinstance(gate, Mapping):
+def quality_gate_result(profile: ExecutionProfile | None, summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Evaluate profile thresholds deterministically and fail closed."""
+    gate = getattr(profile, 'quality_gate', {})
+    if gate is None or (isinstance(gate, Mapping) and not gate):
+        return {'passed': True, 'failures': []}
+    try:
+        rules = normalize_metric_rules(gate, source='profile quality gate')
+    except ValueError as exc:
         return {
             'passed': False,
-            'failures': [{'metric': '__gate__', 'reason': 'invalid_gate_configuration'}],
+            'failures': [{'metric': '__gate__', 'reason': 'invalid_gate_configuration', 'detail': str(exc)}],
         }
-    failures = []
-    summary = summary if isinstance(summary, Mapping) else {}
-    for key, rule in gate.items():
-        if not isinstance(rule, Mapping):
-            failures.append({'metric': key, 'reason': 'invalid_rule'})
-            continue
-        if key not in summary:
-            failures.append({'metric': key, 'reason': 'missing_metric'})
-            continue
-        actual = summary.get(key)
-        try:
-            actual = float(actual)
-        except (TypeError, ValueError):
-            failures.append({'metric': key, 'actual': actual, 'reason': 'invalid_metric'})
-            continue
-        if 'max' in rule:
-            try:
-                maximum = float(rule['max'])
-            except (TypeError, ValueError):
-                failures.append({'metric': key, 'reason': 'invalid_max'})
-            else:
-                if actual > maximum:
-                    failures.append({'metric': key, 'actual': actual, 'max': rule['max']})
-        if 'min' in rule:
-            try:
-                minimum = float(rule['min'])
-            except (TypeError, ValueError):
-                failures.append({'metric': key, 'reason': 'invalid_min'})
-            else:
-                if actual < minimum:
-                    failures.append({'metric': key, 'actual': actual, 'min': rule['min']})
-        if not any(bound in rule for bound in ('min', 'max')):
-            failures.append({'metric': key, 'reason': 'missing_bounds'})
+    failures = evaluate_metric_rules(rules, summary)
     return {'passed': not failures, 'failures': failures}

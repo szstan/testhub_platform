@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from threading import Event, Thread
@@ -126,11 +127,14 @@ class ScheduleLeaseHeartbeat:
         self.lease_seconds = max(int(lease_seconds), 1)
         self.interval_seconds = max(min(self.lease_seconds // 3, 60), 1)
         self._stop = Event()
+        self._lost = Event()
+        self._deadline = time.monotonic() + self.lease_seconds
         self._thread = None
 
     def start(self):
         if not self.token:
             return self
+        self.raise_if_lost()
         self._thread = Thread(
             target=self._run,
             name=f"scheduler-lease-{self.task_id}",
@@ -144,6 +148,21 @@ class ScheduleLeaseHeartbeat:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=min(self.interval_seconds + 1, 10))
 
+    def raise_if_lost(self):
+        """Raise at a source-operation boundary once ownership is no longer valid."""
+        if not self.token:
+            return
+        if self._lost.is_set() or time.monotonic() >= self._deadline:
+            self._lost.set()
+            raise ScheduleClaimLost('scheduler lease was lost or expired')
+        try:
+            # A successor may replace the claim between heartbeat ticks. Check
+            # the authoritative row before each new source operation as well.
+            load_claimed_task(self.model, self.task_id, self.token, require_active=True)
+        except Exception:
+            self._lost.set()
+            raise
+
     def _run(self):
         while not self._stop.wait(self.interval_seconds):
             close_old_connections()
@@ -154,11 +173,16 @@ class ScheduleLeaseHeartbeat:
                     self.token,
                     lease_seconds=self.lease_seconds,
                 )
+                self._deadline = time.monotonic() + self.lease_seconds
             except ScheduleClaimLost:
+                self._lost.set()
                 logger.warning("scheduler lease heartbeat lost: task_id=%s", self.task_id)
                 return
-            except Exception:  # noqa: BLE001 - retry transient DB failures before expiry
+            except Exception:  # noqa: BLE001 - transient failures are tolerated only until expiry
                 logger.exception("scheduler lease heartbeat failed: task_id=%s", self.task_id)
+                if time.monotonic() >= self._deadline:
+                    self._lost.set()
+                    return
             finally:
                 close_old_connections()
 

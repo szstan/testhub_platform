@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """APP自动化仪表盘视图"""
 from rest_framework import viewsets, status
+from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -17,6 +18,11 @@ from ..models import (
 )
 from ..access import scope_executions, scope_test_cases
 from ..serializers import AppTestExecutionSerializer
+from ..schema import (
+    AppAutomationAuthErrorResponseSerializer,
+    AppAutomationFailureResponseSerializer,
+    AppDashboardStatisticsResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,14 @@ class AppDashboardViewSet(viewsets.ViewSet):
     """APP自动化测试Dashboard"""
     permission_classes = [IsAuthenticated]
     
+    @extend_schema(
+        operation_id='app_dashboard_statistics',
+        responses={
+            200: AppDashboardStatisticsResponseSerializer,
+            401: AppAutomationAuthErrorResponseSerializer,
+            500: AppAutomationFailureResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def statistics(self, request):
         """获取统计数据"""

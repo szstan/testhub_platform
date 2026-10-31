@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import quote, urlparse
@@ -15,12 +16,14 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from apps.core.http_transport import guarded_get
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 from .models import TestCase, TestCaseSourceBinding, TestCaseSyncProfile
 
 MAX_FILES = 1000
 MAX_FILE_BYTES = 1 * 1024 * 1024
+MAX_TREE_PAGES = 100
 
 _DEFAULT_SECRET_ALIASES = {
     'github': 'TESTHUB_GIT_TOKEN',
@@ -171,7 +174,7 @@ def _request_json(url: str, *, token: str = ''):
     if token:
         headers['Authorization'] = f'Bearer {token}'
         headers['PRIVATE-TOKEN'] = token
-    response = requests.get(safe_url, headers=headers, timeout=20, allow_redirects=False)
+    response = guarded_get(safe_url, headers=headers, timeout=20, allow_redirects=False, allow_private=False)
     if response.status_code >= 400:
         raise TestCaseSyncError(f'同步源请求失败 HTTP {response.status_code}')
     try:
@@ -190,15 +193,22 @@ def _repository_parts(repository_url: str) -> tuple[str, str]:
     return parts[-2], parts[-1].removesuffix('.git')
 
 
+def _commit_sha(document, field):
+    value = str(document.get(field) or '') if isinstance(document, dict) else ''
+    if not re.fullmatch(r'[0-9a-fA-F]{40,64}', value):
+        raise TestCaseSyncError('同步源未返回有效的不可变 commit SHA')
+    return value
+
+
 def _github_files(profile: TestCaseSyncProfile, token: str):
     repository_url = _validate_provider_url(profile.repository_url, 'github', allow_query=False)
     owner, repository = _repository_parts(repository_url)
     branch = quote(profile.branch or 'main', safe='')
-    tree_url = _validate_provider_url(
-        f'https://api.github.com/repos/{quote(owner)}/{quote(repository)}/git/trees/{branch}?recursive=1',
-        'github',
-    )
-    tree = _request_json(tree_url, token=token)
+    api_root = f'https://api.github.com/repos/{quote(owner)}/{quote(repository)}'
+    commit = _commit_sha(_request_json(
+        _validate_provider_url(f'{api_root}/commits/{branch}', 'github'), token=token,
+    ), 'sha')
+    tree = _request_json(_validate_provider_url(f'{api_root}/git/trees/{commit}?recursive=1', 'github'), token=token)
     if not isinstance(tree, dict) or tree.get('truncated'):
         raise TestCaseSyncError('GitHub tree 结果为空或被截断')
     prefix = (profile.path or '').strip('/ ')
@@ -207,39 +217,56 @@ def _github_files(profile: TestCaseSyncProfile, token: str):
         path = str(item.get('path') or '')
         if item.get('type') == 'blob' and (not prefix or path == prefix or path.startswith(prefix + '/')) and path.lower().endswith(('.yml', '.yaml')):
             raw_url = _validate_provider_url(
-                f'https://raw.githubusercontent.com/{owner}/{repository}/{quote(profile.branch or "main", safe="")}/{quote(path, safe="/")}',
+                f'https://raw.githubusercontent.com/{owner}/{repository}/{commit}/{quote(path, safe="/")}',
                 'github',
             )
             files.append((path, str(item.get('sha') or ''), raw_url))
-    return str(tree.get('sha') or ''), files
+    return commit, files
 
 
 def _gitlab_files(profile: TestCaseSyncProfile, token: str):
     repository_url = _validate_provider_url(profile.repository_url, 'gitlab', allow_query=False)
     parsed_repository = urlparse(repository_url)
-    owner, repository = _repository_parts(repository_url)
+    _repository_parts(repository_url)
     if profile.api_base_url:
         base = _validate_provider_url(profile.api_base_url.rstrip('/'), 'gitlab', allow_query=False)
     else:
         base = _validate_provider_url(
             f'{parsed_repository.scheme}://{parsed_repository.netloc}/api/v4',
-            'gitlab',
-            allow_query=False,
+            'gitlab', allow_query=False,
         )
-    project = quote(f'{owner}/{repository}', safe='')
-    tree_url = f'{base}/projects/{project}/repository/tree?ref={quote(profile.branch or "main", safe="")}&recursive=true&per_page=100'
-    tree = _request_json(tree_url, token=token)
+    # Preserve GitLab subgroup namespaces as part of the repository identity.
+    project = quote(parsed_repository.path.strip('/').removesuffix('.git'), safe='')
+    repository_api = f'{base}/projects/{project}/repository'
+    branch = quote(profile.branch or 'main', safe='')
+    commit = _commit_sha(_request_json(
+        _validate_provider_url(f'{repository_api}/commits/{branch}', 'gitlab'), token=token,
+    ), 'id')
     prefix = (profile.path or '').strip('/ ')
     files = []
-    for item in tree if isinstance(tree, list) else []:
-        path = str(item.get('path') or '')
-        if item.get('type') == 'blob' and (not prefix or path == prefix or path.startswith(prefix + '/')) and path.lower().endswith(('.yml', '.yaml')):
-            raw_url = _validate_provider_url(
-                f'{base}/projects/{project}/repository/files/{quote(path, safe="")}/raw?ref={quote(profile.branch or "main", safe="")}',
-                'gitlab',
-            )
-            files.append((path, str(item.get('id') or ''), raw_url))
-    return '', files
+    seen_paths = set()
+    for page in range(1, MAX_TREE_PAGES + 1):
+        tree_url = _validate_provider_url(
+            f'{repository_api}/tree?ref={commit}&recursive=true&per_page=100&page={page}', 'gitlab',
+        )
+        tree = _request_json(tree_url, token=token)
+        if not isinstance(tree, list) or len(tree) > 100:
+            raise TestCaseSyncError('GitLab tree 返回了无效分页')
+        for item in tree:
+            path = str(item.get('path') or '')
+            if path in seen_paths:
+                raise TestCaseSyncError('GitLab tree 分页重复，未完成同步')
+            seen_paths.add(path)
+            if item.get('type') == 'blob' and (not prefix or path == prefix or path.startswith(prefix + '/')) and path.lower().endswith(('.yml', '.yaml')):
+                raw_url = _validate_provider_url(
+                    f'{repository_api}/files/{quote(path, safe="")}/raw?ref={commit}', 'gitlab',
+                )
+                files.append((path, str(item.get('id') or ''), raw_url))
+                if len(files) > MAX_FILES:
+                    raise TestCaseSyncError(f'同步文件数不能超过 {MAX_FILES}')
+        if len(tree) < 100:
+            return commit, files
+    raise TestCaseSyncError(f'GitLab tree 超过 {MAX_TREE_PAGES} 页，未完成同步')
 
 
 def _load_files(profile: TestCaseSyncProfile, token: str):
@@ -251,8 +278,9 @@ def _load_files(profile: TestCaseSyncProfile, token: str):
         raise TestCaseSyncError(f'同步文件数不能超过 {MAX_FILES}')
     loaded = []
     for path, source_sha, raw_url in files:
-        response = requests.get(
+        response = guarded_get(
             _validate_provider_url(raw_url, profile.provider),
+            allow_private=False,
             headers={'Accept': 'text/plain', 'User-Agent': 'TestHub-TestsAsCode/1.0', **({'PRIVATE-TOKEN': token} if token else {})},
             timeout=20,
             allow_redirects=False,
@@ -344,7 +372,7 @@ def sync_profile(profile: TestCaseSyncProfile) -> SyncSummary:
                         'profile': profile,
                         'external_ref': ref,
                         'source_path': path,
-                        'source_commit': commit or source_sha,
+                        'source_commit': commit,
                         'source_hash': source_hash,
                         'last_synced_at': timezone.now(),
                     },
@@ -353,7 +381,7 @@ def sync_profile(profile: TestCaseSyncProfile) -> SyncSummary:
             warnings.append(f'{path}: {exc}')
             skipped += 1
 
-    profile.last_commit_sha = commit or (files[0][1] if files else '')
+    profile.last_commit_sha = commit
     profile.last_sync_at = timezone.now()
     profile.save(update_fields=['last_commit_sha', 'last_sync_at', 'updated_at'])
     return SyncSummary(profile.pk, profile.provider, profile.last_commit_sha, len(files), created, updated, skipped, conflicts, warnings)

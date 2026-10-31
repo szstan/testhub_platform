@@ -8,6 +8,7 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
+from apps.core.cancellation import execution_cancellation_scope
 from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear_claim, load_claimed_task
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ def _finish_task(task_id, *, scheduler_lease_token, success, result, error_messa
         return task
 
 
-def _run_suite(task):
+def _run_suite(task, cancel_check=None):
     from .test_executor import TestExecutor
 
     suite = task.test_suite
@@ -80,8 +81,11 @@ def _run_suite(task):
         browser=task.browser,
         headless=task.headless,
         executed_by=task.created_by,
+        cancel_check=cancel_check,
     )
     executor.run()
+    if cancel_check is not None:
+        cancel_check()
     suite.refresh_from_db()
     success = suite.execution_status == 'passed'
     return success, {
@@ -93,7 +97,7 @@ def _run_suite(task):
     }
 
 
-def _run_cases(task):
+def _run_cases(task, cancel_check=None):
     from .models import TestCase, TestSuite
     from .test_executor import TestExecutor
 
@@ -104,6 +108,8 @@ def _run_cases(task):
     passed = 0
     failed = 0
     for test_case in test_cases:
+        if cancel_check is not None:
+            cancel_check()
         temp_suite = TestSuite.objects.create(
             project=task.project,
             name=f'[scheduled:{task.pk}] {test_case.name}',
@@ -118,7 +124,10 @@ def _run_cases(task):
                 browser=task.browser,
                 headless=task.headless,
                 executed_by=task.created_by,
+                cancel_check=cancel_check,
             ).run()
+            if cancel_check is not None:
+                cancel_check()
             temp_suite.refresh_from_db()
             ok = temp_suite.execution_status == 'passed'
             if ok:
@@ -127,6 +136,8 @@ def _run_cases(task):
                 failed += 1
             results.append({'case_id': test_case.pk, 'case_name': test_case.name, 'status': 'success' if ok else 'failed'})
         except Exception as exc:  # noqa: BLE001 - retain per-case failure and continue
+            if cancel_check is not None:
+                cancel_check()
             failed += 1
             results.append({'case_id': test_case.pk, 'case_name': test_case.name, 'status': 'failed', 'error': str(exc)[:1000]})
         finally:
@@ -158,19 +169,24 @@ def execute_ui_scheduled_task(self, task_id, scheduler_lease_token='', lease_sec
                 scheduler_lease_token,
                 lease_seconds=lease_seconds,
             ).start()
-        if task.task_type == 'TEST_SUITE':
-            success, result = _run_suite(task)
-        elif task.task_type == 'TEST_CASE':
-            success, result = _run_cases(task)
-        else:
-            raise ValueError(f'unknown scheduled task type: {task.task_type}')
-        _finish_task(
-            task_id,
-            scheduler_lease_token=scheduler_lease_token,
-            success=success,
-            result=result,
-            error_message='' if success else result.get('message', 'scheduled task failed'),
-        )
+        with execution_cancellation_scope(
+            heartbeat.raise_if_lost if heartbeat is not None else None
+        ) as cancellation:
+            cancellation.raise_if_cancelled()
+            if task.task_type == 'TEST_SUITE':
+                success, result = _run_suite(task, cancellation.raise_if_cancelled)
+            elif task.task_type == 'TEST_CASE':
+                success, result = _run_cases(task, cancellation.raise_if_cancelled)
+            else:
+                raise ValueError(f'unknown scheduled task type: {task.task_type}')
+            cancellation.raise_if_cancelled()
+            _finish_task(
+                task_id,
+                scheduler_lease_token=scheduler_lease_token,
+                success=success,
+                result=result,
+                error_message='' if success else result.get('message', 'scheduled task failed'),
+            )
         from .views import UiScheduledTaskViewSet
         UiScheduledTaskViewSet()._send_task_notification(task, success=success)
         return {'task_id': task_id, 'success': success, 'result': result}
@@ -178,6 +194,12 @@ def execute_ui_scheduled_task(self, task_id, scheduler_lease_token='', lease_sec
         logger.warning('UI scheduled task claim lost: task_id=%s', task_id)
         return {'task_id': task_id, 'success': False, 'claim_lost': True}
     except Exception as exc:  # noqa: BLE001 - update durable schedule state before returning
+        if heartbeat is not None:
+            try:
+                heartbeat.raise_if_lost()
+            except ScheduleClaimLost:
+                logger.warning('UI scheduled task claim lost: task_id=%s', task_id)
+                return {'task_id': task_id, 'success': False, 'claim_lost': True}
         logger.exception('UI scheduled task failed: task_id=%s', task_id)
         try:
             _finish_task(

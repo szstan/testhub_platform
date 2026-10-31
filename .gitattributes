@@ -1,0 +1,4 @@
+# These legacy APP worker blobs are tracked with CRLF line endings.
+# Keep whitespace checks useful without treating the CR as trailing space.
+apps/app_automation/tasks.py whitespace=trailing-space,space-before-tab,cr-at-eol
+apps/app_automation/executors/test_executor.py whitespace=trailing-space,space-before-tab,cr-at-eol

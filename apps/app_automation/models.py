@@ -96,6 +96,7 @@ class AppDevice(models.Model):
     )
     locked_at = models.DateTimeField(null=True, blank=True, verbose_name='锁定时间')
     max_allocation_time = models.IntegerField(default=28800, verbose_name='最大分配时间(秒)', help_text='默认8小时')
+    lease_generation = models.PositiveBigIntegerField(default=0, verbose_name='租约世代')
     lease_token_hash = models.CharField(max_length=128, blank=True, default='', verbose_name='租约令牌哈希')
     lease_acquired_at = models.DateTimeField(null=True, blank=True, verbose_name='租约开始时间')
     lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='租约过期时间')
@@ -127,18 +128,37 @@ class AppDevice(models.Model):
         return f"{self.name or self.device_id} ({self.get_status_display()})"
     
     def lock(self, user):
-        """锁定设备"""
-        self.locked_by = user
-        self.locked_at = timezone.now()
-        self.status = DeviceStatus.LOCKED
-        self.save()
-    
-    def unlock(self):
-        """释放设备"""
-        self.locked_by = None
-        self.locked_at = None
-        self.status = DeviceStatus.AVAILABLE
-        self.save()
+        """Create a new legacy lock generation under the authoritative row lock."""
+        from django.db import transaction
+        from .device_pool import DeviceLeaseError, _acquire_locked_device, _lease_fields
+
+        with transaction.atomic():
+            current = type(self).objects.select_for_update().get(pk=self.pk)
+            if current.maintenance_mode or current.status == DeviceStatus.OFFLINE:
+                raise DeviceLeaseError('设备不可用')
+            # Reuse allocation validation so status drift cannot overwrite a
+            # live lease. The manual lock keeps the tokenless legacy contract.
+            _acquire_locked_device(
+                current, user, now=timezone.now(), lease_seconds=current.max_allocation_time
+            )
+            current.lease_token_hash = ''
+            current.lease_acquired_at = None
+            current.lease_expires_at = None
+            current.save(update_fields=_lease_fields())
+            self.__dict__.update(current.__dict__)
+
+    def unlock(self, *, expected_generation=None, expected_owner_id=None):
+        """Compare-and-release this snapshot, including calls from legacy paths."""
+        from .device_pool import release_device_execution_lease
+
+        generation = self.lease_generation if expected_generation is None else expected_generation
+        owner_id = self.locked_by_id if expected_owner_id is None else expected_owner_id
+        # The release helper needs only an identity, never a user credential.
+        from types import SimpleNamespace
+        released = release_device_execution_lease(self.pk, SimpleNamespace(id=owner_id), generation)
+        if released:
+            self.refresh_from_db()
+        return released
     
     def is_lock_expired(self):
         """检查锁定是否过期"""
@@ -592,10 +612,13 @@ class AppTestExecution(models.Model):
         related_name='app_test_executions', 
         verbose_name='执行用户'
     )
+    device_lease_generation = models.PositiveBigIntegerField(
+        null=True, blank=True, verbose_name='设备租约世代'
+    )
     status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
-        default=ExecutionStatus.PENDING, 
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=ExecutionStatus.PENDING,
         verbose_name='执行状态'
     )
     result = models.CharField(
@@ -750,6 +773,9 @@ class AppScheduledTask(models.Model):
         verbose_name = 'APP定时任务'
         verbose_name_plural = 'APP定时任务'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['scheduler_lease_expires_at'], name='app_sched_lease_exp_idx'),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.get_task_type_display()})"

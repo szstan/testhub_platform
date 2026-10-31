@@ -7,10 +7,12 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 import logging
 
 from ..models import AppPackage, AppTestCase, AppDevice, AppTestExecution
 from ..access import scope_test_cases, device_action_allowed
+from ..device_pool import DeviceLeaseError, assert_device_execution_lease, validate_device_lease
 from ..serializers import AppPackageSerializer, AppTestCaseSerializer, AppTestExecutionSerializer
 
 logger = logging.getLogger(__name__)
@@ -64,36 +66,49 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
                 'message': '请选择执行设备'
             }, status=status.HTTP_400_BAD_REQUEST)
         
+        lease_generation = None
         try:
-            # 检查设备是否可用
-            device = AppDevice.objects.get(device_id=device_id)
-            if not device_action_allowed(request.user, device):
-                return Response({
-                    'success': False,
-                    'message': '无权使用其他用户锁定的设备'
-                }, status=status.HTTP_403_FORBIDDEN)
-            if test_case.app_package and package_name and package_name != test_case.app_package.package_name:
-                return Response({
-                    'success': False,
-                    'message': '执行包名必须与测试用例一致'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            if device.locked_by_id != request.user.id:
-                return Response({
-                    'success': False,
-                    'message': '请先锁定设备后再执行测试'
-                }, status=status.HTTP_403_FORBIDDEN)
-            
-            # 创建执行记录
-            execution = AppTestExecution.objects.create(
-                test_case=test_case,
-                device=device,
-                user=request.user,
-                status='pending'
-            )
-            
-            # 调用 Celery 任务异步执行
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(device_id=device_id)
+                if not device_action_allowed(request.user, device):
+                    return Response({
+                        'success': False,
+                        'message': '无权使用其他用户锁定的设备'
+                    }, status=status.HTTP_403_FORBIDDEN)
+                if test_case.app_package and package_name and package_name != test_case.app_package.package_name:
+                    return Response({
+                        'success': False,
+                        'message': '执行包名必须与测试用例一致'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                if device.locked_by_id != request.user.id:
+                    return Response({
+                        'success': False,
+                        'message': '请先锁定设备后再执行测试'
+                    }, status=status.HTTP_403_FORBIDDEN)
+                try:
+                    validate_device_lease(
+                        device.pk, request.user, request.data.get('lease_token') or ''
+                    )
+                    assert_device_execution_lease(
+                        device.pk, request.user, device.lease_generation
+                    )
+                except DeviceLeaseError as exc:
+                    return Response({'success': False, 'message': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+                lease_generation = device.lease_generation
+                execution = AppTestExecution.objects.create(
+                    test_case=test_case,
+                    device=device,
+                    user=request.user,
+                    status='pending',
+                    device_lease_generation=lease_generation,
+                )
+
             from ..tasks import execute_app_test_task
-            task = execute_app_test_task.delay(execution.id, package_name=package_name)
+            task = execute_app_test_task.delay(
+                execution.id,
+                package_name=package_name,
+                lease_generation=lease_generation,
+            )
             execution.task_id = task.id
             execution.save()
             

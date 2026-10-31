@@ -41,6 +41,22 @@ from apps.projects.models import Project
 from apps.testcases.models import TestCase
 from apps.users.serializers import UserSimpleSerializer
 from apps.versions.models import Version
+from .source_contract import (
+    SourceBindingAccessError,
+    SourceBindingError,
+    is_active_actor,
+    is_privileged_actor,
+    parse_source_id,
+    resolve_native_source,
+)
+
+
+_APP_SOURCE_METADATA_DEFAULTS = {
+    'approved': False,
+    'capabilities': {},
+    'lease_seconds': 3600,
+}
+_APP_PRIVILEGED_METADATA_KEYS = frozenset(_APP_SOURCE_METADATA_DEFAULTS)
 
 
 def accessible_execution_projects(user):
@@ -90,22 +106,53 @@ class ExecutionSourceBindingSerializer(serializers.ModelSerializer):
             attrs.get('source_project_id', getattr(self.instance, 'source_project_id', '')) or ''
         ).strip()
         metadata = attrs.get('metadata', getattr(self.instance, 'metadata', {}) or {})
-        if project is None or not accessible_execution_projects(user).filter(pk=project.pk).exists():
+        if project is None or not is_active_actor(user) or not accessible_execution_projects(user).filter(pk=project.pk).exists():
             raise PermissionDenied('没有权限管理该项目的执行 source binding')
         if not source_project_id:
             raise serializers.ValidationError({'source_project_id': 'source_project_id 不能为空'})
         if not isinstance(metadata, dict):
             raise serializers.ValidationError({'metadata': 'metadata 必须是对象'})
         try:
-            from .source_contract import parse_source_id
-            parse_source_id(source_type, source_id)
-        except Exception as exc:
+            reference = parse_source_id(source_type, source_id)
+            resolve_native_source(reference, source_project_id, user)
+        except SourceBindingAccessError as exc:
+            raise PermissionDenied(str(exc)) from exc
+        except SourceBindingError as exc:
             raise serializers.ValidationError({'source_id': str(exc)}) from exc
+
+        previous_type = getattr(self.instance, 'source_type', None)
+        previous_metadata = getattr(self.instance, 'metadata', {}) or {}
+        was_app_binding = previous_type == 'app'
+        if was_app_binding or source_type == 'app':
+            previous_values = dict(_APP_SOURCE_METADATA_DEFAULTS)
+            if was_app_binding:
+                previous_values.update(previous_metadata)
+            effective_values = dict(_APP_SOURCE_METADATA_DEFAULTS)
+            effective_values.update(metadata)
+            changed = any(
+                previous_values[key] != effective_values[key]
+                for key in _APP_PRIVILEGED_METADATA_KEYS
+            )
+            scope_changed = self.instance is not None and any((
+                self.instance.project_id != project.pk,
+                previous_type != source_type,
+                self.instance.source_id != reference.canonical,
+                str(self.instance.source_project_id or '').strip() != source_project_id,
+                not self.instance.enabled and attrs.get('enabled', self.instance.enabled),
+            ))
+            has_privileged_metadata = any(
+                previous_values[key] != _APP_SOURCE_METADATA_DEFAULTS[key]
+                or effective_values[key] != _APP_SOURCE_METADATA_DEFAULTS[key]
+                for key in _APP_PRIVILEGED_METADATA_KEYS
+            )
+            if (changed or (scope_changed and has_privileged_metadata)) and not is_privileged_actor(user):
+                raise PermissionDenied('仅特权用户可以修改 APP source binding 的审批、能力、租约配置或已批准范围')
+        attrs['source_id'] = reference.canonical
+        attrs['source_project_id'] = source_project_id
         return attrs
 
     def get_source_reference(self, obj):
         try:
-            from .source_contract import parse_source_id
             reference = parse_source_id(obj.source_type, obj.source_id)
             return {
                 'source_type': reference.source_type,
@@ -263,14 +310,15 @@ class ExecutionNotificationEventSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = (
             'id', 'project', 'subscription', 'event_key', 'event_type', 'status',
-            'payload', 'error_message', 'sent_at', 'created_at',
+            'delivery_claim_id', 'delivery_claim_expires_at', 'delivery_attempts',
+            'next_attempt_at', 'payload', 'error_message', 'sent_at', 'created_at',
         )
 
     def to_representation(self, instance):
         result = super().to_representation(instance)
         from .result_events import redact_result_payload
         result['payload'] = redact_result_payload(result.get('payload') or {})
-        result['error_message'] = str(result.get('error_message') or '')[:1000]
+        result['error_message'] = redact_result_payload(result.get('error_message') or '')[:1000]
         return result
 
 
@@ -305,6 +353,18 @@ class ExecutionProfileSerializer(serializers.ModelSerializer):
     def get_secret_configured(self, obj):
         import os
         return bool(obj.webhook_secret_ref and os.environ.get(obj.webhook_secret_ref))
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        if project is None or not accessible_execution_projects(user).filter(pk=project.pk).exists():
+            raise PermissionDenied('没有权限访问该项目')
+
+        version = attrs.get('version', getattr(self.instance, 'version', None))
+        if version is not None and not version.projects.filter(pk=project.pk).exists():
+            raise serializers.ValidationError({'version': '版本不属于所选项目'})
+        return attrs
 
 
 class ExecutionRetryPolicySerializer(serializers.ModelSerializer):
@@ -480,19 +540,34 @@ class ExecutionJobSerializer(serializers.ModelSerializer):
             reference = parse_source_id(obj.source_type, obj.source_id)
         except Exception:
             return 'invalid'
-        binding = ExecutionSourceBinding.objects.filter(
-            project_id=obj.project_id,
-            source_type=reference.source_type,
-            source_id=reference.canonical,
-        ).only('enabled').first()
-        if binding is None:
-            return 'missing'
-        return 'ready' if binding.enabled else 'disabled'
+
+        key = (obj.project_id, reference.source_type, reference.canonical)
+        if 'source_binding_statuses' in self.context:
+            statuses = self.context['source_binding_statuses']
+            if key not in statuses:
+                return 'missing'
+            return 'ready' if statuses[key] else 'disabled'
+
+        cache = getattr(self, '_source_binding_status_cache', None)
+        if cache is None:
+            cache = self._source_binding_status_cache = {}
+        if key not in cache:
+            binding = ExecutionSourceBinding.objects.filter(
+                project_id=obj.project_id,
+                source_type=reference.source_type,
+                source_id=reference.canonical,
+            ).only('enabled').first()
+            cache[key] = (
+                'missing' if binding is None else 'ready' if binding.enabled else 'disabled'
+            )
+        return cache[key]
 
     def get_execution_supported(self, obj):
         return self.get_executor_status(obj) == 'ready'
 
     def get_attempts_count(self, obj):
+        if hasattr(obj, '_attempts_count'):
+            return obj._attempts_count
         return obj.attempts.count()
 
     def validate(self, attrs):

@@ -46,6 +46,16 @@ from .serializers import (
     GenerationConfigSerializer
 )
 from .services import RequirementAnalysisService, DocumentProcessor
+from .schema import (
+    RequirementAnalyzeTextErrorResponseSerializer,
+    RequirementAnalyzeTextRequestSerializer,
+    RequirementAuthFailureResponseSerializer,
+    RequirementConfigStatusErrorResponseSerializer,
+    RequirementConfigStatusResponseSerializer,
+    RequirementQueuedAnalysisResponseSerializer,
+    RequirementUploadRequestSerializer,
+    RequirementUploadValidationErrorResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +632,16 @@ class AnalysisTaskViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
+@extend_schema(
+    operation_id='requirement_upload_and_analyze',
+    request={'multipart/form-data': RequirementUploadRequestSerializer},
+    responses={
+        202: RequirementQueuedAnalysisResponseSerializer,
+        400: RequirementUploadValidationErrorResponseSerializer,
+        401: RequirementAuthFailureResponseSerializer,
+        500: RequirementAnalyzeTextErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def upload_and_analyze(request):
@@ -714,6 +734,21 @@ def upload_and_analyze(request):
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    operation_id='requirement_analyze_text',
+    request={
+        'application/json': RequirementAnalyzeTextRequestSerializer,
+        'application/x-www-form-urlencoded': RequirementAnalyzeTextRequestSerializer,
+        'multipart/form-data': RequirementAnalyzeTextRequestSerializer,
+    },
+    responses={
+        202: RequirementQueuedAnalysisResponseSerializer,
+        400: RequirementAnalyzeTextErrorResponseSerializer,
+        401: RequirementAuthFailureResponseSerializer,
+        403: RequirementAnalyzeTextErrorResponseSerializer,
+        500: RequirementAnalyzeTextErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def analyze_text(request):
@@ -3109,6 +3144,13 @@ class ConfigStatusViewSet(viewsets.ViewSet):
     """配置状态检查视图集"""
     permission_classes = []  # 允许未认证用户访问
 
+    @extend_schema(
+        operation_id='requirement_config_status_check',
+        responses={
+            200: RequirementConfigStatusResponseSerializer,
+            500: RequirementConfigStatusErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def check(self, request):
         """检查AI配置状态"""

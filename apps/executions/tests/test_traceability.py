@@ -137,6 +137,10 @@ def test_traceability_links_and_coverage_are_project_scoped(traceability_data):
         step_key='test',
         status='passed',
     )
+    from apps.executions.policies import preserve_final_result
+    data['job'].status = 'passed'
+    data['job'].save(update_fields=['status'])
+    preserve_final_result(data['job'], attempt, 'passed', {})
     executed_coverage = client.get(f"/api/executions/builds/coverage/?project={data['project'].id}")
     assert executed_coverage.data['executed_requirements'] == 1
     assert executed_coverage.data['passed_requirements'] == 1

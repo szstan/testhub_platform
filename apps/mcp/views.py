@@ -27,12 +27,22 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
-from drf_spectacular.utils import extend_schema_view, extend_schema
+from drf_spectacular.utils import extend_schema
 
 from .confirm import ConfirmError, approve_pending, reject_pending
 from .models import McpCallLog, McpPendingConfirm
 from .registry import CATEGORY_ORDER, TOOL_REGISTRY, catalog_summary, get_tool_meta
 from .serializers import McpCallLogSerializer, McpPendingConfirmSerializer
+from .schema import (
+    McpAuthErrorResponseSerializer,
+    McpConnectionConfigResponseSerializer,
+    McpPendingApproveResponseSerializer,
+    McpPendingRejectResponseSerializer,
+    McpSchemaErrorResponseSerializer,
+    McpToolCatalogResponseSerializer,
+    McpToolDetailResponseSerializer,
+    mcp_forbidden_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +117,18 @@ def _serialize_tool(meta, input_schema, stats, detail=False):
     return data
 
 
-@extend_schema_view(get=extend_schema(operation_id='mcp_tool_catalog'))
 class McpToolCatalogView(APIView):
     """工具目录：汇总（总数/分类计数/近 7 天调用量）+ 全量工具列表。"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='mcp_tool_catalog',
+        responses={
+            200: McpToolCatalogResponseSerializer,
+            401: McpAuthErrorResponseSerializer,
+            403: McpAuthErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         schemas = _tool_input_schemas()
         stats = _tool_stats()
@@ -123,11 +140,19 @@ class McpToolCatalogView(APIView):
         return Response({'summary': summary, 'tools': items})
 
 
-@extend_schema_view(get=extend_schema(operation_id='mcp_tool_detail'))
 class McpToolDetailView(APIView):
     """单工具详情：目录字段 + 完整描述。"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='mcp_tool_detail',
+        responses={
+            200: McpToolDetailResponseSerializer,
+            401: McpAuthErrorResponseSerializer,
+            403: McpAuthErrorResponseSerializer,
+            404: McpSchemaErrorResponseSerializer,
+        },
+    )
     def get(self, request, name):
         meta = get_tool_meta(name)
         if meta is None:
@@ -146,6 +171,14 @@ class McpConnectionConfigView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='mcp_connection_config',
+        responses={
+            200: McpConnectionConfigResponseSerializer,
+            401: McpAuthErrorResponseSerializer,
+            403: mcp_forbidden_response(),
+        },
+    )
     def get(self, request):
         if not getattr(settings, 'MCP_ENABLED', True):
             return Response({'error': 'MCP Server 已被管理员关闭（settings.MCP_ENABLED=False）'},
@@ -292,6 +325,17 @@ class _PendingActionView(APIView):
 class McpPendingApproveView(_PendingActionView):
     """手动批准：服务端直接触发该危险操作执行。"""
 
+    @extend_schema(
+        operation_id='mcp_pending_approve',
+        request=None,
+        responses={
+            200: McpPendingApproveResponseSerializer,
+            400: McpSchemaErrorResponseSerializer,
+            401: McpAuthErrorResponseSerializer,
+            403: mcp_forbidden_response(),
+            404: McpSchemaErrorResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         pending, err = self._get_pending(request, pk, independent_approval=True)
         if err:
@@ -307,6 +351,17 @@ class McpPendingApproveView(_PendingActionView):
 class McpPendingRejectView(_PendingActionView):
     """手动拒绝：confirm 令牌作废。"""
 
+    @extend_schema(
+        operation_id='mcp_pending_reject',
+        request=None,
+        responses={
+            200: McpPendingRejectResponseSerializer,
+            400: McpSchemaErrorResponseSerializer,
+            401: McpAuthErrorResponseSerializer,
+            403: mcp_forbidden_response(),
+            404: McpSchemaErrorResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         pending, err = self._get_pending(request, pk)
         if err:

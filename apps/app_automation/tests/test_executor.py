@@ -123,8 +123,8 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
     results_dir = tmp_path / 'allure-results'
     results_dir.mkdir()
     process = Mock()
-    process.stdout = []
-    process.wait.return_value = 0
+    process.communicate.return_value = ('pytest output\n', None)
+    process.returncode = 0
 
     with (
         patch.object(
@@ -153,6 +153,34 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
     ):
         with pytest.raises(AppTestWorkerError, match='Allure report generation failed'):
             executor.run_tests(1, 'device', 'package')
+
+
+def test_run_tests_terminates_pytest_when_lease_is_lost(tmp_path):
+    executor = AppTestExecutor(base_path=str(tmp_path))
+    process = Mock()
+    checks = {'count': 0}
+
+    def cancel_check():
+        checks['count'] += 1
+        if checks['count'] >= 3:
+            raise RuntimeError('device lease lost')
+
+    with (
+        patch.object(executor, '_preflight_worker', return_value={
+            'adb_path': str(tmp_path / 'adb'),
+            'allure_path': str(ALLURE_COMMAND),
+        }),
+        patch.object(executor, '_get_allure_results_dir', return_value=str(tmp_path / 'allure-results')),
+        patch.object(subprocess, 'Popen', return_value=process) as popen,
+    ):
+        with pytest.raises(RuntimeError, match='device lease lost'):
+            executor.run_tests(1, 'device', 'package', cancel_check=cancel_check)
+
+    popen.assert_called_once()
+    process.terminate.assert_called_once()
+    process.wait.assert_called_once_with(timeout=5)
+    process.communicate.assert_not_called()
+    assert executor._current_process is None
 
 
 def test_run_tests_does_not_spawn_pytest_when_worker_preflight_fails(tmp_path):

@@ -8,6 +8,7 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
+from apps.core.cancellation import execution_cancellation_scope
 from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear_claim, load_claimed_task
 
 logger = logging.getLogger(__name__)
@@ -84,20 +85,31 @@ def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_toke
                 scheduler_lease_token,
                 lease_seconds=lease_seconds,
             ).start()
-        log.status = 'RUNNING'
-        log.start_time = timezone.now()
-        log.save(update_fields=['status', 'start_time'])
+        with execution_cancellation_scope(
+            heartbeat.raise_if_lost if heartbeat is not None else None
+        ) as cancellation:
+            cancellation.raise_if_cancelled()
+            log.status = 'RUNNING'
+            log.start_time = timezone.now()
+            log.save(update_fields=['status', 'start_time'])
 
-        if task.task_type == 'TEST_SUITE':
-            if not task.test_suite:
-                raise ValueError('scheduled task has no test suite')
-            result = execute_test_suite(task.test_suite, task.environment, task.created_by)
-        elif task.task_type == 'API_REQUEST':
-            if not task.api_request:
-                raise ValueError('scheduled task has no API request')
-            result = execute_api_request(task.api_request, task.environment, task.created_by)
-        else:
-            raise ValueError(f'unknown scheduled task type: {task.task_type}')
+            if task.task_type == 'TEST_SUITE':
+                if not task.test_suite:
+                    raise ValueError('scheduled task has no test suite')
+                result = execute_test_suite(
+                    task.test_suite, task.environment, task.created_by,
+                    cancel_check=cancellation.raise_if_cancelled,
+                )
+            elif task.task_type == 'API_REQUEST':
+                if not task.api_request:
+                    raise ValueError('scheduled task has no API request')
+                result = execute_api_request(
+                    task.api_request, task.environment, task.created_by,
+                    cancel_check=cancellation.raise_if_cancelled,
+                )
+            else:
+                raise ValueError(f'unknown scheduled task type: {task.task_type}')
+            cancellation.raise_if_cancelled()
 
         success = bool(result and result.get('success', False))
         log.status = 'COMPLETED' if success else 'FAILED'
@@ -118,11 +130,11 @@ def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_toke
         return {'task_id': task_id, 'execution_log_id': log.pk, 'success': success}
     except ScheduleClaimLost:
         logger.warning('API scheduled task claim lost: task_id=%s', task_id)
-        if log.status == 'PENDING':
+        if log.status in {'PENDING', 'RUNNING'}:
             log.status = 'CANCELLED'
             log.end_time = timezone.now()
-            log.error_message = 'scheduler lease lost before execution'
-            log.save(update_fields=['status', 'end_time', 'error_message'])
+            log.error_message = 'scheduler lease lost; execution cancelled'
+            log.save(update_fields=['status', 'end_time', 'error_message', 'duration'])
         return {'task_id': task_id, 'execution_log_id': log.pk, 'success': False, 'claim_lost': True}
     except Exception as exc:  # noqa: BLE001 - durable log and task state are authoritative
         logger.exception('API scheduled task failed: task_id=%s', task_id)

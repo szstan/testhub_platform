@@ -2,6 +2,7 @@ import pytest
 from django.test import override_settings
 from rest_framework.test import APIClient
 
+from apps.api_testing.models import ApiProject, TestSuite as ApiSourceSuite
 from apps.executions.models import ExecutionJob, ExecutionSourceBinding
 from apps.projects.models import Project
 from apps.users.models import User
@@ -19,6 +20,8 @@ def binding_fixture(db):
 @pytest.mark.django_db
 def test_source_binding_api_is_project_scoped_and_validates_typed_reference(binding_fixture):
     owner, outsider, project, other_project = binding_fixture
+    native = ApiProject.objects.create(name='Binding native API project', owner=owner)
+    suite = ApiSourceSuite.objects.create(project=native, name='Binding native suite', created_by=owner)
     client = APIClient()
     client.force_authenticate(user=owner)
 
@@ -27,14 +30,14 @@ def test_source_binding_api_is_project_scoped_and_validates_typed_reference(bind
         {
             'project': project.pk,
             'source_type': 'api',
-            'source_id': 'api:suite:42',
-            'source_project_id': 'legacy-api-project',
+            'source_id': f'api:suite:{suite.pk}',
+            'source_project_id': str(native.pk),
             'metadata': {'environment': 'staging'},
         },
         format='json',
     )
     assert created.status_code == 201, created.data
-    assert created.data['source_reference']['canonical'] == 'api:suite:42'
+    assert created.data['source_reference']['canonical'] == f'api:suite:{suite.pk}'
     assert created.data['source_binding_status'] if 'source_binding_status' in created.data else True
     assert created.data['route_configured'] is False
     assert created.data['executor_status'] == 'unsupported'

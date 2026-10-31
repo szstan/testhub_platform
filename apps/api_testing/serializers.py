@@ -20,6 +20,7 @@ from .models import (
     ScheduledTask, TaskExecutionLog, NotificationLog,
     TaskNotificationSetting, OperationLog, AIServiceConfig,
 )
+from .utils import can_use_environment, redact_assertion_results
 
 User = get_user_model()
 
@@ -171,6 +172,11 @@ class RequestHistorySerializer(serializers.ModelSerializer):
             'executed_by', 'executed_at'
         ]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['assertions_results'] = redact_assertion_results(data.get('assertions_results'))
+        return data
+
 
 class TestSuiteRequestSerializer(serializers.ModelSerializer):
     request = ApiRequestSerializer(read_only=True)
@@ -191,6 +197,15 @@ class TestSuiteSerializer(serializers.ModelSerializer):
             'suite_requests', 'created_by', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        environment = attrs.get('environment', getattr(self.instance, 'environment', None))
+        if environment and not can_use_environment(environment, user, project=project):
+            raise serializers.ValidationError({'environment': '无权使用该执行环境'})
+        return attrs
 
     def create(self, validated_data):
         validated_data['created_by'] = self.context['request'].user
@@ -291,7 +306,8 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
         task_type = attrs.get('task_type')
         if task_type == 'TEST_SUITE' and not attrs.get('test_suite'):
             raise serializers.ValidationError("测试套件不能为空")
-        user = self.context.get('request').user
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
         suite = attrs.get('test_suite') or getattr(self.instance, 'test_suite', None)
         request_obj = attrs.get('api_request') or getattr(self.instance, 'api_request', None)
         environment = attrs.get('environment') or getattr(self.instance, 'environment', None)
@@ -307,6 +323,7 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
         project_ids.discard(None)
         if len(project_ids) > 1:
             raise serializers.ValidationError('定时任务关联资源必须属于同一项目')
+        project = None
         if project_ids:
             from .models import ApiProject
             project = ApiProject.objects.filter(id=project_ids.pop()).filter(
@@ -314,6 +331,11 @@ class ScheduledTaskSerializer(serializers.ModelSerializer):
             ).first()
             if not project:
                 raise serializers.ValidationError('无权使用定时任务关联项目')
+        environment_project = project
+        if environment_project is None and environment and environment.scope == 'LOCAL':
+            environment_project = environment.project
+        if environment and not can_use_environment(environment, user, project=environment_project):
+            raise serializers.ValidationError({'environment': '无权使用定时任务关联环境'})
 
         return attrs
 

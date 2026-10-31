@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import time
+from itertools import islice
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from django.conf import settings
 
+from apps.core.http_transport import guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from apps.quality_intelligence.services.redaction import redact_payload
 
@@ -46,6 +48,43 @@ def _path_with_examples(path: str, parameters: list[Any]) -> str:
     return result
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(str(url))
+    host = (parsed.hostname or '').rstrip('.').lower()
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port or (443 if scheme == 'https' else 80)
+    except ValueError as exc:
+        raise ValueError('OpenAPI case URL has an invalid port') from exc
+    return scheme, host, port
+
+
+def _case_url(base_url: str, case: Mapping[str, Any], *, allow_private: bool) -> str:
+    path = _path_with_examples(case['path'], case.get('parameters', []))
+    if (
+        not path.startswith('/')
+        or path.startswith('//')
+        or '\\' in path
+        or any(ord(char) < 32 or ord(char) == 127 for char in path)
+    ):
+        raise ValueError('OpenAPI operation path must be a local absolute path')
+    path_parts = urlsplit(path)
+    if path_parts.scheme or path_parts.netloc:
+        raise ValueError('OpenAPI operation path cannot override the request authority')
+
+    resolved = urljoin(base_url.rstrip('/') + '/', path)
+    expected_origin = _origin(base_url)
+    if _origin(resolved) != expected_origin:
+        raise ValueError('OpenAPI case URL changed the configured server origin')
+    try:
+        validated = validate_outbound_url(resolved, allow_private=allow_private)
+    except UnsafeOutboundURL as exc:
+        raise ValueError(str(exc)) from exc
+    if _origin(validated) != expected_origin:
+        raise ValueError('OpenAPI case URL changed the configured server origin')
+    return validated
+
+
 def _response_is_expected(status_code: int, case: Mapping[str, Any]) -> bool:
     expected = set(str(key) for key in (case.get('responses') or {}).keys())
     if case.get('case_kind') == 'security':
@@ -67,6 +106,7 @@ def execute_contract_cases(
     kinds: list[str] | None = None,
     limit: int = 100,
     timeout: float = 15.0,
+    case_definitions: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Execute bounded generated cases; never persists raw request/response secrets."""
 
@@ -77,21 +117,25 @@ def execute_contract_cases(
             base_url = str(servers[0].get('url') or '')
     if not base_url:
         raise ValueError('OpenAPI contract execution requires base_url or document.servers[0].url')
+    allow_private = bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))
     try:
-        base_url = validate_outbound_url(
-            base_url,
-            allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-        )
+        base_url = validate_outbound_url(base_url, allow_private=allow_private)
     except UnsafeOutboundURL as exc:
         raise ValueError(str(exc)) from exc
     headers = dict(headers or {})
     selected = set(kinds or ('positive', 'negative', 'security'))
-    cases = [case for case in generate_contract_cases(spec) if case['case_kind'] in selected][:max(1, min(int(limit), 100))]
+    definitions = generate_contract_cases(spec) if case_definitions is None else case_definitions
+    cases = list(islice(
+        (case for case in definitions if case['case_kind'] in selected),
+        max(1, min(int(limit), 100)),
+    ))
+    # Validate every rendered target before the first request so a later unsafe
+    # path cannot make a run partially execute against an attacker-controlled host.
+    targets = [(case, _case_url(base_url, case, allow_private=allow_private)) for case in cases]
     results = []
-    for case in cases:
+    for case, url in targets:
         started = time.monotonic()
         method = case['method']
-        url = urljoin(base_url.rstrip('/') + '/', _path_with_examples(case['path'], case.get('parameters', []))).replace('://', '§§').replace('//', '/').replace('§§', '://')
         request_headers = dict(headers)
         if case['case_kind'] == 'security':
             request_headers = {
@@ -104,9 +148,10 @@ def execute_contract_cases(
             if required and body:
                 body.pop(next(iter(body)))
         try:
-            response = requests.request(
+            response = guarded_request(
                 method=method,
                 url=url,
+                allow_private=allow_private,
                 headers=request_headers,
                 json=body if method not in {'GET', 'HEAD', 'OPTIONS'} else None,
                 timeout=max(0.5, min(float(timeout), 60.0)),
@@ -135,7 +180,7 @@ def execute_contract_cases(
                 'status': 'failed',
                 'duration_ms': int((time.monotonic() - started) * 1000),
                 'result': redact_payload({'method': method, 'path': case['path']}),
-                'error_message': str(exc)[:4000],
+                'error_message': redact_payload(str(exc)[:4000]),
             })
     return results
 

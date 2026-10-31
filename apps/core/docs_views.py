@@ -14,6 +14,13 @@ from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
+from .openapi import (
+    DocsContentResponseSerializer,
+    DocsErrorResponseSerializer,
+    DocsListResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,12 @@ class DocsListView(APIView):
     """文档列表：GET /api/core/docs/"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        responses={
+            200: DocsListResponseSerializer,
+            401: DocsErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         items = []
         for doc in list_doc_files():
@@ -81,6 +94,19 @@ class DocsContentView(APIView):
     """文档内容：GET /api/core/docs/content/?name=xxx.md"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        parameters=[OpenApiParameter(
+            "name", OpenApiTypes.STR, OpenApiParameter.QUERY, required=True,
+            description="Relative Markdown path returned by the docs list endpoint.",
+        )],
+        responses={
+            200: DocsContentResponseSerializer,
+            400: DocsErrorResponseSerializer,
+            401: DocsErrorResponseSerializer,
+            404: DocsErrorResponseSerializer,
+            500: DocsErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         name = (request.query_params.get('name') or '').strip()
 

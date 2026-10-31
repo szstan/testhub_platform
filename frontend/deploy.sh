@@ -62,14 +62,60 @@ compose() {
 
 check_dist_dir() {
     local dist_dir="$1"
-    [[ -f "${dist_dir}/index.html" ]] || die "找不到 ${dist_dir}/index.html"
-    if command -v restorecon >/dev/null 2>&1; then
-        restorecon -R "${dist_dir}" || die "无法恢复 ${dist_dir} 的 SELinux 上下文"
+    [[ -f "${dist_dir}/index.html" ]] || { print_error "找不到 ${dist_dir}/index.html"; return 1; }
+    local selinux_mode
+    selinux_mode="$(getenforce 2>/dev/null || true)"
+    if [[ "${selinux_mode}" == "Enforcing" ]] && ! command -v restorecon >/dev/null 2>&1; then
+        print_error "SELinux 正在强制模式下运行，但找不到 restorecon"
+        return 1
     fi
-    [[ -r "${dist_dir}/index.html" ]] || die "${dist_dir}/index.html 不可读"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R "${dist_dir}" || { print_error "无法恢复 ${dist_dir} 的 SELinux 上下文"; return 1; }
+    fi
+    [[ -r "${dist_dir}/index.html" ]] || { print_error "${dist_dir}/index.html 不可读"; return 1; }
     if id nginx >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-        runuser -u nginx -- test -r "${dist_dir}/index.html" \
-            || die "nginx 用户无法读取 ${dist_dir}/index.html"
+        if ! find "${dist_dir}" -type d -exec bash -c \
+            'for artifact_path in "$@"; do runuser -u nginx -- test -x "$artifact_path" || exit 1; done' _ '{}' +; then
+            print_error "无法完整检查 nginx 对 ${dist_dir} 的目录访问权限"
+            return 1
+        fi
+        if ! find "${dist_dir}" -type f -exec bash -c \
+            'for artifact_path in "$@"; do runuser -u nginx -- test -r "$artifact_path" || exit 1; done' _ '{}' +; then
+            print_error "无法完整检查 nginx 对 ${dist_dir} 的文件读取权限"
+            return 1
+        fi
+    fi
+}
+
+set_dist_permissions() {
+    local dist_dir="$1"
+    find "${dist_dir}" -type d -exec chmod 0755 '{}' + && find "${dist_dir}" -type f -exec chmod 0644 '{}' +
+}
+
+rollback_dist_swap() {
+    local remove_current="${1:-yes}"
+    local dist_dir="${SCRIPT_DIR}/dist"
+
+    if [[ "${remove_current}" == "yes" && ( -e "${dist_dir}" || -L "${dist_dir}" ) ]]; then
+        if ! rm -rf -- "${dist_dir}"; then
+            print_error "无法移除失败的静态资源，上一版保留在 ${PREVIOUS_DIST_DIR:-未备份}"
+            return 1
+        fi
+    elif [[ "${remove_current}" != "yes" && ( -e "${dist_dir}" || -L "${dist_dir}" ) ]]; then
+        print_error "dist 已被其他进程创建，未覆盖它；上一版保留在 ${PREVIOUS_DIST_DIR:-未备份}"
+        return 1
+    fi
+
+    if [[ -n "${PREVIOUS_DIST_DIR}" && ( -e "${PREVIOUS_DIST_DIR}" || -L "${PREVIOUS_DIST_DIR}" ) ]]; then
+        if ! mv -- "${PREVIOUS_DIST_DIR}" "${dist_dir}"; then
+            print_error "无法恢复上一版 dist；备份保留在 ${PREVIOUS_DIST_DIR}"
+            return 1
+        fi
+        PREVIOUS_DIST_DIR=""
+        if ! check_dist_dir "${dist_dir}"; then
+            print_error "上一版 dist 已恢复，但权限或 SELinux 检查未通过"
+            return 1
+        fi
     fi
 }
 
@@ -83,28 +129,56 @@ build_frontend() {
 
     print_step "安装前端依赖并构建生产静态资源..."
     local staging_dir
-    staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/testhub-frontend-dist.XXXXXX")"
+    staging_dir="$(mktemp -d "${SCRIPT_DIR}/.dist.staging.XXXXXX")"
     (
         cd "${SCRIPT_DIR}"
-        npm ci --no-audit --no-fund
-        npm run build -- --outDir "${staging_dir}"
+        npm ci --no-audit --no-fund &&
+            npm run build -- --outDir "${staging_dir}"
     ) || {
         rm -rf "${staging_dir}"
         die "前端构建失败，保留当前 dist"
     }
 
-    check_dist_dir "${staging_dir}"
-    PREVIOUS_DIST_DIR="${SCRIPT_DIR}/dist.previous.$(date +%Y%m%d%H%M%S)"
-    if [[ -e "${SCRIPT_DIR}/dist" ]]; then
+    set_dist_permissions "${staging_dir}" || {
+        rm -rf -- "${staging_dir}"
+        die "无法设置静态资源目录权限，保留当前 dist"
+    }
+    if [[ ! -f "${staging_dir}/index.html" ]]; then
+        rm -rf -- "${staging_dir}"
+        die "找不到 ${staging_dir}/index.html，保留当前 dist"
+    fi
+    PREVIOUS_DIST_DIR=""
+    if [[ -e "${SCRIPT_DIR}/dist" || -L "${SCRIPT_DIR}/dist" ]]; then
+        PREVIOUS_DIST_DIR="$(mktemp -d "${SCRIPT_DIR}/.dist.previous.XXXXXX")" || {
+            rm -rf -- "${staging_dir}"
+            die "无法分配上一版 dist 的备份路径"
+        }
+        if ! rmdir "${PREVIOUS_DIST_DIR}"; then
+            rm -rf -- "${staging_dir}" "${PREVIOUS_DIST_DIR}"
+            PREVIOUS_DIST_DIR=""
+            die "无法准备上一版 dist 的备份路径"
+        fi
         mv "${SCRIPT_DIR}/dist" "${PREVIOUS_DIST_DIR}" \
             || { rm -rf "${staging_dir}"; die "无法保存上一版 dist"; }
     fi
-    if ! mv "${staging_dir}" "${SCRIPT_DIR}/dist"; then
-        [[ -e "${PREVIOUS_DIST_DIR}" ]] && mv "${PREVIOUS_DIST_DIR}" "${SCRIPT_DIR}/dist" || true
-        rm -rf "${staging_dir}"
+    if ! mv -- "${staging_dir}" "${SCRIPT_DIR}/dist"; then
+        rm -rf -- "${staging_dir}"
+        if ! rollback_dist_swap no; then
+            print_error "新 dist 切换失败且自动恢复未完成"
+        fi
         die "无法切换新的 dist"
     fi
-    print_info "✓ 前端静态资源已原子切换，上一版保留在 ${PREVIOUS_DIST_DIR}"
+    if ! check_dist_dir "${SCRIPT_DIR}/dist"; then
+        if ! rollback_dist_swap yes; then
+            print_error "静态资源检查失败且自动恢复未完成"
+        fi
+        die "静态资源检查失败，已尝试恢复上一版 dist"
+    fi
+    if [[ -n "${PREVIOUS_DIST_DIR}" ]]; then
+        print_info "✓ 前端静态资源已原子切换，上一版保留在 ${PREVIOUS_DIST_DIR}"
+    else
+        print_info "✓ 前端静态资源已原子切换（首次构建，无上一版 dist）"
+    fi
 }
 
 health_request() {
@@ -121,7 +195,7 @@ wait_for_health() {
     local attempts="${1:-${HEALTH_ATTEMPTS}}"
     local attempt
 
-    check_dist
+    check_dist || return 1
 
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         print_error "未找到 curl 或 wget，无法执行前端健康检查"
@@ -146,12 +220,13 @@ start_production() {
     build_frontend
 
     print_step "启动前端生产环境..."
-    if ! compose up -d || ! wait_for_health; then
-        if [[ -n "${PREVIOUS_DIST_DIR}" && -d "${PREVIOUS_DIST_DIR}" ]]; then
-            print_warn "新版本健康检查失败，恢复上一版静态资源"
-            rm -rf "${SCRIPT_DIR}/dist"
-            mv "${PREVIOUS_DIST_DIR}" "${SCRIPT_DIR}/dist"
-            compose up -d || true
+    # Recreate so Docker resolves the newly promoted host bind-mount directory.
+    if ! compose up -d --force-recreate || ! wait_for_health; then
+        print_warn "新版本启动或健康检查失败，恢复上一版静态资源"
+        if rollback_dist_swap yes; then
+            compose up -d --force-recreate || true
+        else
+            print_error "自动恢复未完成，请检查 dist 和 ${PREVIOUS_DIST_DIR:-上一版备份}"
         fi
         die "前端生产环境启动或健康检查失败"
     fi

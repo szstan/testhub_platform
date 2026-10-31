@@ -178,8 +178,6 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
         if package_name and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', str(package_name)):
             return Response({'success': False, 'message': '非法 Android package name'}, status=status.HTTP_400_BAD_REQUEST)
-        if not lease_token:
-            return Response({'success': False, 'message': '执行设备必须先取得有效 lease'}, status=status.HTTP_403_FORBIDDEN)
 
         suite_cases = suite.suite_cases.select_related('test_case').all()
         if suite_cases.filter(test_case__project_id__isnull=False).exclude(
@@ -204,13 +202,15 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                 except DeviceLeaseError as exc:
                     return Response({'success': False, 'message': str(exc)}, status=status.HTTP_403_FORBIDDEN)
 
+                lease_generation = device.lease_generation
                 executions = [
                     AppTestExecution.objects.create(
                         test_case=sc.test_case,
                         test_suite=suite,
                         device=device,
                         user=request.user,
-                        status='pending'
+                        status='pending',
+                        device_lease_generation=lease_generation,
                     )
                     for sc in suite_cases
                 ]
@@ -223,7 +223,8 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
                 task = execute_app_suite_task.delay(
                     suite_id=suite.id,
                     execution_ids=execution_ids,
-                    package_name=package_name
+                    package_name=package_name,
+                    lease_generation=lease_generation,
                 )
             except Exception:
                 AppTestExecution.objects.filter(id__in=execution_ids).update(

@@ -1,53 +1,37 @@
-"""Executor-neutral adapters for the unified execution domain.
-
-Adapters deliberately keep the legacy module entry points behind a small
-contract.  A caller may inject the existing Celery/thread/task callable as the
-``dispatcher``; this module owns durable job/attempt state and result mapping,
-not the implementation of an API/UI/APP/performance runner.
-"""
+"""Durable, executor-neutral dispatch, retry and result aggregation."""
 
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+from types import SimpleNamespace
 
 from django.db import transaction
 from django.utils import timezone
 
 from .dispatch import CeleryExecutionDispatcher
-from .models import ExecutionArtifact, ExecutionAttempt, ExecutionJob, ExecutionRetryRequest, ExecutionStepResult
-from .result_events import redact_result_payload
-from .state_machine import (
-    AttemptStatus,
-    ErrorType,
-    ExecutionStatus,
-    InvalidExecutionTransition,
-    StepStatus,
-)
+from .models import ExecutionAttempt, ExecutionJob, ExecutionRetryRequest, ExecutionStepResult
+from .result_events import ResultEventIngestor, redact_result_payload
+from .state_machine import AttemptStatus, ErrorType, ExecutionStatus, StepStatus
 from .policies import (
-    apply_quality_gate,
-    check_dispatch_governance,
-    clear_final_for_retry,
-    create_retry_request,
-    mark_retry_requested,
-    preserve_final_result,
-    resolve_retry_policy,
-    should_retry,
-    sync_quality_result,
+    apply_quality_gate, check_dispatch_governance, clear_final_for_retry,
+    create_retry_request, mark_retry_requested, preserve_final_result,
+    resolve_retry_policy, should_retry, sync_quality_result,
 )
 
 
 class AdapterError(RuntimeError):
-    """Base error for an invalid or failed adapter operation."""
+    pass
 
 
 class UnsupportedExecutorError(AdapterError):
-    """Raised when a source has no registered runtime dispatcher."""
+    pass
 
 
 class AdapterConflict(AdapterError):
-    """Raised when an operation cannot be applied to the current lifecycle."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -57,749 +41,565 @@ class AdapterReceipt:
     attempt_number: int
     status: str
     supported: bool
-    dispatch_id: str = ""
-    message: str = ""
+    dispatch_id: str = ''
+    message: str = ''
     created_attempt: bool = False
     details: Mapping[str, Any] = field(default_factory=dict)
 
 
-_TERMINAL_SUCCESS = {
-    ExecutionStatus.PASSED,
-    ExecutionStatus.SUCCEEDED,
-    ExecutionStatus.COMPLETED,
-}
-_TERMINAL_FAILURE = {
-    ExecutionStatus.FAILED,
-    ExecutionStatus.BLOCKED,
-    ExecutionStatus.UNSUPPORTED,
-    ExecutionStatus.CANCELLED,
-}
+_TERMINAL_SUCCESS = {ExecutionStatus.PASSED, ExecutionStatus.SUCCEEDED, ExecutionStatus.COMPLETED}
+_TERMINAL_FAILURE = {ExecutionStatus.FAILED, ExecutionStatus.BLOCKED, ExecutionStatus.UNSUPPORTED, ExecutionStatus.CANCELLED}
+_TERMINAL = _TERMINAL_SUCCESS | _TERMINAL_FAILURE
 
 
-def _normalise_job_status(value: Any) -> str:
-    raw = getattr(value, "value", value)
-    raw = str(raw or "").strip().lower()
-    aliases = {
-        "success": ExecutionStatus.SUCCEEDED,
-        "passed": ExecutionStatus.PASSED,
-        "complete": ExecutionStatus.COMPLETED,
-        "completed": ExecutionStatus.COMPLETED,
-        "error": ExecutionStatus.FAILED,
-        "failure": ExecutionStatus.FAILED,
-        "stopped": ExecutionStatus.CANCELLED,
-        "skip": ExecutionStatus.UNSUPPORTED,
-        "skipped": ExecutionStatus.UNSUPPORTED,
-    }
-    return aliases.get(raw, raw)
+def _normalise_job_status(value):
+    raw = str(getattr(value, 'value', value) or '').strip().lower()
+    return {'success': 'succeeded', 'complete': 'completed', 'error': 'failed',
+            'failure': 'failed', 'stopped': 'cancelled', 'skip': 'unsupported',
+            'skipped': 'unsupported'}.get(raw, raw)
 
 
-def _normalise_step_status(value: Any) -> str:
-    raw = str(getattr(value, "value", value) or "").strip().lower()
-    aliases = {
-        "success": StepStatus.SUCCEEDED,
-        "passed": StepStatus.PASSED,
-        "complete": StepStatus.COMPLETED,
-        "completed": StepStatus.COMPLETED,
-        "error": StepStatus.FAILED,
-        "failure": StepStatus.FAILED,
-        "skipped": StepStatus.SKIPPED,
-    }
-    return aliases.get(raw, raw)
+def _normalise_step_status(value):
+    raw = str(getattr(value, 'value', value) or '').strip().lower()
+    return {'success': 'succeeded', 'complete': 'completed', 'error': 'failed', 'failure': 'failed'}.get(raw, raw)
 
 
-def _error_type(value: Any) -> str:
-    raw = str(getattr(value, "value", value) or "").strip().lower()
-    allowed = {choice for choice, _label in ErrorType.choices}
-    return raw if raw in allowed else ErrorType.UNKNOWN
+def _error_type(value):
+    raw = str(getattr(value, 'value', value) or '').strip().lower()
+    return raw if raw in ErrorType.values else ErrorType.UNKNOWN
+
+
+def _safe_text(value):
+    return redact_result_payload(str(value or ''))[:4000]
 
 
 def _call_dispatcher(dispatcher, job, attempt, variant):
-    """Call old two-argument dispatchers and new variant-aware ones safely."""
     try:
         parameters = inspect.signature(dispatcher).parameters.values()
-        positional = [
-            parameter for parameter in parameters
-            if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        accepts_varargs = any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters)
+        positional = [p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        variadic = any(p.kind == p.VAR_POSITIONAL for p in parameters)
     except (TypeError, ValueError):
-        accepts_varargs = True
-        positional = []
-    if accepts_varargs or len(positional) >= 3:
+        variadic, positional = True, []
+    if variadic or len(positional) >= 3:
         return dispatcher(job, attempt, variant)
     return dispatcher(job, attempt)
 
 
 def _variant_aggregate(job):
+    from .gate_policy import extract_metrics, normalize_metric_rules, evaluate_metric_rules
+
     variants = list(job.variants.order_by('ordinal'))
-    statuses = [str(variant.status) for variant in variants]
-    active = {
-        ExecutionStatus.PENDING,
-        ExecutionStatus.QUEUED,
-        ExecutionStatus.RUNNING,
-        ExecutionStatus.CANCEL_REQUESTED,
-    }
-    if not variants or any(value in active for value in statuses):
-        aggregate_status = ExecutionStatus.RUNNING if variants else ExecutionStatus.PENDING
-    elif any(value == ExecutionStatus.BLOCKED for value in statuses):
-        aggregate_status = ExecutionStatus.BLOCKED
-    elif any(value == ExecutionStatus.FAILED for value in statuses):
-        aggregate_status = ExecutionStatus.FAILED
-    elif any(value == ExecutionStatus.CANCELLED for value in statuses):
-        aggregate_status = ExecutionStatus.CANCELLED
-    elif all(value == ExecutionStatus.UNSUPPORTED for value in statuses):
-        aggregate_status = ExecutionStatus.UNSUPPORTED
+    statuses = [v.status for v in variants]
+    if not variants or any(s not in _TERMINAL for s in statuses):
+        status = ExecutionStatus.RUNNING if variants else ExecutionStatus.PENDING
+    elif ExecutionStatus.BLOCKED in statuses:
+        status = ExecutionStatus.BLOCKED
+    elif ExecutionStatus.FAILED in statuses:
+        status = ExecutionStatus.FAILED
+    elif ExecutionStatus.CANCELLED in statuses:
+        status = ExecutionStatus.CANCELLED
+    elif ExecutionStatus.UNSUPPORTED in statuses:
+        status = ExecutionStatus.UNSUPPORTED
     else:
-        aggregate_status = ExecutionStatus.PASSED
-    return aggregate_status, {
-        'status': aggregate_status,
-        'count': len(variants),
-        'variants': [
-            {
-                'variant_key': variant.variant_key,
-                'ordinal': variant.ordinal,
-                'status': variant.status,
-                'result': variant.result,
-                'error_type': variant.error_type,
-                'error_message': variant.error_message,
-            }
-            for variant in variants
-        ],
+        status = ExecutionStatus.PASSED
+    aggregate = {
+        'status': status, 'count': len(variants),
+        'total': len(variants),
+        'passed': sum(v.status in _TERMINAL_SUCCESS for v in variants),
+        'failed': sum(v.status in {ExecutionStatus.FAILED, ExecutionStatus.BLOCKED} for v in variants),
+        'skipped': sum(v.status in {ExecutionStatus.CANCELLED, ExecutionStatus.UNSUPPORTED} for v in variants),
+        'variants': [dict(variant_key=v.variant_key, ordinal=v.ordinal, status=v.status,
+                          result=v.result, error_type=v.error_type, error_message=v.error_message) for v in variants],
     }
+    # Count metrics are additive; other configured metrics must hold for EVERY
+    # variant. Select a failing value if present, otherwise the strictest bound.
+    gate = getattr(getattr(job, 'profile', None), 'quality_gate', {})
+    try:
+        rules = normalize_metric_rules(gate)
+    except ValueError:
+        rules = {}
+    count_metrics = {'total', 'passed', 'failed', 'skipped', 'matched', 'unmatched'}
+    count_aggregation = {}
+    rows = [extract_metrics(v.result) for v in variants]
+    for metric, rule in rules.items():
+        if metric in count_metrics:
+            reported = [row[metric] for row in rows if metric in row]
+            if not reported:
+                count_aggregation[metric] = {
+                    'state': 'derived', 'reported_variants': 0,
+                    'expected_variants': len(rows), 'reported_total': None,
+                }
+                continue
+
+            def is_valid_count(value):
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return False
+                try:
+                    number = float(value)
+                except (OverflowError, TypeError, ValueError):
+                    return False
+                return math.isfinite(number) and number >= 0 and number.is_integer()
+
+            valid = [value for value in reported if is_valid_count(value)]
+            if len(reported) != len(rows):
+                aggregate[metric] = None
+                count_aggregation[metric] = {
+                    'state': 'partial', 'reported_variants': len(reported),
+                    'expected_variants': len(rows), 'reported_total': sum(valid),
+                    'invalid_values': len(reported) - len(valid),
+                }
+            elif len(valid) != len(reported):
+                aggregate[metric] = None
+                count_aggregation[metric] = {
+                    'state': 'invalid', 'reported_variants': len(reported),
+                    'expected_variants': len(rows), 'reported_total': sum(valid),
+                    'invalid_values': len(reported) - len(valid),
+                }
+            else:
+                aggregate[metric] = sum(reported)
+                count_aggregation[metric] = {
+                    'state': 'complete', 'reported_variants': len(reported),
+                    'expected_variants': len(rows), 'reported_total': aggregate[metric],
+                }
+            continue
+        if not rows or any(metric not in row for row in rows):
+            continue
+        values = [row[metric] for row in rows]
+        invalid = [value for value in values if evaluate_metric_rules({metric: rule}, {metric: value})]
+        aggregate[metric] = invalid[0] if invalid else values[0]
+    if count_aggregation:
+        aggregate['metric_aggregation'] = count_aggregation
+    return status, aggregate
+
+
+def _retry_decision(job, attempt, *, automatic):
+    if attempt is not None and attempt.variant_id:
+        scoped = SimpleNamespace(
+            attempt_number=attempt.variant.attempts.count(),
+            status=attempt.status,
+            error_type=attempt.error_type,
+        )
+        return should_retry(job, scoped, automatic=automatic)
+    return should_retry(job, attempt, automatic=automatic)
+
+
+def _receipt(job, attempt, *, created=False, supported=True, message='', details=None):
+    return AdapterReceipt(job.pk, attempt.pk if attempt else 0,
+                          attempt.attempt_number if attempt else 0, job.status, supported,
+                          dispatch_id=attempt.dispatch_id if attempt else '', message=message,
+                          created_attempt=created, details=details or {})
 
 
 class ExecutorAdapter:
-    """Small lifecycle contract shared by API/UI/APP/performance adapters."""
+    source_type = 'other'
 
-    source_type = "other"
-
-    def validate(self, job: ExecutionJob) -> None:
+    def validate(self, job):
         if job.source_type != self.source_type:
-            raise AdapterError(
-                f"Adapter {self.source_type!r} cannot handle source {job.source_type!r}"
-            )
+            raise AdapterError(f'Adapter {self.source_type!r} cannot handle source {job.source_type!r}')
         if not job.project_id:
-            raise AdapterError("Execution job must belong to a project")
+            raise AdapterError('Execution job must belong to a project')
 
     def _resolve_dispatcher(self, dispatcher=None):
         candidate = dispatcher if dispatcher is not None else getattr(self, 'dispatcher', None)
         supports = getattr(candidate, 'supports', None)
         if callable(supports):
             try:
-                supported = supports(self.source_type)
+                if not supports(self.source_type):
+                    return None
             except ValueError as exc:
-                raise AdapterConflict(f"Invalid dispatcher configuration: {exc}") from exc
-            if not supported:
-                return None
+                raise AdapterConflict(f'Invalid dispatcher configuration: {exc}') from exc
         return candidate
 
-    def _has_dispatcher(self) -> bool:
+    def _has_dispatcher(self):
         return self._resolve_dispatcher() is not None
 
-    def _schedule_retry_dispatch(self, request_id: int, dispatcher, worker: str = "") -> None:
+    def _schedule_retry_dispatch(self, request_id, dispatcher, worker=''):
         if dispatcher is None:
             return
 
         def dispatch_after_commit():
-            retry_request = ExecutionRetryRequest.objects.select_related('job', 'to_attempt').filter(pk=request_id).first()
-            if retry_request is None or retry_request.status != 'queued' or retry_request.scheduled_at > timezone.now():
+            request = ExecutionRetryRequest.objects.select_related('job').filter(pk=request_id).first()
+            if request is None or request.status != 'queued' or request.scheduled_at > timezone.now():
                 return
             try:
-                fresh_job = ExecutionJob.objects.get(pk=retry_request.job_id)
-                self.submit(fresh_job, dispatcher=dispatcher, worker=worker, requested_by=fresh_job.requested_by)
-                retry_request.status = 'dispatched'
-                retry_request.dispatched_at = timezone.now()
-                retry_request.save(update_fields=['status', 'dispatched_at', 'updated_at'])
-            except Exception as exc:  # noqa: BLE001 - outbox retains failure
-                retry_request.status = 'failed'
-                retry_request.error_message = str(exc)[:4000]
-                retry_request.save(update_fields=['status', 'error_message', 'updated_at'])
-
+                self.submit(request.job, dispatcher=dispatcher, worker=worker, requested_by=request.job.requested_by)
+                request.status, request.dispatched_at = 'dispatched', timezone.now()
+                request.save(update_fields=['status', 'dispatched_at', 'updated_at'])
+            except Exception as exc:
+                request.status, request.error_message = 'failed', _safe_text(exc)
+                request.save(update_fields=['status', 'error_message', 'updated_at'])
         transaction.on_commit(dispatch_after_commit)
 
-    def _submit_dataset(
-        self,
-        job: ExecutionJob,
-        *,
-        dispatcher=None,
-        worker='',
-    ) -> AdapterReceipt:
-        if not job.dataset_snapshot or not job.variants.exists():
-            job.initialize_dataset_variants()
-
-        with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.is_terminal and locked_job.status not in _TERMINAL_FAILURE:
-                raise AdapterConflict('A successful execution cannot be submitted again')
-            variants = list(locked_job.variants.select_for_update().order_by('ordinal'))
-            attempts = []
-            for variant in variants:
-                attempt = variant.attempts.order_by('-attempt_number').first()
-                if attempt is None or attempt.is_terminal:
-                    attempt, _created = locked_job.create_attempt(variant=variant, worker=worker)
-                attempts.append((variant, attempt))
-                if variant.status in _TERMINAL_FAILURE:
-                    continue
-                variant.status = AttemptStatus.QUEUED
-                variant.save(update_fields=['status', 'updated_at'])
-            if locked_job.status == ExecutionStatus.PENDING:
-                locked_job.transition_to(ExecutionStatus.QUEUED)
-
-        if dispatcher is None:
-            message = f'No dispatcher is registered for source type {self.source_type}'
-            for variant, attempt in attempts:
-                if not attempt.is_terminal:
-                    attempt.transition_to(AttemptStatus.UNSUPPORTED)
-                variant.status = ExecutionStatus.UNSUPPORTED
-                variant.error_type = ErrorType.UNSUPPORTED
-                variant.error_message = message
-                variant.finished_at = timezone.now()
-                variant.save(update_fields=['status', 'error_type', 'error_message', 'finished_at', 'updated_at'])
-            locked_job.refresh_from_db()
-            locked_job.result = _variant_aggregate(locked_job)[1]
-            locked_job.error_type = ErrorType.UNSUPPORTED
-            locked_job.error_message = message
-            locked_job.transition_to(ExecutionStatus.UNSUPPORTED, reason=message)
-            locked_job.save(update_fields=['result', 'error_type', 'error_message', 'updated_at'])
-            return AdapterReceipt(
-                job_id=locked_job.pk,
-                attempt_id=attempts[0][1].pk if attempts else 0,
-                attempt_number=attempts[0][1].attempt_number if attempts else 0,
-                status=locked_job.status,
-                supported=False,
-                message=message,
-                created_attempt=True,
-                details={'variant_count': len(attempts), 'variants': [variant.variant_key for variant, _ in attempts]},
-            )
-
-        if locked_job.status == ExecutionStatus.QUEUED:
-            locked_job.transition_to(ExecutionStatus.RUNNING)
-        dispatch_ids = []
-        for variant, attempt in attempts:
-            if variant.status in _TERMINAL_FAILURE:
-                continue
-            if attempt.status == AttemptStatus.QUEUED:
-                attempt.transition_to(AttemptStatus.RUNNING)
-            variant.status = ExecutionStatus.RUNNING
-            variant.started_at = timezone.now()
-            variant.save(update_fields=['status', 'started_at', 'updated_at'])
-            try:
-                dispatch_result = _call_dispatcher(dispatcher, locked_job, attempt, variant)
-                if isinstance(dispatch_result, Mapping) and (
-                    'status' in dispatch_result or 'result' in dispatch_result or 'summary' in dispatch_result
-                ):
-                    self.collect_variant_result(locked_job, variant, dispatch_result, attempt=attempt)
-                    dispatch_id = dispatch_result.get('dispatch_id', '')
-                else:
-                    dispatch_id = str(dispatch_result or '')
-                    variant.dispatch_id = dispatch_id
-                    variant.save(update_fields=['dispatch_id', 'updated_at'])
-                if dispatch_id:
-                    attempt.dispatch_id = str(dispatch_id)
-                    attempt.save(update_fields=['dispatch_id', 'updated_at'])
-                dispatch_ids.append(dispatch_id)
-            except Exception as exc:  # noqa: BLE001 - preserve per-variant failure
-                self.collect_variant_result(
-                    locked_job,
-                    variant,
-                    {'status': ExecutionStatus.FAILED, 'error_type': ErrorType.INFRASTRUCTURE, 'error_message': str(exc)},
-                    attempt=attempt,
-                )
-        locked_job.refresh_from_db()
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=attempts[0][1].pk if attempts else 0,
-            attempt_number=attempts[0][1].attempt_number if attempts else 0,
-            status=locked_job.status,
-            supported=True,
-            dispatch_id=str(dispatch_ids[0] if dispatch_ids else ''),
-            created_attempt=bool(attempts),
-            details={
-                'variant_count': len(attempts),
-                'variants': [variant.variant_key for variant, _ in attempts],
-                'dispatch_ids': dispatch_ids,
-            },
-        )
-
-    def submit(
-        self,
-        job: ExecutionJob,
-        *,
-        dispatcher: Optional[Callable[[ExecutionJob, ExecutionAttempt], Any]] = None,
-        worker: str = "",
-        quarantine_override: bool = False,
-        override_reason: str = "",
-        requested_by=None,
-    ) -> AdapterReceipt:
-        """Create an attempt and optionally dispatch the legacy executor.
-
-        ``dispatcher`` is injected by the module integration layer.  Without
-        it, the request is closed as UNSUPPORTED instead of pretending that a
-        pending job was executed.
-        """
-        self.validate(job)
-        governance = check_dispatch_governance(
-            job,
-            override=quarantine_override,
-            override_reason=override_reason,
-            actor=requested_by or job.requested_by,
-        )
-        if not governance.get("allowed"):
-            raise AdapterConflict(f"Dispatch denied: {governance.get('reason')}")
-        if job.dataset_id:
-            return self._submit_dataset(
-                job,
-                dispatcher=dispatcher,
-                worker=worker,
-            )
-        with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.is_terminal and locked_job.status not in _TERMINAL_FAILURE:
-                raise AdapterConflict("A successful execution cannot be submitted again")
-            latest_attempt = locked_job.attempts.order_by('-attempt_number').first()
-            if (
-                locked_job.status == ExecutionStatus.QUEUED
-                and latest_attempt is not None
-                and latest_attempt.status in {AttemptStatus.PENDING, AttemptStatus.QUEUED}
-            ):
-                attempt, created = latest_attempt, False
-            else:
-                attempt, created = locked_job.create_attempt(worker=worker)
-            if locked_job.status == ExecutionStatus.PENDING:
-                locked_job.transition_to(ExecutionStatus.QUEUED)
-            if attempt.status == AttemptStatus.PENDING:
-                attempt.transition_to(AttemptStatus.QUEUED)
-
-        if dispatcher is None:
-            message = f"No dispatcher is registered for source type {self.source_type}"
-            attempt.transition_to(AttemptStatus.UNSUPPORTED)
-            locked_job.transition_to(ExecutionStatus.UNSUPPORTED, reason=message)
-            return AdapterReceipt(
-                job_id=locked_job.pk,
-                attempt_id=attempt.pk,
-                attempt_number=attempt.attempt_number,
-                status=locked_job.status,
-                supported=False,
-                message=message,
-                created_attempt=created,
-            )
-
-        try:
-            dispatch_id = dispatcher(locked_job, attempt)
-            attempt.dispatch_id = str(dispatch_id or '')
-            attempt.save(update_fields=['dispatch_id', 'updated_at'])
-        except Exception as exc:  # noqa: BLE001 - adapter boundary records failure
-            message = str(exc)[:4000]
-            attempt.error_type = ErrorType.INFRASTRUCTURE
-            attempt.error_message = message
-            attempt.save(update_fields=["error_type", "error_message", "updated_at"])
-            attempt.transition_to(AttemptStatus.FAILED)
-            locked_job.error_type = ErrorType.INFRASTRUCTURE
-            locked_job.error_message = message
-            locked_job.save(update_fields=["error_type", "error_message", "updated_at"])
-            locked_job.transition_to(ExecutionStatus.FAILED)
-            decision = should_retry(locked_job, attempt, automatic=True)
-            retry_request_id = None
-            if decision.allowed:
-                policy = resolve_retry_policy(locked_job)
-                clear_final_for_retry(locked_job)
-                mark_retry_requested(attempt, "automatic retry: dispatcher failure", policy=policy, decision=decision.reason)
-                locked_job.transition_to(ExecutionStatus.QUEUED, reason="automatic retry")
-                next_attempt, _created = locked_job.create_attempt()
-                next_attempt.transition_to(AttemptStatus.QUEUED)
-                retry_request = create_retry_request(locked_job, attempt, next_attempt, policy, "automatic retry: dispatcher failure")
-                retry_request_id = retry_request.pk
-            if retry_request_id:
-                self._schedule_retry_dispatch(retry_request_id, dispatcher, worker)
-            return AdapterReceipt(
-                job_id=locked_job.pk,
-                attempt_id=attempt.pk,
-                attempt_number=attempt.attempt_number,
-                status=locked_job.status,
-                supported=True,
-                message=message,
-                details={"automatic_retry": bool(retry_request_id), "retry_request_id": retry_request_id},
-            )
-
+    def _reserve(self, job, attempt, dispatcher):
+        if attempt.dispatch_reserved_at or attempt.dispatch_id or attempt.worker_claim_id or attempt.is_terminal:
+            return False
+        attempt.dispatch_reserved_at = timezone.now()
+        if isinstance(dispatcher, CeleryExecutionDispatcher):
+            attempt.dispatch_id = f'execution-{job.pk}-{attempt.pk}'
+            if attempt.variant_id:
+                attempt.dispatch_id += f'-variant-{attempt.variant_id}'
+        attempt.save(update_fields=['dispatch_reserved_at', 'dispatch_id', 'updated_at'])
+        if attempt.status == AttemptStatus.PENDING:
+            attempt.transition_to(AttemptStatus.QUEUED)
         if attempt.status == AttemptStatus.QUEUED:
             attempt.transition_to(AttemptStatus.RUNNING)
-        if locked_job.status == ExecutionStatus.QUEUED:
-            locked_job.worker = worker or locked_job.worker
-            locked_job.save(update_fields=["worker", "updated_at"])
-            locked_job.transition_to(ExecutionStatus.RUNNING)
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=attempt.pk,
-            attempt_number=attempt.attempt_number,
-            status=locked_job.status,
-            supported=True,
-            dispatch_id=str(dispatch_id or ""),
-            created_attempt=created,
-        )
+        return True
 
-    def cancel(
-        self,
-        job: ExecutionJob,
-        *,
-        reason: str = "",
-        canceller: Optional[Callable[[ExecutionJob, ExecutionAttempt], Any]] = None,
-    ) -> AdapterReceipt:
-        """Request cancellation and invoke a legacy stop callback when supplied."""
+    def _dispatch_reserved(self, job, attempt, dispatcher, variant=None):
+        if dispatcher is None:
+            self.collect_result(job, attempt, {'status': 'unsupported', 'error_type': 'unsupported',
+                                             'error_message': f'No dispatcher is registered for source type {self.source_type}'})
+            return ''
+        try:
+            result = _call_dispatcher(dispatcher, job, attempt, variant)
+            if isinstance(result, Mapping):
+                if 'status' in result or 'result' in result or 'summary' in result:
+                    self.collect_result(job, attempt, result)
+                dispatch_id = str(result.get('dispatch_id') or '')
+            else:
+                dispatch_id = str(result or '')
+            # Update only the dispatch field; eager workers may already have
+            # finished this attempt while the broker call was returning.
+            if dispatch_id:
+                ExecutionAttempt.objects.filter(pk=attempt.pk).update(dispatch_id=dispatch_id)
+                if variant is not None:
+                    type(variant).objects.filter(pk=variant.pk).update(dispatch_id=dispatch_id)
+                attempt.dispatch_id = dispatch_id
+            return dispatch_id
+        except Exception as exc:
+            self.collect_result(job, attempt, {'status': 'failed', 'error_type': 'infrastructure', 'error_message': _safe_text(exc)})
+            return ''
+
+    def _submit_dataset(self, job, *, dispatcher=None, worker=''):
+        with transaction.atomic():
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            if locked.is_terminal:
+                raise AdapterConflict('A terminal execution requires an explicit retry')
+            if locked.status == ExecutionStatus.CANCEL_REQUESTED:
+                return _receipt(locked, locked.attempts.order_by('-attempt_number').first(), message='execution cancellation requested')
+            if not locked.dataset_snapshot or not locked.variants.exists():
+                locked.initialize_dataset_variants()
+            variants = list(locked.variants.select_for_update().order_by('ordinal'))
+            if not variants:
+                raise AdapterConflict('Dataset must produce at least one variant')
+            reserved, attempts = [], []
+            for variant in variants:
+                attempt = variant.attempts.order_by('-attempt_number').first()
+                if attempt is None:
+                    attempt, _ = locked.create_attempt(variant=variant, worker=worker)
+                attempts.append(attempt)
+                if variant.status in _TERMINAL:
+                    continue
+                if self._reserve(locked, attempt, dispatcher):
+                    variant.status, variant.started_at = ExecutionStatus.RUNNING, timezone.now()
+                    variant.save(update_fields=['status', 'started_at', 'updated_at'])
+                    reserved.append((variant, attempt))
+            if locked.status == ExecutionStatus.PENDING:
+                locked.transition_to(ExecutionStatus.QUEUED)
+            if locked.status == ExecutionStatus.QUEUED:
+                locked.transition_to(ExecutionStatus.RUNNING)
+        ids = [self._dispatch_reserved(locked, a, dispatcher, v) for v, a in reserved]
+        locked.refresh_from_db()
+        attempts[0].refresh_from_db()
+        return _receipt(locked, attempts[0], created=bool(reserved), supported=dispatcher is not None,
+                        details={'variant_count': len(variants), 'variants': [v.variant_key for v in variants], 'dispatch_ids': ids})
+
+    def submit(self, job, *, dispatcher: Optional[Callable] = None, worker='',
+               quarantine_override=False, override_reason='', requested_by=None):
+        self.validate(job)
+        governance = check_dispatch_governance(job, override=quarantine_override,
+                                              override_reason=override_reason, actor=requested_by or job.requested_by)
+        if not governance.get('allowed'):
+            raise AdapterConflict(f"Dispatch denied: {governance.get('reason')}")
+        if job.dataset_id:
+            return self._submit_dataset(job, dispatcher=dispatcher, worker=worker)
+        with transaction.atomic():
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            if locked.is_terminal:
+                raise AdapterConflict('A terminal execution requires an explicit retry')
+            attempt = locked.attempts.order_by('-attempt_number').first()
+            created = attempt is None
+            if attempt is None:
+                attempt, _ = locked.create_attempt(worker=worker)
+            if locked.status == ExecutionStatus.CANCEL_REQUESTED or not self._reserve(locked, attempt, dispatcher):
+                return _receipt(locked, attempt, message='dispatch already reserved')
+            if locked.status == ExecutionStatus.PENDING:
+                locked.transition_to(ExecutionStatus.QUEUED)
+            if locked.status == ExecutionStatus.QUEUED:
+                locked.worker = worker or locked.worker
+                locked.save(update_fields=['worker', 'updated_at'])
+                locked.transition_to(ExecutionStatus.RUNNING)
+        self._dispatch_reserved(locked, attempt, dispatcher)
+        locked.refresh_from_db()
+        attempt.refresh_from_db()
+        return _receipt(locked, attempt, created=created, supported=dispatcher is not None,
+                        message=attempt.error_message,
+                        details={'automatic_retry': locked.retry_requests.filter(from_attempt=attempt).exists()})
+
+    def cancel(self, job, *, reason='', canceller=None):
         self.validate(job)
         with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.status in _TERMINAL_SUCCESS:
-                raise AdapterConflict("A successful execution cannot be cancelled")
-            attempt = locked_job.attempts.order_by("-attempt_number").first()
-            locked_job.request_cancel(reason)
-            if attempt and attempt.status in {
-                AttemptStatus.PENDING,
-                AttemptStatus.QUEUED,
-                AttemptStatus.RUNNING,
-            }:
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            if locked.status in _TERMINAL_SUCCESS:
+                raise AdapterConflict('A successful execution cannot be cancelled')
+            locked.request_cancel(_safe_text(reason))
+            attempts = list(locked.attempts.filter(status__in=[AttemptStatus.PENDING, AttemptStatus.QUEUED, AttemptStatus.RUNNING]))
+            for attempt in attempts:
                 attempt.transition_to(AttemptStatus.CANCEL_REQUESTED)
+        if canceller:
+            for attempt in attempts:
+                canceller(locked, attempt)
+        return _receipt(locked, attempts[-1] if attempts else None, message=_safe_text(reason))
 
-        if canceller and attempt:
-            canceller(locked_job, attempt)
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=attempt.pk if attempt else 0,
-            attempt_number=attempt.attempt_number if attempt else 0,
-            status=locked_job.status,
-            supported=True,
-            message=reason,
-        )
-
-    def retry(self, job: ExecutionJob, *, reason: str = "retry requested", requested_by=None, automatic: bool = False) -> AdapterReceipt:
-        """Queue a new attempt with an auditable reason and policy check."""
+    def retry(self, job, *, reason='retry requested', requested_by=None, automatic=False):
         self.validate(job)
         if self._resolve_dispatcher() is None:
-            raise AdapterConflict(
-                f"No dispatcher is registered for source type {self.source_type}; retry cannot be queued"
-            )
+            raise AdapterConflict(f'No dispatcher is registered for source type {self.source_type}; retry cannot be queued')
         with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.status not in _TERMINAL_FAILURE:
-                raise AdapterConflict("Only failed, blocked, cancelled or unsupported jobs can retry")
-            previous = locked_job.attempts.order_by('-attempt_number').first()
-            decision = should_retry(locked_job, previous, automatic=automatic)
-            if not decision.allowed:
-                raise AdapterConflict(f"Retry denied: {decision.reason}")
-            policy = resolve_retry_policy(locked_job)
-            if previous is not None:
-                clear_final_for_retry(locked_job)
-                mark_retry_requested(
-                    previous,
-                    reason,
-                    requested_by,
-                    policy=policy,
-                    decision=decision.reason,
-                    automatic=automatic,
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            if locked.status not in _TERMINAL_FAILURE:
+                raise AdapterConflict('Only failed, blocked, cancelled or unsupported jobs can retry')
+            previous = locked.attempts.order_by('-attempt_number').first()
+            is_matrix = bool(locked.dataset_id or locked.dataset_snapshot or locked.variants.exists())
+            retry_entries = []
+            if is_matrix:
+                failed_variants = list(
+                    locked.variants.select_for_update()
+                    .filter(status__in=_TERMINAL_FAILURE)
+                    .order_by('ordinal')
                 )
-            locked_job.transition_to(ExecutionStatus.QUEUED, reason=str(reason or "retry requested")[:4000])
-            attempt, created = locked_job.create_attempt()
-            attempt.transition_to(AttemptStatus.QUEUED)
-            retry_request = create_retry_request(
-                locked_job,
-                previous or attempt,
-                attempt,
-                policy,
-                reason,
-                automatic=automatic,
-                requested_by=requested_by,
-            )
-        if getattr(self, 'dispatcher', None) is not None:
-            self._schedule_retry_dispatch(retry_request.pk, self.dispatcher)
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=attempt.pk,
-            attempt_number=attempt.attempt_number,
-            status=locked_job.status,
-            supported=True,
-            message="retry queued",
-            created_attempt=created,
-            details={"retry_reason": str(reason or "retry requested")[:4000], "policy": decision.as_dict(), "retry_request_id": retry_request.pk},
-        )
-
-    def collect_variant_result(
-        self,
-        job: ExecutionJob,
-        variant,
-        payload: Mapping[str, Any],
-        *,
-        attempt=None,
-    ) -> AdapterReceipt:
-        """Persist one variant result and aggregate it into the owning job."""
-        status_value = _normalise_job_status(payload.get('status', ExecutionStatus.SUCCEEDED))
-        if status_value not in set(ExecutionStatus.values):
-            raise AdapterError(f'Unknown execution result status: {status_value}')
-        with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            locked_variant = locked_job.variants.select_for_update().get(pk=variant.pk)
-            locked_attempt = None
-            if attempt is not None:
-                locked_attempt = ExecutionAttempt.objects.select_for_update().get(pk=attempt.pk)
+                if not failed_variants:
+                    raise AdapterConflict('Dataset has no failed variants to retry')
+                decisions = []
+                for variant in failed_variants:
+                    old_attempt = variant.latest_attempt
+                    variant_decision = _retry_decision(locked, old_attempt, automatic=automatic)
+                    decisions.append((variant, old_attempt, variant_decision))
+                retry_entries = [entry for entry in decisions if entry[1] is not None and entry[2].allowed]
+                if not retry_entries:
+                    reason_code = decisions[0][2].reason if decisions else 'NO_RETRYABLE_VARIANTS'
+                    raise AdapterConflict(f'Retry denied: {reason_code}')
+                decision = retry_entries[0][2]
+                previous = retry_entries[0][1]
             else:
-                locked_attempt = locked_variant.attempts.order_by('-attempt_number').first()
-            if locked_attempt is None:
+                decision = _retry_decision(locked, previous, automatic=automatic)
+                if not decision.allowed:
+                    raise AdapterConflict(f'Retry denied: {decision.reason}')
+            policy = resolve_retry_policy(locked)
+            clear_final_for_retry(locked)
+            locked.transition_to(ExecutionStatus.QUEUED, reason=_safe_text(reason))
+            retry_requests = []
+            attempts = []
+            if is_matrix:
+                for variant, old_attempt, variant_decision in retry_entries:
+                    mark_retry_requested(old_attempt, _safe_text(reason), requested_by, policy=policy,
+                                         decision=variant_decision.reason, automatic=automatic)
+                    attempt, _ = locked.create_attempt(variant=variant)
+                    attempt.transition_to(AttemptStatus.QUEUED)
+                    variant.status, variant.finished_at = ExecutionStatus.QUEUED, None
+                    variant.save(update_fields=['status', 'finished_at', 'updated_at'])
+                    attempts.append(attempt)
+                    retry_requests.append(create_retry_request(
+                        locked, old_attempt, attempt, policy, _safe_text(reason),
+                        automatic=automatic, requested_by=requested_by,
+                    ))
+                attempt = attempts[0]
+            else:
+                if previous:
+                    mark_retry_requested(previous, _safe_text(reason), requested_by, policy=policy,
+                                         decision=decision.reason, automatic=automatic)
+                attempt, _ = locked.create_attempt()
+                attempt.transition_to(AttemptStatus.QUEUED)
+                attempts.append(attempt)
+                retry_requests.append(create_retry_request(
+                    locked, previous or attempt, attempt, policy, _safe_text(reason),
+                    automatic=automatic, requested_by=requested_by,
+                ))
+        dispatcher = self._resolve_dispatcher()
+        for request in retry_requests:
+            self._schedule_retry_dispatch(request.pk, dispatcher)
+        request_ids = [request.pk for request in retry_requests]
+        return _receipt(locked, attempt, created=True, message='retry queued',
+                        details={'retry_reason': _safe_text(reason), 'policy': decision.as_dict(),
+                                 'retry_request_id': request_ids[0], 'retry_request_ids': request_ids})
+
+    def collect_variant_result(self, job, variant, payload, *, attempt=None):
+        if not isinstance(payload, Mapping):
+            raise AdapterError('Execution result must be an object')
+        target = _normalise_job_status(payload.get('status', ExecutionStatus.SUCCEEDED))
+        if target not in _TERMINAL:
+            raise AdapterError(f'Unknown terminal execution result status: {target}')
+        with transaction.atomic():
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            variant = locked.variants.select_for_update().get(pk=variant.pk)
+            current = variant.attempts.order_by('-attempt_number').first()
+            if current is None:
                 raise AdapterError('Variant has no execution attempt')
-            if locked_variant.status in _TERMINAL_SUCCESS | _TERMINAL_FAILURE:
-                return AdapterReceipt(
-                    job_id=locked_job.pk,
-                    attempt_id=locked_attempt.pk,
-                    attempt_number=locked_attempt.attempt_number,
-                    status=locked_job.status,
-                    supported=True,
-                    message='late variant result retained as history',
-                    details={'ignored': True, 'variant_key': locked_variant.variant_key},
-                )
+            if attempt is not None and (attempt.job_id != locked.pk or attempt.variant_id != variant.pk):
+                raise AdapterError('Attempt does not belong to the variant')
+            attempt = ExecutionAttempt.objects.select_for_update().get(pk=(attempt or current).pk)
+            if locked.final_attempt_id or locked.is_terminal or attempt.pk != current.pk or attempt.is_terminal or variant.status in _TERMINAL:
+                return _receipt(locked, attempt, message='late variant result retained as history', details={'ignored': True})
+            if locked.status == ExecutionStatus.CANCEL_REQUESTED or attempt.status == AttemptStatus.CANCEL_REQUESTED:
+                target = ExecutionStatus.CANCELLED
+            result = payload.get('result') or payload.get('summary') or {}
+            if not isinstance(result, Mapping):
+                raise AdapterError('Execution result must be an object')
+            result = redact_result_payload(dict(result))
+            error_type = _error_type(payload.get('error_type')) if target in _TERMINAL_FAILURE else ''
+            error = _safe_text(payload.get('error_message'))
+            variant.status, variant.result = target, result
+            variant.error_type, variant.error_message, variant.finished_at = error_type, error, timezone.now()
+            variant.save(update_fields=['status', 'result', 'error_type', 'error_message', 'finished_at', 'updated_at'])
+            attempt.result, attempt.error_type, attempt.error_message = result, error_type, error
+            attempt.save(update_fields=['result', 'error_type', 'error_message', 'updated_at'])
+            attempt.transition_to(target)
+            aggregate_status, aggregate = _variant_aggregate(locked)
+            locked.result = redact_result_payload(aggregate)
+            locked.save(update_fields=['result', 'updated_at'])
+            if aggregate_status in _TERMINAL:
+                gate = apply_quality_gate(locked, aggregate, stage='result', attempt=attempt)
+                if aggregate_status in _TERMINAL_SUCCESS and gate.get('configured') and not gate.get('passed'):
+                    aggregate_status = ExecutionStatus.BLOCKED
+                    locked.error_type, locked.error_message = ErrorType.CONFIGURATION, 'Quality gate failed'
+                    locked.save(update_fields=['error_type', 'error_message', 'updated_at'])
+                if locked.status == ExecutionStatus.PENDING:
+                    locked.transition_to(ExecutionStatus.QUEUED)
+                if locked.status == ExecutionStatus.QUEUED:
+                    locked.transition_to(ExecutionStatus.RUNNING)
+                retry_requests = []
+                retry_dispatcher = self._resolve_dispatcher()
+                if retry_dispatcher is not None and locked.status != ExecutionStatus.CANCEL_REQUESTED:
+                    for failed_variant in locked.variants.filter(status__in=_TERMINAL_FAILURE).order_by('ordinal'):
+                        previous = failed_variant.latest_attempt
+                        decision = _retry_decision(locked, previous, automatic=True)
+                        if not decision.allowed:
+                            continue
+                        policy = resolve_retry_policy(locked)
+                        reason = 'automatic variant retry: ' + decision.reason
+                        mark_retry_requested(previous, reason, policy=policy, decision=decision.reason)
+                        next_attempt, _ = locked.create_attempt(variant=failed_variant)
+                        next_attempt.transition_to(AttemptStatus.QUEUED)
+                        failed_variant.status, failed_variant.finished_at = ExecutionStatus.QUEUED, None
+                        failed_variant.save(update_fields=['status', 'finished_at', 'updated_at'])
+                        retry_requests.append(create_retry_request(locked, previous, next_attempt, policy, reason).pk)
+                if retry_requests:
+                    locked.result = redact_result_payload(_variant_aggregate(locked)[1])
+                    locked.save(update_fields=['result', 'updated_at'])
+                    for request_id in retry_requests:
+                        self._schedule_retry_dispatch(request_id, retry_dispatcher)
+                else:
+                    locked.transition_to(aggregate_status)
+                    sync_quality_result(locked, attempt, aggregate_status, aggregate)
+                    preserve_final_result(locked, attempt, aggregate_status, aggregate, gate)
+        return _receipt(locked, attempt, message='variant result collected', details={'variant_key': variant.variant_key, 'aggregate': aggregate})
 
-            safe_result = redact_result_payload(payload.get('result') or payload.get('summary') or {})
-            error_type = _error_type(payload.get('error_type')) if status_value in _TERMINAL_FAILURE else ''
-            error_message = str(payload.get('error_message') or '')[:4000]
-            locked_variant.result = safe_result
-            locked_variant.status = status_value
-            locked_variant.error_type = error_type
-            locked_variant.error_message = error_message
-            locked_variant.finished_at = timezone.now() if status_value in _TERMINAL_SUCCESS | _TERMINAL_FAILURE else None
-            locked_variant.save(update_fields=['result', 'status', 'error_type', 'error_message', 'finished_at', 'updated_at'])
-            locked_attempt.result = safe_result
-            locked_attempt.error_type = error_type
-            locked_attempt.error_message = error_message
-            locked_attempt.save(update_fields=['result', 'error_type', 'error_message', 'updated_at'])
-            if not locked_attempt.is_terminal:
-                locked_attempt.transition_to(status_value)
-
-            aggregate_status, aggregate = _variant_aggregate(locked_job)
-            locked_job.result = redact_result_payload(aggregate)
-            locked_job.save(update_fields=['result', 'updated_at'])
-            if aggregate_status == ExecutionStatus.RUNNING:
-                if locked_job.status == ExecutionStatus.PENDING:
-                    locked_job.transition_to(ExecutionStatus.QUEUED)
-                if locked_job.status == ExecutionStatus.QUEUED:
-                    locked_job.transition_to(ExecutionStatus.RUNNING)
-            elif not locked_job.is_terminal:
-                if locked_job.status == ExecutionStatus.PENDING:
-                    locked_job.transition_to(ExecutionStatus.QUEUED)
-                if locked_job.status == ExecutionStatus.QUEUED:
-                    locked_job.transition_to(ExecutionStatus.RUNNING)
-                locked_job.transition_to(aggregate_status)
-                locked_attempt.is_final = True
-                locked_attempt.save(update_fields=['is_final', 'updated_at'])
-                ExecutionAttempt.objects.filter(job=locked_job).exclude(pk=locked_attempt.pk).update(is_final=False)
-                locked_job.final_result = redact_result_payload(aggregate)
-                locked_job.final_attempt = locked_attempt
-                locked_job.final_status = aggregate_status
-                locked_job.finalized_at = timezone.now()
-                locked_job.save(update_fields=['final_result', 'final_attempt', 'final_status', 'finalized_at', 'updated_at'])
-
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=locked_attempt.pk,
-            attempt_number=locked_attempt.attempt_number,
-            status=locked_job.status,
-            supported=True,
-            message='variant result collected',
-            details={'variant_key': locked_variant.variant_key, 'aggregate': aggregate},
-        )
-
-    def collect_result(
-        self,
-        job: ExecutionJob,
-        attempt: ExecutionAttempt,
-        payload: Mapping[str, Any],
-    ) -> AdapterReceipt:
-        """Persist a normalized result payload emitted by a legacy executor."""
-        variant = getattr(attempt, 'variant', None)
-        if variant is not None:
-            return self.collect_variant_result(job, variant, payload, attempt=attempt)
-        status_value = _normalise_job_status(payload.get("status", ExecutionStatus.SUCCEEDED))
-        if status_value not in set(ExecutionStatus.values):
-            raise AdapterError(f"Unknown execution result status: {status_value}")
-        step_payloads = payload.get("steps") or []
-        artifact_payloads = payload.get("artifacts") or []
-        retry_request_id = None
+    def collect_result(self, job, attempt, payload):
+        if not isinstance(payload, Mapping):
+            raise AdapterError('Execution result must be an object')
+        if attempt.variant_id:
+            return self.collect_variant_result(job, attempt.variant, payload, attempt=attempt)
+        target = _normalise_job_status(payload.get('status', ExecutionStatus.SUCCEEDED))
+        if target not in _TERMINAL:
+            raise AdapterError(f'Unknown terminal execution result status: {target}')
+        result = payload.get('result') or payload.get('summary') or {}
+        if not isinstance(result, Mapping):
+            raise AdapterError('Execution result must be an object')
+        steps, artifacts = payload.get('steps') or [], payload.get('artifacts') or []
+        if not isinstance(steps, list) or not isinstance(artifacts, list):
+            raise AdapterError('Steps and artifacts must be lists')
+        request_id, retried, retry_blocked = None, False, False
         with transaction.atomic():
-            locked_job = ExecutionJob.objects.select_for_update().get(pk=job.pk)
-            locked_attempt = ExecutionAttempt.objects.select_for_update().get(pk=attempt.pk)
-            if locked_job.final_attempt_id:
-                return AdapterReceipt(
-                    job_id=locked_job.pk,
-                    attempt_id=locked_attempt.pk,
-                    attempt_number=locked_attempt.attempt_number,
-                    status=locked_job.status,
-                    supported=True,
-                    message="late result retained as history",
-                    details={"ignored": True, "final_attempt_id": locked_job.final_attempt_id},
-                )
-            locked_attempt.result = redact_result_payload(dict(payload.get("result") or payload.get("summary") or {}))
-            locked_attempt.error_type = _error_type(payload.get("error_type")) if status_value in _TERMINAL_FAILURE else ""
-            locked_attempt.error_message = str(payload.get("error_message") or "")[:4000]
-            locked_attempt.save(update_fields=["result", "error_type", "error_message", "updated_at"])
-            if locked_attempt.status not in {AttemptStatus.PENDING, AttemptStatus.QUEUED, AttemptStatus.RUNNING}:
-                raise AdapterConflict("Attempt is already terminal")
-
-            for item in step_payloads:
-                item = dict(item)
-                case_key = str(item.get("case_key") or "default")
-                step_key = str(item.get("step_key") or item.get("id") or case_key)
-                step, _created = ExecutionStepResult.objects.get_or_create(
-                    attempt=locked_attempt,
-                    case_key=case_key,
-                    step_key=step_key,
-                    defaults={
-                        "idempotency_key": str(item.get("idempotency_key") or "step-" + case_key + "-" + step_key),
-                    },
-                )
-                normalized_step_status = _normalise_step_status(item.get("status", status_value))
-                if normalized_step_status not in set(StepStatus.values):
-                    raise AdapterError(f"Unknown execution step status: {normalized_step_status}")
-                if step.status in set(StepStatus.values) - {StepStatus.PENDING, StepStatus.RUNNING} and normalized_step_status != step.status:
-                    raise AdapterConflict("Attempt step is already terminal")
-                step.status = normalized_step_status
-                step.result = redact_result_payload(dict(item.get("result") or {}))
-                step.error_type = _error_type(item.get("error_type"))
-                step.error_message = str(item.get("error_message") or "")[:4000]
-                step.duration_ms = item.get("duration_ms")
-                step.save(update_fields=["status", "result", "error_type", "error_message", "duration_ms", "updated_at"])
-
-            for item in artifact_payloads:
-                item = dict(item)
-                uri = str(item.get("uri") or "").strip()
-                if not uri:
-                    continue
-                ExecutionArtifact.objects.get_or_create(
-                    idempotency_key=str(item.get("idempotency_key") or f"artifact-{locked_attempt.pk}-{uri}"),
-                    defaults={
-                        "job": locked_job,
-                        "attempt": locked_attempt,
-                        "uri": uri,
-                        "content_hash": str(item.get("content_hash") or ""),
-                        "media_type": str(item.get("media_type") or ""),
-                        "size_bytes": item.get("size_bytes"),
-                        "retention_policy": str(item.get("retention_policy") or "default"),
-                        "metadata": redact_result_payload(dict(item.get("metadata") or {})),
-                    },
-                )
-
-            result_payload = redact_result_payload(dict(payload.get("result") or payload.get("summary") or {}))
-            gate_result = apply_quality_gate(locked_job, result_payload, stage="result", attempt=locked_attempt)
-            effective_status = status_value
-            if status_value in _TERMINAL_SUCCESS and gate_result.get("configured") and not gate_result.get("passed"):
-                effective_status = ExecutionStatus.BLOCKED
-                locked_attempt.error_type = ErrorType.CONFIGURATION
-                locked_attempt.error_message = "Quality gate failed"
-                locked_attempt.save(update_fields=["error_type", "error_message", "updated_at"])
-
-            locked_job.result = result_payload
-            locked_job.error_type = locked_attempt.error_type
-            locked_job.error_message = locked_attempt.error_message
-            locked_job.save(update_fields=["result", "error_type", "error_message", "updated_at"])
-            if locked_job.status not in {ExecutionStatus.PENDING, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING}:
-                raise AdapterConflict("Job is already terminal")
-            locked_attempt.transition_to(effective_status)
-            locked_job.transition_to(effective_status)
-            sync_quality_result(locked_job, locked_attempt, effective_status, result_payload)
-
-            decision = should_retry(locked_job, locked_attempt, automatic=True)
-            retried = False
-            retry_blocked = False
-            retry_dispatcher = self._resolve_dispatcher()
-            if effective_status in _TERMINAL_FAILURE and decision.allowed and retry_dispatcher is not None:
-                policy = resolve_retry_policy(locked_job)
-                clear_final_for_retry(locked_job)
-                mark_retry_requested(
-                    locked_attempt,
-                    "automatic retry: " + decision.reason,
-                    policy=policy,
-                    decision=decision.reason,
-                    automatic=True,
-                )
-                locked_job.transition_to(ExecutionStatus.QUEUED, reason="automatic retry")
-                next_attempt, _next_created = locked_job.create_attempt()
+            locked = ExecutionJob.objects.select_for_update().get(pk=job.pk)
+            attempt = ExecutionAttempt.objects.select_for_update().get(pk=attempt.pk, job=locked)
+            current = locked.attempts.filter(variant_id=None).order_by('-attempt_number').first()
+            if locked.final_attempt_id or locked.is_terminal or attempt.is_terminal or current.pk != attempt.pk:
+                return _receipt(locked, attempt, message='late result retained as history', details={'ignored': True, 'final_attempt_id': locked.final_attempt_id})
+            if locked.status == ExecutionStatus.CANCEL_REQUESTED or attempt.status == AttemptStatus.CANCEL_REQUESTED:
+                target = ExecutionStatus.CANCELLED
+            attempt.result = redact_result_payload(dict(result))
+            attempt.error_type = _error_type(payload.get('error_type')) if target in _TERMINAL_FAILURE else ''
+            attempt.error_message = _safe_text(payload.get('error_message'))
+            attempt.save(update_fields=['result', 'error_type', 'error_message', 'updated_at'])
+            for item in steps:
+                if not isinstance(item, Mapping):
+                    raise AdapterError('Step must be an object')
+                ResultEventIngestor._record_step(attempt, redact_result_payload(dict(item)))
+            for item in artifacts:
+                if not isinstance(item, Mapping):
+                    raise AdapterError('Artifact must be an object')
+                normalized = dict(item)
+                normalized['artifact_idempotency_key'] = normalized.get('idempotency_key', '')
+                ResultEventIngestor._record_artifact(locked, attempt, redact_result_payload(normalized))
+            gate = apply_quality_gate(locked, attempt.result, stage='result', attempt=attempt)
+            if target in _TERMINAL_SUCCESS and gate.get('configured') and not gate.get('passed'):
+                target = ExecutionStatus.BLOCKED
+                attempt.error_type, attempt.error_message = ErrorType.CONFIGURATION, 'Quality gate failed'
+                attempt.save(update_fields=['error_type', 'error_message', 'updated_at'])
+            locked.result, locked.error_type, locked.error_message = attempt.result, attempt.error_type, attempt.error_message
+            locked.save(update_fields=['result', 'error_type', 'error_message', 'updated_at'])
+            if locked.status == ExecutionStatus.PENDING:
+                locked.transition_to(ExecutionStatus.QUEUED)
+            if locked.status == ExecutionStatus.QUEUED:
+                locked.transition_to(ExecutionStatus.RUNNING)
+            attempt.transition_to(target)
+            locked.transition_to(target)
+            sync_quality_result(locked, attempt, target, attempt.result)
+            decision = should_retry(locked, attempt, automatic=True)
+            dispatcher = self._resolve_dispatcher()
+            if target in _TERMINAL_FAILURE and decision.allowed and dispatcher is not None:
+                policy = resolve_retry_policy(locked)
+                clear_final_for_retry(locked)
+                mark_retry_requested(attempt, 'automatic retry: ' + decision.reason, policy=policy, decision=decision.reason)
+                locked.transition_to(ExecutionStatus.QUEUED, reason='automatic retry')
+                next_attempt, _ = locked.create_attempt()
                 next_attempt.transition_to(AttemptStatus.QUEUED)
-                retry_request = create_retry_request(
-                    locked_job,
-                    locked_attempt,
-                    next_attempt,
-                    policy,
-                    "automatic retry: " + decision.reason,
-                )
-                retry_request_id = retry_request.pk
-                retried = True
-            elif effective_status in _TERMINAL_FAILURE and decision.allowed:
-                retry_blocked = True
-                locked_job.error_type = ErrorType.CONFIGURATION
-                locked_job.error_message = (
-                    f"Automatic retry unavailable: no dispatcher is registered for source type {self.source_type}"
-                )
-                locked_job.save(update_fields=["error_type", "error_message", "updated_at"])
-                preserve_final_result(locked_job, locked_attempt, effective_status, result_payload, gate_result)
+                request = create_retry_request(locked, attempt, next_attempt, policy, 'automatic retry: ' + decision.reason)
+                request_id, retried = request.pk, True
             else:
-                preserve_final_result(locked_job, locked_attempt, effective_status, result_payload, gate_result)
-
-        if retry_request_id and self._resolve_dispatcher() is not None:
-            self._schedule_retry_dispatch(retry_request_id, self._resolve_dispatcher())
-        return AdapterReceipt(
-            job_id=locked_job.pk,
-            attempt_id=locked_attempt.pk,
-            attempt_number=locked_attempt.attempt_number,
-            status=locked_job.status,
-            supported=True,
-            message="result collected",
-            details={
-                "steps": len(step_payloads),
-                "artifacts": len(artifact_payloads),
-                "quality_gate": gate_result,
-                "automatic_retry": retried,
-                "automatic_retry_blocked": retry_blocked,
-            },
-        )
+                if target in _TERMINAL_FAILURE and decision.allowed:
+                    retry_blocked = True
+                    locked.error_type = ErrorType.CONFIGURATION
+                    locked.error_message = f'Automatic retry unavailable: no dispatcher is registered for source type {self.source_type}'
+                    locked.save(update_fields=['error_type', 'error_message', 'updated_at'])
+                preserve_final_result(locked, attempt, target, attempt.result, gate)
+        if request_id:
+            self._schedule_retry_dispatch(request_id, dispatcher)
+        return _receipt(locked, attempt, message='result collected', details={'steps': len(steps), 'artifacts': len(artifacts), 'quality_gate': gate, 'automatic_retry': retried, 'automatic_retry_blocked': retry_blocked})
 
 
 class SourceExecutorAdapter(ExecutorAdapter):
-    """Compatibility adapter for one existing module's executor."""
+    def __init__(self, source_type, dispatcher=None, canceller=None):
+        self.source_type, self.dispatcher, self.canceller = source_type, dispatcher, canceller
 
-    def __init__(self, source_type: str, dispatcher=None, canceller=None):
-        self.source_type = source_type
-        self.dispatcher = dispatcher
-        self.canceller = canceller
+    def submit(self, job, *, dispatcher=None, worker='', quarantine_override=False, override_reason='', requested_by=None):
+        resolved = self._resolve_dispatcher(dispatcher)
+        if resolved is not None and not job.source_id:
+            raise AdapterConflict(f'Unified execution source_id is required for source type {self.source_type}')
+        return super().submit(job, dispatcher=resolved, worker=worker, quarantine_override=quarantine_override, override_reason=override_reason, requested_by=requested_by)
 
-    def submit(self, job, *, dispatcher=None, worker="", quarantine_override=False, override_reason="", requested_by=None):
-        resolved_dispatcher = self._resolve_dispatcher(dispatcher)
-        if resolved_dispatcher is not None and not job.source_id:
-            raise AdapterConflict(f"Unified execution source_id is required for source type {self.source_type}")
-        return super().submit(
-            job,
-            dispatcher=resolved_dispatcher,
-            worker=worker,
-            quarantine_override=quarantine_override,
-            override_reason=override_reason,
-            requested_by=requested_by,
-        )
-
-    def cancel(self, job, *, reason="", canceller=None):
+    def cancel(self, job, *, reason='', canceller=None):
         return super().cancel(job, reason=reason, canceller=canceller or self.canceller)
 
 
 class ApiExecutorAdapter(SourceExecutorAdapter):
     def __init__(self, dispatcher=None, canceller=None):
-        super().__init__("api", dispatcher=dispatcher, canceller=canceller)
+        super().__init__('api', dispatcher, canceller)
 
 
 class UiExecutorAdapter(SourceExecutorAdapter):
     def __init__(self, dispatcher=None, canceller=None):
-        super().__init__("ui", dispatcher=dispatcher, canceller=canceller)
+        super().__init__('ui', dispatcher, canceller)
 
 
 class AppExecutorAdapter(SourceExecutorAdapter):
     def __init__(self, dispatcher=None, canceller=None):
-        super().__init__("app", dispatcher=dispatcher, canceller=canceller)
+        super().__init__('app', dispatcher, canceller)
 
 
 class PerformanceExecutorAdapter(SourceExecutorAdapter):
     def __init__(self, dispatcher=None, canceller=None):
-        super().__init__("performance", dispatcher=dispatcher, canceller=canceller)
+        super().__init__('performance', dispatcher, canceller)
 
 
 class ExecutorAdapterRegistry:
@@ -808,63 +608,42 @@ class ExecutorAdapterRegistry:
         for adapter in adapters or ():
             self.register(adapter)
 
-    def register(self, adapter: ExecutorAdapter):
+    def register(self, adapter):
         self._adapters[adapter.source_type] = adapter
         return adapter
 
-    def get(self, source_type: str) -> ExecutorAdapter:
+    def get(self, source_type):
         try:
             return self._adapters[source_type]
         except KeyError as exc:
-            raise UnsupportedExecutorError(f"No adapter for source type {source_type!r}") from exc
+            raise UnsupportedExecutorError(f'No adapter for source type {source_type!r}') from exc
 
     def supported_sources(self):
         return tuple(sorted(self._adapters))
 
 
-DEFAULT_EXECUTOR_REGISTRY = ExecutorAdapterRegistry(
-    [
-        ApiExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
-        UiExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
-        AppExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
-        PerformanceExecutorAdapter(dispatcher=CeleryExecutionDispatcher()),
-    ]
-)
+DEFAULT_EXECUTOR_REGISTRY = ExecutorAdapterRegistry([
+    ApiExecutorAdapter(CeleryExecutionDispatcher()), UiExecutorAdapter(CeleryExecutionDispatcher()),
+    AppExecutorAdapter(CeleryExecutionDispatcher()), PerformanceExecutorAdapter(CeleryExecutionDispatcher()),
+])
 
 
-def get_executor_adapter(source_type: str, registry=None) -> ExecutorAdapter:
+def get_executor_adapter(source_type, registry=None):
     return (registry or DEFAULT_EXECUTOR_REGISTRY).get(source_type)
 
 
-def register_executor_dispatcher(source_type: str, dispatcher):
-    """Register a process-local source dispatcher used by API dispatch."""
+def register_executor_dispatcher(source_type, dispatcher):
     adapter = DEFAULT_EXECUTOR_REGISTRY.get(source_type)
     adapter.dispatcher = dispatcher
     return adapter
 
 
-def unregister_executor_dispatcher(source_type: str):
-    adapter = DEFAULT_EXECUTOR_REGISTRY.get(source_type)
-    adapter.dispatcher = None
-    return adapter
+def unregister_executor_dispatcher(source_type):
+    return register_executor_dispatcher(source_type, None)
 
 
-__all__ = [
-    "AdapterConflict",
-    "AdapterError",
-    "AdapterReceipt",
-    "ApiExecutorAdapter",
-    "AppExecutorAdapter",
-    "CeleryExecutionDispatcher",
-    "DEFAULT_EXECUTOR_REGISTRY",
-    "ExecutorAdapter",
-    "ExecutorAdapterRegistry",
-    "PerformanceExecutorAdapter",
-    "SourceExecutorAdapter",
-    "UiExecutorAdapter",
-    "UnsupportedExecutorError",
-    "register_executor_dispatcher",
-    "unregister_executor_dispatcher",
-    "_call_dispatcher",
-    "_variant_aggregate",
-]
+__all__ = ['AdapterConflict', 'AdapterError', 'AdapterReceipt', 'ApiExecutorAdapter',
+           'AppExecutorAdapter', 'CeleryExecutionDispatcher', 'DEFAULT_EXECUTOR_REGISTRY',
+           'ExecutorAdapter', 'ExecutorAdapterRegistry', 'PerformanceExecutorAdapter',
+           'SourceExecutorAdapter', 'UiExecutorAdapter', 'UnsupportedExecutorError',
+           'register_executor_dispatcher', 'unregister_executor_dispatcher', '_call_dispatcher', '_variant_aggregate']

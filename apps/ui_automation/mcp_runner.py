@@ -19,6 +19,7 @@ import time
 from django.db import connection
 from django.utils import timezone
 
+from .evidence import project_screenshots
 from .models import TestCaseExecution
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,12 @@ def _finish_execution(execution, status, step_results, screenshots,
         execution.error_message = error_message or ''
         execution.execution_logs = json.dumps(step_results, ensure_ascii=False)
         execution.execution_time = round(time.time() - start_time, 2)
-        execution.screenshots = screenshots
+        execution.screenshots = project_screenshots(
+            screenshots,
+            producer='mcp_runner',
+            execution_id=execution.id,
+            item_id=execution.test_case_id,
+        )
         execution.finished_at = timezone.now()
         execution.save()
     except Exception:

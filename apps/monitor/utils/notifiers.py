@@ -14,6 +14,7 @@ import time
 import urllib.parse
 
 import requests
+from apps.core.http_transport import guarded_post
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from django.conf import settings
 from django.core.mail import EmailMessage, get_connection
@@ -44,11 +45,13 @@ def send_dingtalk(webhook_url, secret, message, at_all=True, timeout=10):
         "at": {"isAtAll": bool(at_all)},
     }
     try:
-        resp = requests.post(
+        resp = guarded_post(
             url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
             data=json.dumps(payload),
             headers={"Content-Type": "application/json", "Charset": "utf-8"},
             timeout=timeout,
+            allow_redirects=False,
         )
         if resp.status_code != 200:
             return False, "HTTP {}".format(resp.status_code)
@@ -82,11 +85,13 @@ def send_wecom(webhook_url, message, mentioned_list=None, at_all=False, timeout=
         },
     }
     try:
-        resp = requests.post(
+        resp = guarded_post(
             webhook_url,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
             data=json.dumps(payload),
             headers={"Content-Type": "application/json", "Charset": "utf-8"},
             timeout=timeout,
+            allow_redirects=False,
         )
         if resp.status_code != 200:
             return False, "HTTP {}".format(resp.status_code)

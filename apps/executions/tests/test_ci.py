@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import time
+from types import SimpleNamespace
 
 import pytest
 from rest_framework.test import APIClient
@@ -90,3 +91,24 @@ def test_ci_webhook_rejects_invalid_signature(monkeypatch):
 
 def test_quality_gate_result_is_deterministic():
     assert quality_gate_result(None, {'pass_rate': 99}) == {'passed': True, 'failures': []}
+
+
+@pytest.mark.parametrize(
+    ('gate', 'summary', 'reason'),
+    [
+        ({'pass_rate': {'max': float('nan')}}, {'pass_rate': 99}, 'invalid_gate_configuration'),
+        ({'pass_rate': {'min': float('inf')}}, {'pass_rate': 99}, 'invalid_gate_configuration'),
+        ({'pass_rate': {'min': 95, 'max': 90}}, {'pass_rate': 99}, 'invalid_gate_configuration'),
+        ({'pass_rate': {}}, {'pass_rate': 99}, 'invalid_gate_configuration'),
+        ({'pass_rate': {'min': 95}}, {'pass_rate': float('nan')}, 'invalid_metric'),
+    ],
+)
+def test_quality_gate_rejects_non_finite_and_invalid_rules(gate, summary, reason):
+    result = quality_gate_result(SimpleNamespace(quality_gate=gate), summary)
+    assert result['passed'] is False
+    assert any(item['reason'] == reason for item in result['failures'])
+
+
+def test_quality_gate_reads_nested_metrics_consistently():
+    profile = SimpleNamespace(quality_gate={'pass_rate': {'min': 95}})
+    assert quality_gate_result(profile, {'summary': {'pass_rate': 96}}) == {'passed': True, 'failures': []}

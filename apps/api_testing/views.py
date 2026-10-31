@@ -1,5 +1,6 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
+from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
@@ -8,6 +9,7 @@ from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
+from apps.core.http_transport import guarded_post, guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from apps.quality_intelligence.services.redaction import redact_payload
 from django.utils import timezone
@@ -46,9 +48,10 @@ from .serializers import (
 
 logger = logging.getLogger(__name__)
 
-from .utils import execute_assertions
+from .utils import can_use_environment, execute_assertions, redact_response_data
 from .operation_logger import log_operation
 from .variable_resolver import VariableResolver
+from .schema import ApiDashboardAuthErrorResponseSerializer, ApiDashboardStatsResponseSerializer
 from .serializers import (
     ApiProjectSerializer, ApiCollectionSerializer, ApiRequestSerializer,
     EnvironmentSerializer, RequestHistorySerializer, TestSuiteSerializer,
@@ -394,12 +397,9 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             # 解析环境变量
             variables = {}
             if environment_id:
-                env = Environment.objects.filter(
-                    models.Q(project__in=ApiProject.objects.filter(models.Q(owner=request.user) | models.Q(members=request.user)))
-                    | models.Q(project__isnull=True, created_by=request.user),
-                    id=environment_id,
-                ).first()
-                if env is None:
+                env = Environment.objects.filter(id=environment_id).first()
+                request_project = getattr(getattr(api_request, 'collection', None), 'project', None)
+                if env is None or not can_use_environment(env, request.user, project=request_project):
                     return Response({'error': '环境不存在或无权限'}, status=status.HTTP_403_FORBIDDEN)
                 variables.update(env.variables)
             
@@ -474,9 +474,10 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             # 根据请求体类型决定使用 data 还是 json 参数
             if body_type == 'raw':
                 # raw 类型使用 data 参数，发送原始字符串
-                response = requests.request(
+                response = guarded_request(
                     method=request_method,
                     url=url,
+                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                     headers=headers,
                     params=params,
                     data=body_data,
@@ -485,9 +486,10 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                 )
             else:
                 # json 类型使用 json 参数，自动序列化
-                response = requests.request(
+                response = guarded_request(
                     method=request_method,
                     url=url,
+                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                     headers=headers,
                     params=params,
                     json=body_data,
@@ -510,19 +512,16 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                 request=api_request,
                 environment_id=environment_id,
                 request_data={
-                    'url': url,
+                    'url': redact_payload(url),
                     'method': request_method,
                     'headers': redact_payload(headers),
                     'params': redact_payload(params),
                     'body': redact_payload(body_data)
                 },
-                response_data={
-                    'headers': redact_payload(dict(response.headers)),
-                    'body': redact_payload(response.text),
-                    'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
-                },
+                response_data=redact_response_data(response),
                 status_code=response.status_code,
                 response_time=response_time,
+                assertions_results=assertions_results,
                 executed_by=request.user
             )
             
@@ -744,6 +743,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     def execute(self, request, pk=None):
         """执行测试套件"""
         test_suite = self.get_object()
+        if not can_use_environment(test_suite.environment, request.user, project=test_suite.project):
+            return Response({'error': '无权使用该执行环境'}, status=status.HTTP_403_FORBIDDEN)
         
         try:
             # 创建执行记录
@@ -821,9 +822,10 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
 
                     # 执行请求
                     start_time = time.time()
-                    response = requests.request(
+                    response = guarded_request(
                         method=api_request.method,
                         url=url,
+                        allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                         headers=headers,
                         params=params,
                         json=body_data,
@@ -886,17 +888,13 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                         request=api_request,
                         environment=test_suite.environment,
                         request_data={
-                            'url': url,
+                            'url': redact_payload(url),
                             'method': api_request.method,
                             'headers': redact_payload(headers),
                             'params': redact_payload(params),
                             'body': redact_payload(body_data)
                         },
-                        response_data={
-                            'headers': redact_payload(dict(response.headers)),
-                            'body': redact_payload(response.text),
-                            'json': redact_payload(response.json()) if response.headers.get('content-type', '').startswith('application/json') else None
-                        },
+                        response_data=redact_response_data(response),
                         status_code=response.status_code,
                         response_time=response_time,
                         assertions_results=assertions_results,
@@ -945,8 +943,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         if not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
             raise PermissionDenied('无权使用该项目')
         environment = serializer.validated_data.get('environment')
-        if environment and environment.scope == 'LOCAL' and environment.project_id != project.id:
-            raise PermissionDenied('环境必须属于同一项目')
+        if environment and not can_use_environment(environment, user, project=project):
+            raise PermissionDenied('无权使用该执行环境')
         instance = serializer.save(created_by=user)
         log_operation(
             operation_type='create',
@@ -963,8 +961,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         if not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
             raise PermissionDenied('无权使用该项目')
         environment = serializer.validated_data.get('environment', serializer.instance.environment)
-        if environment and environment.scope == 'LOCAL' and environment.project_id != project.id:
-            raise PermissionDenied('环境必须属于同一项目')
+        if environment and not can_use_environment(environment, user, project=project):
+            raise PermissionDenied('无权使用该执行环境')
         instance = serializer.save()
         log_operation(
             operation_type='edit',
@@ -1249,12 +1247,12 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
 <!DOCTYPE html>
 <html>
 <head>
-    <title>测试报告 - {execution.test_suite.name}</title>
+    <title>测试报告 - {suite_name_html}</title>
 </head>
 <body>
     <h1>测试报告</h1>
-    <p>测试套件: {execution.test_suite.name}</p>
-    <p>状态: {execution.get_status_display()}</p>
+    <p>测试套件: {suite_name_html}</p>
+    <p>状态: {status_html}</p>
     <p>总请求数: {execution.total_requests}</p>
     <p>通过: {execution.passed_requests}</p>
     <p>失败: {execution.failed_requests}</p>
@@ -1271,7 +1269,7 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>测试报告概览 - {execution.test_suite.name}</title>
+    <title>测试报告概览 - {suite_name_html}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -1476,7 +1474,7 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
         <div class="summary-card">
             <div class="status-row">
                 <div class="status-badge {status_class}">
-                    状态: {execution.get_status_display()}
+                    状态: {status_html}
                 </div>
                 <span class="execution-time">
                     执行时间: {execution.created_at.strftime('%Y-%m-%d %H:%M:%S') if execution.created_at else 'N/A'}
@@ -1704,6 +1702,12 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
         
         task = self.get_object()
         logger.info(f"获取任务对象: {task.id} - {task.name}")
+        task_project = (
+            task.test_suite.project if task.test_suite_id
+            else getattr(getattr(task.api_request, 'collection', None), 'project', None)
+        )
+        if not can_use_environment(task.environment, task.created_by, project=task_project):
+            return Response({'error': '无权使用定时任务关联环境'}, status=status.HTTP_403_FORBIDDEN)
         
         # 检查权限
         if not request.user.is_staff and task.created_by != request.user:
@@ -2286,8 +2290,9 @@ class ScheduledTaskViewSet(viewsets.ModelViewSet):
 
                 # 发送webhook请求
                 try:
-                    response = requests.post(
+                    response = guarded_post(
                         webhook_url,
+                        allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
                         json=message_data,
                         headers={'Content-Type': 'application/json'},
                         timeout=10
@@ -2474,6 +2479,13 @@ class ApiDashboardViewSet(viewsets.ViewSet):
     """API测试仪表盘视图集"""
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='api_dashboard_stats',
+        responses={
+            200: ApiDashboardStatsResponseSerializer,
+            401: ApiDashboardAuthErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """获取仪表盘统计数据"""
@@ -2576,8 +2588,9 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
                 config.base_url,
                 allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
             )
-            response = requests.post(
+            response = guarded_post(
                 f"{api_url.rstrip('/')}/chat/completions",
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 json=test_data,
                 timeout=10,
@@ -2684,8 +2697,9 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
+            response = guarded_post(
                 f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 json=ai_data,
                 timeout=30,
@@ -2765,8 +2779,9 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
+            response = guarded_post(
                 f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 json=ai_data,
                 timeout=30,
@@ -2846,8 +2861,9 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
+            response = guarded_post(
                 f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 json=ai_data,
                 timeout=30,
@@ -2939,8 +2955,9 @@ URL参数: {json.dumps(request_data['params'], ensure_ascii=False)}
                 'temperature': config.temperature
             }
 
-            response = requests.post(
+            response = guarded_post(
                 f"{validate_outbound_url(config.base_url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))).rstrip('/')}/chat/completions",
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 json=ai_data,
                 timeout=30,

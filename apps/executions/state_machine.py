@@ -84,6 +84,7 @@ JOB_TRANSITIONS = {
         ExecutionStatus.COMPLETED,
         ExecutionStatus.FAILED,
         ExecutionStatus.BLOCKED,
+        ExecutionStatus.UNSUPPORTED,
     },
     ExecutionStatus.CANCEL_REQUESTED: {
         ExecutionStatus.CANCEL_REQUESTED,
@@ -138,6 +139,7 @@ ATTEMPT_TRANSITIONS = {
         AttemptStatus.COMPLETED,
         AttemptStatus.FAILED,
         AttemptStatus.BLOCKED,
+        AttemptStatus.UNSUPPORTED,
     },
     AttemptStatus.CANCEL_REQUESTED: {
         AttemptStatus.CANCEL_REQUESTED,

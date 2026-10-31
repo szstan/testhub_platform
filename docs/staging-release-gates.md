@@ -2,6 +2,23 @@
 
 这份清单用于获得授权材料后执行 staging 验证。当前只记录 gate，不执行远端写入。
 
+## Release candidate validation
+
+### Credential-free browser auth acceptance
+
+Staging health checks prove service availability and static asset delivery only; they do not prove browser authentication behavior. Run credential-free browser auth acceptance as a separate check using a fresh browser profile with no saved cookies, tokens, or local storage. Confirm the login surface loads, a protected route does not expose authenticated content, unauthenticated protected API requests are rejected, and `/media/` is not publicly served. Record those results separately from `/health` and `/readiness`; do not enter or capture real credentials for this acceptance.
+
+### Candidate integrity and Nginx validation
+
+For strict candidate validation, verify the v2 manifest's complete inventory, Git commit/tree proof, and `frontend/dist/build-receipt.json`; legacy v1 is rejected by default. For candidate runtime probes, configure `STAGING_BACKEND_URL` and `STAGING_FRONTEND_URL` to the candidate's actual backend and frontend endpoints; the defaults are `http://127.0.0.1:18002` and `http://127.0.0.1:18003`. These URLs do not configure Nginx `listen` or `proxy_pass`, so candidate config must independently use the matching asset root, listen endpoint, and backend. `TESTHUB_ALLOW_LEGACY_RELEASE_MANIFEST=1` is an explicit compatibility opt-in and must be recorded as partial-integrity validation, never as strict source provenance.
+
+A candidate Nginx check must use a temporary copy of that candidate's `staging-nginx/nginx.conf`. The validator selects the binary with `STAGING_NGINX_BIN` (default `/usr/sbin/nginx`) and config with `STAGING_NGINX_CONFIG` (default `$REPO_ROOT/staging-nginx/nginx.conf`). The candidate copy must point `root` at the actual candidate `frontend/dist`, set its actual `listen` address/port and API `proxy_pass` backend, and use candidate-specific PID/log paths. The validator does not rewrite these Nginx directives: `STAGING_FRONTEND_URL` and `STAGING_BACKEND_URL` only select HTTP probe endpoints, defaulting to `http://127.0.0.1:18003` and `http://127.0.0.1:18002`. Configure those URLs to match the candidate listen/backend endpoints. `nginx -t -c <candidate-config> -p <candidate-prefix>` parses the supplied main config rather than inheriting host `server` blocks; only includes explicitly named by the candidate config are read. An unmodified config with canonical `/opt/testhub_platform` paths is not proof that another candidate tree was tested.
+
+For the validator's legacy compatibility mode, set `TESTHUB_ALLOW_LEGACY_RELEASE_MANIFEST=1`; the validator passes `--allow-legacy` and reports partial integrity only, without strict source provenance. The default remains strict v2. Do not start or reload Nginx during config-only candidate validation. The canonical staging config must deny `/media/` using `location ^~ /media/`; private media remains accessible only through authenticated APIs.
+
+The frontend build checks also include `npm --prefix frontend run test:auth`. Default pytest collection includes `apps/api_testing/tests.py` and `scripts/tests`; the separate optional UI automation suite installs `requirements-prod.txt` plus `requirements-ui-optional.txt` and runs only mocked runner/browser boundary tests, without launching a real browser.
+
+
 ## APP authenticated smoke gate
 
 开始前必须由环境负责人提供并确认：

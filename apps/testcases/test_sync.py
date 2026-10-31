@@ -22,14 +22,16 @@ def test_github_tests_as_code_sync_is_idempotent_and_records_source():
         path='tests',
         created_by=user,
     )
+    commit = Mock(status_code=200)
+    commit.json.return_value = {'sha': 'a' * 40}
     tree = Mock(status_code=200)
     tree.json.return_value = {
-        'sha': 'commit-1',
+        'sha': 'b' * 40,
         'tree': [{'type': 'blob', 'path': 'tests/login.yml', 'sha': 'blob-1'}],
     }
     raw = Mock(status_code=200, content=b'id: checkout.login\ntitle: Login\ntype: api\nexpected_result: ok\n')
 
-    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.requests.get', side_effect=[tree, raw]):
+    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree, raw]):
         summary = sync_profile(profile)
 
     assert summary.created == 1
@@ -37,12 +39,12 @@ def test_github_tests_as_code_sync_is_idempotent_and_records_source():
     case = TestCase.objects.get(project=project, external_ref='checkout.login')
     binding = TestCaseSourceBinding.objects.get(testcase=case)
     assert binding.source_path == 'tests/login.yml'
-    assert binding.source_commit == 'commit-1'
+    assert binding.source_commit == 'a' * 40
 
     tree_again = Mock(status_code=200)
     tree_again.json.return_value = tree.json.return_value
     raw_again = Mock(status_code=200, content=raw.content)
-    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.requests.get', side_effect=[tree_again, raw_again]):
+    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree_again, raw_again]):
         repeated = sync_profile(profile)
 
     assert repeated.created == 0
@@ -102,12 +104,14 @@ def test_gitlab_sync_keeps_same_provider_api_base():
         api_base_url='https://gitlab.com/api/v4',
         created_by=user,
     )
+    commit = Mock(status_code=200)
+    commit.json.return_value = {'id': 'a' * 40}
     tree = Mock(status_code=200)
     tree.json.return_value = [{'type': 'blob', 'path': 'tests/login.yml', 'id': 'blob-1'}]
     with patch(
         'apps.testcases.sync.validate_outbound_url',
         side_effect=lambda url, allow_private=False: url,
-    ), patch('apps.testcases.sync.requests.get', return_value=tree) as request:
+    ), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree]) as request:
         _, files = _gitlab_files(profile, 'gitlab-secret')
 
     assert files[0][2].startswith('https://gitlab.com/api/v4/')

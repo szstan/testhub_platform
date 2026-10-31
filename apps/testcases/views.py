@@ -7,6 +7,8 @@ from rest_framework import filters
 from django.db import models
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.views import APIView
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 
 from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from .serializers import (
@@ -18,6 +20,13 @@ from .services import TestCaseImportTemplateService, TestCaseExcelImportService
 from .tasks import import_testcases_from_excel
 from apps.executions.models import TestCaseRevision
 from .sync import TestCaseSyncError, sync_profile
+from .schema import (
+    TestCaseAuthFailureResponseSerializer,
+    TestCaseDownloadNotFoundResponseSerializer,
+    TestCaseSyncProfileSyncErrorResponseSerializer,
+    TestCaseSyncProfileSyncResponseSerializer,
+)
+
 
 class TestCasePagination(pagination.PageNumberPagination):
     page_size = 10
@@ -49,11 +58,12 @@ def get_user_accessible_projects(user):
 class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = TestCaseSyncProfileSerializer
+    pagination_class = TestCasePagination
 
     def get_queryset(self):
         return TestCaseSyncProfile.objects.filter(
             project__in=get_user_accessible_projects(self.request.user)
-        ).select_related('project', 'created_by')
+        ).select_related('project', 'created_by').order_by('pk')
 
     def perform_create(self, serializer):
         project = serializer.validated_data.get('project')
@@ -78,6 +88,16 @@ class TestCaseSyncProfileDetailView(generics.RetrieveUpdateDestroyAPIView):
 class TestCaseSyncProfileSyncView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @extend_schema(
+        operation_id='testcase_sync_profile_sync',
+        request=None,
+        responses={
+            200: TestCaseSyncProfileSyncResponseSerializer,
+            400: TestCaseSyncProfileSyncErrorResponseSerializer,
+            401: TestCaseAuthFailureResponseSerializer,
+            404: TestCaseSyncProfileSyncErrorResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         profile = TestCaseSyncProfile.objects.filter(
             pk=pk,
@@ -248,6 +268,13 @@ class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
 class TestCaseImportTemplateDownloadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @extend_schema(
+        operation_id='testcase_import_template_download',
+        responses={
+            (200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'): OpenApiTypes.BINARY,
+            401: TestCaseAuthFailureResponseSerializer,
+        },
+    )
     def get(self, request):
         template_stream = TestCaseImportTemplateService.build_template()
         return FileResponse(
@@ -318,6 +345,14 @@ class TestCaseImportRecordDetailView(generics.RetrieveAPIView):
 class TestCaseImportFailureReportDownloadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @extend_schema(
+        operation_id='testcase_import_failure_report_download',
+        responses={
+            (200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'): OpenApiTypes.BINARY,
+            401: TestCaseAuthFailureResponseSerializer,
+            404: TestCaseDownloadNotFoundResponseSerializer,
+        },
+    )
     def get(self, request, pk):
         record = TestCaseImportRecord.objects.filter(
             pk=pk,

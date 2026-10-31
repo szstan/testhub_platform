@@ -4,6 +4,7 @@ AI模型配置和服务
 """
 
 from django.conf import settings
+from apps.core.http_transport import outbound_httpx_options
 from apps.core.network import validate_outbound_url
 from django.db import models
 from django.contrib.auth import get_user_model
@@ -177,7 +178,7 @@ class AIModelService:
             
         try:
             # Increase timeout to 120s for long generation tasks
-            async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=False, **outbound_httpx_options(bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))) as client:
                 response = await client.post(
                     url,
                     headers=headers,

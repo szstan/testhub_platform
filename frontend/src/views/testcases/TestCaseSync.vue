@@ -23,6 +23,17 @@
           </template>
         </el-table-column>
       </el-table>
+      <div class="pagination-container">
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          :page-sizes="[20, 50, 100]"
+          :total="total"
+          layout="total, sizes, prev, pager, next"
+          @current-change="handlePageChange"
+          @size-change="handlePageSizeChange"
+        />
+      </div>
       <el-empty v-if="!loading && profiles.length === 0" :description="$t('testcase.sync.empty')" />
     </el-card>
 
@@ -73,6 +84,10 @@ import {
 
 const profiles = ref([])
 const loading = ref(false)
+const currentPage = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
+let latestLoadRequest = 0
 const saving = ref(false)
 const syncing = ref(null)
 const visible = ref(false)
@@ -82,12 +97,25 @@ const result = ref(null)
 const form = ref({ name: '', project: null, provider: 'github', repository_url: '', api_base_url: '', branch: 'main', path: '', token_env_ref: '', enabled: true })
 
 const load = async () => {
+  const requestId = ++latestLoadRequest
   loading.value = true
   try {
-    const response = await listTestCaseSyncProfiles()
-    profiles.value = response.data?.results || response.data || []
-  } catch (error) { ElMessage.error(error.response?.data?.detail || '加载同步配置失败') } finally { loading.value = false }
+    const response = await listTestCaseSyncProfiles({
+      page: currentPage.value,
+      page_size: pageSize.value,
+    })
+    if (requestId !== latestLoadRequest) return
+    const data = response.data
+    profiles.value = Array.isArray(data) ? data : data?.results || []
+    total.value = Array.isArray(data) ? data.length : data?.count ?? profiles.value.length
+  } catch (error) {
+    if (requestId === latestLoadRequest) ElMessage.error(error.response?.data?.detail || '加载同步配置失败')
+  } finally {
+    if (requestId === latestLoadRequest) loading.value = false
+  }
 }
+const handlePageChange = page => { currentPage.value = page; load() }
+const handlePageSizeChange = size => { pageSize.value = size; currentPage.value = 1; load() }
 const openCreate = () => { editing.value = null; form.value = { name: '', project: null, provider: 'github', repository_url: '', api_base_url: '', branch: 'main', path: '', token_env_ref: '', enabled: true }; visible.value = true }
 const edit = row => { editing.value = row.id; form.value = { ...row, token_env_ref: '' }; visible.value = true }
 const save = async () => {
@@ -96,7 +124,10 @@ const save = async () => {
     const payload = { ...form.value }
     if (!payload.token_env_ref) delete payload.token_env_ref
     if (editing.value) await updateTestCaseSyncProfile(editing.value, payload)
-    else await createTestCaseSyncProfile(payload)
+    else {
+      await createTestCaseSyncProfile(payload)
+      currentPage.value = 1
+    }
     visible.value = false
     await load()
     ElMessage.success('保存成功')
@@ -114,6 +145,7 @@ const sync = async row => {
 const remove = async row => {
   await ElMessageBox.confirm(`确定删除同步配置 ${row.name} 吗？`, '确认')
   await deleteTestCaseSyncProfile(row.id)
+  if (currentPage.value > 1 && profiles.value.length === 1) currentPage.value -= 1
   await load()
 }
 onMounted(load)
@@ -124,5 +156,6 @@ onMounted(load)
 .page-header { display: flex; justify-content: space-between; margin-bottom: 18px; }
 .page-header h1 { margin: 0; font-size: 24px; }
 .page-header p { color: var(--el-text-color-secondary); }
+.pagination-container { display: flex; justify-content: flex-end; padding-top: 16px; }
 .warnings { margin-top: 18px; }
 </style>

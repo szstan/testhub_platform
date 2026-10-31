@@ -39,6 +39,8 @@ def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any], *, max_variant
     columns = sorted(matrix)
     if len(columns) > 50 or any(len(matrix[column]) > 1000 for column in columns):
         raise DatasetError('dataset.matrix exceeds column/row limits')
+    if any(not matrix[column] for column in columns):
+        raise DatasetError('dataset.matrix columns cannot be empty')
     variant_count = 1
     for column in columns:
         variant_count *= len(matrix[column])

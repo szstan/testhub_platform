@@ -4,6 +4,7 @@ from rest_framework import filters, generics, permissions, status
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.utils import extend_schema
 
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
@@ -14,6 +15,19 @@ from .serializers import (
     TestSuiteCreateSerializer,
     TestSuiteSerializer,
     TestSuiteUpdateSerializer,
+)
+from .schema import (
+    TEST_SUITE_BATCH_CASES_REQUEST,
+    TEST_SUITE_REORDER_REQUEST,
+    TEST_SUITE_SINGLE_CASE_REQUEST,
+    TestSuiteDeleteBodyAutoSchema,
+    TestSuiteCaseAuthFailureResponseSerializer,
+    TestSuiteCaseBatchAddResponseSerializer,
+    TestSuiteCaseMembershipResponseSerializer,
+    TestSuiteCaseNotFoundResponseSerializer,
+    TestSuiteCaseRemoveResponseSerializer,
+    TestSuiteCaseReorderResponseSerializer,
+    TestSuiteCaseValidationErrorResponseSerializer,
 )
 
 
@@ -276,10 +290,26 @@ class SuiteCasesMixin:
 class TestSuiteCaseListView(SuiteCasesMixin, APIView):
     """Read suite members, and accept a single-case POST as a convenience."""
 
+    @extend_schema(
+        responses={
+            200: TestSuiteCaseMembershipResponseSerializer(many=True),
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def get(self, request, pk):
         suite = self.get_suite(pk)
         return Response(_serialize_suite_cases(suite))
 
+    @extend_schema(
+        request=TEST_SUITE_SINGLE_CASE_REQUEST,
+        responses={
+            201: TestSuiteCaseMembershipResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         suite = self.get_suite(pk)
         association = self._add_case(request, suite)
@@ -290,6 +320,16 @@ class TestSuiteCaseListView(SuiteCasesMixin, APIView):
 
 
 class TestSuiteAddCaseView(SuiteCasesMixin, APIView):
+    @extend_schema(
+        operation_id='testsuite_add_case',
+        request=TEST_SUITE_SINGLE_CASE_REQUEST,
+        responses={
+            201: TestSuiteCaseMembershipResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         suite = self.get_suite(pk)
         association = self._add_case(request, suite)
@@ -300,6 +340,16 @@ class TestSuiteAddCaseView(SuiteCasesMixin, APIView):
 
 
 class TestSuiteAddCasesView(SuiteCasesMixin, APIView):
+    @extend_schema(
+        operation_id='testsuite_add_cases',
+        request=TEST_SUITE_BATCH_CASES_REQUEST,
+        responses={
+            201: TestSuiteCaseBatchAddResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         suite = self.get_suite(pk)
         testcase_ids = _case_ids_from_request(request.data)
@@ -330,6 +380,8 @@ class TestSuiteAddCasesView(SuiteCasesMixin, APIView):
 
 
 class TestSuiteRemoveCaseView(SuiteCasesMixin, APIView):
+    schema = TestSuiteDeleteBodyAutoSchema()
+
     def _remove(self, request, pk, testcase_id=None):
         suite = self.get_suite(pk, request=request)
         if testcase_id is None:
@@ -341,14 +393,43 @@ class TestSuiteRemoveCaseView(SuiteCasesMixin, APIView):
         association.delete()
         return Response({'success': True, 'deleted': True, 'test_case_id': testcase_id})
 
+    @extend_schema(
+        operation_id='testsuite_remove_case_post',
+        request=TEST_SUITE_SINGLE_CASE_REQUEST,
+        responses={
+            200: TestSuiteCaseRemoveResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         return self._remove(request, pk)
 
+    @extend_schema(
+        operation_id='testsuite_remove_case_delete',
+        request=TEST_SUITE_SINGLE_CASE_REQUEST,
+        responses={
+            200: TestSuiteCaseRemoveResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def delete(self, request, pk, testcase_id=None):
         return self._remove(request, pk, testcase_id)
 
 
 class TestSuiteReorderCasesView(SuiteCasesMixin, APIView):
+    @extend_schema(
+        request=TEST_SUITE_REORDER_REQUEST,
+        responses={
+            200: TestSuiteCaseReorderResponseSerializer,
+            400: TestSuiteCaseValidationErrorResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def post(self, request, pk):
         suite = self.get_suite(pk)
         items = request.data.get('test_case_orders', request.data.get('testcase_orders'))
@@ -401,6 +482,14 @@ class TestSuiteReorderCasesView(SuiteCasesMixin, APIView):
 class TestSuiteCaseDetailView(SuiteCasesMixin, APIView):
     """REST-friendly alias for deleting one membership by URL."""
 
+    @extend_schema(
+        operation_id='testsuite_case_delete',
+        responses={
+            200: TestSuiteCaseRemoveResponseSerializer,
+            401: TestSuiteCaseAuthFailureResponseSerializer,
+            404: TestSuiteCaseNotFoundResponseSerializer,
+        },
+    )
     def delete(self, request, pk, testcase_id):
         suite = self.get_suite(pk)
         association = suite.testsuitecase_set.filter(testcase_id=testcase_id).first()

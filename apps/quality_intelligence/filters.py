@@ -49,6 +49,13 @@ def apply_quality_filters(queryset: Any, params: Any, *, date_field: str = "crea
     if profile_id not in (None, "") and "profile" in direct_fields:
         queryset = queryset.filter(profile_id=profile_id)
 
+    resolved = params.get("resolved")
+    if resolved not in (None, "") and "resolved_at" in direct_fields:
+        if str(resolved).lower() not in {"true", "false"}:
+            raise ValidationError({"resolved": "must be true or false"})
+        queryset = queryset.filter(resolved_at__isnull=str(resolved).lower() == "false")
+    search = params.get("search")
+    if search not in (None, ""):
         search = bound_text(redact_text(search, max_length=255), 255)
         if hasattr(queryset.model, "name"):
             queryset = queryset.filter(name__icontains=search)

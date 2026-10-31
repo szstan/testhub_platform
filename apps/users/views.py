@@ -1,12 +1,16 @@
 from rest_framework import generics, status, permissions
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, OpenApiParameter, PolymorphicProxySerializer
 from django.conf import settings
 from django.contrib.auth import logout
 from django.views.decorators.csrf import csrf_exempt
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
 from .models import User
+from . import schema as schema
 from .serializers import (
     UserSerializer,
     user_session_data,
@@ -43,14 +47,41 @@ def _clear_refresh_cookie(response):
 class CookieTokenRefreshView(TokenRefreshView):
     """Refresh JWT from an HttpOnly cookie without exposing it to JavaScript."""
 
+    @extend_schema(
+        auth=[],
+        request=schema.UsersRefreshRequestSerializer,
+        responses={
+            200: schema.UsersRefreshResponseSerializer,
+            400: schema.UsersAuthFailureResponseSerializer,
+            401: schema.UsersAuthFailureResponseSerializer,
+            415: schema.UsersAuthFailureResponseSerializer,
+        },
+        parameters=[
+            OpenApiParameter(
+                REFRESH_COOKIE_NAME, OpenApiTypes.STR, OpenApiParameter.COOKIE,
+                required=False,
+                description='Alternative to body.refresh. The browser HttpOnly cookie is scoped to /api/auth/, so browser recovery uses /api/auth/token/refresh/.',
+            ),
+            OpenApiParameter(
+                'Set-Cookie', OpenApiTypes.STR, OpenApiParameter.HEADER,
+                required=False, response=[200, 401],
+                description='A successful refresh may rotate the HttpOnly cookie; an invalid refresh clears the cookie at /api/auth/.',
+            ),
+        ],
+        description='Provide a refresh value in the body or the HttpOnly cookie. The JSON response contains only access; missing/invalid refresh is a controlled 401.',
+    )
     def post(self, request, *args, **kwargs):
         data = request.data.copy()
         if not data.get('refresh'):
             data['refresh'] = request.COOKIES.get(REFRESH_COOKIE_NAME, '')
+        if not data.get('refresh'):
+            response = Response({'detail': 'refresh token invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+            _clear_refresh_cookie(response)
+            return response
         serializer = self.get_serializer(data=data)
         try:
             serializer.is_valid(raise_exception=True)
-        except (User.DoesNotExist, TokenError):
+        except (User.DoesNotExist, TokenError, AuthenticationFailed, ValidationError):
             response = Response({'detail': 'refresh token invalid'}, status=status.HTTP_401_UNAUTHORIZED)
             _clear_refresh_cookie(response)
             return response
@@ -70,6 +101,10 @@ import redis
 import re
 import uuid
 
+@extend_schema(responses={
+    200: schema.UsersSessionResponseSerializer,
+    401: schema.UsersAuthFailureResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_current_user(request):
@@ -89,6 +124,15 @@ class RegisterView(generics.CreateAPIView):
             'user': user_session_data(user),
         }, status=status.HTTP_201_CREATED)
 
+@extend_schema(
+    request=schema.UsersLoginRequestSerializer,
+    responses={
+        200: schema.UsersLoginResponseSerializer,
+        400: schema.UsersLoginValidationErrorResponseSerializer,
+        429: schema.UsersErrorResponseSerializer,
+    },
+    description='The refresh JWT is set only as an HttpOnly cookie and is not included in the JSON response.',
+)
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
@@ -119,8 +163,17 @@ def login_view(request):
     _set_refresh_cookie(response, refresh_token)
     return response
 
+@extend_schema(
+    request=schema.UsersLogoutRequestSerializer,
+    responses={200: schema.UsersMessageResponseSerializer},
+    description=(
+        'The optional `refresh` body field takes precedence over the refresh cookie. '
+        'The refresh cookie is cleared in the response.'
+    ),
+)
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
+@authentication_classes([])
+@permission_classes([permissions.AllowAny])
 def logout_view(request):
     """用户退出登录，将 refresh token 加入黑名单并清理 HttpOnly cookie"""
     refresh_token = request.data.get('refresh') or request.COOKIES.get(REFRESH_COOKIE_NAME)
@@ -136,6 +189,19 @@ def logout_view(request):
     _clear_refresh_cookie(response)
     return response
 
+@extend_schema(
+    responses={
+        200: schema.UsersSessionResponseSerializer,
+        401: PolymorphicProxySerializer(
+            component_name='UsersProfileUnauthorizedResponse',
+            serializers=[
+                schema.UsersErrorResponseSerializer,
+                schema.UsersAuthFailureResponseSerializer,
+            ],
+            resource_type_field_name=None,
+        ),
+    },
+)
 @api_view(['GET'])
 def profile_view(request):
     if not request.user.is_authenticated:
@@ -187,6 +253,10 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 # ========== 图形验证码 & 短信验证码 ==========
 
+@extend_schema(responses={
+    200: schema.UsersCaptchaResponseSerializer,
+    503: schema.UsersSuccessErrorResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
 def get_captcha(request):
@@ -201,6 +271,13 @@ def get_captcha(request):
     return Response(result)
 
 
+@extend_schema(
+    request=schema.UsersSmsCodeRequestSerializer,
+    responses={
+        200: schema.UsersSmsCodeSentResponseSerializer,
+        400: schema.UsersSuccessErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
@@ -234,6 +311,14 @@ def send_register_code(request):
         return Response(result, status=status.HTTP_400_BAD_REQUEST)
 
 
+@extend_schema(
+    request=schema.UsersSmsLoginRequestSerializer,
+    responses={
+        200: schema.UsersSmsLoginResponseSerializer,
+        400: schema.UsersErrorResponseSerializer,
+    },
+    description='The refresh JWT is set only as an HttpOnly cookie and is not included in the JSON response.',
+)
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
@@ -277,6 +362,15 @@ def sms_login_view(request):
     return response
 
 
+@extend_schema(
+    request=schema.UsersWebsocketTicketRequestSerializer,
+    responses={
+        200: schema.UsersWebsocketTicketResponseSerializer,
+        400: schema.UsersErrorResponseSerializer,
+        401: schema.UsersAuthFailureResponseSerializer,
+        404: schema.UsersErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
 def websocket_ticket_view(request):
@@ -328,6 +422,26 @@ def websocket_ticket_view(request):
     })
 
 
+@extend_schema(
+    request=schema.UsersExchangeTokenRequestSerializer,
+    responses={
+        200: PolymorphicProxySerializer(
+            component_name='UsersExchangeTokenSuccessResponse',
+            serializers=[
+                schema.UsersExchangeCreatedResponseSerializer,
+                schema.UsersExchangeRedeemedResponseSerializer,
+            ],
+            resource_type_field_name=None,
+        ),
+        400: schema.UsersErrorResponseSerializer,
+        401: schema.UsersErrorResponseSerializer,
+    },
+    description=(
+        'Action `create` requires an authenticated request and returns a one-time code. '
+        'Action `redeem` requires `code` and is available without authentication; the code is '
+        'consumed on success. The refresh JWT is delivered only in the HttpOnly cookie.'
+    ),
+)
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 @csrf_exempt

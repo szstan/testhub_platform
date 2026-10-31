@@ -1,9 +1,11 @@
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
+from drf_spectacular.utils import extend_schema
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
+from . import schema as schema
 from .models import Version
 from .serializers import VersionSerializer, VersionCreateSerializer
 from apps.projects.models import Project
@@ -75,6 +77,11 @@ class VersionDetailView(generics.RetrieveUpdateDestroyAPIView):
         ).distinct()
         return Version.objects.filter(projects__in=accessible_projects).distinct()
 
+@extend_schema(responses={
+    200: schema.VersionsProjectVersionResponseSerializer(many=True),
+    401: schema.VersionsAuthFailureResponseSerializer,
+    403: schema.VersionsProjectAccessErrorResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_project_versions(request, project_id):

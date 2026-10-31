@@ -827,6 +827,9 @@ class UiScheduledTask(models.Model):
         verbose_name = 'UI定时任务'
         verbose_name_plural = 'UI定时任务'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['scheduler_lease_expires_at'], name='ui_sched_lease_exp_idx'),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.get_task_type_display()})"

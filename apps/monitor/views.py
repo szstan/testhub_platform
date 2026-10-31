@@ -5,6 +5,7 @@
 """
 from rest_framework import viewsets, permissions
 from rest_framework.decorators import action
+from drf_spectacular.utils import extend_schema
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from django.db.models import Count
@@ -25,6 +26,11 @@ from .serializers import (
 from .utils.notifiers import send_via_channel
 from .access import is_monitor_admin, scope_owned, scope_target_related
 from .utils.scheduler_heartbeat import get_scheduler_status
+from .schema import (
+    MonitorDashboardAuthErrorResponseSerializer,
+    MonitorDashboardResponseSerializer,
+    MonitorSchedulerStatusResponseSerializer,
+)
 
 
 class MonitorPagination(PageNumberPagination):
@@ -205,11 +211,25 @@ class DashboardViewSet(viewsets.ViewSet):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    @extend_schema(
+        operation_id='monitor_dashboard_scheduler',
+        responses={
+            200: MonitorSchedulerStatusResponseSerializer,
+            401: MonitorDashboardAuthErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def scheduler(self, request):
         """调度器在线状态：online / offline / unknown。"""
         return Response({'status': get_scheduler_status()})
 
+    @extend_schema(
+        operation_id='monitor_dashboard_list',
+        responses={
+            200: MonitorDashboardResponseSerializer,
+            401: MonitorDashboardAuthErrorResponseSerializer,
+        },
+    )
     def list(self, request):
         now = timezone.now()
 

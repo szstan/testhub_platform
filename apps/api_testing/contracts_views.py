@@ -1,5 +1,6 @@
 import hashlib
 import json
+from itertools import islice
 
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
@@ -14,7 +15,7 @@ from apps.executions.models import ExecutionJob
 from apps.executions.result_events import ResultEventError, ResultEventIngestor
 
 from .contract_runner import execute_contract_cases
-from .contracts import coverage_for_spec, diff_contracts, generate_contract_cases
+from .contracts import contract_operations, coverage_for_spec, diff_contracts, generate_contract_cases
 from .models import OpenApiContractSpec
 
 
@@ -39,7 +40,30 @@ class OpenApiContractSpecSerializer(serializers.ModelSerializer):
     def validate_document(self, value):
         if not isinstance(value, dict) or not isinstance(value.get('paths'), dict):
             raise serializers.ValidationError('document 必须包含 paths 对象')
+        try:
+            contract_operations(value)
+        except ValueError as exc:
+            raise serializers.ValidationError({'document': str(exc)}) from exc
         return value
+
+
+def _contract_result_summary(expected_cases, rows):
+    expected_keys = {case['contract_key'] for case in expected_cases}
+    rows_by_key = {row['contract_key']: row for row in rows}
+    missing_keys = expected_keys - set(rows_by_key)
+    skipped = sum(row.get('status') == 'skipped' for row in rows_by_key.values())
+    failed = sum(row.get('status') in {'failed', 'blocked'} for row in rows_by_key.values())
+    complete = bool(expected_keys) and not missing_keys and skipped == 0
+    final_status = 'failed' if failed else 'passed' if complete else 'blocked'
+    return {
+        'total': len(expected_keys),
+        'observed': len(rows_by_key),
+        'failed': failed,
+        'unmatched': 0,
+        'missing': len(missing_keys),
+        'skipped': skipped,
+        'complete': complete and failed == 0,
+    }, final_status
 
 
 class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
@@ -144,14 +168,26 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
         if job.is_terminal or job.final_attempt_id:
             return Response({'detail': 'job 已有终态结果，请创建新的 job 记录 contract run'}, status=status.HTTP_409_CONFLICT)
         try:
+            selected_kinds = request.data.get('kinds')
+            if not isinstance(selected_kinds, list):
+                selected_kinds = None
+            limit = request.data.get('limit', 100)
+            operations = contract_operations(spec.document)
+            case_definitions = generate_contract_cases(spec, operations=operations)
             results = execute_contract_cases(
                 spec,
                 base_url=str(request.data.get('base_url') or ''),
                 headers=request.data.get('headers') or {},
-                kinds=request.data.get('kinds') if isinstance(request.data.get('kinds'), list) else None,
-                limit=request.data.get('limit', 100),
+                kinds=selected_kinds,
+                limit=limit,
                 timeout=request.data.get('timeout', 15),
+                case_definitions=case_definitions,
             )
+            selected = set(selected_kinds or ('positive', 'negative', 'security'))
+            cases = list(islice(
+                (case for case in case_definitions if case['case_kind'] in selected),
+                max(1, min(int(limit), 100)),
+            ))
             next_attempt_number = (job.attempts.order_by('-attempt_number').values_list('attempt_number', flat=True).first() or 0) + 1
             ResultEventIngestor.ingest(job, 'run_started', {'attempt': next_attempt_number}, idempotency_key=f'contract-runner:{spec.pk}:{job.pk}')
             for row in results:
@@ -170,7 +206,7 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
                     },
                     idempotency_key=f"contract-runner-event:{spec.pk}:{job.pk}:{row['contract_key']}",
                 )
-            final_status = 'failed' if any(row['status'] in {'failed', 'blocked'} for row in results) else 'passed'
+            summary, final_status = _contract_result_summary(cases, results)
             ResultEventIngestor.ingest(
                 job,
                 'run_finished',
@@ -180,16 +216,21 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
                     'result': {
                         'contract_spec_id': spec.pk,
                         'contract_version': spec.version,
-                        'total': len(results),
-                        'failed': sum(row['status'] in {'failed', 'blocked'} for row in results),
-                        'unmatched': 0,
+                        **summary,
                     },
                 },
                 idempotency_key=f'contract-runner-finish:{spec.pk}:{job.pk}',
             )
         except (TypeError, ValueError, ResultEventError) as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response({'spec_id': spec.pk, 'job_id': job.pk, 'status': final_status, 'results': results, 'coverage': coverage_for_spec(spec)}, status=status.HTTP_201_CREATED)
+        return Response({
+            'spec_id': spec.pk,
+            'job_id': job.pk,
+            'status': final_status,
+            **summary,
+            'results': results,
+            'coverage': coverage_for_spec(spec, operations=operations, case_definitions=case_definitions),
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='record-results')
     def record_results(self, request, pk=None):
@@ -213,6 +254,7 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
             for key in (case['contract_key'], case['external_ref']):
                 expected_by_key[key] = case
         normalized = []
+        seen_contract_keys = set()
         for row in rows[:500]:
             if not isinstance(row, dict):
                 return Response({'detail': 'results 中每一项必须是对象'}, status=status.HTTP_400_BAD_REQUEST)
@@ -231,10 +273,13 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             row_status = str(row.get('status') or '').strip().lower()
-            if row_status in {'pass', 'success'}:
+            if row_status in {'pass', 'success', 'succeeded', 'completed'}:
                 row_status = 'passed'
-            if row_status not in {'passed', 'succeeded', 'completed', 'failed', 'blocked', 'skipped'}:
+            if row_status not in {'passed', 'failed', 'blocked', 'skipped'}:
                 return Response({'detail': f'不支持的 contract result status: {row_status}'}, status=status.HTTP_400_BAD_REQUEST)
+            if case['contract_key'] in seen_contract_keys:
+                return Response({'detail': f'contract case 重复: {case["contract_key"]}'}, status=status.HTTP_400_BAD_REQUEST)
+            seen_contract_keys.add(case['contract_key'])
             normalized.append((case, row_status, row))
 
         try:
@@ -260,7 +305,11 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
                     },
                     idempotency_key=f"contract-step-event:{spec.pk}:{job.pk}:{case['contract_key']}",
                 )
-            final_status = 'failed' if any(row_status in {'failed', 'blocked'} for _, row_status, _ in normalized) else 'passed'
+            result_rows = [
+                {'contract_key': case['contract_key'], 'status': row_status}
+                for case, row_status, _row in normalized
+            ]
+            summary, final_status = _contract_result_summary(expected, result_rows)
             ResultEventIngestor.ingest(
                 job,
                 'run_finished',
@@ -270,9 +319,7 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
                     'result': {
                         'contract_spec_id': spec.pk,
                         'contract_version': spec.version,
-                        'total': len(normalized),
-                        'failed': sum(row_status in {'failed', 'blocked'} for _, row_status, _ in normalized),
-                        'unmatched': 0,
+                        **summary,
                     },
                 },
                 idempotency_key=f'contract-finish:{spec.pk}:{job.pk}',
@@ -284,6 +331,10 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
             'job_id': job.pk,
             'created_results': len(normalized),
             'status': final_status,
+            'total': summary['total'],
+            'missing': summary['missing'],
+            'skipped': summary['skipped'],
+            'complete': summary['complete'],
             'coverage': coverage_for_spec(spec),
         }, status=status.HTTP_201_CREATED)
 

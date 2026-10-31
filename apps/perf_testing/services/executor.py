@@ -980,6 +980,7 @@ def _publish_unified_completion(execution):
                 'error_message': execution.error_message or '',
             },
             idempotency_key=f'performance:{execution.pk}:finished',
+            worker_claim_id=unified.get('worker_claim_id') or None,
         )
     except ObjectDoesNotExist as exc:
         _mark_unified_callback_orphaned(execution, 'unified job or attempt no longer exists')
@@ -1013,6 +1014,27 @@ def reconcile_unified_completions(limit=100):
 
 
 def run_execution(execution_id, stdout=None):
+    """The child owns the unified lease for its entire process lifetime."""
+    from ..models import PerfExecution
+    from apps.executions.worker_leases import ExecutionClaimLost, ExecutionLeaseHeartbeat
+
+    execution = PerfExecution.objects.get(pk=execution_id)
+    unified = dict((execution.script_ref or {}).get('unified_execution') or {})
+    claim_id = unified.get('worker_claim_id')
+    if not claim_id:
+        return _run_execution(execution_id, stdout=stdout)
+    heartbeat = ExecutionLeaseHeartbeat(unified['job_id'], unified['attempt_id'], claim_id)
+    try:
+        with heartbeat:
+            return _run_execution(execution_id, stdout=stdout, lease_heartbeat=heartbeat)
+    except ExecutionClaimLost:
+        execution.refresh_from_db()
+        if execution.status not in PerfExecution.FINAL_STATUSES:
+            _finalize_orphan(execution, 'STOPPED', 'Unified execution ownership was lost')
+        return execution
+
+
+def _run_execution(execution_id, stdout=None, lease_heartbeat=None):
     """子进程主逻辑。异常一律落到 FAILED，绝不留下 RUNNING 悬挂记录。"""
     from ..models import PerfExecution, PerfMetricSample, PerfRequestStat
 
@@ -1062,6 +1084,9 @@ def run_execution(execution_id, stdout=None):
         'peak_cpu': 0.0,
     }
 
+    if lease_heartbeat is not None:
+        lease_heartbeat.on_lost = lambda: state['engine'].stop() if state['engine'] else None
+
     from ..engines import get_engine_class
     from ..engines.base import EngineError
     from .sla import BreachDetector, evaluate
@@ -1073,6 +1098,10 @@ def run_execution(execution_id, stdout=None):
 
     def on_sample(sample):
         """采样回调：推 WS（每个点）+ 落库（按 db_interval 抽稀）+ SLA 熔断。"""
+        if lease_heartbeat is not None and lease_heartbeat._lost.is_set():
+            if state['engine']:
+                state['engine'].stop()
+            return
         offset = int(sample.get('ts_offset') or 0)
         cpu = float(sample.get('cpu_percent') or 0)
         state['peak_cpu'] = max(state['peak_cpu'], cpu)
@@ -1141,7 +1170,11 @@ def run_execution(execution_id, stdout=None):
                               raw_csv_path=raw_csv_path)
         state['engine'] = engine
 
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         engine.prepare()
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
 
         execution.status = 'RUNNING'
         execution.start_time = timezone.now()

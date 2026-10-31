@@ -19,6 +19,17 @@
           <template #default="scope"><el-button link type="primary" @click="openEdit(scope.row)">{{ $t('common.edit') }}</el-button></template>
         </el-table-column>
       </el-table>
+      <div class="pagination">
+        <el-pagination
+          :current-page="pagination.page"
+          :page-size="pagination.pageSize"
+          :page-sizes="[10, 20, 50, 100]"
+          :total="pagination.total"
+          layout="total, sizes, prev, pager, next, jumper"
+          @current-change="changePage"
+          @size-change="changePageSize"
+        />
+      </div>
       <el-empty v-if="!loading && !profiles.length" :description="$t('execution.profiles.empty')" />
     </el-card>
 
@@ -40,11 +51,12 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import api from '@/utils/api'
 import { createExecutionProfile, listExecutionProfiles, updateExecutionProfile } from '@/api/executions'
 
 const profiles = ref([])
 const loading = ref(false)
+const pagination = ref({ page: 1, pageSize: 20, total: 0 })
+let loadRequestId = 0
 const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
@@ -53,12 +65,37 @@ const sources = ['api', 'ui', 'app', 'performance', 'ci', 'manual']
 const form = ref({ name: '', project: null, provider: 'generic', source_type: 'manual', webhook_secret_ref: '', webhook_enabled: false, quality_gate_text: '{}' })
 
 const load = async () => {
+  const requestId = ++loadRequestId
+  const pageSize = pagination.value.pageSize
+  let page = pagination.value.page
   loading.value = true
   try {
-    const response = await listExecutionProfiles()
-    profiles.value = response.data?.results || response.data || []
-  } catch (error) { ElMessage.error(error.response?.data?.detail || '加载执行配置失败') } finally { loading.value = false }
+    const fetchPage = currentPage => listExecutionProfiles({ page: currentPage, page_size: pageSize, ordering: 'project,name,id' })
+    let response = await fetchPage(page)
+    if (requestId !== loadRequestId) return
+    let data = response.data || {}
+    let rows = data.results || (Array.isArray(data) ? data : [])
+    let total = Number(data.count ?? rows.length)
+    const lastPage = Math.max(1, Math.ceil(total / pageSize))
+    if (page > lastPage) {
+      page = lastPage
+      pagination.value.page = page
+      response = await fetchPage(page)
+      if (requestId !== loadRequestId) return
+      data = response.data || {}
+      rows = data.results || (Array.isArray(data) ? data : [])
+      total = Number(data.count ?? rows.length)
+    }
+    profiles.value = rows
+    pagination.value.total = total
+  } catch (error) {
+    if (requestId === loadRequestId) ElMessage.error(error.response?.data?.detail || '加载执行配置失败')
+  } finally {
+    if (requestId === loadRequestId) loading.value = false
+  }
 }
+const changePage = page => { if (page === pagination.value.page) return; pagination.value.page = page; load() }
+const changePageSize = pageSize => { pagination.value.pageSize = pageSize; pagination.value.page = 1; load() }
 const openCreate = () => { editing.value = null; form.value = { name: '', project: null, provider: 'generic', source_type: 'manual', webhook_secret_ref: '', webhook_enabled: false, quality_gate_text: '{}' }; dialogVisible.value = true }
 const openEdit = row => { editing.value = row.id; form.value = { ...row, quality_gate_text: JSON.stringify(row.quality_gate || {}) }; dialogVisible.value = true }
 const save = async () => {
@@ -81,4 +118,5 @@ onMounted(load)
 .page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }
 .page-header h1 { margin: 0; font-size: 24px; }
 .page-header p { color: var(--el-text-color-secondary); }
+.pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 </style>

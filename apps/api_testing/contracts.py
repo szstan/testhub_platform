@@ -26,7 +26,10 @@ def contract_operations(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
         raise ValueError('OpenAPI document.paths 必须是对象')
     operations = {}
     for path, item in paths.items():
-        if not isinstance(item, dict) or not str(path).startswith('/'):
+        path = str(path)
+        if path.startswith('//') or '\\' in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
+            raise ValueError('OpenAPI operation paths must not contain an authority or control characters')
+        if not isinstance(item, dict) or not path.startswith('/'):
             continue
         for method, operation in item.items():
             method = str(method).lower()
@@ -35,7 +38,7 @@ def contract_operations(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
             key = str(operation.get('operationId') or f'{method.upper()} {path}')
             operations[key] = {
                 'key': key,
-                'path': str(path),
+                'path': path,
                 'method': method.upper(),
                 'operation_id': str(operation.get('operationId') or ''),
                 'summary': str(operation.get('summary') or operation.get('description') or '')[:500],
@@ -113,9 +116,10 @@ def contract_case_identity(spec: OpenApiContractSpec, case_key: str) -> dict[str
     return None
 
 
-def generate_contract_cases(spec: OpenApiContractSpec) -> list[dict[str, Any]]:
+def generate_contract_cases(spec: OpenApiContractSpec, *, operations=None) -> list[dict[str, Any]]:
     cases = []
-    for operation in contract_operations(spec.document).values():
+    operation_map = contract_operations(spec.document) if operations is None else operations
+    for operation in operation_map.values():
         key = operation['key']
         case_definitions = [
             ('positive', 'schema-driven'),
@@ -136,9 +140,9 @@ def generate_contract_cases(spec: OpenApiContractSpec) -> list[dict[str, Any]]:
     return cases
 
 
-def coverage_for_spec(spec: OpenApiContractSpec) -> dict[str, Any]:
-    operations = contract_operations(spec.document)
-    expected_cases = generate_contract_cases(spec)
+def coverage_for_spec(spec: OpenApiContractSpec, *, operations=None, case_definitions=None) -> dict[str, Any]:
+    operations = contract_operations(spec.document) if operations is None else operations
+    expected_cases = generate_contract_cases(spec, operations=operations) if case_definitions is None else case_definitions
     operation_keys = set(operations)
     match_keys = {
         key
@@ -151,13 +155,13 @@ def coverage_for_spec(spec: OpenApiContractSpec) -> dict[str, Any]:
         status__in={'passed', 'succeeded', 'completed'},
     ).values_list('case_key', flat=True)
     covered_keys = set(rows)
-    covered_cases = []
-    for case in expected_cases:
-        if case['contract_key'] in covered_keys or case['external_ref'] in covered_keys:
-            covered_cases.append(case)
-    operation_covered = set(
-        case['operation_key'] for case in covered_cases
-    ) | (covered_keys & operation_keys)
+    covered_case_keys = {
+        case['contract_key'] for case in expected_cases
+        if case['contract_key'] in covered_keys or case['external_ref'] in covered_keys
+    }
+    operation_covered = {
+        case['operation_key'] for case in expected_cases if case['contract_key'] in covered_case_keys
+    } | (covered_keys & operation_keys)
     case_rows = []
     for case in expected_cases:
         identity = {
@@ -167,7 +171,7 @@ def coverage_for_spec(spec: OpenApiContractSpec) -> dict[str, Any]:
             'kind': case['case_kind'],
             'contract_key': case['contract_key'],
             'external_ref': case['external_ref'],
-            'covered': case in covered_cases,
+            'covered': case['contract_key'] in covered_case_keys,
         }
         case_rows.append(identity)
     by_kind = {}

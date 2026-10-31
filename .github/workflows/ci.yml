@@ -122,6 +122,36 @@ jobs:
             exit 1
           fi
 
+  backend-ui-automation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements-prod.txt
+            requirements-ui-optional.txt
+
+      - name: Install web and optional UI dependencies
+        run: python -m pip install -r requirements-prod.txt -r requirements-ui-optional.txt
+
+      - name: Validate pinned UI dependencies
+        run: python scripts/validate_runtime_dependencies.py --requirements requirements-prod.txt requirements-ui-optional.txt
+
+      - name: Run mocked UI automation boundary tests
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: python -m pytest -q apps/ui_automation/tests
+
   backend-migration-compatibility:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -266,6 +296,10 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Test frontend auth state
+        working-directory: ${{ github.workspace }}
+        run: npm --prefix frontend run test:auth
 
       - name: Lint frontend
         run: npm run lint

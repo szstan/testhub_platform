@@ -60,6 +60,8 @@ jobs:
           test -n "$TESTHUB_BASE_URL"
           test -n "$TESTHUB_PROJECT_ID"
           python scripts/testhub_ci.py --help >/dev/null
+          python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" import-results --help >/dev/null
+          python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" release-gate --help >/dev/null
 
       - name: Run project tests
         shell: bash

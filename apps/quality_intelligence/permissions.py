@@ -40,14 +40,22 @@ def is_privileged(user: Any) -> bool:
     return bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
 
 
-def accessible_project_ids(user: Any, source_type: Any) -> set[str] | None:
-    """Return project IDs visible to a user, or ``None`` for staff users."""
+def accessible_project_ids(user: Any, source_type: Any, *, project_type: Any = None) -> set[str] | None:
+    """Resolve IDs within an explicit project namespace, never by numeric ID alone."""
 
     if is_privileged(user):
         return None
     if not getattr(user, "is_authenticated", False):
         return set()
-    model = _source_model(source_type)
+    source_key = str(getattr(source_type, "value", source_type) or "").upper()
+    domain = str(project_type or source_key).upper()
+    if domain == "PROJECT":
+        from apps.projects.models import Project
+        model = Project
+    elif domain == source_key:
+        model = _source_model(source_key)
+    else:
+        return set()
     if model is None:
         return set()
     try:
@@ -64,13 +72,19 @@ def quality_project_filter(queryset: Any, user: Any, *, source_field: str = "sou
 
     if is_privileged(user):
         return queryset
+    if not getattr(user, "is_authenticated", False):
+        return queryset.none()
     visible: list[models.Q] = []
+    from apps.projects.models import Project
+
+    global_ids = Project.objects.filter(models.Q(owner=user) | models.Q(members=user)).values('pk')
+    visible.append(models.Q(project_type="PROJECT", project_id__in=global_ids))
     for source_type in _SOURCE_PROJECT_MODELS:
-        project_ids = accessible_project_ids(user, source_type)
-        if project_ids:
-            visible.append(
-                models.Q(**{source_field: source_type}, project_id__in=project_ids)
-            )
+        model = _source_model(source_type)
+        project_ids = model.objects.filter(models.Q(owner=user) | models.Q(members=user)).values('pk')
+        visible.append(models.Q(
+            **{source_field: source_type}, project_type=source_type, project_id__in=project_ids
+        ))
     if not visible:
         return queryset.none()
     condition = visible.pop()

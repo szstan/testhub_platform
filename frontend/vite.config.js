@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import { resolve } from 'path'
+import { releaseReceipt } from './build/release-receipt.mjs'
 
 const curlconverterBrowserParser = {
   name: 'curlconverter-browser-parser',
@@ -19,12 +20,17 @@ const curlconverterBrowserParser = {
   },
 }
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   envDir: resolve(__dirname, '..'),
   plugins: [
     vue(),
-    Components({ resolvers: [ElementPlusResolver()] }),
+    Components({
+      resolvers: [ElementPlusResolver()],
+      // Production builds must leave tracked source inputs unchanged.
+      dts: command === 'serve',
+    }),
     curlconverterBrowserParser,
+    releaseReceipt(),
   ],
   resolve: {
     alias: {
@@ -134,4 +140,4 @@ export default defineConfig({
     },
   },
   assetsInclude: ['**/*.wasm'],
-})
+}))

@@ -252,11 +252,12 @@ class ExecutionJobManager(models.Manager):
                     create_values.pop('build_id')
                 if 'profile' in create_values and 'profile_id' in create_values:
                     create_values.pop('profile_id')
-                return self.create(
-                    project=project,
-                    idempotency_key=idempotency_key,
-                    **create_values,
-                ), True
+                with transaction.atomic():
+                    return self.create(
+                        project=project,
+                        idempotency_key=idempotency_key,
+                        **create_values,
+                    ), True
             except IntegrityError:
                 # A concurrent request may have committed the unique key after
                 # the initial lookup.  Read it back and apply the same payload
@@ -698,8 +699,11 @@ class ExecutionAttempt(models.Model):
     )
     error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
     dispatch_id = models.CharField(max_length=255, blank=True, default='', verbose_name='调度标识')
+    dispatch_reserved_at = models.DateTimeField(null=True, blank=True)
     worker_claim_id = models.CharField(max_length=255, blank=True, default='', verbose_name='worker claim')
     worker_claimed_at = models.DateTimeField(null=True, blank=True, verbose_name='worker claim 时间')
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    worker_claim_expires_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
     created_at = models.DateTimeField(default=timezone.now, verbose_name='创建时间')
@@ -708,6 +712,10 @@ class ExecutionAttempt(models.Model):
     class Meta:
         db_table = 'execution_attempts'
         ordering = ['job_id', 'attempt_number']
+        indexes = [
+            models.Index(fields=('status', 'worker_claim_expires_at'), name='exec_attempt_claim_exp_idx'),
+            models.Index(fields=('status', 'dispatch_reserved_at'), name='exec_attempt_dispatch_idx'),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=('job', 'attempt_number'),
@@ -1364,6 +1372,7 @@ class ExecutionNotificationSubscription(models.Model):
 class ExecutionNotificationEvent(models.Model):
     STATUS_CHOICES = (
         ('pending', 'Pending'),
+        ('dispatching', 'Dispatching'),
         ('sent', 'Sent'),
         ('failed', 'Failed'),
     )
@@ -1373,6 +1382,10 @@ class ExecutionNotificationEvent(models.Model):
     event_key = models.CharField(max_length=255)
     event_type = models.CharField(max_length=32, choices=NOTIFICATION_EVENT_CHOICES)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='pending')
+    delivery_claim_id = models.CharField(max_length=255, blank=True, default='')
+    delivery_claim_expires_at = models.DateTimeField(null=True, blank=True)
+    delivery_attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
     payload = models.JSONField(default=dict, blank=True)
     error_message = models.TextField(blank=True, default='')
     sent_at = models.DateTimeField(null=True, blank=True)
@@ -1385,6 +1398,8 @@ class ExecutionNotificationEvent(models.Model):
         ]
         indexes = [
             models.Index(fields=('project', 'event_type', '-created_at'), name='execution_notify_event_idx'),
+            models.Index(fields=('status', 'next_attempt_at'), name='exec_notify_due_idx'),
+            models.Index(fields=('status', 'delivery_claim_expires_at'), name='exec_notify_claim_exp_idx'),
         ]
 
 

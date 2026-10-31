@@ -1,11 +1,13 @@
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
+from drf_spectacular.utils import extend_schema
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
 from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import PermissionDenied
+from . import schema as schema
 from .models import Project, ProjectMember, ProjectEnvironment
 from .serializers import ProjectSerializer, ProjectCreateSerializer, ProjectMemberSerializer, ProjectEnvironmentSerializer
 
@@ -38,6 +40,10 @@ class ProjectListCreateView(generics.ListCreateAPIView):
             models.Q(owner=user) | models.Q(members=user)
         ).distinct()
 
+@extend_schema(responses={
+    200: schema.ProjectsGetAllItemResponseSerializer(many=True),
+    401: schema.ProjectsAuthFailureResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_all_projects(request):
@@ -69,6 +75,16 @@ class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
         self._require_manage_permission(instance)
         instance.delete()
 
+@extend_schema(
+    request=schema.ProjectsMemberCreateRequestSerializer,
+    responses={
+        201: schema.ProjectsMemberResponseSerializer,
+        400: schema.ProjectsMemberValidationErrorResponseSerializer,
+        401: schema.ProjectsAuthFailureResponseSerializer,
+        403: schema.ProjectsErrorResponseSerializer,
+        404: schema.ProjectsErrorResponseSerializer,
+    },
+)
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
 def add_project_member(request, project_id):
@@ -84,6 +100,12 @@ def add_project_member(request, project_id):
     except Project.DoesNotExist:
         return Response({'error': '项目不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+@extend_schema(responses={
+    200: schema.ProjectsMemberListItemResponseSerializer(many=True),
+    401: schema.ProjectsAuthFailureResponseSerializer,
+    403: schema.ProjectsErrorResponseSerializer,
+    404: schema.ProjectsErrorResponseSerializer,
+})
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_project_members(request, project_id):
@@ -125,6 +147,12 @@ def get_project_members(request, project_id):
     except Project.DoesNotExist:
         return Response({'error': '项目不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+@extend_schema(responses={
+    200: schema.ProjectsMessageResponseSerializer,
+    401: schema.ProjectsAuthFailureResponseSerializer,
+    403: schema.ProjectsErrorResponseSerializer,
+    404: schema.ProjectsErrorResponseSerializer,
+})
 @api_view(['DELETE'])
 @permission_classes([permissions.IsAuthenticated])
 def remove_project_member(request, project_id, member_id):

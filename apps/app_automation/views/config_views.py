@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """APP自动化配置管理视图"""
 from rest_framework import viewsets, status
+from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -9,6 +10,13 @@ import logging
 from ..models import AppTestConfig
 from ..access import is_app_admin
 from ..serializers import AppTestConfigSerializer
+from ..schema import (
+    AppAutomationAuthErrorResponseSerializer,
+    AppConfigCurrentSuccessResponseSerializer,
+    AppAutomationFailureResponseSerializer,
+    AppConfigSaveSuccessResponseSerializer,
+    AppConfigValidationFailureResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +25,14 @@ class AppConfigViewSet(viewsets.ViewSet):
     """APP测试配置视图集"""
     permission_classes = [IsAuthenticated]
     
+    @extend_schema(
+        operation_id='app_config_current',
+        responses={
+            200: AppConfigCurrentSuccessResponseSerializer,
+            401: AppAutomationAuthErrorResponseSerializer,
+            500: AppAutomationFailureResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['get'])
     def current(self, request):
         """获取当前配置"""
@@ -39,6 +55,17 @@ class AppConfigViewSet(viewsets.ViewSet):
                 'message': f'获取配置失败: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
+    @extend_schema(
+        operation_id='app_config_save',
+        request=AppTestConfigSerializer(partial=True),
+        responses={
+            200: AppConfigSaveSuccessResponseSerializer,
+            400: AppConfigValidationFailureResponseSerializer,
+            401: AppAutomationAuthErrorResponseSerializer,
+            403: AppAutomationFailureResponseSerializer,
+            500: AppAutomationFailureResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['post'])
     def save(self, request):
         """保存配置"""

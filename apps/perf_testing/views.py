@@ -20,7 +20,8 @@ from django.db import transaction
 from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -48,6 +49,16 @@ from .services import cleanup as cleanup_service
 from .services import executor, reporter
 from .services.url_rewrite import (collapse_redundant_slashes, normalize_base_url_token,
                                    rewrite_base_url_token)
+from .schema import (
+    PerfComparisonAuthErrorResponseSerializer,
+    PerfComparisonErrorResponseSerializer,
+    PerfComparisonReportBriefSerializer,
+    PerfComparisonReportCreateRequestSerializer,
+    PerfComparisonReportDetailSerializer,
+    PerfComparisonReportListResponseSerializer,
+    PerfEngineAuthErrorResponseSerializer,
+    PerfEngineStatusResponseSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1420,6 +1431,13 @@ class EngineStatusView(APIView):
         except Exception:  # noqa: BLE001
             return False
 
+    @extend_schema(
+        operation_id='perf_engine_status',
+        responses={
+            200: PerfEngineStatusResponseSerializer,
+            401: PerfEngineAuthErrorResponseSerializer,
+        },
+    )
     def get(self, request):
         websocket_ok = self._websocket_available()
 
@@ -1452,7 +1470,16 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
             'created_at': report.created_at,
         }
 
-    @extend_schema(operation_id='perf_comparison_reports_list')
+    @extend_schema(
+        operation_id='perf_comparison_reports_list',
+        parameters=[OpenApiParameter(
+            name='project', type=OpenApiTypes.INT, location=OpenApiParameter.QUERY
+        )],
+        responses={
+            200: PerfComparisonReportListResponseSerializer,
+            401: PerfComparisonAuthErrorResponseSerializer,
+        },
+    )
     def list(self, request):
         qs = scope_by_project(
             PerfComparisonReport.objects.select_related('created_by'),
@@ -1464,7 +1491,17 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         rows = qs.order_by('-created_at')[:200]
         return Response({'items': [self._brief(r) for r in rows], 'total': total})
 
-    @extend_schema(operation_id='perf_comparison_reports_retrieve')
+    @extend_schema(
+        operation_id='perf_comparison_reports_retrieve',
+        parameters=[OpenApiParameter(
+            name='id', type=OpenApiTypes.INT, location=OpenApiParameter.PATH
+        )],
+        responses={
+            200: PerfComparisonReportDetailSerializer,
+            401: PerfComparisonAuthErrorResponseSerializer,
+            404: PerfComparisonErrorResponseSerializer,
+        },
+    )
     def retrieve(self, request, pk=None):
         report = scope_by_project(
             PerfComparisonReport.objects.filter(id=pk).select_related('created_by'),
@@ -1476,7 +1513,17 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         data['ai_analysis'] = report.ai_analysis
         return Response(data)
 
-    @extend_schema(operation_id='perf_comparison_reports_destroy')
+    @extend_schema(
+        operation_id='perf_comparison_reports_destroy',
+        parameters=[OpenApiParameter(
+            name='id', type=OpenApiTypes.INT, location=OpenApiParameter.PATH
+        )],
+        responses={
+            204: None,
+            401: PerfComparisonAuthErrorResponseSerializer,
+            404: PerfComparisonErrorResponseSerializer,
+        },
+    )
     def destroy(self, request, pk=None):
         report = scope_by_project(
             PerfComparisonReport.objects.filter(id=pk), request.user, 'project').first()
@@ -1485,7 +1532,16 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         report.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    @extend_schema(operation_id='perf_comparison_reports_create')
+    @extend_schema(
+        operation_id='perf_comparison_reports_create',
+        request=PerfComparisonReportCreateRequestSerializer,
+        responses={
+            201: PerfComparisonReportBriefSerializer,
+            400: PerfComparisonErrorResponseSerializer,
+            401: PerfComparisonAuthErrorResponseSerializer,
+            404: PerfComparisonErrorResponseSerializer,
+        },
+    )
     def create(self, request):
         raw_ids = request.data.get('execution_ids') or []
         ids = list(dict.fromkeys(int(i) for i in raw_ids

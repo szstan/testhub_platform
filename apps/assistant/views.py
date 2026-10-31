@@ -1,7 +1,10 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
+from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from django.shortcuts import render
+from django.conf import settings
+from apps.core.http_transport import guarded_post
 import requests
 from .models import AssistantSession, AssistantMessage, ChatMessage, DifyConfig
 from .views_config import _validate_dify_url
@@ -10,6 +13,12 @@ from .serializers import (
     AssistantSessionCreateSerializer,
     AssistantMessageSerializer,
     ChatMessageSerializer
+)
+from .schema import (
+    AssistantChatAuthErrorResponseSerializer,
+    AssistantChatErrorResponseSerializer,
+    AssistantChatSendMessageRequestSerializer,
+    AssistantChatSendMessageResponseSerializer,
 )
 
 
@@ -55,6 +64,18 @@ class ChatViewSet(viewsets.ViewSet):
     """聊天功能ViewSet"""
     permission_classes = [permissions.IsAuthenticated]
     
+    @extend_schema(
+        operation_id='assistant_chat_send_message',
+        request=AssistantChatSendMessageRequestSerializer,
+        responses={
+            200: AssistantChatSendMessageResponseSerializer,
+            400: AssistantChatErrorResponseSerializer,
+            401: AssistantChatAuthErrorResponseSerializer,
+            404: AssistantChatErrorResponseSerializer,
+            408: AssistantChatErrorResponseSerializer,
+            502: AssistantChatErrorResponseSerializer,
+        },
+    )
     @action(detail=False, methods=['post'])
     def send_message(self, request):
         """发送消息到Dify API"""
@@ -114,8 +135,9 @@ class ChatViewSet(viewsets.ViewSet):
                 payload['conversation_id'] = session.conversation_id
             
             api_url = _validate_dify_url(dify_config.api_url)
-            response = requests.post(
+            response = guarded_post(
                 f'{api_url}/chat-messages',
+                allow_private=bool((getattr(settings, 'DIFY_ALLOWED_HOSTS', '') or '').strip()),
                 headers=headers,
                 json=payload,
                 timeout=30,

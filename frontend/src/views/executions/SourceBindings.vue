@@ -12,7 +12,7 @@
     </div>
 
     <el-card shadow="never" class="filter-card">
-      <el-form :inline="true" @submit.prevent="load">
+      <el-form :inline="true" @submit.prevent="applyFilters">
         <el-form-item :label="$t('execution.sourceBindings.projectId')">
           <el-input-number v-model="projectFilter" :min="1" :controls="false" clearable />
         </el-form-item>
@@ -21,7 +21,9 @@
             <el-option v-for="item in sourceTypes" :key="item" :label="item.toUpperCase()" :value="item" />
           </el-select>
         </el-form-item>
-        <el-button type="primary" @click="load">{{ $t('common.search') }}</el-button>
+        <el-form-item>
+          <el-button type="primary" @click="applyFilters">{{ $t('common.search') }}</el-button>
+        </el-form-item>
       </el-form>
     </el-card>
 
@@ -51,6 +53,17 @@
           </template>
         </el-table-column>
       </el-table>
+      <div class="pagination">
+        <el-pagination
+          :current-page="pagination.page"
+          :page-size="pagination.pageSize"
+          :page-sizes="[10, 20, 50, 100]"
+          :total="pagination.total"
+          layout="total, sizes, prev, pager, next, jumper"
+          @current-change="changePage"
+          @size-change="changePageSize"
+        />
+      </div>
       <el-empty v-if="!loading && bindings.length === 0" :description="$t('execution.sourceBindings.empty')" />
     </el-card>
 
@@ -98,6 +111,8 @@ import {
 const sourceTypes = ['api', 'ui', 'app', 'performance']
 const bindings = ref([])
 const loading = ref(false)
+const pagination = ref({ page: 1, pageSize: 20, total: 0 })
+let loadRequestId = 0
 const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
@@ -112,25 +127,54 @@ const form = ref({
   enabled: true,
 })
 
-const rowsFrom = payload => payload?.results || (Array.isArray(payload) ? payload : [])
+const pageData = response => {
+  const data = response.data || {}
+  const results = data.results || (Array.isArray(data) ? data : [])
+  return { results, total: Number(data.count ?? results.length) }
+}
 const statusLabel = value => ({ ready: 'Ready', unsupported: 'Unsupported', disabled_binding: 'Disabled', missing_binding: 'Missing binding', invalid_binding: 'Invalid source' }[value] || value || '-')
 const statusType = value => ({ ready: 'success', unsupported: 'warning', disabled_binding: 'info', missing_binding: 'danger', invalid_binding: 'danger' }[value] || 'info')
 
 const load = async () => {
+  const requestId = ++loadRequestId
+  const pageSize = pagination.value.pageSize
+  let page = pagination.value.page
+  const filters = {
+    project: projectFilter.value || undefined,
+    source_type: sourceFilter.value || undefined,
+    ordering: 'project,source_type,source_id,id',
+  }
   loading.value = true
   try {
-    const response = await listExecutionSourceBindings({
-      project: projectFilter.value || undefined,
-      source_type: sourceFilter.value || undefined,
-      page_size: 100,
-    })
-    bindings.value = rowsFrom(response.data)
+    const fetchPage = currentPage => listExecutionSourceBindings({ ...filters, page: currentPage, page_size: pageSize })
+    let response = await fetchPage(page)
+    if (requestId !== loadRequestId) return
+    let { results, total } = pageData(response)
+    const lastPage = Math.max(1, Math.ceil(total / pageSize))
+    if (page > lastPage) {
+      page = lastPage
+      pagination.value.page = page
+      response = await fetchPage(page)
+      if (requestId !== loadRequestId) return
+      const nextPageData = pageData(response)
+      results = nextPageData.results
+      total = nextPageData.total
+    }
+    bindings.value = results
+    pagination.value.total = total
   } catch (error) {
-    ElMessage.error(error.response?.data?.detail || '加载 source binding 失败')
+    if (requestId === loadRequestId) ElMessage.error(error.response?.data?.detail || '加载 source binding 失败')
   } finally {
-    loading.value = false
+    if (requestId === loadRequestId) loading.value = false
   }
 }
+
+const applyFilters = () => {
+  pagination.value.page = 1
+  load()
+}
+const changePage = page => { if (page === pagination.value.page) return; pagination.value.page = page; load() }
+const changePageSize = pageSize => { pagination.value.pageSize = pageSize; pagination.value.page = 1; load() }
 
 const resetForm = () => {
   form.value = {
@@ -211,4 +255,5 @@ onMounted(load)
 .page-header p { margin: 8px 0 0; color: var(--el-text-color-secondary); }
 .header-actions { display: flex; gap: 10px; }
 .filter-card { margin-bottom: 16px; }
+.pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 </style>

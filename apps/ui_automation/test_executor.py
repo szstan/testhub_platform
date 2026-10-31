@@ -28,20 +28,27 @@ from .models import (
     TestCaseExecution, Element
 )
 from .variable_resolver import resolve_variables
+from .evidence import project_screenshots
 
 
 class TestExecutor:
     """测试执行器基类"""
 
-    def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None):
+    def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None,
+                 cancel_check=None):
         self.test_suite = test_suite
         self.engine = engine
         self.browser = browser
         self.headless = headless
         self.executed_by = executed_by
+        self.cancel_check = cancel_check
         self.execution = None
         self.test_cases = []
         self.results = []
+
+    def _check_cancelled(self):
+        if self.cancel_check is not None:
+            self.cancel_check()
 
     def create_execution_record(self):
         """创建测试执行记录"""
@@ -99,6 +106,7 @@ class TestExecutor:
         """执行测试套件"""
         print(f"[TestExecutor] 初始化执行器...")
         try:
+            self._check_cancelled()
             # 设置环境变量，允许在后台线程中使用同步 ORM
             # 这对于 Playwright 执行是必需的
             import os
@@ -139,7 +147,15 @@ class TestExecutor:
                     status='FAILED',
                     error_msg=f"执行失败: {str(e)}\n\n{traceback.format_exc()}"
                 )
+            self._check_cancelled()
         finally:
+            driver = getattr(self, '_selenium_driver', None)
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                self._selenium_driver = None
             # 确保关闭数据库连接
             print(f"[TestExecutor] 关闭数据库连接...")
             connection.close()
@@ -274,6 +290,7 @@ class TestExecutor:
 
         with sync_playwright() as p:
             for i, case_data in enumerate(test_cases_data, 1):
+                self._check_cancelled()
                 print(f"\n{'=' * 60}")
                 print(f"正在执行第 {i}/{len(test_cases_data)} 个用例: {case_data['name']}")
                 print(f"{'=' * 60}")
@@ -337,6 +354,7 @@ class TestExecutor:
                                 allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
                                                            getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
                             )
+                            self._check_cancelled()
                             self.current_page.goto(safe_base_url, wait_until='networkidle',
                                                    timeout=30000)
 
@@ -367,6 +385,12 @@ class TestExecutor:
 
                     # 执行测试用例（不再传递page参数，使用self.current_page）
                     case_result = self.execute_test_case_playwright_no_db(case_data)
+                    case_result['screenshots'] = project_screenshots(
+                        case_result.get('screenshots', []),
+                        producer='ui_test_executor',
+                        execution_id=self.execution.id,
+                        item_id=case_data['id'],
+                    )
                     self.results.append(case_result)
                     print(f"✓ 用例执行完成，状态: {case_result['status']}")
 
@@ -393,6 +417,7 @@ class TestExecutor:
                         skipped += 1
 
                 except Exception as e:
+                    self._check_cancelled()
                     print(f"✗ 用例执行出现异常: {str(e)}")
                     # 记录异常
                     self.results.append({
@@ -458,6 +483,7 @@ class TestExecutor:
                 just_switched_tab = False  # 重置标志
 
                 step_result = self.execute_step_playwright(step_data)
+                self._check_cancelled()
 
                 # Debug: Log which page we're using
                 print(f"📄 步骤 {step_data['step_number']} 执行完成")
@@ -535,6 +561,7 @@ class TestExecutor:
                     break
 
         except Exception as e:
+            self._check_cancelled()
             result['status'] = 'failed'
             result['error'] = str(e)
 
@@ -649,6 +676,7 @@ class TestExecutor:
         Note:
             使用 self.current_page 作为当前活动页面
         """
+        self._check_cancelled()
         import time
         start_time = time.time()
 
@@ -1381,7 +1409,9 @@ class TestExecutor:
             # 在套件开始时启动一次浏览器（Chrome/Firefox/Edge）
             driver = None
             try:
+                self._check_cancelled()
                 driver = self.create_selenium_driver()
+                self._selenium_driver = driver
                 print(f"✓ 浏览器已启动（将复用于所有用例）\n")
             except Exception as e:
                 print(f"✗ 浏览器启动失败: {str(e)}")
@@ -1416,6 +1446,7 @@ class TestExecutor:
 
         # 执行所有测试用例
         for i, case_data in enumerate(test_cases_data, 1):
+            self._check_cancelled()
             print(f"\n{'=' * 60}")
             print(f"正在执行第 {i}/{len(test_cases_data)} 个用例: {case_data['name']}")
             print(f"{'=' * 60}")
@@ -1429,7 +1460,9 @@ class TestExecutor:
             # Safari：为每个用例启动新的浏览器
             if not use_browser_reuse:
                 try:
+                    self._check_cancelled()
                     driver = self.create_selenium_driver()
+                    self._selenium_driver = driver
                     print(f"✓ Safari 浏览器已启动")
                 except Exception as e:
                     print(f"✗ Safari 浏览器启动失败: {str(e)}")
@@ -1484,6 +1517,7 @@ class TestExecutor:
                             allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
                                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
                         )
+                        self._check_cancelled()
                         driver.get(safe_base_url)
                         final_url = getattr(driver, 'current_url', safe_base_url) or safe_base_url
                         validate_outbound_url(
@@ -1525,6 +1559,12 @@ class TestExecutor:
 
                 # 执行测试用例
                 case_result = self.execute_test_case_selenium_no_db(driver, case_data)
+                case_result['screenshots'] = project_screenshots(
+                    case_result.get('screenshots', []),
+                    producer='ui_test_executor',
+                    execution_id=self.execution.id,
+                    item_id=case_data['id'],
+                )
                 self.results.append(case_result)
                 print(f"✓ 用例执行完成，状态: {case_result['status']}")
 
@@ -1550,6 +1590,7 @@ class TestExecutor:
                     skipped += 1
 
             except Exception as e:
+                self._check_cancelled()
                 print(f"✗ 用例执行出现异常: {str(e)}")
                 # 记录异常
                 self.results.append({
@@ -1581,6 +1622,7 @@ class TestExecutor:
                     except Exception as e:
                         print(f"✗ 关闭 Safari 浏览器时出错: {str(e)}\n")
                     driver = None
+                    self._selenium_driver = None
 
         # 所有用例执行完毕后，关闭浏览器（仅对复用浏览器的情况）
         if use_browser_reuse and driver:
@@ -1588,6 +1630,7 @@ class TestExecutor:
                 print(f"\n{'=' * 60}")
                 print(f"正在关闭浏览器...")
                 driver.quit()
+                self._selenium_driver = None
                 print(f"✓ 浏览器已关闭")
                 print(f"{'=' * 60}\n")
             except Exception as e:
@@ -1806,6 +1849,7 @@ class TestExecutor:
             # 遍历预先准备好的步骤数据
             for step_data in case_data['steps']:
                 step_result = self.execute_step_selenium(driver, step_data)
+                self._check_cancelled()
                 result['steps'].append(step_result)
 
                 # 步骤执行完后添加短暂延迟，确保页面状态稳定
@@ -1840,6 +1884,7 @@ class TestExecutor:
                     break
 
         except Exception as e:
+            self._check_cancelled()
             result['status'] = 'failed'
             result['error'] = str(e)
 
@@ -1925,6 +1970,7 @@ class TestExecutor:
             driver: Selenium WebDriver对象
             step_data: 预先准备的步骤数据字典
         """
+        self._check_cancelled()
         from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
         start_time = time.time()
 
