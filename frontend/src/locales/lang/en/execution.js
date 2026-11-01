@@ -214,7 +214,11 @@ export default {
     scaleBytes: 'Artifact bytes',
     scaleExpired: 'Expired artifacts',
     metricsTitle: 'Quality metrics',
-    noMetrics: 'No quality metrics'
+    noMetrics: 'No quality metrics',
+    refreshMetrics: 'Refresh metrics',
+    metricsLoading: 'Loading quality metrics…',
+    metricsLoadFailed: 'Failed to load quality metrics. Please try again.',
+    flakyUnavailable: 'Not available'
   },
 
   failureReview: {

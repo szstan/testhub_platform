@@ -121,7 +121,10 @@ class ExecutionQualityCoreSchemaTests(SimpleTestCase):
             "window_days", "total_jobs", "ci_jobs", "ci_association_rate", "unmatched_results",
             "gate_evaluations", "gate_pass_rate", "failure_categories", "flaky_profiles",
             "recent_runs", "route_readiness", "enabled_bindings", "integration_health", "scale",
+            "quality_intelligence_enabled",
         })
+        self.assertEqual(props["quality_intelligence_enabled"]["type"], "boolean")
+        self.assertTrue(props["quality_intelligence_enabled"]["readOnly"])
         self.assertEqual(props["failure_categories"]["additionalProperties"]["type"], "integer")
         recent_run = self.resolve(props["recent_runs"]["items"])
         self.assertEqual(set(recent_run["properties"]), {

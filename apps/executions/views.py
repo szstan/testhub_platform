@@ -11,7 +11,7 @@ from django.utils import timezone
 from datetime import timedelta
 from django.conf import settings
 from django.db import transaction
-from django.db.models import BigIntegerField, CharField, Count, Max, Min, Q, Sum, Value
+from django.db.models import BigIntegerField, Count, Max, Min, Q, Sum, Value
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce
 from .models import (
@@ -83,6 +83,7 @@ from .serializers import (
     accessible_execution_projects,
 )
 from .state_machine import InvalidExecutionTransition
+from .metrics import scoped_quality_metrics
 from .adapters import AdapterConflict, UnsupportedExecutorError, get_executor_adapter
 from .result_events import ResultEventError, ResultEventIngestor, redact_result_payload
 from .run_comparison import compare_jobs, evaluate_release_gate
@@ -263,12 +264,7 @@ class ExecutionMetricsView(APIView):
             .order_by().values('category').annotate(total=Count('pk'))
             .values_list('category', 'total')
         )
-        from apps.quality_intelligence.models import QualityTestProfile
-        flaky_count = QualityTestProfile.objects.filter(
-            project_type='PROJECT',
-            project_id__in=projects.annotate(scope_id=Cast('pk', CharField())).values('scope_id'),
-            reliability_status='FLAKY',
-        ).count()
+        quality = scoped_quality_metrics(request.user, projects, project_id=project_id)
 
         recent_runs = [
             {
@@ -331,8 +327,6 @@ class ExecutionMetricsView(APIView):
                 'finished_at': last_ci_job.finished_at,
             } if last_ci_job else None,
         }
-        from apps.quality_intelligence.models import QualityEvidence, QualityFailure, QualityFailureCluster, QualityRun
-        from apps.quality_intelligence.permissions import quality_project_filter
         all_jobs = ExecutionJob.objects.filter(project__in=projects)
         artifact_scope = Q(job__project__in=projects) | Q(attempt__job__project__in=projects) | Q(step_result__attempt__job__project__in=projects)
         artifact_queryset = ExecutionArtifact.objects.filter(artifact_scope).distinct()
@@ -343,25 +337,6 @@ class ExecutionMetricsView(APIView):
             latest=Max('created_at'),
         )
         now = timezone.now()
-        quality_runs_visible = quality_project_filter(QualityRun.objects.all(), request.user)
-        unmapped_quality_runs = 0
-        if project_id:
-            mapped_run_filter = Q(project_type='PROJECT', project_id=str(project_id))
-            quality_runs = quality_runs_visible.filter(mapped_run_filter)
-            unmapped_quality_runs = quality_runs_visible.exclude(mapped_run_filter).count()
-        else:
-            quality_runs = quality_runs_visible
-        quality_run_count = quality_runs.count()
-        quality_evidence_count = QualityEvidence.objects.filter(run__in=quality_runs).count()
-        quality_failure_count = QualityFailure.objects.filter(run__in=quality_runs).count()
-        clusters_visible = quality_project_filter(QualityFailureCluster.objects.all(), request.user)
-        unmapped_quality_clusters = 0
-        if project_id:
-            mapped_cluster_filter = Q(mapped_project_id=project_id) | Q(project_type='PROJECT', project_id=str(project_id))
-            quality_cluster_count = clusters_visible.filter(mapped_cluster_filter).count()
-            unmapped_quality_clusters = clusters_visible.exclude(mapped_cluster_filter).count()
-        else:
-            quality_cluster_count = clusters_visible.count()
         scale = {
             'execution_jobs': all_jobs.count(),
             'execution_artifacts': int(artifact_summary['count'] or 0),
@@ -369,12 +344,12 @@ class ExecutionMetricsView(APIView):
             'expired_execution_artifacts': artifact_queryset.filter(retention_until__isnull=False, retention_until__lt=now).count(),
             'execution_oldest_created_at': artifact_summary['oldest'],
             'execution_latest_created_at': artifact_summary['latest'],
-            'quality_runs': quality_run_count,
-            'quality_evidence': quality_evidence_count,
-            'quality_failures': quality_failure_count,
-            'quality_failure_clusters': quality_cluster_count,
-            'unmapped_quality_runs': unmapped_quality_runs,
-            'unmapped_quality_clusters': unmapped_quality_clusters,
+            'quality_runs': quality['quality_runs'],
+            'quality_evidence': quality['quality_evidence'],
+            'quality_failures': quality['quality_failures'],
+            'quality_failure_clusters': quality['quality_failure_clusters'],
+            'unmapped_quality_runs': quality['unmapped_quality_runs'],
+            'unmapped_quality_clusters': quality['unmapped_quality_clusters'],
             'thresholds': {
                 'execution_jobs': getattr(settings, 'EXECUTION_SCALE_WARNING_JOBS', 100000),
                 'execution_artifacts': getattr(settings, 'EXECUTION_SCALE_WARNING_ARTIFACTS', 100000),
@@ -401,7 +376,8 @@ class ExecutionMetricsView(APIView):
             'gate_evaluations': evaluations['total'],
             'gate_pass_rate': round(evaluations['passed'] / evaluations['total'] * 100, 2) if evaluations['total'] else 0,
             'failure_categories': failure_categories,
-            'flaky_profiles': flaky_count,
+            'flaky_profiles': quality['flaky_profiles'],
+            'quality_intelligence_enabled': quality['quality_intelligence_enabled'],
             'recent_runs': recent_runs,
             'route_readiness': route_readiness,
             'enabled_bindings': binding_counts,

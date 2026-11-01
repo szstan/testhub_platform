@@ -272,6 +272,7 @@ class ExecutionMetricsResponseSerializer(serializers.Serializer):
     gate_pass_rate = serializers.FloatField()
     failure_categories = serializers.DictField(child=serializers.IntegerField())
     flaky_profiles = serializers.IntegerField()
+    quality_intelligence_enabled = serializers.BooleanField(read_only=True)
     recent_runs = RecentRunSerializer(many=True)
     route_readiness = RouteReadinessSerializer()
     enabled_bindings = EnabledBindingsSerializer()

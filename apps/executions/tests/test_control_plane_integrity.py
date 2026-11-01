@@ -170,6 +170,7 @@ def test_failure_analysis_get_performs_no_cluster_projection_or_database_write(c
     assert not any(q['sql'].lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')) for q in queries)
 
 
+@override_settings(QUALITY_INTELLIGENCE_ENABLED=True)
 def test_metrics_aggregate_without_loading_job_history_or_large_json(control):
     project = control['project']
     blob = 'unused-result-data' * 1000

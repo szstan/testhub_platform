@@ -9,10 +9,38 @@
     </div>
 
     <el-card shadow="never" class="metrics-card">
-      <template #header>{{ $t('execution.qualityLoop.metricsTitle') }}</template>
-      <el-row v-if="metrics" :gutter="12">
+      <template #header>
+        <div class="metrics-header">
+          <span>{{ $t('execution.qualityLoop.metricsTitle') }}</span>
+          <el-button
+            size="small"
+            :loading="metricsLoading"
+            :disabled="metricsLoading"
+            :aria-label="$t('execution.qualityLoop.refreshMetrics')"
+            @click="loadMetrics"
+          >
+            {{ $t('execution.qualityLoop.refreshMetrics') }}
+          </el-button>
+        </div>
+      </template>
+      <div v-if="metricsLoading" class="metrics-state" role="status" aria-live="polite">
+        {{ $t('execution.qualityLoop.metricsLoading') }}
+      </div>
+      <el-alert
+        v-else-if="metricsError"
+        type="error"
+        :title="$t('execution.qualityLoop.metricsLoadFailed')"
+        :closable="false"
+        show-icon
+        role="alert"
+      />
+      <el-row v-else-if="metrics" :gutter="12">
         <el-col v-for="item in metricCards" :key="item.key" :xs="12" :md="4">
-          <el-statistic :title="item.label" :value="item.value" :suffix="item.suffix || ''" />
+          <el-statistic v-if="!item.unavailable" :title="item.label" :value="item.value" :suffix="item.suffix || ''" />
+          <div v-else class="unavailable-metric" role="status">
+            <div class="unavailable-metric__label">{{ item.label }}</div>
+            <div class="unavailable-metric__value">{{ $t('execution.qualityLoop.flakyUnavailable') }}</div>
+          </div>
         </el-col>
       </el-row>
       <el-empty v-else :description="$t('execution.qualityLoop.noMetrics')" />
@@ -148,21 +176,35 @@ const importFile = ref(null)
 const importResultData = ref(null)
 const gateResult = ref(null)
 const metrics = ref(null)
+const metricsLoading = ref(true)
+const metricsError = ref(false)
 const metricCards = computed(() => metrics.value ? [
   { key: 'ci', label: 'CI jobs', value: metrics.value.ci_jobs },
   { key: 'association', label: '关联率', value: metrics.value.ci_association_rate, suffix: '%' },
   { key: 'unmatched', label: '未匹配', value: metrics.value.unmatched_results },
   { key: 'gate', label: '门禁通过率', value: metrics.value.gate_pass_rate, suffix: '%' },
-  { key: 'flaky', label: 'Flaky', value: metrics.value.flaky_profiles },
+  {
+    key: 'flaky',
+    label: 'Flaky',
+    value: metrics.value.flaky_profiles,
+    unavailable: metrics.value.quality_intelligence_enabled === false,
+  },
 ] : [])
 const importForm = ref({ project_id: null, format: 'junit', external_run_id: '', build_reference: '' })
 const gateForm = ref({ jobId: null, baselineJobId: null, maxFailed: 0, maxUnmatched: 0, policyVersion: '', metricThresholdsText: '{}' })
 
 const loadMetrics = async () => {
+  metricsLoading.value = true
+  metricsError.value = false
+  metrics.value = null
   try {
     const response = await getExecutionMetrics()
     metrics.value = response.data
-  } catch (error) { ElMessage.error(error.response?.data?.detail || '指标加载失败') }
+  } catch {
+    metricsError.value = true
+  } finally {
+    metricsLoading.value = false
+  }
 }
 
 const selectFile = event => {
@@ -242,6 +284,10 @@ onMounted(loadMetrics)
 </script>
 
 <style scoped>
+.metrics-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.metrics-state { display: flex; justify-content: center; padding: 24px 0; color: var(--el-text-color-secondary); }
+.unavailable-metric__label { margin-bottom: 4px; color: var(--el-text-color-regular); font-size: 14px; }
+.unavailable-metric__value { color: var(--el-text-color-secondary); font-size: 24px; line-height: 32px; }
 .scale-card { margin-bottom: 16px; }
 .scale-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; color: var(--el-text-color-secondary); }
 .scale-grid strong { color: var(--el-text-color-primary); }

@@ -214,7 +214,11 @@ export default {
     scaleBytes: '产物字节数',
     scaleExpired: '已过期产物',
     metricsTitle: '质量指标',
-    noMetrics: '暂无质量指标'
+    noMetrics: '暂无质量指标',
+    refreshMetrics: '刷新指标',
+    metricsLoading: '正在加载质量指标…',
+    metricsLoadFailed: '质量指标加载失败，请重试。',
+    flakyUnavailable: '不可用'
   },
 
   failureReview: {
