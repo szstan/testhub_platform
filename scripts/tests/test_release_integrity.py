@@ -273,7 +273,7 @@ def test_real_frontend_receipt_plugin_binds_clean_tree_and_marks_dirty_input(rel
       const root = process.argv[2];
       const plugin = releaseReceipt();
       const output = process.argv[4] || 'dist';
-      plugin.configResolved({root:root+'/frontend',envDir:root,build:{outDir:output,target:'es2022'},mode:process.env.TEST_RECEIPT_MODE || 'production',base:'/',envPrefix:'VITE_'});
+      plugin.configResolved({root:root+'/frontend',envDir:root,build:{outDir:output,target:'es2022'},mode:process.env.TEST_RECEIPT_MODE || 'production',base:'/'});
       plugin.buildStart();
       if (process.argv[3] === 'stage-output') {
         mkdirSync(root+'/frontend/'+output+'/assets', {recursive:true});

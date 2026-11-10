@@ -20,7 +20,8 @@ export const releaseReceipt = () => {
   const frontendBuildInputs = () => {
     const loaded = loadEnv(configMode, resolvedConfig.envDir, 'VITE_')
     const environment = Object.fromEntries(approvedFrontendEnv.map((key) => [key, Object.hasOwn(loaded, key) ? loaded[key] : null]))
-    const envPrefix = Array.isArray(resolvedConfig.envPrefix) ? resolvedConfig.envPrefix : [resolvedConfig.envPrefix]
+    const configuredEnvPrefix = resolvedConfig.envPrefix ?? 'VITE_'
+    const envPrefix = Array.isArray(configuredEnvPrefix) ? configuredEnvPrefix : [configuredEnvPrefix]
     return {
       base: resolvedConfig.base,
       target: resolvedConfig.build.target,
