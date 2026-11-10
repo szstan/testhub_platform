@@ -398,15 +398,20 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
 
 
 class JudgeSingleView(APIView):
-    """单条评分（同步）：Django 进程内直接调 JudgeService。"""
+    """Score one request using a rubric visible to the current user."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         serializer = JudgeSingleRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        if data.get('rubric') and not Rubric.objects.filter(pk=data['rubric'], is_active=True).exists():
-            return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
+        rubric_id = data.get('rubric')
+        if rubric_id:
+            rubric_queryset = Rubric.objects.filter(is_active=True)
+            if not (request.user.is_staff or request.user.is_superuser):
+                rubric_queryset = rubric_queryset.filter(is_default=True)
+            if not rubric_queryset.filter(pk=rubric_id).exists():
+                return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
 
         from .service import JudgeService
         service = JudgeService()

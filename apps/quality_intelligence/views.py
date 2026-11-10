@@ -132,19 +132,15 @@ def _baseline_queryset(user):
 
 
 def _comparison_queryset(user):
-    return QualityComparison.objects.filter(run__in=_run_queryset(user)).select_related("run", "baseline", "profile")
+    return QualityComparison.objects.filter(
+        Q(baseline__isnull=True) | Q(baseline__in=_baseline_queryset(user)),
+        run__in=_run_queryset(user),
+    ).select_related("run", "baseline", "profile")
 
 
 def _cluster_queryset(user):
     queryset = QualityFailureCluster.objects.all().select_related('owner', 'defect', 'last_failure_run', 'last_fixed_run')
-    if is_privileged(user):
-        return queryset
-    visible_quality = quality_project_filter(queryset, user).values('pk')
-    global_project_ids = Project.objects.filter(Q(owner=user) | Q(members=user)).values('pk')
-    return queryset.filter(
-        Q(pk__in=visible_quality)
-        | Q(project_type__in=['PROJECT', 'EXECUTION'], project_id__in=global_project_ids)
-    ).distinct()
+    return quality_project_filter(queryset, user)
 
 
 
@@ -181,10 +177,10 @@ def _paginate(view, queryset, serializer_class):
     return Response(serializer_class(queryset, many=True).data)
 
 
-def _parse_project_access(user, source_type: str, project_id: Any) -> bool:
+def _parse_project_access(user, source_type: str, project_id: Any, project_type: str) -> bool:
     if is_privileged(user):
         return True
-    visible = accessible_project_ids(user, source_type)
+    visible = accessible_project_ids(user, source_type, project_type=project_type)
     return visible is not None and str(project_id) in visible
 
 
@@ -574,8 +570,10 @@ class ProfileViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             run__project_type=profile.project_type,
             run__project_id=profile.project_id,
             test_key=profile.test_key,
-            environment_fingerprint=profile.environment_fingerprint,
             run__in=_run_queryset(request.user),
+        ).filter(
+            Q(environment_fingerprint=profile.environment_fingerprint)
+            | Q(environment_fingerprint__in=['', 'unknown'], run__environment_fingerprint=profile.environment_fingerprint)
         ).order_by("-created_at", "-id")
         return _paginate(self, queryset, QualityRunItemSerializer)
 
@@ -719,7 +717,7 @@ class BaselineViewSet(
             return _error("INVALID_BASELINE", "invalid baseline", status.HTTP_400_BAD_REQUEST, fields=serializer.errors)
         values = dict(serializer.validated_data)
         profile_id = values.pop("profile_id", None)
-        if not _parse_project_access(request.user, values["source_type"], values["project_id"]):
+        if not _parse_project_access(request.user, values["source_type"], values["project_id"], values["project_type"]):
             return _error("PROJECT_FORBIDDEN", "project is not accessible", status.HTTP_404_NOT_FOUND)
         if profile_id is not None:
             profile = _profile_queryset(request.user).filter(
@@ -751,7 +749,7 @@ class BaselineViewSet(
         project_type = values.get("project_type", baseline.project_type)
         project_id = values.get("project_id", baseline.project_id)
         if any(key in values for key in ("project_id", "source_type", "project_type")):
-            if not _parse_project_access(request.user, source_type, project_id):
+            if not _parse_project_access(request.user, source_type, project_id, project_type):
                 return _error("PROJECT_FORBIDDEN", "project is not accessible", status.HTTP_404_NOT_FOUND)
         if has_profile:
             if profile_id is None:
@@ -766,6 +764,10 @@ class BaselineViewSet(
                 if profile is None:
                     return _error("PROFILE_NOT_FOUND", "quality profile not found", status.HTTP_404_NOT_FOUND)
                 values["profile"] = profile
+        elif baseline.profile_id and not _profile_queryset(request.user).filter(
+            pk=baseline.profile_id, source_type=source_type, project_type=project_type, project_id=project_id,
+        ).exists():
+            return _error("PROFILE_NOT_FOUND", "quality profile identity does not match baseline", status.HTTP_404_NOT_FOUND)
         for key, value in values.items():
             if key == "snapshot":
                 value = redact_payload(value or {})

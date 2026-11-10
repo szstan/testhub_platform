@@ -16,6 +16,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
 from django.conf import settings
+from apps.core.browser_proxy import create_guarded_selenium_driver
 from apps.core.network import configure_selenium_network_guard, validate_outbound_url
 import logging
 
@@ -185,6 +186,8 @@ class SeleniumTestEngine:
                 raise Exception(full_error)
             if error_msg:
                 logger.info(f"Selenium 执行环境提示: {error_msg}")
+            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
+                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
             if self.browser_type == 'chrome':
                 from selenium.webdriver.chrome.options import Options
                 from selenium.webdriver.chrome.service import Service
@@ -231,7 +234,9 @@ class SeleniumTestEngine:
 
                 # 使用缓存优先策略
                 service = Service(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=options)
+                self.driver = create_guarded_selenium_driver(
+                    webdriver.Chrome, options, browser_type='chrome', allow_private=allow_private, service=service
+                )
 
             elif self.browser_type == 'firefox':
                 from selenium.webdriver.firefox.options import Options
@@ -261,7 +266,9 @@ class SeleniumTestEngine:
 
                 # 使用缓存优先策略
                 service = Service(GeckoDriverManager().install())
-                self.driver = webdriver.Firefox(service=service, options=options)
+                self.driver = create_guarded_selenium_driver(
+                    webdriver.Firefox, options, browser_type='firefox', allow_private=allow_private, service=service
+                )
 
             elif self.browser_type == 'edge':
                 from selenium.webdriver.edge.options import Options
@@ -276,14 +283,18 @@ class SeleniumTestEngine:
 
                 # 使用缓存优先策略，7天内不重新下载
                 service = Service(EdgeChromiumDriverManager().install())
-                self.driver = webdriver.Edge(service=service, options=options)
+                self.driver = create_guarded_selenium_driver(
+                    webdriver.Edge, options, browser_type='edge', allow_private=allow_private, service=service
+                )
 
             elif self.browser_type == 'safari':
                 # Safari 不支持 headless 模式
                 # 需要先启用：sudo safaridriver --enable
                 # 并在 Safari 设置 -> 开发菜单中启用"允许远程自动化"
                 try:
-                    self.driver = webdriver.Safari()
+                    self.driver = create_guarded_selenium_driver(
+                        webdriver.Safari, browser_type='safari', allow_private=allow_private
+                    )
                     self.driver.set_window_size(1920, 1080)
                 except Exception as e:
                     error_msg = str(e)
@@ -334,28 +345,37 @@ class SeleniumTestEngine:
                 options.add_argument('--disable-infobars')  # 禁用信息栏
 
                 service = Service(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=options)
+                self.driver = create_guarded_selenium_driver(
+                    webdriver.Chrome, options, browser_type='chrome', allow_private=allow_private, service=service
+                )
 
             # 设置隐式等待
             self.driver.implicitly_wait(3)
-            # Configure Chromium request blocking before the first navigation;
-            # navigate() performs the authoritative rendered URL validation.
-            configure_selenium_network_guard(self.driver)
+            # The proxy pins the actual connection; browser-level checks are supplementary.
+            configure_selenium_network_guard(self.driver, allow_private=allow_private)
 
             logger.info(f"浏览器启动成功: {self.browser_type}, headless={self.headless}")
 
         except Exception as e:
             logger.error(f"启动浏览器失败: {str(e)}")
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
             raise
 
     def stop(self):
-        """关闭浏览器"""
+        """Close the browser and its guarded egress proxy."""
         try:
             if self.driver:
                 self.driver.quit()
             logger.info("浏览器已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器失败: {str(e)}")
+        finally:
+            self.driver = None
 
     def _get_locator(self, locator_strategy: str, locator_value: str) -> Tuple[str, str]:
         """
@@ -1052,8 +1072,9 @@ class SeleniumTestEngine:
             allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
                                         getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
             safe_url = validate_outbound_url(url, allow_private=allow_private)
-            # Validate immediately before the browser request.  Chromium's CDP
-            # deny list additionally blocks common private redirect targets.
+            # Install request interception before navigation so every redirect
+            # and subresource URL is checked before Chromium accesses it.
+            configure_selenium_network_guard(self.driver, allow_private=allow_private)
             self.driver.get(safe_url)
 
             # Reject redirects not caught by the browser deny list.

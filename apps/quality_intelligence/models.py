@@ -354,6 +354,7 @@ class QualityFailureCluster(models.Model):
             models.Index(fields=['source_type', 'project_type', 'project_id', '-last_seen_at'], name='qi_cluster_project_seen_idx'),
             models.Index(fields=['signature', '-last_seen_at'], name='qi_cluster_signature_seen_idx'),
             models.Index(fields=['owner', 'resolved_at'], name='qi_cluster_owner_resolved_idx'),
+            models.Index(fields=['source_type', 'project_type', 'project_id', 'test_key', 'environment_fingerprint', 'resolved_at'], name='qi_cluster_case_env_fixed_idx'),
         ]
 
 

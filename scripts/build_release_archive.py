@@ -1,185 +1,197 @@
 #!/usr/bin/env python3
-"""Build a source release archive with the production frontend artifact included.
+"""Package a clean fixed Git tree plus a frontend build bound to that tree.
 
-The archive is a transport artifact only. It never publishes or deploys a
-release, and it intentionally excludes local credentials, virtualenvs,
-node_modules, caches, and repository workflow scratch data.
+This creates a local transport artifact only. It never commits, publishes or
+uses untracked source/runtime files. Dirty development builds remain usable,
+but must be committed and rebuilt before they can become a strict release.
 """
-
 from __future__ import annotations
 
 import argparse
+import base64
+import gzip
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tarfile
 from pathlib import Path
 
+if __package__:
+    from .release_integrity import RELEASE_RE, git_object_id, safe_relative, verified_source_files
+    from .validate_release_manifest import validate_manifest
+else:
+    from release_integrity import RELEASE_RE, git_object_id, safe_relative, verified_source_files
+    from validate_release_manifest import validate_manifest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXCLUDED_PARTS = {
-    ".git",
-    ".workflow",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    "node_modules",
-    "venv-prod",
-    "venv-automation",
-}
-EXCLUDED_ROOTS = {"backups", "logs", "media", "static_files", "wheels", "testhub-login-192-168-10-111.png", ".coverage", ".playwright-mcp"}
 
 
-def git_commit() -> str:
+def _git(*args):
     try:
-        value = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-        ).strip()
+        return subprocess.check_output(['git', *args], cwd=REPO_ROOT, stderr=subprocess.PIPE)
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise SystemExit(f"unable to determine git commit: {exc}") from exc
-    if not value:
-        raise SystemExit("git returned an empty commit identifier")
-    return value
+        raise SystemExit('unable to read the selected Git source tree') from exc
 
 
-def git_release() -> str:
+def git_commit(ref='HEAD'):
+    return _git('rev-parse', '--verify', '--end-of-options', f'{ref}^{{commit}}').decode('ascii').strip()
+
+
+def git_release():
     return git_commit()[:7]
 
 
-def sha256(path: Path) -> str:
+def sha256(path):
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path, help="output .tar.gz path")
-    parser.add_argument("--release", default=None, help="release identifier; defaults to git HEAD")
-    return parser.parse_args()
+def _require_clean(commit):
+    result = subprocess.run(['git', 'diff', '--quiet', commit, '--'], cwd=REPO_ROOT, capture_output=True)
+    if result.returncode:
+        raise SystemExit('tracked source differs from the selected commit; commit and rebuild before packaging')
 
 
-def should_include(path: Path) -> bool:
-    relative = path.relative_to(REPO_ROOT)
-    if not relative.parts:
-        return False
-    if relative.parts[0] in EXCLUDED_ROOTS:
-        return False
-    if path.name.startswith('.env') or path.suffix.lower() in {'.pem', '.key'}:
-        return False
-    if any(part.startswith('dist.previous.') or part.startswith('.dist-staging.') for part in relative.parts):
-        return False
-    return not any(part in EXCLUDED_PARTS for part in relative.parts)
-
-
-def tracked_executable_paths() -> set[str]:
+def _objects(oids):
+    selected = sorted(set(oids))
+    if not selected:
+        return {}
     try:
         output = subprocess.check_output(
-            ['git', 'ls-files', '-s'],
-            cwd=REPO_ROOT,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
+            ['git', 'cat-file', '--batch'], input=('\n'.join(selected) + '\n').encode('ascii'),
+            cwd=REPO_ROOT, stderr=subprocess.PIPE,
         )
-    except (OSError, subprocess.CalledProcessError):
-        return set()
-    executable_paths = set()
-    for line in output.splitlines():
-        fields = line.split(maxsplit=3)
-        if len(fields) == 4 and fields[0] == '100755':
-            executable_paths.add(fields[3])
-    return executable_paths
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit('unable to export fixed Git objects') from exc
+    result = {}
+    offset = 0
+    for requested in selected:
+        end = output.find(b'\n', offset)
+        try:
+            oid, kind, raw_size = output[offset:end].decode('ascii').split()
+            size = int(raw_size)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SystemExit('invalid Git object export') from exc
+        payload = output[end + 1:end + 1 + size]
+        if oid != requested or git_object_id(kind, payload) != oid:
+            raise SystemExit('Git object export failed integrity verification')
+        result[oid] = (kind, payload)
+        offset = end + size + 2
+    return result
 
 
-def build_release_manifest(release: str) -> dict:
-    requirement_entries = []
-    for path in sorted(REPO_ROOT.glob('requirements*.txt')):
-        if path.is_file():
-            requirement_entries.append({
-                'path': path.relative_to(REPO_ROOT).as_posix(),
-                'sha256': sha256(path),
-            })
-    frontend_index = REPO_ROOT / 'frontend' / 'dist' / 'index.html'
-    return {
-        'schema_version': 1,
-        'release': release,
-        'source_commit': git_commit(),
-        'requirements': requirement_entries,
-        'files': {
-            'frontend/dist/index.html': sha256(frontend_index),
-        },
+def _frontend_files():
+    root = REPO_ROOT / 'frontend' / 'dist'
+    if root.is_symlink() or root.parent.is_symlink():
+        raise SystemExit('frontend build contains a symlink directory')
+    if not (root / 'index.html').is_file() or not (root / 'build-receipt.json').is_file():
+        raise SystemExit('frontend production index and build-receipt.json are required; rebuild before packaging')
+    payloads = {}
+    for directory, dirs, names in os.walk(root, followlinks=False):
+        for name in [*dirs, *names]:
+            candidate = Path(directory) / name
+            if candidate.is_symlink():
+                raise SystemExit('frontend build contains a symlink')
+        for name in names:
+            path = Path(directory) / name
+            if name.startswith('.env') or path.suffix.lower() in {'.key', '.pem'}:
+                raise SystemExit('frontend build contains a private configuration/key path')
+            relative = safe_relative(path.relative_to(REPO_ROOT).as_posix())
+            payloads[relative] = path.read_bytes()
+    return payloads
+
+
+def build_archive(output: Path, release: str, source_ref='HEAD'):
+    if not RELEASE_RE.fullmatch(release):
+        raise SystemExit('release identifier must be one safe path component (letters, digits, dot, underscore or hyphen)')
+    commit = git_commit(source_ref)
+    _require_clean(commit)
+    tree = _git('rev-parse', f'{commit}^{{tree}}').decode('ascii').strip()
+    tree_oids = {tree}
+    for record in _git('ls-tree', '-rtz', '--full-tree', commit).split(b'\0'):
+        if record:
+            metadata, _path = record.split(b'\t', 1)
+            _mode, kind, oid = metadata.decode('ascii').split()
+            if kind == 'tree':
+                tree_oids.add(oid)
+    proof = _objects([commit, *tree_oids])
+    manifest = {
+        'schema_version': 2, 'release': release, 'source_commit': commit, 'source_tree': tree,
+        'source_commit_object': base64.b64encode(proof[commit][1]).decode('ascii'),
+        'source_tree_objects': {oid: base64.b64encode(proof[oid][1]).decode('ascii') for oid in sorted(tree_oids)},
     }
-
-
-def add_release_manifest(archive: tarfile.TarFile, archive_root: str, release: str) -> None:
-    payload = json.dumps(
-        build_release_manifest(release),
-        ensure_ascii=False,
-        sort_keys=True,
-        indent=2,
-    ).encode('utf-8') + b'\n'
-    info = tarfile.TarInfo(name=f'{archive_root}/release-manifest.json')
-    info.mode = 0o644
-    info.size = len(payload)
-    archive.addfile(info, io.BytesIO(payload))
-
-
-def archive_mode(relative: Path, source: Path, executable_paths: set[str]) -> int:
-    if relative.as_posix() in executable_paths or source.stat().st_mode & 0o111:
-        return 0o755
-    return 0o644
-
-
-def build_archive(output: Path, release: str) -> None:
-    frontend_index = REPO_ROOT / "frontend" / "dist" / "index.html"
-    if not frontend_index.is_file():
-        raise SystemExit(
-            "frontend/dist/index.html is required; run the frontend production build before packaging"
-        )
+    source_files = verified_source_files(manifest)
+    blobs = _objects(entry['git_blob'] for entry in source_files.values())
+    payloads = {path: blobs[entry['git_blob']][1] for path, entry in source_files.items()}
+    frontend = _frontend_files()
+    if set(payloads) & set(frontend):
+        raise SystemExit('frontend output overlaps fixed source inventory')
+    payloads.update(frontend)
+    manifest['source_files'] = source_files
+    manifest['files'] = {path: hashlib.sha256(data).hexdigest() for path, data in sorted(payloads.items())}
+    manifest['requirements'] = [
+        {'path': path, 'sha256': digest}
+        for path, digest in manifest['files'].items() if '/' not in path and path.startswith('requirements') and path.endswith('.txt')
+    ]
+    receipt = json.loads(frontend['frontend/dist/build-receipt.json'].decode('utf-8'))
+    manifest['frontend_build'] = {
+        'mode': receipt.get('mode'),
+        'build_inputs': receipt.get('build_inputs'),
+    }
+    validate_manifest(manifest, payloads.__getitem__, expected_release=release)
+    _require_clean(commit)
 
     output = output.expanduser().resolve()
     if output == REPO_ROOT or REPO_ROOT in output.parents:
-        raise SystemExit(f"refusing to write release archive inside repository: {output}")
+        raise SystemExit('refusing to write a release archive inside the repository')
     if output.exists():
-        raise SystemExit(f"refusing to overwrite existing archive: {output}")
+        raise SystemExit('refusing to overwrite an existing release archive')
     output.parent.mkdir(parents=True, exist_ok=True)
-
-    archive_root = f"testhub_platform-{release}"
-    executable_paths = tracked_executable_paths()
-    with tarfile.open(output, "w:gz") as archive:
-        for path in sorted(REPO_ROOT.rglob("*")):
-            if not path.is_file() or not should_include(path):
-                continue
-            relative = path.relative_to(REPO_ROOT)
-            info = archive.gettarinfo(str(path), arcname=Path(archive_root) / relative)
-            info.mode = archive_mode(relative, path, executable_paths)
-            with path.open("rb") as handle:
-                prefix = handle.read(2)
-                handle.seek(0)
-                if prefix == b'#!':
-                    payload = handle.read().replace(b'\r\n', b'\n')
-                    info.size = len(payload)
-                    archive.addfile(info, io.BytesIO(payload))
-                else:
-                    archive.addfile(info, handle)
-        add_release_manifest(archive, archive_root, release)
-
-    print(f"archive={output}")
-    print(f"release={release}")
-    print(f"sha256={sha256(output)}")
+    payloads['release-manifest.json'] = json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2).encode('utf-8') + b'\n'
+    archive_root = f'testhub_platform-{release}'
+    owned_output = False
+    try:
+        with output.open('xb') as destination:
+            owned_output = True
+            with gzip.GzipFile(filename='', mode='wb', fileobj=destination, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode='w') as archive:
+                    for path, payload in sorted(payloads.items()):
+                        info = tarfile.TarInfo(f'{archive_root}/{path}')
+                        info.mode = source_files.get(path, {}).get('mode', 0o644)
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+    except Exception:
+        if owned_output:
+            output.unlink(missing_ok=True)
+        raise
+    print(f'archive={output}')
+    print(f'release={release}')
+    print(f'source_commit={commit}')
+    print(f'source_tree={tree}')
+    print(f'sha256={sha256(output)}')
 
 
-def main() -> int:
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--release', default=None)
+    parser.add_argument('--source-ref', default='HEAD', help='fixed source commit/ref; working tracked source must match it')
+    return parser.parse_args()
+
+
+def main():
     args = parse_args()
-    build_archive(args.output, args.release or git_release())
+    try:
+        build_archive(args.output, args.release if args.release is not None else git_commit(args.source_ref)[:7], args.source_ref)
+    except ValueError as exc:
+        raise SystemExit(f'release build refused: {exc}') from exc
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

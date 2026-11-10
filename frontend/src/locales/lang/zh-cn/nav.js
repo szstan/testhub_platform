@@ -38,12 +38,14 @@ export default {
     ciProfiles: 'CI执行配置',
     sourceBindings: '执行 Source 绑定',
     datasetsPlugins: '数据集与插件',
+    executionGovernance: '执行治理',
     evidenceExplorer: '证据探索器',
     testReport: '测试报告',
 
     // 接口测试
     dashboard: '数据看板',
     interfaceManagement: '接口管理',
+    openapiContracts: 'OpenAPI 契约',
     automationTesting: '自动化测试',
     requestHistory: '请求历史',
     environmentManagement: '环境管理',

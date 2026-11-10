@@ -9,6 +9,7 @@ import glob
 import importlib
 import json
 import shutil
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -57,6 +58,7 @@ class AppTestExecutor:
         package_name: str,
         execution_id: Optional[int] = None,
         username: Optional[str] = None,
+        cancel_check=None,
     ) -> Dict[str, Any]:
         """
         运行APP测试用例并生成报告
@@ -72,6 +74,8 @@ class AppTestExecutor:
             执行结果字典
         """
         logger.info(f"开始执行APP测试: test_case_id={test_case_id}, device={device_id}")
+        if cancel_check is not None:
+            cancel_check()
 
         # Fail before starting pytest so a broken worker is reported as an execution
         # error instead of a misleading completed/skipped test run.
@@ -113,87 +117,113 @@ class AppTestExecutor:
             logger.info(f"工作目录: {os.getcwd()}")
             logger.info(f"PYTHONPATH: {env['PYTHONPATH']}")
             
-            # 执行 pytest
-            process = subprocess.Popen(
-                pytest_args,
-                cwd=self.base_path,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                bufsize=1,
-                env=env
-            )
-            
-            self._current_process = process
-            
-            # 准备日志文件
+            # Stream pytest output to disk; only a bounded tail is retained in memory.
             log_file_path = self._get_log_file_path(username or 'unknown')
-            
-            # 收集输出并写入日志文件
-            output_lines = []
             important_patterns = ['PASSED', 'FAILED', 'ERROR', 'SKIPPED', 'collected', 'passed', 'failed']
-            
-            log_file = open(log_file_path, 'a', encoding='utf-8')
-            try:
+            with open(log_file_path, 'a+', encoding='utf-8', errors='replace') as log_file:
+                log_file.seek(0, os.SEEK_END)
+                output_start = log_file.tell()
                 log_file.write(f"\n{'='*80}\n")
                 log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                              f"执行记录 ID: {execution_id}, 用例 ID: {test_case_id}, "
-                              f"设备: {device_id}\n")
+                               f"执行记录 ID: {execution_id}, 用例 ID: {test_case_id}, "
+                               f"设备: {device_id}\n")
                 log_file.write(f"{'='*80}\n")
-                
-                if process.stdout:
-                    for line in process.stdout:
-                        line = line.rstrip()
-                        if line:
-                            output_lines.append(line)
-                            log_file.write(line + '\n')
-                            if any(pattern in line for pattern in important_patterns):
-                                logger.info(f"[pytest] {line}")
-                
-                log_file.write(f"\n[执行完毕]\n")
-            finally:
-                log_file.close()
-            
+                log_file.flush()
+
+                if cancel_check is not None:
+                    cancel_check()
+                process = subprocess.Popen(
+                    pytest_args,
+                    cwd=self.base_path,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                    env=env,
+                )
+                self._current_process = process
+                while True:
+                    if cancel_check is not None:
+                        cancel_check()
+                    try:
+                        exit_code = process.wait(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+
+                self._current_process = None
+                log_file.write("\n[执行完毕]\n")
+                log_file.flush()
+                log_file.seek(output_start)
+                output_lines = self._read_log_tail(log_file, important_patterns)
+
             logger.info(f"执行日志已保存: {log_file_path}")
-            
-            # 等待执行完成
-            exit_code = process.wait()
-            self._current_process = None
-            
             logger.info(f"pytest 执行完成，退出码: {exit_code}")
-            
-            # 解析测试结果
+
+            if cancel_check is not None:
+                cancel_check()
             test_results = self._parse_allure_results(allure_results_dir)
-            
-            # 生成 Allure 报告
+            if cancel_check is not None:
+                cancel_check()
             report_path = self._generate_allure_report(execution_id)
             if not report_path:
                 raise AppTestWorkerError(
                     "Allure report generation failed after pytest completed"
                 )
-            
+
             return {
                 'success': exit_code == 0,
                 'exit_code': exit_code,
                 'report_path': report_path,
                 'test_results': test_results,
-                'output': '\n'.join(output_lines[-50:]),  # 保留最后50行输出
+                'output': '\n'.join(output_lines),
             }
             
         except AppTestWorkerError:
             logger.error("APP worker execution failed", exc_info=True)
             raise
         except Exception as e:
+            if cancel_check is not None:
+                try:
+                    cancel_check()
+                except Exception:
+                    raise
             logger.error(f"执行测试失败: {str(e)}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
             }
         finally:
+            if self._current_process is not None:
+                self.stop()
             os.chdir(original_cwd)
     
+    @staticmethod
+    def _read_log_tail(log_file, important_patterns, *, max_lines=50, max_line_chars=16384):
+        tail = deque(maxlen=max_lines)
+        carry = ''
+
+        def record(line):
+            line = line[-max_line_chars:].rstrip()
+            if line:
+                tail.append(line)
+                if any(pattern in line for pattern in important_patterns):
+                    logger.info(f"[pytest] {line}")
+
+        while True:
+            chunk = log_file.read(8192)
+            if not chunk:
+                break
+            parts = (carry + chunk).split('\n')
+            carry = parts.pop()
+            for line in parts:
+                record(line)
+            if len(carry) > max_line_chars:
+                carry = carry[-max_line_chars:]
+        record(carry)
+        return list(tail)
+
     def _build_pytest_args(self, allure_results_dir: str) -> list:
         """构建只执行 APP UI Flow 的 pytest 参数。"""
         return [
@@ -504,6 +534,7 @@ class AppTestExecutor:
                 logger.info("测试执行已停止")
             except subprocess.TimeoutExpired:
                 self._current_process.kill()
+                self._current_process.wait(timeout=5)
                 logger.warning("测试执行被强制终止")
             except Exception as e:
                 logger.error(f"停止测试失败: {str(e)}")

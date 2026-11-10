@@ -980,6 +980,7 @@ def _publish_unified_completion(execution):
                 'error_message': execution.error_message or '',
             },
             idempotency_key=f'performance:{execution.pk}:finished',
+            worker_claim_id=unified.get('worker_claim_id') or None,
         )
     except ObjectDoesNotExist as exc:
         _mark_unified_callback_orphaned(execution, 'unified job or attempt no longer exists')
@@ -1013,8 +1014,30 @@ def reconcile_unified_completions(limit=100):
 
 
 def run_execution(execution_id, stdout=None):
+    """The child owns the unified lease for its entire process lifetime."""
+    from ..models import PerfExecution
+    from apps.executions.worker_leases import ExecutionClaimLost, ExecutionLeaseHeartbeat
+
+    execution = PerfExecution.objects.get(pk=execution_id)
+    unified = dict((execution.script_ref or {}).get('unified_execution') or {})
+    claim_id = unified.get('worker_claim_id')
+    if not claim_id:
+        return _run_execution(execution_id, stdout=stdout)
+    heartbeat = ExecutionLeaseHeartbeat(unified['job_id'], unified['attempt_id'], claim_id)
+    try:
+        with heartbeat:
+            return _run_execution(execution_id, stdout=stdout, lease_heartbeat=heartbeat)
+    except ExecutionClaimLost:
+        execution.refresh_from_db()
+        if execution.status not in PerfExecution.FINAL_STATUSES:
+            _finalize_orphan(execution, 'STOPPED', 'Unified execution ownership was lost')
+        return execution
+
+
+def _run_execution(execution_id, stdout=None, lease_heartbeat=None):
     """子进程主逻辑。异常一律落到 FAILED，绝不留下 RUNNING 悬挂记录。"""
     from ..models import PerfExecution, PerfMetricSample, PerfRequestStat
+    from apps.executions.worker_leases import ExecutionClaimLost
 
     def emit(msg):
         line = f'[{timezone.localtime():%H:%M:%S}] {msg}'
@@ -1031,6 +1054,8 @@ def run_execution(execution_id, stdout=None):
     os.makedirs(art_dir, exist_ok=True)
     raw_csv_path = os.path.join(art_dir, 'raw.csv.gz')
 
+    if lease_heartbeat is not None:
+        lease_heartbeat.raise_if_lost()
     execution.status = 'PREPARING'
     execution.heartbeat_at = timezone.now()
     execution.save(update_fields=['status', 'heartbeat_at'])
@@ -1062,6 +1087,9 @@ def run_execution(execution_id, stdout=None):
         'peak_cpu': 0.0,
     }
 
+    if lease_heartbeat is not None:
+        lease_heartbeat.on_lost = lambda: state['engine'].stop() if state['engine'] else None
+
     from ..engines import get_engine_class
     from ..engines.base import EngineError
     from .sla import BreachDetector, evaluate
@@ -1073,6 +1101,10 @@ def run_execution(execution_id, stdout=None):
 
     def on_sample(sample):
         """采样回调：推 WS（每个点）+ 落库（按 db_interval 抽稀）+ SLA 熔断。"""
+        if lease_heartbeat is not None and lease_heartbeat._lost.is_set():
+            if state['engine']:
+                state['engine'].stop()
+            return
         offset = int(sample.get('ts_offset') or 0)
         cpu = float(sample.get('cpu_percent') or 0)
         state['peak_cpu'] = max(state['peak_cpu'], cpu)
@@ -1134,6 +1166,7 @@ def run_execution(execution_id, stdout=None):
     result = None
     error_message = ''
     status = 'COMPLETED'
+    lease_lost = False
 
     try:
         engine_class = get_engine_class(snapshot.get('engine') or 'BUILTIN')
@@ -1141,7 +1174,11 @@ def run_execution(execution_id, stdout=None):
                               raw_csv_path=raw_csv_path)
         state['engine'] = engine
 
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         engine.prepare()
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
 
         execution.status = 'RUNNING'
         execution.start_time = timezone.now()
@@ -1152,22 +1189,43 @@ def run_execution(execution_id, stdout=None):
         emit(f'压测开始：{scenario.name}（引擎 {snapshot.get("engine")}）')
 
         engine.run()
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         result = engine.collect()
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
 
+    except ExecutionClaimLost:
+        lease_lost = True
+        raise
     except EngineError as exc:
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         status = 'FAILED'
         error_message = str(exc)
         emit(f'ERROR 配置校验失败：{exc}')
     except Exception as exc:  # noqa: BLE001 - 兜底，任何异常都要落终态
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         status = 'FAILED'
         error_message = f'{type(exc).__name__}: {exc}'
         logger.exception('压测 %s 执行异常', execution.execution_no)
         emit(f'ERROR 执行异常：{error_message}')
     finally:
         _close_stale_connections()
-        _flush(state, execution)
-        # 排空事件循环期间交付给后台线程的采样批，确保进程退出前全部落库
+        lost_error = None
+        if lease_heartbeat is not None and not lease_lost:
+            try:
+                lease_heartbeat.raise_if_lost()
+            except ExecutionClaimLost as exc:
+                lease_lost = True
+                lost_error = exc
+        if not lease_lost:
+            _flush(state, execution)
+        # 排空已提交的采样批，确保进程退出前后台落库线程完成。
         _db_flush_worker.flush(timeout=5.0)
+        if lost_error is not None:
+            raise lost_error
 
     # ---- 收尾 ---- #
     execution.refresh_from_db(fields=['status'])
@@ -1191,6 +1249,8 @@ def run_execution(execution_id, stdout=None):
 
     stats = (result or {}).get('request_stats') or []
     if stats:
+        if lease_heartbeat is not None:
+            lease_heartbeat.raise_if_lost()
         PerfRequestStat.objects.bulk_create([
             PerfRequestStat(
                 execution_id=execution.id,
@@ -1238,6 +1298,8 @@ def run_execution(execution_id, stdout=None):
         round((execution.end_time - execution.start_time).total_seconds(), 2)
         if execution.start_time else 0)
     execution.heartbeat_at = timezone.now()
+    if lease_heartbeat is not None:
+        lease_heartbeat.raise_if_lost()
     execution.save()
 
     # 紧跟终态回写任务计数：报告生成可能耗时数秒，放在其后会让

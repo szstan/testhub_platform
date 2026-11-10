@@ -10,6 +10,7 @@ import re
 import copy
 from typing import Any, Dict, List, Optional
 from django.conf import settings
+from apps.core.http_transport import guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 from airtest.core.api import (
@@ -1165,9 +1166,10 @@ class UiFlowRunner:
         logger.info(f"HTTP请求: {method} {url}")
         
         try:
-            response = req_lib.request(
+            response = guarded_request(
                 method=method,
                 url=url,
+                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
                 headers=headers,
                 params=params,
                 json=json_data if json_data else None,

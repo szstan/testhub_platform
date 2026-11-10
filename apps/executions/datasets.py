@@ -26,6 +26,8 @@ def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any], *, max_variant
     else:
         data = dataset.get('data') or []
         matrix = dataset.get('matrix') or {}
+    if data and matrix:
+        raise DatasetError('dataset cannot contain both data and matrix')
     if data:
         if not isinstance(data, list) or not all(isinstance(item, Mapping) for item in data):
             raise DatasetError('dataset.data must be a list of objects')
@@ -39,6 +41,8 @@ def expand_dataset(dataset: ExecutionDataset | Mapping[str, Any], *, max_variant
     columns = sorted(matrix)
     if len(columns) > 50 or any(len(matrix[column]) > 1000 for column in columns):
         raise DatasetError('dataset.matrix exceeds column/row limits')
+    if any(not matrix[column] for column in columns):
+        raise DatasetError('dataset.matrix columns cannot be empty')
     variant_count = 1
     for column in columns:
         variant_count *= len(matrix[column])

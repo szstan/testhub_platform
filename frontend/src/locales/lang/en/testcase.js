@@ -166,6 +166,7 @@ export default {
       apiBase: 'API Base URL',
       projectId: 'Project ID',
       branch: 'Branch',
+      lastCommit: 'Last Commit',
       path: 'Path',
       tokenRef: 'Token environment variable',
       enabled: 'Enabled',

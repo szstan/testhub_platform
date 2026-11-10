@@ -17,6 +17,18 @@ def test_matrix_expansion_is_deterministic():
     ]
 
 
+def test_dataset_expansion_rejects_both_nonempty_shapes():
+    with pytest.raises(DatasetError, match='both data and matrix'):
+        expand_dataset({
+            'data': [{'account': 'active'}],
+            'matrix': {'region': ['west', 'east']},
+        })
+
+
+def test_row_dataset_expansion_remains_supported():
+    assert expand_dataset({'data': [{'account': 'active'}]}) == [{'account': 'active'}]
+
+
 def test_dataset_rejects_invalid_shape_and_redacts_secrets():
     with pytest.raises(DatasetError):
         expand_dataset({'matrix': {'browser': 'chrome'}})

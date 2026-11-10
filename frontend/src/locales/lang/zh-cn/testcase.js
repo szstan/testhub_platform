@@ -166,6 +166,7 @@ export default {
       apiBase: 'API Base URL',
       projectId: '项目 ID',
       branch: '分支',
+      lastCommit: '最近提交',
       path: '路径',
       tokenRef: 'Token 环境变量',
       enabled: '启用',

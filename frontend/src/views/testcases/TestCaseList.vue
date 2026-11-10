@@ -26,7 +26,7 @@
         <el-button @click="goToImportRecords">
           {{ $t('testcase.importRecords') }}
         </el-button>
-        <el-button @click="$router.push('/testcases/sync')">
+        <el-button @click="router.push({ name: 'TestCaseSync' })">
           {{ $t('testcase.sync.nav') }}
         </el-button>
         <el-button type="primary" @click="$router.push('/ai-generation/testcases/create')">
@@ -636,7 +636,7 @@ const goToImportRecords = () => {
 
 const fetchProjects = async () => {
   try {
-    const response = await api.get('/projects/')
+    const response = await api.get('/projects/all/')
     projects.value = response.data.results || response.data || []
   } catch (error) {
     ElMessage.error(t('testcase.fetchProjectsFailed'))

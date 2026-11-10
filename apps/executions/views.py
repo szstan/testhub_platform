@@ -11,7 +11,9 @@ from django.utils import timezone
 from datetime import timedelta
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, Max, Min, Q, Sum
+from django.db.models import BigIntegerField, CharField, Count, Max, Min, Q, Sum, Value
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast, Coalesce
 from .models import (
     ExecutionArtifact,
     ExecutionAttempt,
@@ -82,7 +84,7 @@ from .serializers import (
 )
 from .state_machine import InvalidExecutionTransition
 from .adapters import AdapterConflict, UnsupportedExecutorError, get_executor_adapter
-from .result_events import ResultEventError, ResultEventIngestor
+from .result_events import ResultEventError, ResultEventIngestor, redact_result_payload
 from .run_comparison import compare_jobs, evaluate_release_gate
 from .failure_intelligence import analyze_job_failures
 from .ci import WebhookVerificationError, process_webhook, verify_webhook_request
@@ -101,10 +103,35 @@ from apps.defects.models import Defect
 from apps.users.permissions import CIServiceTokenPermission
 
 
+def _integer_parameter(params, name, *, default=None, minimum=1, maximum=2 ** 63 - 1, required=False):
+    value = params.get(name)
+    if value is None:
+        if required:
+            raise ValidationError({name: '参数不能为空'})
+        return default
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, str))
+        or not str(value).isascii()
+        or not str(value).isdecimal()
+        or len(str(value)) > 19
+    ):
+        raise ValidationError({name: '参数必须为有效整数'})
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise ValidationError({name: f'参数必须在 {minimum} 到 {maximum} 之间'})
+    return number
+
+
 class ExecutionPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+    def get_page_size(self, request):
+        return _integer_parameter(
+            request.query_params, 'page_size', default=self.page_size, maximum=self.max_page_size,
+        )
 
 
 def get_accessible_projects(user):
@@ -123,7 +150,7 @@ class ResultImportView(APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
-        project_id = request.data.get('project_id')
+        project_id = _integer_parameter(request.data, 'project_id', required=True)
         result_format = request.data.get('format')
         external_run_id = request.data.get('external_run_id')
         build_reference = request.data.get('build_reference', '')
@@ -173,30 +200,40 @@ class ExecutionMetricsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        days = max(1, min(int(request.query_params.get('days', 30)), 365))
+        days = _integer_parameter(request.query_params, 'days', default=30, maximum=365)
         since = timezone.now() - timedelta(days=days)
         projects = accessible_execution_projects(request.user)
-        project_id = request.query_params.get('project')
-        if project_id:
+        project_id = _integer_parameter(request.query_params, 'project')
+        if project_id is not None:
             projects = projects.filter(pk=project_id)
         jobs_queryset = ExecutionJob.objects.filter(
-            project__in=projects,
-            created_at__gte=since,
-        ).order_by('-created_at')
-        jobs = list(jobs_queryset)
-        ci_jobs = [job for job in jobs if job.source_type == 'ci']
-        summaries = [job.result or {} for job in ci_jobs if isinstance(job.result, dict)]
-        evaluations = list(ExecutionQualityGateEvaluation.objects.filter(job__in=jobs, stage='release'))
-        from collections import Counter
-        failure_reviews = ExecutionFailureReview.objects.filter(job__in=jobs)
-        try:
-            from apps.quality_intelligence.models import QualityTestProfile
-            flaky_count = QualityTestProfile.objects.filter(
-                project_id__in=[str(project.pk) for project in projects],
-                reliability_status='FLAKY',
-            ).count()
-        except Exception:
-            flaky_count = 0
+            project__in=projects, created_at__gte=since,
+        ).order_by()
+        total_jobs = jobs_queryset.count()
+        ci_summary = jobs_queryset.filter(source_type='ci').annotate(
+            unmatched_count=Coalesce(
+                Cast(KeyTextTransform('unmatched', 'result'), BigIntegerField()),
+                Value(0), output_field=BigIntegerField(),
+            ),
+        ).aggregate(
+            total=Count('pk'),
+            associated=Count('pk', filter=Q(unmatched_count=0)),
+            unmatched=Sum('unmatched_count', default=0),
+        )
+        evaluations = ExecutionQualityGateEvaluation.objects.filter(
+            job__in=jobs_queryset.values('pk'), stage='release',
+        ).aggregate(total=Count('pk'), passed=Count('pk', filter=Q(passed=True)))
+        failure_categories = dict(
+            ExecutionFailureReview.objects.filter(job__in=jobs_queryset.values('pk'))
+            .order_by().values('category').annotate(total=Count('pk'))
+            .values_list('category', 'total')
+        )
+        from apps.quality_intelligence.models import QualityTestProfile
+        flaky_count = QualityTestProfile.objects.filter(
+            project_type='PROJECT',
+            project_id__in=projects.annotate(scope_id=Cast('pk', CharField())).values('scope_id'),
+            reliability_status='FLAKY',
+        ).count()
 
         recent_runs = [
             {
@@ -206,12 +243,16 @@ class ExecutionMetricsView(APIView):
                 'source_id': job.source_id,
                 'build_reference': job.build_reference,
                 'status': job.final_status or job.status,
-                'quality_gate': job.quality_gate_result or {},
+                'quality_gate': redact_result_payload(job.quality_gate_result or {}),
                 'created_at': job.created_at,
                 'finished_at': job.finished_at,
-                'error_message': (job.error_message or '')[:512],
+                'error_message': redact_result_payload(job.error_message or '')[:512],
             }
-            for job in jobs[:10]
+            for job in jobs_queryset.order_by('-created_at', '-pk').only(
+                'pk', 'project_id', 'source_type', 'source_id', 'build_reference',
+                'final_status', 'status', 'quality_gate_result', 'created_at',
+                'finished_at', 'error_message',
+            )[:10]
         ]
         route_readiness = {}
         for source_type in ('api', 'ui', 'app', 'performance'):
@@ -223,20 +264,19 @@ class ExecutionMetricsView(APIView):
             except UnsupportedExecutorError:
                 route_readiness[source_type] = False
 
-        binding_counts = {}
-        for source_type in ('api', 'ui', 'app', 'performance'):
-            binding_counts[source_type] = ExecutionSourceBinding.objects.filter(
-                project__in=projects,
-                source_type=source_type,
-                enabled=True,
-            ).count()
+        binding_counts = dict.fromkeys(('api', 'ui', 'app', 'performance'), 0)
+        binding_counts.update(dict(
+            ExecutionSourceBinding.objects.filter(project__in=projects, enabled=True)
+            .order_by().values('source_type').annotate(total=Count('pk'))
+            .values_list('source_type', 'total')
+        ))
         last_webhook = WebhookEvent.objects.filter(
             profile__project__in=projects,
-        ).order_by('-received_at').first()
+        ).only('pk', 'provider', 'status', 'received_at', 'job_id').order_by('-received_at', '-pk').first()
         last_ci_job = ExecutionJob.objects.filter(
             project__in=projects,
             source_type='ci',
-        ).order_by('-created_at').first()
+        ).only('pk', 'final_status', 'status', 'created_at', 'finished_at').order_by('-created_at', '-pk').first()
         integration_health = {
             'webhook_profiles': ExecutionProfile.objects.filter(
                 project__in=projects,
@@ -271,7 +311,7 @@ class ExecutionMetricsView(APIView):
         quality_runs_visible = quality_project_filter(QualityRun.objects.all(), request.user)
         unmapped_quality_runs = 0
         if project_id:
-            mapped_run_filter = Q(project_type__in=['PROJECT', 'EXECUTION'], project_id=str(project_id))
+            mapped_run_filter = Q(project_type='PROJECT', project_id=str(project_id))
             quality_runs = quality_runs_visible.filter(mapped_run_filter)
             unmapped_quality_runs = quality_runs_visible.exclude(mapped_run_filter).count()
         else:
@@ -282,7 +322,7 @@ class ExecutionMetricsView(APIView):
         clusters_visible = quality_project_filter(QualityFailureCluster.objects.all(), request.user)
         unmapped_quality_clusters = 0
         if project_id:
-            mapped_cluster_filter = Q(mapped_project_id=project_id) | Q(project_type__in=['PROJECT', 'EXECUTION'], project_id=str(project_id))
+            mapped_cluster_filter = Q(mapped_project_id=project_id) | Q(project_type='PROJECT', project_id=str(project_id))
             quality_cluster_count = clusters_visible.filter(mapped_cluster_filter).count()
             unmapped_quality_clusters = clusters_visible.exclude(mapped_cluster_filter).count()
         else:
@@ -319,13 +359,13 @@ class ExecutionMetricsView(APIView):
         ]
         return Response({
             'window_days': days,
-            'total_jobs': len(jobs),
-            'ci_jobs': len(ci_jobs),
-            'ci_association_rate': round(sum(1 for item in summaries if not int(item.get('unmatched', 0) or 0)) / len(summaries) * 100, 2) if summaries else 0,
-            'unmatched_results': sum(int(item.get('unmatched', 0) or 0) for item in summaries),
-            'gate_evaluations': len(evaluations),
-            'gate_pass_rate': round(sum(1 for item in evaluations if item.passed) / len(evaluations) * 100, 2) if evaluations else 0,
-            'failure_categories': dict(Counter(failure_reviews.values_list('category', flat=True))),
+            'total_jobs': total_jobs,
+            'ci_jobs': ci_summary['total'],
+            'ci_association_rate': round(ci_summary['associated'] / ci_summary['total'] * 100, 2) if ci_summary['total'] else 0,
+            'unmatched_results': ci_summary['unmatched'],
+            'gate_evaluations': evaluations['total'],
+            'gate_pass_rate': round(evaluations['passed'] / evaluations['total'] * 100, 2) if evaluations['total'] else 0,
+            'failure_categories': failure_categories,
             'flaky_profiles': flaky_count,
             'recent_runs': recent_runs,
             'route_readiness': route_readiness,
@@ -335,59 +375,94 @@ class ExecutionMetricsView(APIView):
         })
 
 
+_EVIDENCE_MAX_OFFSET = 100_000
+
+
 class ExecutionEvidenceExplorerView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        params = request.query_params
+        project_id = _integer_parameter(params, 'project')
+        job_id = _integer_parameter(params, 'job')
+        attempt_id = _integer_parameter(params, 'attempt')
+        quality_run_id = _integer_parameter(params, 'quality_run')
+        limit = _integer_parameter(params, 'limit', default=100, maximum=200)
+        page_size = _integer_parameter(params, 'page_size', default=limit, maximum=200)
+        page = _integer_parameter(params, 'page', default=1, maximum=1000000)
+        artifact_page = _integer_parameter(params, 'artifact_page', default=page, maximum=1000000)
+        quality_page = _integer_parameter(params, 'quality_page', default=page, maximum=1000000)
+        artifact_size = _integer_parameter(params, 'artifact_page_size', default=page_size, maximum=200)
+        quality_size = _integer_parameter(params, 'quality_page_size', default=page_size, maximum=200)
+        artifact_offset = (artifact_page - 1) * artifact_size
+        quality_offset = (quality_page - 1) * quality_size
+        if artifact_offset > _EVIDENCE_MAX_OFFSET or quality_offset > _EVIDENCE_MAX_OFFSET:
+            raise ValidationError({'page': 'Requested evidence page exceeds the scan limit; narrow the filters'})
         accessible = accessible_execution_projects(request.user)
-        project_id = request.query_params.get('project')
-        if project_id:
+        if project_id is not None:
             if not accessible.filter(pk=project_id).exists():
                 return Response({'detail': '项目不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
             accessible = accessible.filter(pk=project_id)
-        limit = max(1, min(int(request.query_params.get('limit', 100)), 200))
-        artifact_query = ExecutionArtifact.objects.select_related('job', 'attempt', 'step_result').filter(
+        artifact_query = ExecutionArtifact.objects.filter(
             Q(job__project__in=accessible)
             | Q(attempt__job__project__in=accessible)
             | Q(step_result__attempt__job__project__in=accessible)
+        ).filter(
+            Q(job__isnull=True) | Q(job__project__in=accessible),
+            Q(attempt__isnull=True) | Q(attempt__job__project__in=accessible),
+            Q(step_result__isnull=True) | Q(step_result__attempt__job__project__in=accessible),
         ).distinct()
-        if request.query_params.get('job'):
-            artifact_query = artifact_query.filter(job_id=request.query_params['job'])
-        if request.query_params.get('attempt'):
-            artifact_query = artifact_query.filter(attempt_id=request.query_params['attempt'])
-        if request.query_params.get('case_key'):
-            artifact_query = artifact_query.filter(step_result__case_key=request.query_params['case_key'])
-        if request.query_params.get('media_type'):
-            artifact_query = artifact_query.filter(media_type=request.query_params['media_type'])
-        artifacts = list(artifact_query.order_by('-created_at')[:limit])
+        if job_id is not None:
+            artifact_query = artifact_query.filter(
+                Q(job_id=job_id) | Q(attempt__job_id=job_id) | Q(step_result__attempt__job_id=job_id),
+            )
+        if attempt_id is not None:
+            artifact_query = artifact_query.filter(Q(attempt_id=attempt_id) | Q(step_result__attempt_id=attempt_id))
+        if params.get('case_key'):
+            artifact_query = artifact_query.filter(step_result__case_key=params['case_key'])
+        # These filters intentionally have separate vocabularies/tables.
+        if params.get('media_type'):
+            artifact_query = artifact_query.filter(media_type=params['media_type'])
+        artifact_total = artifact_query.count()
+        artifacts = (
+            list(artifact_query.order_by('-created_at', '-pk')[artifact_offset:artifact_offset + artifact_size])
+            if artifact_offset < artifact_total else []
+        )
 
-        quality_rows = []
+        quality_rows, quality_total = [], 0
         if getattr(settings, 'QUALITY_INTELLIGENCE_ENABLED', False):
             from apps.quality_intelligence.models import QualityEvidence, QualityRun
             from apps.quality_intelligence.permissions import quality_project_filter
             from apps.quality_intelligence.serializers import QualityEvidenceSerializer
             runs = quality_project_filter(QualityRun.objects.all(), request.user)
-            if project_id:
-                runs = runs.filter(Q(project_type__in=['PROJECT', 'EXECUTION'], project_id=str(project_id)))
-            if request.query_params.get('quality_run'):
-                runs = runs.filter(pk=request.query_params['quality_run'])
-            evidence_query = QualityEvidence.objects.filter(run__in=runs).select_related('run', 'item')
-            if request.query_params.get('evidence_type'):
-                evidence_query = evidence_query.filter(evidence_type=request.query_params['evidence_type'])
-            if request.query_params.get('availability'):
-                evidence_query = evidence_query.filter(availability=request.query_params['availability'])
-            if request.query_params.get('media_type'):
-                evidence_query = evidence_query.filter(mime_type=request.query_params['media_type'])
-            quality_rows = QualityEvidenceSerializer(
-                evidence_query.order_by('-created_at')[:limit], many=True
-            ).data
+            if project_id is not None:
+                runs = runs.filter(project_type='PROJECT', project_id=str(project_id))
+            if quality_run_id is not None:
+                runs = runs.filter(pk=quality_run_id)
+            evidence_query = QualityEvidence.objects.filter(run__in=runs)
+            if params.get('evidence_type'):
+                evidence_query = evidence_query.filter(evidence_type=params['evidence_type'])
+            if params.get('availability'):
+                evidence_query = evidence_query.filter(availability=params['availability'])
+            quality_total = evidence_query.count()
+            if quality_offset < quality_total:
+                quality_rows = QualityEvidenceSerializer(
+                    evidence_query.order_by('-created_at', '-pk')[quality_offset:quality_offset + quality_size], many=True,
+                ).data
 
         return Response({
             'execution_artifacts': ExecutionArtifactSerializer(artifacts, many=True).data,
             'quality_evidence': quality_rows,
-            'counts': {
-                'execution_artifacts': len(artifacts),
-                'quality_evidence': len(quality_rows),
+            'counts': {'execution_artifacts': artifact_total, 'quality_evidence': quality_total},
+            'pagination': {
+                'execution_artifacts': {
+                    'total': artifact_total, 'page': artifact_page, 'page_size': artifact_size,
+                    'has_next': artifact_offset + len(artifacts) < artifact_total,
+                },
+                'quality_evidence': {
+                    'total': quality_total, 'page': quality_page, 'page_size': quality_size,
+                    'has_next': (quality_page - 1) * quality_size + len(quality_rows) < quality_total,
+                },
             },
         })
 
@@ -704,6 +779,44 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(project_id=self.request.auth.project_id)
         return queryset
 
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset()).annotate(_attempts_count=Count('attempts', distinct=True))
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(queryset, many=True).data)
+
+    def get_serializer(self, *args, **kwargs):
+        if args and 'data' not in kwargs:
+            from .source_contract import SourceBindingError, parse_source_id
+            instances = list(args[0]) if kwargs.get('many') else [args[0]]
+            references = set()
+            for job in instances:
+                if job.source_type not in {'api', 'ui', 'app', 'performance'}:
+                    continue
+                try:
+                    ref = parse_source_id(job.source_type, job.source_id)
+                except SourceBindingError:
+                    continue
+                references.add((job.project_id, ref.source_type, ref.canonical))
+            context = kwargs.setdefault('context', self.get_serializer_context())
+            bindings = {}
+            if references:
+                # Inputs are limited to this response page, never the full job
+                # history; the serializer must not issue per-row lookups.
+                bindings = {
+                    (project_id, source_type, source_id): enabled
+                    for project_id, source_type, source_id, enabled in ExecutionSourceBinding.objects.filter(
+                        project_id__in={item[0] for item in references},
+                        source_type__in={item[1] for item in references},
+                        source_id__in={item[2] for item in references},
+                    ).values_list('project_id', 'source_type', 'source_id', 'enabled')
+                }
+            context['source_binding_statuses'] = bindings
+            if kwargs.get('many'):
+                args = (instances, *args[1:])
+        return super().get_serializer(*args, **kwargs)
+
     def create(self, request, *args, **kwargs):
         header_key = request.headers.get('Idempotency-Key') or request.META.get(
             'HTTP_IDEMPOTENCY_KEY'
@@ -714,8 +827,8 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
                 {'detail': 'Idempotency-Key header does not match request body'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        project_id = request.data.get('project')
-        if getattr(request.auth, 'project_id', None) and project_id and int(project_id) != request.auth.project_id:
+        project_id = _integer_parameter(request.data, 'project')
+        if getattr(request.auth, 'project_id', None) and project_id and project_id != request.auth.project_id:
             return Response({'detail': 'CI token 无权访问该项目'}, status=status.HTTP_403_FORBIDDEN)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -882,8 +995,6 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], url_path='failure-analysis')
     def failure_analysis(self, request, pk=None):
         job = self.get_object()
-        from apps.quality_intelligence.services.clusters import sync_execution_job_clusters
-        sync_execution_job_clusters(job)
         return Response(analyze_job_failures(job))
 
     @action(detail=True, methods=['get'], url_path='ci-status')
@@ -910,7 +1021,7 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='compare')
     def compare(self, request, pk=None):
         job = self.get_object()
-        baseline_id = request.data.get('baseline_job_id')
+        baseline_id = _integer_parameter(request.data, 'baseline_job_id', required=True)
         baseline = self.get_queryset().filter(pk=baseline_id).first()
         if baseline is None:
             return Response({'detail': 'baseline_job_id 不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
@@ -923,15 +1034,15 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='release-gate')
     def release_gate(self, request, pk=None):
         job = self.get_object()
-        baseline_id = request.data.get('baseline_job_id')
+        baseline_id = _integer_parameter(request.data, 'baseline_job_id')
         baseline = None
         if baseline_id:
             baseline = self.get_queryset().filter(pk=baseline_id).first()
             if baseline is None:
                 return Response({'detail': 'baseline_job_id 不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
         try:
-            max_failed = int(request.data.get('max_failed', 0))
-            max_unmatched = int(request.data.get('max_unmatched', 0))
+            max_failed = _integer_parameter(request.data, 'max_failed', default=0, minimum=0)
+            max_unmatched = _integer_parameter(request.data, 'max_unmatched', default=0, minimum=0)
             policy_version = str(request.data.get('policy_version') or '').strip()[:128]
             policy_snapshot = request.data.get('policy_snapshot') or {}
             metric_thresholds = request.data.get('metric_thresholds') or {}
@@ -1032,6 +1143,7 @@ class ExecutionAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only attempt history scoped through the owning project."""
 
     queryset = ExecutionAttempt.objects.select_related('job', 'job__project')
+    serializer_class = ExecutionAttemptSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = ExecutionPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -1049,6 +1161,7 @@ class ExecutionStepResultViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only stable case/step results scoped through the owning project."""
 
     queryset = ExecutionStepResult.objects.select_related('attempt', 'attempt__job__project')
+    serializer_class = ExecutionStepResultSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = ExecutionPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -1066,6 +1179,7 @@ class ExecutionArtifactViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only artifact references scoped through the owning project."""
 
     queryset = ExecutionArtifact.objects.select_related('job', 'attempt', 'step_result')
+    serializer_class = ExecutionArtifactSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = ExecutionPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -1122,72 +1236,15 @@ class ExecutionBuildViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def coverage(self, request):
-        project_id = request.query_params.get('project')
-        if not project_id:
-            raise ValidationError({'project': 'project 参数不能为空'})
+        from .control_plane import requirement_coverage
+        from apps.versions.models import Version
+        project_id = _integer_parameter(request.query_params, 'project', required=True)
+        version_id = _integer_parameter(request.query_params, 'version')
         if not accessible_execution_projects(request.user).filter(pk=project_id).exists():
             raise PermissionDenied('没有权限访问该项目')
-        requirements = BusinessRequirement.objects.filter(
-            analysis__document__project_id=project_id,
-        )
-        links = RequirementTestCaseLink.objects.filter(
-            requirement__in=requirements,
-            test_case__project_id=project_id,
-        ).select_related('requirement', 'test_case')
-        requirement_case_keys = {}
-        linked_requirement_ids = set()
-        for link in links:
-            linked_requirement_ids.add(link.requirement_id)
-            requirement_case_keys.setdefault(link.requirement_id, set()).add(
-                link.test_case.external_ref
-            )
-
-        version_id = request.query_params.get('version')
-        result_rows = ExecutionStepResult.objects.filter(
-            attempt__job__project_id=project_id,
-        ).select_related('attempt', 'attempt__job')
-        if version_id:
-            result_rows = result_rows.filter(attempt__job__version_id=version_id)
-        result_rows = result_rows.order_by('case_key', '-attempt__job__created_at', '-id')
-        latest_by_case = {}
-        for row in result_rows:
-            latest_by_case.setdefault(row.case_key, row.status)
-        passed_statuses = {'passed', 'succeeded', 'completed'}
-        executed_statuses = passed_statuses | {'failed', 'blocked', 'skipped', 'inconclusive', 'error'}
-        executed_requirement_ids = set()
-        passed_requirement_ids = set()
-        failed_requirement_ids = set()
-        for requirement_id, case_keys in requirement_case_keys.items():
-            statuses = [latest_by_case[key] for key in case_keys if key in latest_by_case]
-            if any(status in executed_statuses for status in statuses):
-                executed_requirement_ids.add(requirement_id)
-            if statuses and all(status in passed_statuses for status in statuses):
-                passed_requirement_ids.add(requirement_id)
-            if any(status in {'failed', 'blocked', 'error'} for status in statuses):
-                failed_requirement_ids.add(requirement_id)
-
-        total = requirements.count()
-        linked_count = len(linked_requirement_ids)
-        executed_count = len(executed_requirement_ids)
-        passed_count = len(passed_requirement_ids)
-        return Response({
-            'project': int(project_id),
-            'version': int(version_id) if version_id and str(version_id).isdigit() else None,
-            'total_requirements': total,
-            'covered_requirements': linked_count,
-            'linked_requirements': linked_count,
-            'executed_requirements': executed_count,
-            'passed_requirements': passed_count,
-            'failed_requirements': len(failed_requirement_ids),
-            'unexecuted_requirements': sorted(linked_requirement_ids - executed_requirement_ids),
-            'uncovered_requirement_ids': sorted(set(requirements.values_list('id', flat=True)) - linked_requirement_ids),
-            'executed_requirement_ids': sorted(executed_requirement_ids),
-            'passed_requirement_ids': sorted(passed_requirement_ids),
-            'failed_requirement_ids': sorted(failed_requirement_ids),
-            'coverage_rate': round(linked_count / total * 100, 1) if total else 0,
-            'executed_coverage_rate': round(executed_count / total * 100, 1) if total else 0,
-            'passed_coverage_rate': round(passed_count / total * 100, 1) if total else 0,
-        })
+        if version_id is not None and not Version.objects.filter(pk=version_id, projects__pk=project_id).exists():
+            raise ValidationError({'version': '版本不属于所选项目'})
+        return Response(requirement_coverage(project_id, version_id))
 
 
 class RequirementTestCaseLinkViewSet(viewsets.ModelViewSet):
@@ -1567,9 +1624,11 @@ class ExecutionDatasetViewSet(viewsets.ModelViewSet):
     serializer_class = ExecutionDatasetSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = ExecutionPagination
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['project', 'enabled']
     search_fields = ['name', 'description']
+    ordering_fields = ['id', 'project', 'name', 'created_at', 'updated_at']
+    ordering = ['project_id', 'name', 'id']
 
     def get_queryset(self):
         return self.queryset.filter(project__in=accessible_execution_projects(self.request.user)).distinct()
@@ -1650,9 +1709,11 @@ class ExecutionPluginManifestViewSet(viewsets.ModelViewSet):
     serializer_class = ExecutionPluginManifestSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = ExecutionPagination
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['project', 'kind', 'enabled']
     search_fields = ['name', 'version']
+    ordering_fields = ['id', 'name', 'version', 'kind', 'created_at', 'updated_at']
+    ordering = ['id']
 
     def get_queryset(self):
         return self.queryset.filter(

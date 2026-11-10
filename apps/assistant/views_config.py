@@ -1,4 +1,5 @@
 from django.conf import settings
+from apps.core.http_transport import guarded_post
 from django.db import transaction
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -116,8 +117,9 @@ class DifyConfigViewSet(viewsets.ModelViewSet):
             # 去除URL末尾的斜杠
             api_url = api_url.rstrip('/')
             
-            response = requests.post(
+            response = guarded_post(
                 f'{api_url}/chat-messages',
+                allow_private=bool((getattr(settings, 'DIFY_ALLOWED_HOSTS', '') or '').strip()),
                 headers=headers,
                 json=test_data,
                 timeout=10,

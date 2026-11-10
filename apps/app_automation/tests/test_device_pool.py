@@ -7,8 +7,10 @@ from rest_framework.test import APIClient
 from apps.app_automation.device_pool import (
     DeviceLeaseError,
     acquire_device,
+    assert_device_execution_lease,
     heartbeat_device,
     release_device,
+    release_device_execution_lease,
 )
 from apps.app_automation.models import AppDevice
 from apps.users.models import User
@@ -25,6 +27,56 @@ def device_pool_user(db):
         capabilities={'platform': 'android', 'android_version': '12', 'resolution': '1080x1920'},
     )
     return user, device
+
+
+@pytest.mark.django_db
+def test_same_owner_replacement_fences_stale_worker(device_pool_user):
+    user, device = device_pool_user
+    leased, _token = acquire_device(user)
+    stale_generation = leased.lease_generation
+
+    assert release_device_execution_lease(device.id, user, stale_generation)
+    replacement, _replacement_token = acquire_device(user)
+
+    assert replacement.lease_generation == stale_generation + 1
+    with pytest.raises(DeviceLeaseError, match='世代'):
+        assert_device_execution_lease(device.id, user, stale_generation)
+    assert not release_device_execution_lease(device.id, user, stale_generation)
+    replacement.refresh_from_db()
+    assert replacement.locked_by_id == user.id
+
+
+@pytest.mark.django_db
+def test_discovery_refresh_preserves_active_lease(device_pool_user):
+    from apps.app_automation.views.device_views import _upsert_discovered_device
+
+    user, device = device_pool_user
+    leased, _token = acquire_device(user)
+    generation = leased.lease_generation
+
+    refreshed = _upsert_discovered_device(
+        device.device_id,
+        {'name': 'rediscovered', 'status': 'online'},
+    )
+
+    assert refreshed.status == 'locked'
+    assert refreshed.locked_by_id == user.id
+    assert refreshed.lease_generation == generation
+    assert refreshed.name == 'rediscovered'
+
+
+@pytest.mark.django_db
+def test_expired_execution_lease_cannot_be_renewed(device_pool_user):
+    user, device = device_pool_user
+    leased, _token = acquire_device(user)
+    generation = leased.lease_generation
+    AppDevice.objects.filter(pk=device.pk).update(
+        lease_expires_at=timezone.now() - timedelta(seconds=1),
+    )
+
+    with pytest.raises(DeviceLeaseError, match='过期'):
+        from apps.app_automation.device_pool import heartbeat_device_execution
+        heartbeat_device_execution(device.pk, user, generation)
 
 
 @pytest.mark.django_db

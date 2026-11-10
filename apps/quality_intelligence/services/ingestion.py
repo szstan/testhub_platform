@@ -32,11 +32,8 @@ from apps.quality_intelligence.models import (
     QualityTestProfile,
 )
 from apps.quality_intelligence.services.clusters import failure_cluster_key, sync_failure_clusters
-from apps.quality_intelligence.services.flakiness import (
-    DEFAULT_WINDOW_SIZE,
-    MIN_ELIGIBLE_ATTEMPTS,
-    calculate_flakiness,
-)
+from apps.quality_intelligence.services.identity import effective_environment
+from apps.quality_intelligence.services.profiles import refresh_profiles as _refresh_profiles
 from apps.quality_intelligence.services.hashing import canonical_json, fingerprint, signature
 from apps.quality_intelligence.services.provenance import (
     PROVENANCE_VERSION,
@@ -311,7 +308,9 @@ def _persist_items(run: QualityRun, raw_items: Iterable[Any], *, environment: st
             outcome=outcome,
             attempt=attempt,
             duration_ms=_positive_int(_field(raw_item, "duration_ms")),
-            environment_fingerprint=text(_field(raw_item, "environment_fingerprint", environment), 128) or environment,
+            environment_fingerprint=effective_environment(
+                text(_field(raw_item, "environment_fingerprint", environment), 128), environment
+            ),
             details=_bounded_payload(_field(raw_item, "details", {}) or {}),
         )
         by_key.setdefault(test_key, []).append(item)
@@ -384,8 +383,8 @@ def _persist_failures(run: QualityRun, raw_failures: Iterable[Any], item_map: Ma
             "quality-failure", source_type, execution_id, str(item_key or ""), signature_value
         )
         test_key = str(getattr(item, 'test_key', '') or '')
-        environment_fingerprint = str(
-            getattr(item, 'environment_fingerprint', '') or run.environment_fingerprint or 'unknown'
+        environment_fingerprint = effective_environment(
+            getattr(item, 'environment_fingerprint', ''), run.environment_fingerprint
         )
         cluster_key = failure_cluster_key(
             source_type=source_type,
@@ -422,59 +421,6 @@ def _persist_failures(run: QualityRun, raw_failures: Iterable[Any], item_map: Ma
             confidence=confidence_value if confidence_value is not None else 1.0,
             rule_id=text(_field(raw, "rule_id", ""), 128),
         )
-
-
-def _refresh_profiles(run: QualityRun, items: Iterable[QualityRunItem]) -> dict[tuple[str, str], QualityTestProfile]:
-    profiles: dict[tuple[str, str], QualityTestProfile] = {}
-    for item in items:
-        key = (item.test_key, item.environment_fingerprint or run.environment_fingerprint or "unknown")
-        profile, _ = QualityTestProfile.objects.get_or_create(
-            source_type=run.source_type,
-            project_type=run.project_type,
-            project_id=run.project_id,
-            test_key=item.test_key,
-            environment_fingerprint=key[1],
-            defaults={
-                "name": item.name,
-                "window_size": DEFAULT_WINDOW_SIZE,
-                "min_attempts": MIN_ELIGIBLE_ATTEMPTS,
-            },
-        )
-        profiles[key] = profile
-
-    for key, profile in profiles.items():
-        queryset = QualityRunItem.objects.filter(
-            run__source_type=run.source_type,
-            run__project_type=run.project_type,
-            run__project_id=run.project_id,
-            test_key=profile.test_key,
-            environment_fingerprint=profile.environment_fingerprint,
-        ).select_related("run").order_by("run__created_at", "id")
-        candidates = list(queryset[: max(profile.window_size, DEFAULT_WINDOW_SIZE) * 2])
-        analysis = calculate_flakiness(
-            candidates,
-            window_size=profile.window_size,
-            min_attempts=profile.min_attempts,
-            test_key=profile.test_key,
-            environment_fingerprint=profile.environment_fingerprint,
-            source_type=run.source_type,
-            project_type=run.project_type,
-            project_id=run.project_id,
-        )
-        timestamps = [candidate.run.finished_at or candidate.run.created_at for candidate in candidates]
-        timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
-        profile.name = next((candidate.name for candidate in reversed(candidates) if candidate.name), profile.name)
-        profile.eligible_attempts = int(analysis.get("eligible_attempts", 0))
-        profile.pass_count = int(analysis.get("pass_count", 0))
-        profile.fail_count = int(analysis.get("fail_count", 0))
-        profile.transition_count = int(analysis.get("transition_count", 0))
-        profile.flaky_score = float(analysis.get("flaky_score", 0.0))
-        profile.reliability_status = str(analysis.get("reliability_status", "INSUFFICIENT_DATA"))
-        profile.first_seen_at = min(timestamps) if timestamps else profile.first_seen_at
-        profile.last_seen_at = max(timestamps) if timestamps else profile.last_seen_at
-        profile.metadata = _bounded_payload({"reason": analysis.get("reason", ""), "window_count": analysis.get("window_count", 0)})
-        profile.save()
-    return profiles
 
 
 def _persist_metrics(run: QualityRun, raw_metrics: Iterable[Any], item_map: Mapping[str, list[QualityRunItem]], profiles: Mapping[tuple[str, str], QualityTestProfile]) -> None:

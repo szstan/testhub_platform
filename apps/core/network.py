@@ -26,20 +26,45 @@ def _is_restricted_address(address: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def _resolve_addresses(hostname: str, port: int):
-    try:
-        infos = socket.getaddrinfo(
-            hostname,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-        )
-    except OSError as exc:
-        raise UnsafeOutboundURL('目标主机无法解析') from exc
+def resolve_outbound_addresses(
+    hostname: str,
+    port: int,
+    *,
+    allow_private: bool = False,
+) -> tuple[str, ...]:
+    """Resolve a host to numeric addresses and reject restricted DNS answers."""
+    hostname = str(hostname or '').strip().strip('[]').rstrip('.')
+    if not hostname:
+        raise UnsafeOutboundURL('目标主机格式非法')
 
-    addresses = {item[4][0] for item in infos if item and item[4]}
-    if not addresses:
-        raise UnsafeOutboundURL('目标主机无法解析')
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        addresses = (str(literal),)
+    else:
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                port,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise UnsafeOutboundURL('目标主机无法解析') from exc
+
+        addresses = tuple(dict.fromkeys(
+            str(item[4][0]) for item in infos if item and item[4]
+        ))
+        if not addresses:
+            raise UnsafeOutboundURL('目标主机无法解析')
+
+    if not allow_private:
+        for address in addresses:
+            if _is_restricted_address(address):
+                raise UnsafeOutboundURL('目标地址属于受限网络')
     return addresses
 
 
@@ -70,29 +95,16 @@ def validate_outbound_url(url: str, *, allow_private: bool = False) -> str:
         raise UnsafeOutboundURL('URL 不允许包含认证信息')
 
     try:
-        port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == 'https' else 80
     except ValueError as exc:
         raise UnsafeOutboundURL('URL 端口无效') from exc
     if not 1 <= port <= 65535:
         raise UnsafeOutboundURL('URL 端口无效')
 
     if not allow_private:
-        hostname = hostname.rstrip('.')
-        if not hostname:
-            raise UnsafeOutboundURL('目标主机格式非法')
-        # Check literals before DNS as well; getaddrinfo behaviour differs by OS
-        # for unusual IPv4/IPv6 spellings.
-        try:
-            literal = ipaddress.ip_address(hostname.strip('[]'))
-        except ValueError:
-            literal = None
-        if literal is not None:
-            addresses = {str(literal)}
-        else:
-            addresses = _resolve_addresses(hostname, port)
-        for address in addresses:
-            if _is_restricted_address(address):
-                raise UnsafeOutboundURL('目标地址属于受限网络')
+        resolve_outbound_addresses(hostname, port)
 
     return parsed.geturl()
 
@@ -160,34 +172,61 @@ def guard_playwright_route_sync(route, *, allow_private: bool = False):
     route.continue_()
 
 
-def configure_selenium_network_guard(driver) -> None:
-    """Best-effort block obvious private redirect targets in Chromium CDP.
-
-    Selenium does not expose a portable request interception API.  The initial
-    URL is still validated synchronously by ``navigate``; this CDP deny list adds
-    protection for common Chromium redirect forms before the browser fetches
-    them. Firefox/Safari simply rely on the synchronous URL checks.
-    """
-    execute_cdp_cmd = getattr(driver, 'execute_cdp_cmd', None)
-    if not callable(execute_cdp_cmd):
+def configure_selenium_network_guard(driver, *, allow_private: bool = False) -> None:
+    """Require the DNS-pinned proxy for Selenium and add optional CDP filtering."""
+    if getattr(driver, '_testhub_network_guard_configured', False):
         return
-    blocked = [
-        'http://localhost/*', 'https://localhost/*',
-        'http://localhost.*/*', 'https://localhost.*/*',
-        'http://127.*/*', 'https://127.*/*',
-        'http://0.0.0.0/*', 'https://0.0.0.0/*',
-        'http://[::1]/*', 'https://[::1]/*',
-        'http://10.*/*', 'https://10.*/*',
-        'http://169.254.*/*', 'https://169.254.*/*',
-        'http://192.168.*/*', 'https://192.168.*/*',
-    ]
-    blocked.extend(
-        pattern
-        for prefix in ('http://172.', 'https://172.')
-        for pattern in (f'{prefix}{octet}.*/*' for octet in range(16, 32))
-    )
-    try:
-        execute_cdp_cmd('Network.enable', {})
-        execute_cdp_cmd('Network.setBlockedURLs', {'urls': blocked})
-    except Exception as exc:  # noqa: BLE001 - browser/version dependent
-        logger.debug('Selenium private-target deny list unavailable: %s', exc)
+    if allow_private:
+        driver._testhub_network_guard_configured = True
+        return
+    if getattr(driver, '_testhub_guarded_proxy', None) is None:
+        raise RuntimeError('Selenium network guard requires the guarded outbound proxy')
+
+    execute_cdp_cmd = getattr(driver, 'execute_cdp_cmd', None)
+    if callable(execute_cdp_cmd):
+        blocked = [
+            'http://localhost/*', 'https://localhost/*',
+            'http://localhost.*/*', 'https://localhost.*/*',
+            'http://127.*/*', 'https://127.*/*',
+            'http://0.0.0.0/*', 'https://0.0.0.0/*',
+            'http://[::1]/*', 'https://[::1]/*',
+            'http://10.*/*', 'https://10.*/*',
+            'http://169.254.*/*', 'https://169.254.*/*',
+            'http://192.168.*/*', 'https://192.168.*/*',
+        ]
+        blocked.extend(
+            pattern
+            for prefix in ('http://172.', 'https://172.')
+            for pattern in (f'{prefix}{octet}.*/*' for octet in range(16, 32))
+        )
+        try:
+            execute_cdp_cmd('Network.enable', {})
+            execute_cdp_cmd('Network.setBlockedURLs', {'urls': blocked})
+        except Exception as exc:  # noqa: BLE001 - the guarded proxy remains authoritative
+            logger.debug('Selenium URL-pattern deny list unavailable: %s', exc)
+
+    start_devtools = getattr(driver, 'start_devtools', None)
+    if callable(start_devtools):
+        try:
+            devtools, connection = start_devtools()
+            fetch = devtools.fetch
+
+            def validate_paused_request(event):
+                try:
+                    validate_browser_request_url(event.request.url, allow_private=False)
+                except Exception as exc:  # noqa: BLE001 - fail closed on validation errors
+                    logger.warning('Blocked unsafe Selenium request: %s (%s)', event.request.url, exc)
+                    connection.execute(fetch.fail_request(
+                        event.request_id,
+                        devtools.network.ErrorReason.BLOCKED_BY_CLIENT,
+                    ))
+                    return
+                connection.execute(fetch.continue_request(event.request_id))
+
+            connection.add_callback(fetch.RequestPaused, validate_paused_request)
+            connection.execute(fetch.enable(
+                patterns=[fetch.RequestPattern(url_pattern='*')],
+            ))
+        except Exception as exc:  # noqa: BLE001 - pinned proxy protects actual connections
+            logger.warning('Selenium Fetch interception unavailable; guarded proxy remains active: %s', exc)
+    driver._testhub_network_guard_configured = True

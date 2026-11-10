@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 from .base import (
@@ -16,6 +18,7 @@ from .base import (
     PASS,
     SKIP,
     BaseSourceAdapter,
+    NormalizedEvidence,
     NormalizedItem,
     NormalizedMetric,
     NormalizedRun,
@@ -105,6 +108,87 @@ def _case_context(case_execution: Any) -> dict[str, Any]:
     }
 
 
+def _capture_datetime(value_: Any) -> datetime | None:
+    if isinstance(value_, datetime):
+        return value_
+    if isinstance(value_, str):
+        try:
+            return datetime.fromisoformat(value_.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _producer_reference(reference: Any) -> tuple[str, int, str, str, Mapping[str, Any]] | None:
+    if not isinstance(reference, Mapping):
+        return None
+    digest = reference.get("sha256")
+    size_bytes = reference.get("size_bytes")
+    mime_type = reference.get("mime_type")
+    uri = reference.get("uri")
+    metadata = reference.get("metadata")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return None
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        return None
+    if not isinstance(mime_type, str) or re.fullmatch(
+        r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", mime_type
+    ) is None:
+        return None
+    if uri != f"urn:sha256:{digest}" or reference.get("availability") != "AVAILABLE":
+        return None
+    if not isinstance(metadata, Mapping):
+        return None
+    safe_uri = safe_reference(uri)
+    if safe_uri != uri:
+        return None
+    return digest, size_bytes, mime_type, safe_uri, metadata
+
+
+def _captured_evidence(
+    reference: Any,
+    screenshot: Mapping[str, Any],
+    *,
+    item_key: str,
+) -> NormalizedEvidence | None:
+    parts = _producer_reference(reference)
+    if parts is None:
+        return None
+    digest, size_bytes, mime_type, uri, metadata = parts
+    captured_at = _capture_datetime(metadata.get("captured_at")) or _capture_datetime(
+        screenshot.get("timestamp")
+    )
+    provenance = payload(metadata)
+    return NormalizedEvidence(
+        evidence_type="SCREENSHOT",
+        item_key=str(item_key or ""),
+        snippet=text(screenshot.get("description", "screenshot captured")),
+        source_uri=uri,
+        source_field="screenshots",
+        sha256=digest,
+        mime_type=text(mime_type, 128),
+        size_bytes=size_bytes,
+        availability="AVAILABLE",
+        provenance=dict(provenance) if isinstance(provenance, Mapping) else {},
+        captured_at=captured_at,
+    )
+
+
+def _unavailable_screenshot(
+    screenshot: Mapping[str, Any],
+    *,
+    item_key: str,
+) -> NormalizedEvidence:
+    return NormalizedEvidence(
+        evidence_type="SCREENSHOT",
+        item_key=str(item_key or ""),
+        snippet=text(screenshot.get("description", "screenshot captured")),
+        source_field="screenshots",
+        availability="UNAVAILABLE",
+        captured_at=_capture_datetime(screenshot.get("timestamp")),
+    )
+
+
 def _add_case_evidence(
     target: list[Any],
     *,
@@ -120,19 +204,19 @@ def _add_case_evidence(
     if isinstance(screenshots, list):
         for screenshot in screenshots[:100]:
             if isinstance(screenshot, Mapping):
-                uri = screenshot.get("url") or screenshot.get("path") or screenshot.get("image")
-                # Data URLs contain the complete image and are intentionally
-                # represented as unavailable metadata rather than copied.
-                if isinstance(uri, str) and uri.lower().startswith("data:"):
-                    target.append(
-                        evidence(
-                            "SCREENSHOT",
-                            item_key=item_key,
-                            snippet=screenshot.get("description", "screenshot captured"),
-                            source_field="screenshots",
-                            availability="UNAVAILABLE",
-                        )
+                if "evidence_reference" in screenshot:
+                    captured = _captured_evidence(
+                        screenshot.get("evidence_reference"), screenshot, item_key=item_key
                     )
+                    target.append(
+                        captured
+                        if captured is not None
+                        else _unavailable_screenshot(screenshot, item_key=item_key)
+                    )
+                    continue
+                uri = screenshot.get("url") or screenshot.get("path") or screenshot.get("image")
+                if isinstance(uri, str) and uri.lower().startswith("data:"):
+                    target.append(_unavailable_screenshot(screenshot, item_key=item_key))
                 else:
                     target.append(
                         evidence(
@@ -141,7 +225,7 @@ def _add_case_evidence(
                             snippet=screenshot.get("description", "screenshot captured"),
                             source_uri=uri,
                             source_field="screenshots",
-                            captured_at=screenshot.get("timestamp"),
+                            captured_at=_capture_datetime(screenshot.get("timestamp")),
                         )
                     )
             elif screenshot:
@@ -173,6 +257,8 @@ def _item_from_case(
     outcome = normalize_outcome(status, passed=case_data.get("passed"), skipped=case_data.get("skipped"))
     logs = case_data.get("steps") or case_data.get("logs")
     screenshots = case_data.get("screenshots")
+    if screenshots is None:
+        screenshots = case_data.get("screenshots_sequence")
     error_message = case_data.get("error") or case_data.get("error_message")
     if fallback is not None:
         if logs is None:

@@ -45,6 +45,8 @@ class Command(BaseCommand):
                 now = timezone.localtime(timezone.now())
                 self.stdout.write(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开始检查任务...")
                 retry_count = self.consume_retry_outbox()
+                self.reconcile_execution_claims()
+                self.dispatch_pending_notifications()
                 self.reconcile_performance_callbacks()
                 counts = (
                     self.schedule_api_tasks(),
@@ -73,6 +75,30 @@ class Command(BaseCommand):
                 if run_once:
                     break
                 time.sleep(interval)
+
+    def reconcile_execution_claims(self):
+        try:
+            from apps.executions import worker_leases
+
+            reconcile = getattr(worker_leases, 'reconcile_stale_execution_claims', None)
+            return reconcile(limit=100) if callable(reconcile) else 0
+        except ImportError:
+            return 0
+        except Exception:  # noqa: BLE001 - optional reconciliation cannot stop dispatch
+            logger.exception('execution claim reconciliation failed')
+            return 0
+
+    def dispatch_pending_notifications(self):
+        try:
+            from apps.executions import notifications
+
+            dispatch = getattr(notifications, 'dispatch_pending_notifications', None)
+            return dispatch(limit=100) if callable(dispatch) else 0
+        except ImportError:
+            return 0
+        except Exception:  # noqa: BLE001 - optional integration cannot stop dispatch
+            logger.exception('pending notification dispatch failed')
+            return 0
 
     def reconcile_performance_callbacks(self):
         try:
@@ -135,11 +161,18 @@ class Command(BaseCommand):
                 if claim is None:
                     continue
                 task = claim.task
+                execution_log = None
                 try:
                     execution_log = TaskExecutionLog.objects.create(task_id=task.pk, status='PENDING')
                     execute_scheduled_task.delay(task.pk, execution_log.pk, claim.token, self.lease_seconds)
                     count += 1
                 except Exception as exc:  # broker unavailable: do not leave an invisible lease
+                    if execution_log is not None:
+                        execution_log.status = 'FAILED'
+                        execution_log.end_time = timezone.now()
+                        execution_log.error_message = str(exc)[:4000]
+                        execution_log.result = {'success': False, 'error': str(exc)[:4000]}
+                        execution_log.save(update_fields=['status', 'end_time', 'error_message', 'result'])
                     logger.error('API task dispatch failed: %s', exc, exc_info=True)
                     self._mark_dispatch_failure(ScheduledTask, task.pk, claim.token, due_field='next_run_time', error=exc)
             return count
@@ -173,7 +206,11 @@ class Command(BaseCommand):
     def schedule_app_tasks(self):
         try:
             from apps.app_automation.models import AppScheduledTask, AppTestExecution
-            from apps.app_automation.tasks import execute_app_suite_task, execute_app_test_task
+            from apps.app_automation.tasks import (
+                execute_app_suite_task,
+                execute_app_test_task,
+                settle_undispatched_app_executions,
+            )
 
             count = 0
             for task_id in AppScheduledTask.objects.filter(status='ACTIVE').values_list('pk', flat=True):
@@ -181,21 +218,37 @@ class Command(BaseCommand):
                 if claim is None:
                     continue
                 task = claim.task
+                leased_device = None
+                lease_generation = None
+                executions = []
+                suite_id = task.test_suite_id if task.task_type == 'TEST_SUITE' else None
                 try:
                     if not task.device:
                         raise ValueError('scheduled APP task has no device')
+                    from apps.app_automation.device_pool import (
+                        acquire_specific_device,
+                        release_device_execution_lease,
+                    )
+                    leased_device, _lease_token = acquire_specific_device(
+                        task.device_id,
+                        task.created_by,
+                        lease_seconds=self.lease_seconds,
+                    )
+                    lease_generation = leased_device.lease_generation
                     package_name = task.app_package.package_name if task.app_package else ''
                     if task.task_type == 'TEST_SUITE' and task.test_suite:
                         suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
                         if not suite_cases.exists():
                             raise ValueError('scheduled APP suite has no test cases')
-                        executions = [AppTestExecution.objects.create(
-                            test_case=sc.test_case,
-                            test_suite=task.test_suite,
-                            device=task.device,
-                            user=task.created_by,
-                            status='pending',
-                        ) for sc in suite_cases]
+                        for sc in suite_cases:
+                            executions.append(AppTestExecution.objects.create(
+                                test_case=sc.test_case,
+                                test_suite=task.test_suite,
+                                device=leased_device,
+                                user=task.created_by,
+                                status='pending',
+                                device_lease_generation=lease_generation,
+                            ))
                         task.test_suite.execution_status = 'running'
                         task.test_suite.save(update_fields=['execution_status'])
                         execute_app_suite_task.delay(
@@ -205,20 +258,26 @@ class Command(BaseCommand):
                             scheduled_task_id=task.pk,
                             scheduler_lease_token=claim.token,
                             lease_seconds=self.lease_seconds,
+                            lease_generation=lease_generation,
+                            device_id=leased_device.pk,
+                            device_lease_owner_id=task.created_by_id,
                         )
                     elif task.task_type == 'TEST_CASE' and task.test_case:
                         execution = AppTestExecution.objects.create(
                             test_case=task.test_case,
-                            device=task.device,
+                            device=leased_device,
                             user=task.created_by,
                             status='pending',
+                            device_lease_generation=lease_generation,
                         )
+                        executions.append(execution)
                         celery_task = execute_app_test_task.delay(
                             execution.pk,
                             package_name=package_name,
                             scheduled_task_id=task.pk,
                             scheduler_lease_token=claim.token,
                             lease_seconds=self.lease_seconds,
+                            lease_generation=lease_generation,
                         )
                         execution.task_id = celery_task.id
                         execution.save(update_fields=['task_id'])
@@ -226,6 +285,21 @@ class Command(BaseCommand):
                         raise ValueError('scheduled APP task configuration is incomplete')
                     count += 1
                 except Exception as exc:  # noqa: BLE001
+                    try:
+                        settle_undispatched_app_executions(
+                            [item.pk for item in executions],
+                            exc,
+                            suite_id=suite_id,
+                        )
+                    except Exception:  # noqa: BLE001 - failure to record cannot hide the dispatch error
+                        logger.exception('failed to settle undispatched APP executions')
+                    if leased_device is not None and lease_generation is not None:
+                        try:
+                            release_device_execution_lease(
+                                leased_device.pk, task.created_by, lease_generation
+                            )
+                        except Exception:  # noqa: BLE001 - still record the schedule failure
+                            logger.exception('failed to release APP device lease after dispatch failure')
                     logger.error('APP task dispatch failed: %s', exc, exc_info=True)
                     self._mark_dispatch_failure(AppScheduledTask, task.pk, claim.token, due_field='next_run_time', error=exc)
             return count
@@ -245,6 +319,7 @@ class Command(BaseCommand):
                 if claim is None:
                     continue
                 task = claim.task
+                execution = None
                 try:
                     scenario = task.scenario
                     if scenario.has_active_execution():
@@ -261,6 +336,11 @@ class Command(BaseCommand):
                     task.mark_dispatched(scheduler_lease_token=claim.token)
                     count += 1
                 except Exception as exc:  # noqa: BLE001
+                    if execution is not None:
+                        try:
+                            executor.stop_execution(execution, graceful=False)
+                        except Exception:  # noqa: BLE001 - stop any orphaned child before reporting failure
+                            logger.exception('failed to stop undispatched performance child: %s', execution.pk)
                     logger.error('性能任务 dispatch failed: %s', exc, exc_info=True)
                     self._mark_perf_dispatch_failure(task.pk, claim.token, exc)
             return count

@@ -183,3 +183,46 @@ def test_openapi_contract_resolves_reference_chains_and_encoded_keys():
 
     assert 'schema type changed: component Final.value string->integer' in changes
     assert 'schema type changed: component Envelope.encoded string->object' in changes
+
+
+def test_openapi_contract_detects_inline_request_response_and_parameter_schema_changes():
+    previous = {
+        'paths': {
+            '/items/': {
+                'parameters': [{'in': 'query', 'name': 'limit', 'schema': {'type': 'string'}}],
+                'post': {
+                    'requestBody': {'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {'id': {'type': 'string'}},
+                    }}}},
+                    'responses': {'200': {'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {'id': {'type': 'string'}},
+                    }}}}},
+                },
+            },
+        },
+    }
+    current = {
+        'paths': {
+            '/items/': {
+                'parameters': [{'in': 'query', 'name': 'limit', 'schema': {'type': 'integer'}}],
+                'post': {
+                    'requestBody': {'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {'id': {'type': 'integer'}},
+                    }}}},
+                    'responses': {'200': {'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {'id': {'type': 'integer'}},
+                    }}}}},
+                },
+            },
+        },
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'schema type changed: POST /items/ parameter query:limit string->integer' in changes
+    assert 'schema type changed: POST /items/ request body application/json.id string->integer' in changes
+    assert 'schema type changed: POST /items/ response 200 application/json.id string->integer' in changes

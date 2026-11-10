@@ -20,6 +20,11 @@ const app = createApp(App)
 const pinia = createPinia()
 app.use(pinia)
 
+// Session loss changes the route without reloading and repeating cookie recovery.
+window.addEventListener('testhub:session-expired', () => {
+  if (router.currentRoute.value.meta.requiresAuth) router.replace('/login')
+})
+
 async function init() {
   try {
     const userStore = useUserStore()

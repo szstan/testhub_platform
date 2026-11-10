@@ -14,9 +14,8 @@ from apps.quality_intelligence.models import (
     QualityRun,
     QualityRunItem,
     QualityRunStatus,
-    QualityTestProfile,
 )
-from apps.quality_intelligence.services.flakiness import calculate_flakiness
+from apps.quality_intelligence.services.profiles import refresh_profiles
 from apps.quality_intelligence.services.redaction import redact_payload
 
 _SOURCE_TYPES = {"api": "API", "ui": "UI", "app": "APP", "performance": "PERF"}
@@ -62,7 +61,7 @@ def sync_unified_attempt(job: Any, attempt: Any, status: str, result: Mapping[st
             source_execution_id=f"unified:{job.pk}"[:128],
             defaults={
                 "source_scope": "CASE",
-                "project_type": source_type,
+                "project_type": "PROJECT",
                 "project_id": str(job.project_id),
                 "source_asset_id": str(job.source_id or "")[:128],
                 "source_asset_name": str(job.source_id or "")[:255],
@@ -70,7 +69,7 @@ def sync_unified_attempt(job: Any, attempt: Any, status: str, result: Mapping[st
                 "adapter_version": "unified-1.0",
             },
         )
-        run.project_type = source_type
+        run.project_type = "PROJECT"
         run.project_id = str(job.project_id)
         run.source_status = str(status or "")[:64]
         run.environment_fingerprint = environment
@@ -119,46 +118,8 @@ def sync_unified_attempt(job: Any, attempt: Any, status: str, result: Mapping[st
                 },
             )
 
-        # Update the matching profile deterministically from the retained QI
-        # items. This keeps flaky classification independent of an LLM.
-        for item in run.items.all():
-            candidates = QualityRunItem.objects.filter(
-                run__source_type=source_type,
-                run__project_type=run.project_type,
-                run__project_id=run.project_id,
-                test_key=item.test_key,
-                environment_fingerprint=environment,
-            ).select_related("run").order_by("run__created_at", "id")
-            analysis = calculate_flakiness(
-                candidates,
-                test_key=item.test_key,
-                environment_fingerprint=environment,
-                source_type=source_type,
-                project_type=run.project_type,
-                project_id=run.project_id,
-            )
-            # Persist the deterministic profile projection so quarantine and
-            # execution governance can resolve the same flaky state.
-            profile, _profile_created = QualityTestProfile.objects.get_or_create(
-                source_type=source_type,
-                project_type=run.project_type,
-                project_id=run.project_id,
-                test_key=item.test_key,
-                environment_fingerprint=environment,
-                defaults={"name": item.name},
-            )
-            profile.eligible_attempts = int(analysis.get("eligible_attempts", 0))
-            profile.pass_count = int(analysis.get("pass_count", 0))
-            profile.fail_count = int(analysis.get("fail_count", 0))
-            profile.transition_count = int(analysis.get("transition_count", 0))
-            profile.flaky_score = float(analysis.get("flaky_score", 0.0))
-            profile.reliability_status = str(analysis.get("reliability_status", "INSUFFICIENT_DATA"))
-            profile.metadata = redact_payload({"reason": analysis.get("reason", ""), "source": "unified_execution"})
-            profile.last_seen_at = run.finished_at
-            profile.save(update_fields=[
-                "eligible_attempts", "pass_count", "fail_count", "transition_count",
-                "flaky_score", "reliability_status", "metadata", "last_seen_at", "updated_at",
-            ])
+        # One projection per identity; history is ranked and bounded in the DB.
+        refresh_profiles(run, run.items.all())
         return run
 
 

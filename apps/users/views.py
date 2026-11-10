@@ -1,5 +1,6 @@
 from rest_framework import generics, status, permissions
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework.response import Response
 from django.conf import settings
 from django.contrib.auth import logout
@@ -47,10 +48,14 @@ class CookieTokenRefreshView(TokenRefreshView):
         data = request.data.copy()
         if not data.get('refresh'):
             data['refresh'] = request.COOKIES.get(REFRESH_COOKIE_NAME, '')
+        if not data.get('refresh'):
+            response = Response({'detail': 'refresh token invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+            _clear_refresh_cookie(response)
+            return response
         serializer = self.get_serializer(data=data)
         try:
             serializer.is_valid(raise_exception=True)
-        except (User.DoesNotExist, TokenError):
+        except (User.DoesNotExist, TokenError, AuthenticationFailed, ValidationError):
             response = Response({'detail': 'refresh token invalid'}, status=status.HTTP_401_UNAUTHORIZED)
             _clear_refresh_cookie(response)
             return response
@@ -120,7 +125,8 @@ def login_view(request):
     return response
 
 @api_view(['POST'])
-@permission_classes([permissions.IsAuthenticated])
+@authentication_classes([])
+@permission_classes([permissions.AllowAny])
 def logout_view(request):
     """用户退出登录，将 refresh token 加入黑名单并清理 HttpOnly cookie"""
     refresh_token = request.data.get('refresh') or request.COOKIES.get(REFRESH_COOKIE_NAME)

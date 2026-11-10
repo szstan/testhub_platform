@@ -2,7 +2,7 @@
 """Small CI client for TestHub execution jobs.
 
 Examples:
-  python scripts/testhub_ci.py --base-url http://testhub trigger --project-id 7 --source-type api --source-id api:suite:42 --token "$TESTHUB_TOKEN"
+  python scripts/testhub_ci.py --base-url http://testhub --token "$TESTHUB_TOKEN" trigger --project-id 7 --source-type api --source-id api:suite:42
   python scripts/testhub_ci.py --base-url http://testhub import-results --project-id 7 --format junit --external-run-id "$GITHUB_RUN_ID" --file test-results.xml
   python scripts/testhub_ci.py --base-url http://testhub release-gate --job-id 42 --baseline-job-id 41
   python scripts/testhub_ci.py --base-url http://testhub wait --job-id 42

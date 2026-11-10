@@ -25,6 +25,7 @@ from .models import (
     ExecutionRetryPolicy,
     ExecutionRetryRequest,
 )
+from .gate_policy import finite_json_value, normalize_metric_rules, policy_version_for_snapshot
 
 def redact_result_payload(value: Any, **kwargs: Any) -> Any:
     from .result_events import redact_result_payload as _redact
@@ -331,19 +332,40 @@ def apply_quality_gate(
     evaluated_by: Any = None,
     attempt: ExecutionAttempt | None = None,
 ) -> dict[str, Any]:
-    """Evaluate and audit a configured gate; missing configured data fails closed."""
+    """Evaluate and audit a configured gate with its immutable policy snapshot."""
 
     profile = getattr(job, "profile", None)
     gate = getattr(profile, "quality_gate", {}) if profile else {}
-    if not gate:
+    if gate is None or (isinstance(gate, Mapping) and not gate):
         return {"configured": False, "passed": True, "failures": []}
-    safe_summary = redact_result_payload(dict(summary or {}))
+
     result = _quality_gate(profile, summary or {})
+    try:
+        rules = normalize_metric_rules(gate, source="profile quality gate")
+        policy_snapshot = {
+            "schema": "quality-gate/v1",
+            "profile_id": getattr(profile, "pk", None),
+            "effective_rules": rules,
+        }
+    except ValueError as exc:
+        policy_snapshot = {
+            "schema": "quality-gate/v1",
+            "profile_id": getattr(profile, "pk", None),
+            "invalid_policy": str(exc),
+        }
+    safe_snapshot = redact_result_payload(policy_snapshot)
+    policy_version = policy_version_for_snapshot(safe_snapshot)
+    safe_snapshot["policy_version"] = policy_version
+    safe_summary = redact_result_payload(finite_json_value(
+        dict(summary) if isinstance(summary, Mapping) else {}
+    ))
     failures = result.get("failures", [])
     safe_result = {
         "configured": True,
         "passed": bool(result.get("passed")),
         "failures": redact_result_payload(failures),
+        "policy_version": policy_version,
+        "policy_snapshot": safe_snapshot,
     }
     if isinstance(safe_summary, dict):
         safe_result["summary"] = safe_summary
@@ -352,9 +374,10 @@ def apply_quality_gate(
         "attempt_id": getattr(attempt, "pk", None),
         "stage": stage,
         "summary": safe_summary,
-        "gate": redact_result_payload(gate),
+        "policy_version": policy_version,
+        "policy_snapshot": safe_snapshot,
     }).encode("utf-8")).hexdigest()
-    evaluation, _created = ExecutionQualityGateEvaluation.objects.get_or_create(
+    ExecutionQualityGateEvaluation.objects.get_or_create(
         evaluation_key=evaluation_key,
         defaults={
             "job": job,
@@ -364,6 +387,8 @@ def apply_quality_gate(
             "passed": bool(result.get("passed")),
             "summary": safe_summary if isinstance(safe_summary, dict) else {"value": safe_summary},
             "failures": safe_result["failures"] if isinstance(safe_result["failures"], list) else [],
+            "policy_version": policy_version,
+            "policy_snapshot": safe_snapshot,
             "reason": "passed" if result.get("passed") else "quality_gate_failed",
             "evaluated_by": evaluated_by,
         },
@@ -388,6 +413,7 @@ def active_quarantine_for_job(job: ExecutionJob, case_key: str = "") -> tuple[An
         return None, {"matched": False, "reason": "CASE_KEY_MISSING"}
     profiles = QualityTestProfile.objects.filter(
         source_type=source_type,
+        project_type="PROJECT",
         project_id=str(job.project_id),
         test_key=profile_key,
     )

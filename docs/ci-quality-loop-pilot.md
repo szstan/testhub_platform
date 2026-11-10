@@ -68,7 +68,8 @@ python manage.py revoke_ci_token --project-id 1 --name github-pilot
 - Repository Secret：`TESTHUB_TOKEN`；
 - 手动运行时输入：`project_id`、可选 `baseline_job_id`、allowlisted `test_suite` 和 `max_unmatched`；CI Pilot 的 external_ref 已物化，当前默认 `max_unmatched=0`。
 
-该 workflow 默认不会随每次 push 自动运行，先用 `workflow_dispatch` 做试点，确认关联率和门禁规则后再接入 push/pull_request。
+该 workflow 默认不会随每次 push 自动运行，先用 `workflow_dispatch` 做试点，确认关联率和门禁规则后再接入 push/pull_request。CI 的默认 pytest 收集现在覆盖 `apps/api_testing/tests.py` 和 `scripts/tests`；UI automation 边界测试单独运行，并在该 job 安装 `requirements-prod.txt` 与 `requirements-ui-optional.txt`。前端 CI 还会运行 `npm run test:auth`。
+
 ## GitHub Actions
 
 如果暂时不使用仓库内的手动 workflow，也可以把以下步骤嵌入现有 workflow。配置项如下：
@@ -105,8 +106,7 @@ jobs:
           TESTHUB_BASE_URL: ${{ vars.TESTHUB_BASE_URL }}
           TESTHUB_PROJECT_ID: ${{ vars.TESTHUB_PROJECT_ID }}
         run: |
-          python scripts/testhub_ci.py import-results \
-            --base-url "$TESTHUB_BASE_URL" \
+          python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" import-results \
             --project-id "$TESTHUB_PROJECT_ID" \
             --format junit \
             --external-run-id "github-${{ github.run_id }}" \
@@ -121,8 +121,7 @@ jobs:
           TESTHUB_BASE_URL: ${{ vars.TESTHUB_BASE_URL }}
           BASELINE_JOB_ID: ${{ vars.TESTHUB_BASELINE_JOB_ID }}
         run: |
-          python scripts/testhub_ci.py release-gate \
-            --base-url "$TESTHUB_BASE_URL" \
+          python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" release-gate \
             --job-id "${{ steps.import.outputs.job_id }}" \
             --baseline-job-id "$BASELINE_JOB_ID" \
             --max-failed 0 \
@@ -130,6 +129,8 @@ jobs:
 ```
 
 Pull requests should initially run the gate in report-only mode or use a dedicated staging threshold. Make the gate blocking only after the team has reviewed false positives for several runs.
+
+`--base-url` is a global CLI option and must precede the subcommand. `--token` is also global and must precede the subcommand when supplied; the examples read it from `TESTHUB_TOKEN` instead.
 
 ## GitLab CI
 
@@ -151,8 +152,7 @@ testhub-results:
   script:
     - pytest -q --junitxml=test-results.xml
     - |
-      python scripts/testhub_ci.py import-results \
-        --base-url "$TESTHUB_BASE_URL" \
+      python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" import-results \
         --project-id "$TESTHUB_PROJECT_ID" \
         --format junit \
         --external-run-id "gitlab-$CI_PIPELINE_ID" \
@@ -170,8 +170,7 @@ quality-gate:
   needs: [testhub-results]
   script:
     - |
-      python scripts/testhub_ci.py release-gate \
-        --base-url "$TESTHUB_BASE_URL" \
+      python scripts/testhub_ci.py --base-url "$TESTHUB_BASE_URL" release-gate \
         --job-id "$(python -c 'import json; print(json.load(open("testhub-import.json"))["job_id"])')" \
         --baseline-job-id "$TESTHUB_BASELINE_JOB_ID" \
         --max-failed 0 \

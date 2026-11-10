@@ -5,6 +5,7 @@ import pytest
 
 from apps.core.network import (
     UnsafeOutboundURL,
+    configure_selenium_network_guard,
     guard_playwright_route,
     validate_browser_request_url,
     validate_outbound_url,
@@ -84,6 +85,113 @@ def test_validate_outbound_url_allows_public_target(monkeypatch):
         ],
     )
     assert validate_outbound_url('https://public.example.test/api') == 'https://public.example.test/api'
+
+
+def test_selenium_fetch_guard_blocks_private_redirect_before_browser_access(monkeypatch):
+    from types import SimpleNamespace
+
+    class Fetch:
+        RequestPaused = SimpleNamespace(event_class='Fetch.requestPaused')
+
+        @staticmethod
+        def RequestPattern(**kwargs):
+            return kwargs
+
+        @staticmethod
+        def enable(**kwargs):
+            return ('enable', kwargs)
+
+        @staticmethod
+        def fail_request(request_id, error_reason):
+            return ('fail', request_id, error_reason)
+
+        @staticmethod
+        def continue_request(request_id):
+            return ('continue', request_id)
+
+    class Connection:
+        def add_callback(self, _event, callback):
+            self.callback = callback
+
+        def execute(self, command):
+            self.commands.append(command)
+
+        def __init__(self):
+            self.commands = []
+
+    connection = Connection()
+    devtools = SimpleNamespace(
+        fetch=Fetch,
+        network=SimpleNamespace(ErrorReason=SimpleNamespace(BLOCKED_BY_CLIENT='blocked')),
+    )
+
+    class Driver:
+        def execute_cdp_cmd(self, *_args):
+            return None
+
+        def start_devtools(self):
+            return devtools, connection
+
+    monkeypatch.setattr(
+        'apps.core.network.socket.getaddrinfo',
+        lambda host, port, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.1.2.3', port)),
+        ],
+    )
+    driver = Driver()
+    driver._testhub_guarded_proxy = object()
+    configure_selenium_network_guard(driver)
+    connection.callback(SimpleNamespace(
+        request=SimpleNamespace(url='https://internal.example.test/admin'),
+        request_id='redirect-hop',
+    ))
+    assert connection.commands[-1] == ('fail', 'redirect-hop', 'blocked')
+
+
+def test_selenium_fetch_guard_continues_a_public_redirect(monkeypatch):
+    from types import SimpleNamespace
+
+    class Fetch:
+        RequestPaused = SimpleNamespace(event_class='Fetch.requestPaused')
+        RequestPattern = lambda **kwargs: kwargs
+        enable = lambda **kwargs: ('enable', kwargs)
+        fail_request = lambda request_id, error_reason: ('fail', request_id, error_reason)
+        continue_request = lambda request_id: ('continue', request_id)
+
+    class Connection:
+        def __init__(self):
+            self.commands = []
+
+        def add_callback(self, _event, callback):
+            self.callback = callback
+
+        def execute(self, command):
+            self.commands.append(command)
+
+    connection = Connection()
+    devtools = SimpleNamespace(fetch=Fetch, network=SimpleNamespace())
+
+    class Driver:
+        def execute_cdp_cmd(self, *_args):
+            return None
+
+        def start_devtools(self):
+            return devtools, connection
+
+    monkeypatch.setattr(
+        'apps.core.network.socket.getaddrinfo',
+        lambda host, port, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', port)),
+        ],
+    )
+    driver = Driver()
+    driver._testhub_guarded_proxy = object()
+    configure_selenium_network_guard(driver)
+    connection.callback(SimpleNamespace(
+        request=SimpleNamespace(url='https://public.example.test/redirected'),
+        request_id='public-hop',
+    ))
+    assert connection.commands[-1] == ('continue', 'public-hop')
 
 
 def test_validate_redirect_url_rejects_private_location():

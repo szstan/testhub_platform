@@ -123,7 +123,7 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
     results_dir = tmp_path / 'allure-results'
     results_dir.mkdir()
     process = Mock()
-    process.stdout = []
+    process.returncode = 0
     process.wait.return_value = 0
 
     with (
@@ -153,6 +153,72 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
     ):
         with pytest.raises(AppTestWorkerError, match='Allure report generation failed'):
             executor.run_tests(1, 'device', 'package')
+
+
+def test_run_tests_streams_all_output_and_returns_only_a_bounded_tail(tmp_path):
+    executor = AppTestExecutor(base_path=str(tmp_path))
+    results_dir = tmp_path / 'allure-results'
+    results_dir.mkdir()
+    log_path = tmp_path / 'pytest.log'
+    process = Mock()
+    process.returncode = 0
+    process.wait.return_value = 0
+
+    def spawn(*_args, **kwargs):
+        assert kwargs['stdout'] is not subprocess.PIPE
+        for index in range(1000):
+            kwargs['stdout'].write(f'pytest-line-{index}\n')
+        kwargs['stdout'].flush()
+        return process
+
+    with (
+        patch.object(executor, '_preflight_worker', return_value={
+            'adb_path': str(tmp_path / 'adb'),
+            'allure_path': str(ALLURE_COMMAND),
+        }),
+        patch.object(executor, '_get_allure_results_dir', return_value=str(results_dir)),
+        patch.object(executor, '_get_log_file_path', return_value=str(log_path)),
+        patch.object(executor, '_parse_allure_results', return_value={'total': 0}),
+        patch.object(executor, '_generate_allure_report', return_value='report'),
+        patch('apps.app_automation.executors.test_executor.subprocess.Popen', side_effect=spawn) as popen,
+    ):
+        result = executor.run_tests(1, 'device', 'package')
+
+    assert result['success'] is True
+    assert len(result['output'].splitlines()) == 50
+    assert result['output'].splitlines()[-2] == 'pytest-line-999'
+    assert 'pytest-line-0' in log_path.read_text(encoding='utf-8')
+    assert 'pytest-line-999' in log_path.read_text(encoding='utf-8')
+    popen.assert_called_once()
+    process.communicate.assert_not_called()
+
+
+def test_run_tests_terminates_pytest_when_lease_is_lost(tmp_path):
+    executor = AppTestExecutor(base_path=str(tmp_path))
+    process = Mock()
+    checks = {'count': 0}
+
+    def cancel_check():
+        checks['count'] += 1
+        if checks['count'] >= 3:
+            raise RuntimeError('device lease lost')
+
+    with (
+        patch.object(executor, '_preflight_worker', return_value={
+            'adb_path': str(tmp_path / 'adb'),
+            'allure_path': str(ALLURE_COMMAND),
+        }),
+        patch.object(executor, '_get_allure_results_dir', return_value=str(tmp_path / 'allure-results')),
+        patch.object(subprocess, 'Popen', return_value=process) as popen,
+    ):
+        with pytest.raises(RuntimeError, match='device lease lost'):
+            executor.run_tests(1, 'device', 'package', cancel_check=cancel_check)
+
+    popen.assert_called_once()
+    process.terminate.assert_called_once()
+    process.wait.assert_called_once_with(timeout=5)
+    process.communicate.assert_not_called()
+    assert executor._current_process is None
 
 
 def test_run_tests_does_not_spawn_pytest_when_worker_preflight_fails(tmp_path):

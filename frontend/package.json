@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --ignore-path .gitignore"
+    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --ignore-path .gitignore",
+    "test:auth": "node --test tests/auth.test.mjs",
+    "test:execution-workflows": "node --test tests/execution-workflows.test.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.1.0",

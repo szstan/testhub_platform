@@ -177,6 +177,11 @@ const routes = [
                 component: () => import('@/views/executions/DatasetsPlugins.vue')
             },
             {
+                path: 'governance',
+                name: 'ExecutionGovernance',
+                component: () => import('@/views/executions/ExecutionGovernance.vue')
+            },
+            {
                 path: 'executions/:id',
                 name: 'ExecutionDetail',
                 component: () => import('@/views/executions/ExecutionDetailView.vue')
@@ -226,6 +231,11 @@ const routes = [
                 path: 'interfaces',
                 name: 'ApiInterfaces',
                 component: () => import('@/views/api-testing/InterfaceManagement.vue')
+            },
+            {
+                path: 'openapi-contracts',
+                name: 'OpenApiContracts',
+                component: () => import('@/views/api-testing/OpenApiContracts.vue')
             },
             {
                 path: 'automation',
@@ -772,11 +782,7 @@ router.beforeEach(async (to, _from, next) => {
                 action: 'redeem',
                 code: code,
             })
-            const expiresAt = Date.now() + 30 * 60 * 1000
-            userStore.accessToken = response.data.access
-            userStore.refreshToken = ''
-            userStore.tokenExpiresAt = expiresAt
-            userStore.user = response.data.user
+            userStore.applySession(response.data)
 
             // 清除 URL 中的 code，使用 replace 避免产生多余历史记录
             const query = { ...to.query }
@@ -788,19 +794,9 @@ router.beforeEach(async (to, _from, next) => {
         }
     }
 
-    // 有内存 token 或受保护路由时初始化认证；刷新 cookie 由 store 负责恢复 access token
-    if (to.meta.requiresAuth && !userStore.user && !userStore.accessToken) {
-        try {
-            await userStore.initAuth()
-        } catch (error) {
-            console.error('认证初始化失败:', error)
-        }
-    } else if (!userStore.user && userStore.accessToken) {
-        try {
-            await userStore.initAuth()
-        } catch (error) {
-            console.error('认证初始化失败:', error)
-        }
+    // initAuth shares startup work and remembers an anonymous result for this boot.
+    if (to.meta.requiresAuth || to.meta.requiresGuest) {
+        await userStore.initAuth()
     }
 
     if (to.meta.featureFlag === 'quality-intelligence' && !QUALITY_INTELLIGENCE_ENABLED) {

@@ -282,3 +282,67 @@ def test_refresh_clears_cookie_when_refresh_user_no_longer_exists(api_client, ac
     assert refresh_response.status_code == status.HTTP_401_UNAUTHORIZED
     assert refresh_response.json()['detail'] == 'refresh token invalid'
     assert refresh_response.cookies['testhub_refresh']['max-age'] == 0
+
+
+@pytest.mark.parametrize('failure', ['missing', 'malformed', 'expired', 'blacklisted', 'inactive'])
+def test_refresh_failures_are_401_and_always_clear_cookie(api_client, active_user, failure):
+    from datetime import timedelta
+    from django.utils import timezone
+    from rest_framework_simplejwt.tokens import RefreshToken
+
+    refresh = RefreshToken.for_user(active_user)
+    if failure == 'expired':
+        refresh.set_exp(from_time=timezone.now(), lifetime=timedelta(seconds=-1))
+    elif failure == 'blacklisted':
+        refresh.blacklist()
+    elif failure == 'inactive':
+        active_user.is_active = False
+        active_user.save(update_fields=['is_active'])
+    if failure != 'missing':
+        api_client.cookies['testhub_refresh'] = 'invalid.jwt' if failure == 'malformed' else str(refresh)
+
+    response = api_client.post('/api/auth/token/refresh/', {}, format='json')
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json() == {'detail': 'refresh token invalid'}
+    assert response.cookies['testhub_refresh']['max-age'] == 0
+    assert response.cookies['testhub_refresh']['path'] == '/api/auth/'
+
+
+@pytest.mark.parametrize('authorization', [None, 'Bearer invalid.jwt', 'expired', 'inactive'])
+def test_logout_clears_cookie_even_without_valid_access(api_client, active_user, authorization):
+    from datetime import timedelta
+    from django.utils import timezone
+    from rest_framework_simplejwt.exceptions import TokenError
+    from rest_framework_simplejwt.tokens import RefreshToken
+
+    refresh = RefreshToken.for_user(active_user)
+    raw_refresh = str(refresh)
+    api_client.cookies['testhub_refresh'] = raw_refresh
+    if authorization in {'expired', 'inactive'}:
+        access = refresh.access_token
+        if authorization == 'expired':
+            access.set_exp(from_time=timezone.now(), lifetime=timedelta(seconds=-1))
+        else:
+            active_user.is_active = False
+            active_user.save(update_fields=['is_active'])
+        authorization = f'Bearer {access}'
+    if authorization:
+        api_client.credentials(HTTP_AUTHORIZATION=authorization)
+
+    response = api_client.post('/api/auth/logout/', {}, format='json')
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.cookies['testhub_refresh']['max-age'] == 0
+    with pytest.raises(TokenError):
+        RefreshToken(raw_refresh)
+    # Logout is idempotent after the browser has already removed the cookie.
+    assert api_client.post('/api/auth/logout/', {}, format='json').status_code == status.HTTP_200_OK
+
+
+def test_logout_with_invalid_cookie_does_not_require_login(api_client):
+    api_client.cookies['testhub_refresh'] = 'invalid.jwt'
+    response = api_client.post('/api/auth/logout/', {}, format='json')
+    assert response.status_code == status.HTTP_200_OK
+    assert response.cookies['testhub_refresh']['max-age'] == 0
+    assert api_client.get('/api/auth/profile/').status_code == status.HTTP_401_UNAUTHORIZED

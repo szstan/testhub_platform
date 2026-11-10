@@ -729,7 +729,7 @@ export default {
       // 在开始生成前，主动刷新token确保生成过程中不会过期
       try {
         const userStore = useUserStore()
-        if (userStore.isTokenExpiringSoon && userStore.refreshToken) {
+        if (userStore.accessToken && userStore.isTokenExpiringSoon()) {
           console.log('Refreshing token before generation...')
           await userStore.refreshAccessToken()
           console.log('Token refreshed successfully, safe to start generation')

@@ -72,6 +72,10 @@
               <el-icon><Collection /></el-icon>
               <span>{{ $t('menu.datasetsPlugins') }}</span>
             </el-menu-item>
+            <el-menu-item index="/ai-generation/governance">
+              <el-icon><Setting /></el-icon>
+              <span>{{ $t('menu.executionGovernance') }}</span>
+            </el-menu-item>
             <el-menu-item index="/ai-generation/reports">
               <el-icon><DataAnalysis /></el-icon>
               <span>{{ $t('menu.testReport') }}</span>
@@ -91,6 +95,10 @@
             <el-menu-item index="/api-testing/interfaces">
               <el-icon><Link /></el-icon>
               <span>{{ $t('menu.interfaceManagement') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/api-testing/openapi-contracts">
+              <el-icon><DocumentCopy /></el-icon>
+              <span>{{ $t('menu.openapiContracts') }}</span>
             </el-menu-item>
             <el-menu-item index="/api-testing/automation">
               <el-icon><VideoPlay /></el-icon>
@@ -579,12 +587,14 @@ const breadcrumbTitle = computed(() => {
     '/ai-generation/ci-profiles': t('menu.ciProfiles'),
     '/ai-generation/evidence': t('menu.evidenceExplorer'),
     '/ai-generation/datasets-plugins': t('menu.datasetsPlugins'),
+    '/ai-generation/governance': t('menu.executionGovernance'),
     '/ai-generation/reports': t('menu.testReport'),
 
     // 接口测试
     '/api-testing/dashboard': t('menu.dashboard'),
     '/api-testing/projects': t('menu.projectManagement'),
     '/api-testing/interfaces': t('menu.interfaceManagement'),
+    '/api-testing/openapi-contracts': t('menu.openapiContracts'),
     '/api-testing/automation': t('menu.automationTesting'),
     '/api-testing/history': t('menu.requestHistory'),
     '/api-testing/environments': t('menu.environmentManagement'),

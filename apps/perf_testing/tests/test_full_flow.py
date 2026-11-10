@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -496,6 +497,72 @@ class EngineIntegrationTest(MockServerMixin, PerfTestBase):
         self.assertTrue(execution.report_url)
         report_path = os.path.join(self.media_root, execution.report_url)
         self.assertTrue(os.path.isfile(report_path))
+
+    def test_worker_lease_loss_after_run_cannot_collect_or_finalize_stale_result(self):
+        from apps.executions.worker_leases import ExecutionClaimLost
+
+        scenario = self._scenario(self.project, self.user)
+        self._step(scenario, 'ping', f'{self.base_url}/api/ping')
+        execution = create_execution(scenario)
+        execution.script_ref = {
+            'unified_execution': {
+                'job_id': 91,
+                'attempt_id': 92,
+                'worker_claim_id': 'lost-claim',
+            },
+        }
+        execution.save(update_fields=['script_ref'])
+
+        class FakeHeartbeat:
+            def __init__(self):
+                self._lost = threading.Event()
+                self.on_lost = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_if_lost(self):
+                if self._lost.is_set():
+                    raise ExecutionClaimLost('execution worker ownership was lost')
+
+        heartbeat = FakeHeartbeat()
+
+        class FakeEngine:
+            def __init__(self, *_args, **_kwargs):
+                self.stop_called = False
+                self.collect_called = False
+
+            def prepare(self):
+                return None
+
+            def run(self):
+                heartbeat._lost.set()
+                if heartbeat.on_lost:
+                    heartbeat.on_lost()
+
+            def stop(self):
+                self.stop_called = True
+
+            def collect(self):
+                self.collect_called = True
+                return {'summary': {'total_requests': 1}}
+
+        engine = FakeEngine()
+        with (
+            patch('apps.executions.worker_leases.ExecutionLeaseHeartbeat', return_value=heartbeat),
+            patch('apps.perf_testing.engines.get_engine_class', return_value=lambda *_args, **_kwargs: engine),
+            patch.object(executor._db_flush_worker, 'flush'),
+        ):
+            result = run_execution(execution.pk)
+
+        result.refresh_from_db()
+        self.assertEqual(result.status, 'STOPPED')
+        self.assertIn('ownership was lost', result.error_message)
+        self.assertTrue(engine.stop_called)
+        self.assertFalse(engine.collect_called)
 
     def test_csv_param_execution(self):
         """CSV 参数化生效：变量在真实压测中被解析，不崩。"""

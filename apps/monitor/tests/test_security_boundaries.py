@@ -57,3 +57,23 @@ class MonitorAuthorizationBoundaryTests(TestCase):
         self.assertNotIn('legacy-secret-token', repr(data))
         self.assertEqual(data['detail']['token'], '******')
         self.assertIn('[REDACTED]', data['error_message'])
+
+
+def test_webhook_senders_never_follow_redirects():
+    from unittest.mock import patch
+
+    from apps.monitor.utils.notifiers import send_dingtalk, send_wecom
+
+    for sender, args in (
+        (send_dingtalk, ('https://hooks.example.test/dingtalk', 'secret', 'message')),
+        (send_wecom, ('https://hooks.example.test/wecom', 'message')),
+    ):
+        response = type('Response', (), {'status_code': 302})()
+        with patch('apps.monitor.utils.notifiers.validate_outbound_url', side_effect=lambda value, **kwargs: value), \
+             patch('apps.monitor.utils.notifiers.requests.post', return_value=response) as post:
+            success, detail = sender(*args)
+
+        assert success is False
+        assert detail == 'HTTP 302'
+        assert post.call_count == 1
+        assert post.call_args.kwargs['allow_redirects'] is False

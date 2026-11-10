@@ -38,12 +38,14 @@ export default {
     ciProfiles: 'CI Profiles',
     sourceBindings: 'Execution Source Bindings',
     datasetsPlugins: 'Datasets & Plugins',
+    executionGovernance: 'Execution Governance',
     evidenceExplorer: 'Evidence Explorer',
     testReport: 'Test Report',
 
     // API Testing
     dashboard: 'Dashboard',
     interfaceManagement: 'Interface Management',
+    openapiContracts: 'OpenAPI Contracts',
     automationTesting: 'Automation Testing',
     requestHistory: 'Request History',
     environmentManagement: 'Environment Management',

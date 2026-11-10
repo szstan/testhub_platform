@@ -5,9 +5,14 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 
-from .models import ExecutionJob, ExecutionStepResult
+from .control_plane import final_step_results
+from .models import ExecutionJob
 from .result_events import redact_result_payload
+
+
+_QI_SOURCE_TYPES = {'api': 'API', 'ui': 'UI', 'app': 'APP', 'performance': 'PERF'}
 
 
 def classify_failure(message: str, error_type: str = '') -> tuple[str, str]:
@@ -31,43 +36,56 @@ def _signature(category: str, subtype: str, message: str) -> str:
     return hashlib.sha256(f'{category}|{subtype}|{normalized}'.encode()).hexdigest()[:32]
 
 
+def _quality_environment(job: ExecutionJob) -> str:
+    snapshot = getattr(job, 'environment_snapshot', {}) or {}
+    if isinstance(snapshot, Mapping):
+        return str(snapshot.get('environment_fingerprint') or snapshot.get('name') or 'unknown')[:128]
+    return 'unknown'
+
+
 def analyze_job_failures(job: ExecutionJob) -> dict:
-    attempt_id = job.final_attempt_id or job.attempts.filter(is_final=True).order_by('-attempt_number').values_list('id', flat=True).first()
-    rows = ExecutionStepResult.objects.filter(attempt_id=attempt_id, status__in={'failed', 'blocked'}) if attempt_id else ExecutionStepResult.objects.none()
+    rows = final_step_results(project_id=job.project_id, job_id=job.pk).filter(
+        status__in={'failed', 'blocked'},
+    )
     clusters = defaultdict(lambda: {'signature': '', 'category': '', 'subtype': '', 'count': 0, 'cases': [], 'sample_message': ''})
-    flaky_cases = []
+    flaky_profiles = set()
     try:
         from apps.quality_intelligence.models import QualityTestProfile
-        profiles = {
-            profile.test_key: profile.reliability_status
-            for profile in QualityTestProfile.objects.filter(
-                project_id=str(job.project_id),
-                test_key__in=list(rows.values_list('case_key', flat=True)),
-            )
-        }
-    except Exception:
-        profiles = {}
 
-    for row in rows:
-        category, subtype = classify_failure(row.error_message, row.error_type)
-        signature = _signature(category, subtype, row.error_message)
+        source_type = _QI_SOURCE_TYPES.get(str(getattr(job, 'source_type', '') or '').lower())
+        if source_type:
+            case_keys = rows.order_by().values('case_key').distinct()
+            flaky_profiles = set(QualityTestProfile.objects.filter(
+                source_type=source_type,
+                project_type='PROJECT',
+                project_id=str(job.project_id),
+                environment_fingerprint=_quality_environment(job),
+                test_key__in=case_keys,
+                reliability_status='FLAKY',
+            ).values_list('test_key', flat=True))
+    except Exception:
+        flaky_profiles = set()
+
+    for row in rows.order_by('case_key', 'step_key').values(
+        'case_key', 'error_message', 'error_type',
+    ).iterator(chunk_size=1000):
+        category, subtype = classify_failure(row['error_message'], row['error_type'])
+        signature = _signature(category, subtype, row['error_message'])
         cluster = clusters[signature]
         cluster['signature'] = signature
         cluster['category'] = category
         cluster['subtype'] = subtype
         cluster['count'] += 1
         if len(cluster['cases']) < 20:
-            cluster['cases'].append(row.case_key)
+            cluster['cases'].append(row['case_key'])
         if not cluster['sample_message']:
-            cluster['sample_message'] = row.error_message[:1000]
-        if profiles.get(row.case_key) == 'FLAKY' and row.case_key not in flaky_cases:
-            flaky_cases.append(row.case_key)
+            cluster['sample_message'] = row['error_message'][:1000]
 
     result = {
         'job_id': job.pk,
         'failure_count': sum(item['count'] for item in clusters.values()),
         'clusters': sorted(clusters.values(), key=lambda item: (-item['count'], item['signature'])),
-        'flaky_cases': sorted(flaky_cases),
+        'flaky_cases': sorted(flaky_profiles),
         'classified': bool(clusters),
     }
     return redact_result_payload(result)

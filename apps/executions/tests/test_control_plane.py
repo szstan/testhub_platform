@@ -2,7 +2,7 @@ import pytest
 from django.test import override_settings
 from rest_framework.test import APIClient
 
-from apps.executions.models import ExecutionJob, ExecutionQualityGateEvaluation, ExecutionSourceBinding
+from apps.executions.models import ExecutionAttempt, ExecutionJob, ExecutionQualityGateEvaluation, ExecutionSourceBinding
 from apps.projects.models import Project
 from apps.users.models import User
 
@@ -50,13 +50,26 @@ def test_control_plane_metrics_are_scoped_and_report_readiness():
 def test_release_gate_persists_declared_policy_snapshot():
     owner = User.objects.create_user(username='policy-owner', password='pass')
     project = Project.objects.create(name='Policy Project', owner=owner)
+    summary = {'failed': 0, 'unmatched': 0}
     job = ExecutionJob.objects.create(
         project=project,
         source_type='ci',
         source_id='ci-run-1',
         requested_by=owner,
-        result={'failed': 0, 'unmatched': 0},
+        status='passed',
+        final_status='passed',
+        result=summary,
+        final_result=summary,
     )
+    attempt = ExecutionAttempt.objects.create(
+        job=job,
+        attempt_number=1,
+        status='passed',
+        result=summary,
+        is_final=True,
+    )
+    job.final_attempt = attempt
+    job.save(update_fields=['final_attempt', 'updated_at'])
     client = APIClient()
     client.force_authenticate(user=owner)
 

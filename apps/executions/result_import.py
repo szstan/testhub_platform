@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -79,17 +80,36 @@ def _status(value: Any) -> str:
     return "failed"
 
 
-def _duration_ms(value: Any) -> int | None:
-    if value in (None, ""):
+def _junit_duration_ms(value: Any) -> int | None:
+    if value is None or not str(value).strip():
         return None
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ResultImportError("JUnit testcase time 必须是有限非负秒数") from exc
+    if not math.isfinite(seconds) or seconds < 0 or seconds > 86_400:
+        raise ResultImportError("JUnit testcase time 必须是 24 小时以内的有限非负秒数")
+    return int(round(seconds * 1000))
+
+
+def _allure_duration_ms(start: Any, stop: Any) -> int | None:
+    if start is None or stop is None:
         return None
-    # JUnit reports seconds; Allure start/stop reports milliseconds.
-    if number < 1000:
-        number *= 1000
-    return max(0, min(int(number), 86_400_000))
+    try:
+        if isinstance(start, bool) or isinstance(stop, bool):
+            raise ValueError
+        if isinstance(start, float) and (not math.isfinite(start) or not start.is_integer()):
+            raise ValueError
+        if isinstance(stop, float) and (not math.isfinite(stop) or not stop.is_integer()):
+            raise ValueError
+        start_ms = int(start)
+        stop_ms = int(stop)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ResultImportError("Allure start/stop 必须是有限整数毫秒") from exc
+    duration_ms = stop_ms - start_ms
+    if duration_ms < 0 or duration_ms > 86_400_000:
+        raise ResultImportError("Allure duration 必须是 24 小时以内的非负毫秒数")
+    return duration_ms
 
 
 def _xml_local_name(tag: str) -> str:
@@ -133,7 +153,7 @@ def parse_junit(payload: bytes) -> list[ImportedCase]:
             case_key=_bounded_key(case_key),
             name=name,
             status=status,
-            duration_ms=_duration_ms(node.attrib.get("time")),
+            duration_ms=_junit_duration_ms(node.attrib.get("time")),
             error_message=message,
             metadata={"classname": classname} if classname else {},
         ))
@@ -163,19 +183,12 @@ def parse_allure(payload: bytes) -> list[ImportedCase]:
         details = item.get("statusDetails") or {}
         if not isinstance(details, dict):
             details = {}
-        start = item.get("start")
-        stop = item.get("stop")
-        duration = None
-        if start is not None and stop is not None:
-            try:
-                duration = int(stop) - int(start)
-            except (TypeError, ValueError):
-                duration = None
+        duration_ms = _allure_duration_ms(item.get("start"), item.get("stop"))
         cases.append(ImportedCase(
             case_key=_bounded_key(case_key),
             name=name,
             status=_status(item.get("status")),
-            duration_ms=max(0, min(int(duration), 86_400_000)) if duration is not None else None,
+            duration_ms=duration_ms,
             error_message=_text(details.get("message") or details.get("trace")),
             metadata={
                 "full_name": _text(item.get("fullName"), 500),
@@ -222,8 +235,8 @@ def _legacy_import_idempotency_key(result_format: str, external_run_id: str) -> 
     return f'result-import:{result_format}:{external_run_id}'
 
 
-def _step_idempotency_key(import_key: str, case_key: str) -> str:
-    digest = hashlib.sha256(f'{import_key}:{case_key}'.encode('utf-8')).hexdigest()
+def _step_idempotency_key(import_key: str, case_key: str, instance_index: int = 1) -> str:
+    digest = hashlib.sha256(f'{import_key}:{case_key}:{instance_index}'.encode('utf-8')).hexdigest()
     return f'result-step:{digest}'
 
 
@@ -300,24 +313,29 @@ def import_results(*, project, payload: bytes, result_format: str, external_run_
         attempt.transition_to(AttemptStatus.RUNNING)
 
         matched = 0
+        case_keys = {item.case_key for item in cases}
+        matched_case_keys = set(TestCase.objects.filter(
+            project=project,
+            external_ref__in=case_keys,
+        ).values_list("external_ref", flat=True))
+        occurrence_counts: dict[str, int] = {}
         step_rows = []
         for item in cases:
-            testcase_exists = TestCase.objects.filter(
-                project=project,
-                external_ref=item.case_key,
-            ).exists()
+            instance_index = occurrence_counts.get(item.case_key, 0) + 1
+            occurrence_counts[item.case_key] = instance_index
+            testcase_exists = item.case_key in matched_case_keys
             matched += int(testcase_exists)
             step = ExecutionStepResult.objects.create(
                 attempt=attempt,
                 case_key=item.case_key,
-                step_key="test",
-                idempotency_key=_step_idempotency_key(idempotency_key, item.case_key),
+                step_key="test" if instance_index == 1 else f"test:{instance_index}",
+                idempotency_key=_step_idempotency_key(idempotency_key, item.case_key, instance_index),
                 result=redact_result_payload({
                     "name": item.name,
                     "matched_testcase": testcase_exists,
-                    "metadata": item.metadata or {},
+                    "metadata": redact_result_payload(item.metadata or {}),
                 }),
-                error_message=item.error_message,
+                error_message=redact_result_payload(item.error_message),
                 error_type=ErrorType.ASSERTION if item.status == "failed" else "",
                 duration_ms=item.duration_ms,
             )

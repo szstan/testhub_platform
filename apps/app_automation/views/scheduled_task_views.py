@@ -9,11 +9,19 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
+from django.db import transaction
 
 from .test_case_views import AppPagination
 from ..models import (
     AppScheduledTask, AppNotificationLog,
     AppTestSuite, AppTestCase, AppDevice,
+)
+from ..device_pool import (
+    DeviceLeaseError,
+    acquire_specific_device,
+    is_device_lease_active,
+    release_device_execution_lease,
+    validate_device_lease,
 )
 from ..access import scope_project, scheduled_task_relation_errors
 from ..serializers import (
@@ -87,6 +95,8 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        executions = []
+        suite_id = task.test_suite_id if task.task_type == 'TEST_SUITE' else None
         try:
             if not task.device:
                 return Response(
@@ -94,14 +104,44 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            device = task.device
-            if device.status == 'locked' and device.locked_by != request.user:
+            if task.task_type not in {'TEST_CASE', 'TEST_SUITE'}:
                 return Response(
-                    {'success': False, 'message': '设备已被其他用户锁定'},
+                    {'success': False, 'message': '不支持的任务类型'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Update counters only after every foreign-key relation passed validation.
+            device = task.device
+            release_device_lease = False
+            lease_generation = None
+            if is_device_lease_active(device):
+                if device.locked_by_id != request.user.id:
+                    return Response(
+                        {'success': False, 'message': '设备已被其他用户锁定'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    with transaction.atomic():
+                        device = validate_device_lease(
+                            device.pk, request.user, request.data.get('lease_token') or ''
+                        )
+                except DeviceLeaseError as exc:
+                    return Response({'success': False, 'message': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+                lease_generation = device.lease_generation
+            else:
+                device, _lease_token = acquire_specific_device(device.pk, request.user)
+                lease_generation = device.lease_generation
+                release_device_lease = True
+
+            if task.task_type == 'TEST_SUITE':
+                suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
+                if not suite_cases.exists():
+                    if release_device_lease:
+                        release_device_execution_lease(device.pk, request.user, lease_generation)
+                    return Response(
+                        {'success': False, 'message': '测试套件没有用例'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
             task.last_run_time = timezone.now()
             task.total_runs += 1
             task.next_run_time = task.calculate_next_run()
@@ -110,26 +150,19 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
             package_name = task.app_package.package_name if task.app_package else ''
 
             if task.task_type == 'TEST_SUITE':
-                suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
-                if not suite_cases.exists():
-                    return Response(
-                        {'success': False, 'message': '测试套件没有用例'},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
                 from ..models import AppTestExecution
                 from ..tasks import execute_app_suite_task
 
-                executions = [
-                    AppTestExecution.objects.create(
+                executions = []
+                for sc in suite_cases:
+                    executions.append(AppTestExecution.objects.create(
                         test_case=sc.test_case,
                         test_suite=task.test_suite,
                         device=device,
                         user=request.user,
                         status='pending',
-                    )
-                    for sc in suite_cases
-                ]
+                        device_lease_generation=lease_generation,
+                    ))
 
                 task.test_suite.execution_status = 'running'
                 task.test_suite.save(update_fields=['execution_status'])
@@ -139,6 +172,10 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                     execution_ids=[e.id for e in executions],
                     package_name=package_name,
                     scheduled_task_id=task.id,
+                    lease_generation=lease_generation,
+                    device_id=device.pk,
+                    device_lease_owner_id=request.user.pk,
+                    release_device_lease=release_device_lease,
                 )
                 return Response({
                     'success': True,
@@ -155,11 +192,15 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                     device=device,
                     user=request.user,
                     status='pending',
+                    device_lease_generation=lease_generation,
                 )
+                executions.append(execution)
                 celery_task = execute_app_test_task.delay(
                     execution.id,
                     package_name=package_name,
                     scheduled_task_id=task.id,
+                    lease_generation=lease_generation,
+                    release_device_lease=release_device_lease,
                 )
                 execution.task_id = celery_task.id
                 execution.save(update_fields=['task_id'])
@@ -174,9 +215,28 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         except Exception as e:
+            failure = f'执行失败: {str(e)}'
+            try:
+                from ..tasks import settle_undispatched_app_executions
+                settle_undispatched_app_executions(
+                    [item.pk for item in executions],
+                    failure,
+                    suite_id=suite_id,
+                )
+            except Exception:  # noqa: BLE001 - retain the broker failure response
+                logger.exception('settling manually scheduled APP executions failed')
+            if locals().get('release_device_lease') and locals().get('lease_generation') is not None:
+                try:
+                    release_device_execution_lease(device.pk, request.user, lease_generation)
+                except Exception:
+                    logger.exception('释放未成功派发的 APP 设备租约失败')
+            task.failed_runs += 1
+            task.error_message = failure[:4000]
+            task.last_result = {'status': 'failed', 'error': failure[:4000]}
+            task.save(update_fields=['failed_runs', 'error_message', 'last_result', 'updated_at'])
             logger.error(f'执行定时任务失败: {str(e)}', exc_info=True)
             return Response(
-                {'success': False, 'message': f'执行失败: {str(e)}'},
+                {'success': False, 'message': failure},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

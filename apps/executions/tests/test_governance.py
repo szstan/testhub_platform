@@ -16,6 +16,7 @@ from apps.executions.models import (
 )
 from apps.executions.policies import (
     AISuggestionDisabled,
+    apply_quality_gate,
     check_dispatch_governance,
     record_ai_suggestion,
     review_ai_suggestion,
@@ -180,7 +181,18 @@ def test_quality_gate_blocks_and_is_audited(governed_job):
     assert job.final_status == ExecutionStatus.BLOCKED
     evaluation = ExecutionQualityGateEvaluation.objects.get(job=job, stage='result')
     assert evaluation.passed is False
+    assert evaluation.policy_version.startswith('gate-')
+    assert evaluation.policy_snapshot['effective_rules'] == {'pass_rate': {'min': 90.0}}
     assert evaluation.failures[0]['metric'] == 'pass_rate'
+    replay = apply_quality_gate(
+        job,
+        evaluation.summary,
+        stage='result',
+        evaluated_by=job.requested_by,
+        attempt=evaluation.attempt,
+    )
+    assert replay['policy_version'] == evaluation.policy_version
+    assert ExecutionQualityGateEvaluation.objects.filter(job=job, stage='result').count() == 1
 
 
 @pytest.mark.django_db
@@ -231,7 +243,7 @@ def test_quarantine_approval_and_override_are_audited(governed_job):
     reviewer = User.objects.create_user(username='governance-reviewer', password='pass', is_staff=True)
     quality_profile = QualityTestProfile.objects.create(
         source_type='API',
-        project_type='API',
+        project_type='PROJECT',
         project_id=str(project.pk),
         test_key='case-governed',
         environment_fingerprint='unknown',
@@ -253,6 +265,32 @@ def test_quarantine_approval_and_override_are_audited(governed_job):
     assert denied['allowed'] is False
     allowed = check_dispatch_governance(job, override=True, override_reason='release for diagnosis', actor=reviewer)
     assert allowed['allowed'] is True
+
+
+@pytest.mark.django_db
+def test_legacy_source_project_quarantine_does_not_match_unified_project_id(governed_job):
+    owner, project, _profile, job = governed_job
+    reviewer = User.objects.create_user(username='legacy-quarantine-reviewer', password='pass', is_staff=True)
+    legacy_profile = QualityTestProfile.objects.create(
+        source_type='API',
+        project_type='API',
+        project_id=str(project.pk),
+        test_key='case-governed',
+        environment_fingerprint='unknown',
+    )
+    quarantine = QualityQuarantine.objects.create(
+        profile=legacy_profile,
+        reason='legacy source project id collision',
+        owner=owner,
+        created_by=owner,
+        approval_status=QualityQuarantineApprovalStatus.PENDING,
+        starts_at=timezone.now(),
+    )
+    approve_quarantine(quarantine, reviewer, 'approved for collision regression')
+
+    decision = check_dispatch_governance(job)
+    assert decision['allowed'] is True
+    assert decision['reason'] == 'NO_ACTIVE_QUARANTINE'
 
 
 @pytest.mark.django_db

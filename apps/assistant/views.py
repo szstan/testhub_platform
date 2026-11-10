@@ -2,6 +2,8 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import render
+from django.conf import settings
+from apps.core.http_transport import guarded_post
 import requests
 from .models import AssistantSession, AssistantMessage, ChatMessage, DifyConfig
 from .views_config import _validate_dify_url
@@ -114,8 +116,9 @@ class ChatViewSet(viewsets.ViewSet):
                 payload['conversation_id'] = session.conversation_id
             
             api_url = _validate_dify_url(dify_config.api_url)
-            response = requests.post(
+            response = guarded_post(
                 f'{api_url}/chat-messages',
+                allow_private=bool((getattr(settings, 'DIFY_ALLOWED_HOSTS', '') or '').strip()),
                 headers=headers,
                 json=payload,
                 timeout=30,

@@ -49,11 +49,12 @@ def get_user_accessible_projects(user):
 class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = TestCaseSyncProfileSerializer
+    pagination_class = TestCasePagination
 
     def get_queryset(self):
         return TestCaseSyncProfile.objects.filter(
             project__in=get_user_accessible_projects(self.request.user)
-        ).select_related('project', 'created_by')
+        ).select_related('project', 'created_by').order_by('pk')
 
     def perform_create(self, serializer):
         project = serializer.validated_data.get('project')

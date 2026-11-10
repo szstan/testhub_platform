@@ -3,7 +3,9 @@ from rest_framework.test import APIClient
 
 from apps.executions.models import (
     ExecutionArtifact,
+    ExecutionDataset,
     ExecutionJob,
+    ExecutionJobVariant,
     ExecutionStepResult,
 )
 from apps.executions.state_machine import (
@@ -33,6 +35,79 @@ def _job_payload(project_id, *, source_id='case-1'):
         'environment_snapshot': {'name': 'test'},
         'priority': 'normal',
     }
+
+
+@pytest.mark.django_db
+def test_execution_job_rejects_dual_mode_dataset_without_partial_writes(execution_users):
+    owner, _, project = execution_users
+    dataset = ExecutionDataset.objects.create(
+        project=project,
+        name='ambiguous dataset',
+        data=[{'account': 'active'}],
+        matrix={'region': ['west', 'east']},
+        created_by=owner,
+    )
+    client = APIClient()
+    client.force_authenticate(user=owner)
+
+    response = client.post(
+        '/api/executions/jobs/',
+        {**_job_payload(project.id), 'dataset': dataset.pk},
+        format='json',
+        HTTP_IDEMPOTENCY_KEY='ambiguous-dataset-new-job',
+    )
+
+    assert response.status_code == 400
+    assert 'both data and matrix' in str(response.data['dataset'])
+    assert not ExecutionJob.objects.filter(project=project).exists()
+    assert not ExecutionJobVariant.objects.filter(job__project=project).exists()
+
+
+@pytest.mark.django_db
+def test_dual_mode_dataset_replay_preserves_frozen_job_and_rejects_new_key(execution_users):
+    owner, _, project = execution_users
+    dataset = ExecutionDataset.objects.create(
+        project=project,
+        name='mutable dataset',
+        data=[{'account': 'initial'}],
+        created_by=owner,
+    )
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    payload = {**_job_payload(project.id), 'dataset': dataset.pk}
+
+    first = client.post(
+        '/api/executions/jobs/', payload, format='json',
+        HTTP_IDEMPOTENCY_KEY='frozen-dataset-replay',
+    )
+    assert first.status_code == 201
+    job = ExecutionJob.objects.get(pk=first.data['id'])
+    frozen_snapshot = job.dataset_snapshot
+    frozen_variants = list(job.variants.order_by('ordinal').values_list('payload', flat=True))
+
+    dataset.data = [{'account': 'changed'}]
+    dataset.matrix = {'region': ['west']}
+    dataset.save(update_fields=['data', 'matrix'])
+
+    replay = client.post(
+        '/api/executions/jobs/', payload, format='json',
+        HTTP_IDEMPOTENCY_KEY='frozen-dataset-replay',
+    )
+    assert replay.status_code == 200
+    assert replay.data['id'] == job.pk
+
+    rejected_new_job = client.post(
+        '/api/executions/jobs/', payload, format='json',
+        HTTP_IDEMPOTENCY_KEY='frozen-dataset-new-key',
+    )
+    assert rejected_new_job.status_code == 400
+    assert 'both data and matrix' in str(rejected_new_job.data['dataset'])
+
+    job.refresh_from_db()
+    assert job.dataset_snapshot == frozen_snapshot
+    assert list(job.variants.order_by('ordinal').values_list('payload', flat=True)) == frozen_variants
+    assert ExecutionJob.objects.filter(project=project).count() == 1
+    assert ExecutionJobVariant.objects.filter(job__project=project).count() == 1
 
 
 @pytest.mark.django_db

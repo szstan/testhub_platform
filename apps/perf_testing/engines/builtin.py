@@ -20,6 +20,7 @@ import time
 import httpx
 from django.conf import settings
 
+from apps.core.http_transport import outbound_httpx_options
 from apps.core.network import validate_outbound_url, validate_redirect_url
 
 from ..services.metrics import MetricsCollector
@@ -256,6 +257,10 @@ class BuiltinEngine(BaseEngine):
         )
 
         self._start_ts = time.time()
+        proxy_options = build_proxy_kwargs(self.runtime)
+        if not _allow_private_targets() and (proxy_options.get('proxy') or proxy_options.get('trust_env')):
+            raise EngineError('Strict outbound address validation does not allow proxy routing')
+        proxy_options.update(outbound_httpx_options(_allow_private_targets(), verify=verify_ssl, limits=limits))
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             limits=limits,
@@ -263,7 +268,7 @@ class BuiltinEngine(BaseEngine):
             follow_redirects=follow_redirects,
             event_hooks={'response': [_validate_httpx_redirect]},
             headers=self._global_headers(),
-            **build_proxy_kwargs(self.runtime),
+            **proxy_options,
         ) as client:
             self._client = client
             sampler = asyncio.create_task(self._sample_loop())
@@ -717,13 +722,17 @@ async def debug_run(snapshot, max_steps=50):
         if k:
             headers_global[str(k)] = str(v)
 
+    proxy_options = build_proxy_kwargs(runtime)
+    if not _allow_private_targets() and (proxy_options.get('proxy') or proxy_options.get('trust_env')):
+        raise EngineError('Strict outbound address validation does not allow proxy routing')
+    proxy_options.update(outbound_httpx_options(_allow_private_targets(), verify=bool(env.get('verify_ssl', True))))
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(float(runtime.get('timeout') or 30)),
         verify=bool(env.get('verify_ssl', True)),
         follow_redirects=bool(runtime.get('follow_redirects', False)),
         event_hooks={'response': [_validate_httpx_redirect]},
         headers=headers_global,
-        **build_proxy_kwargs(runtime),
+        **proxy_options,
     ) as client:
         file_cache = {}
         for step in steps:

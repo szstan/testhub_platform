@@ -556,6 +556,7 @@ class PerfScheduledTask(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['status', 'next_run_at'], name='perf_sched_status_next_idx'),
+            models.Index(fields=['scheduler_lease_expires_at'], name='perf_sched_lease_exp_idx'),
         ]
 
     def __str__(self):

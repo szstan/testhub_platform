@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import { resolve } from 'path'
+import { releaseReceipt } from './build/release-receipt.mjs'
 
 const curlconverterBrowserParser = {
   name: 'curlconverter-browser-parser',
@@ -25,6 +26,7 @@ export default defineConfig({
     vue(),
     Components({ resolvers: [ElementPlusResolver()] }),
     curlconverterBrowserParser,
+    releaseReceipt(),
   ],
   resolve: {
     alias: {

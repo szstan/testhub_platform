@@ -25,9 +25,27 @@ from ..device_pool import (
     heartbeat_device,
     release_device,
     reap_expired_device_leases,
+    is_device_lease_active,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _upsert_discovered_device(device_id, defaults):
+    """Refresh discovery fields without overwriting a live worker lease."""
+    with transaction.atomic():
+        device, created = AppDevice.objects.select_for_update().get_or_create(
+            device_id=device_id,
+            defaults=defaults,
+        )
+        if created:
+            return device
+        for field, value in defaults.items():
+            setattr(device, field, value)
+        if is_device_lease_active(device):
+            device.status = 'locked'
+        device.save(update_fields=[*defaults.keys(), 'status', 'updated_at'])
+        return device
 
 
 def _remote_device_allowed(ip_address):
@@ -126,9 +144,9 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                     connection_type = 'usb'
                     ip_address = device_info.get('ip_address') or ''
                 
-                device, created = AppDevice.objects.update_or_create(
-                    device_id=device_info['device_id'],
-                    defaults={
+                device = _upsert_discovered_device(
+                    device_info['device_id'],
+                    {
                         'name': device_info.get('name') or '',
                         'status': device_info.get('status') or 'offline',
                         'android_version': device_info.get('android_version') or '',
@@ -142,7 +160,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                             'android_version': device_info.get('android_version') or '',
                             'connection_type': connection_type,
                         },
-                    }
+                    },
                 )
                 db_devices.append(device)
             
@@ -172,7 +190,10 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                         'success': False,
                         'message': '设备已被锁定'
                     }, status=status.HTTP_400_BAD_REQUEST)
-                device.lock(request.user)
+                try:
+                    device.lock(request.user)
+                except DeviceLeaseError as exc:
+                    return Response({'success': False, 'message': str(exc)}, status=status.HTTP_409_CONFLICT)
         except AppDevice.DoesNotExist:
             return Response({'detail': '设备不存在或无权操作'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -193,8 +214,10 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 'message': '无权释放他人锁定的设备'
             }, status=status.HTTP_403_FORBIDDEN)
         
-        device.unlock()
-        
+        if not device.unlock():
+            return Response({'success': False, 'message': '设备租约已变更，请刷新后重试'},
+                            status=status.HTTP_409_CONFLICT)
+
         return Response({
             'success': True,
             'message': '设备释放成功',
@@ -270,16 +293,16 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             device_info = manager.connect_device(ip_address, port)
 
             # 创建或更新设备记录
-            device, created = AppDevice.objects.update_or_create(
-                device_id=device_info['device_id'],
-                defaults={
+            device = _upsert_discovered_device(
+                device_info['device_id'],
+                {
                     'name': device_info.get('name') or '',
                     'status': 'online',
                     'android_version': device_info.get('android_version', ''),
                     'ip_address': ip_address,
                     'port': port,
                     'connection_type': 'remote_emulator',
-                }
+                },
             )
             
             return Response({
