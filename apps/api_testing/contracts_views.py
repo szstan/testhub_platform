@@ -31,6 +31,14 @@ from .contracts import (
 from .models import OpenApiContractSpec
 
 
+def _accessible_contract_projects(user):
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return Project.objects.none()
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
+    return Project.objects.filter(models.Q(owner=user) | models.Q(members=user)).distinct()
+
+
 class OpenApiContractSpecSerializer(serializers.ModelSerializer):
     created_by = serializers.StringRelatedField(read_only=True)
     document_hash = serializers.CharField(read_only=True)
@@ -43,9 +51,7 @@ class OpenApiContractSpecSerializer(serializers.ModelSerializer):
     def validate_project(self, value):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
-        if not user or not user.is_authenticated or not Project.objects.filter(pk=value.pk).filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).exists():
+        if not _accessible_contract_projects(user).filter(pk=value.pk).exists():
             raise serializers.ValidationError('项目不存在或无权限')
         return value
 
@@ -109,10 +115,7 @@ class OpenApiContractSpecViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        projects = Project.objects.all() if user.is_staff or user.is_superuser else Project.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        projects = _accessible_contract_projects(self.request.user)
         return OpenApiContractSpec.objects.filter(project__in=projects).select_related('project', 'created_by')
 
     def perform_create(self, serializer):

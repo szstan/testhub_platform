@@ -47,6 +47,12 @@ const { executions, contracts, calls, enExecution, zhExecution, enNav, zhNav } =
 after(() => rm(bundleDir, { recursive: true, force: true }))
 beforeEach(() => calls.splice(0))
 
+test('contract execution can create an idempotent pending job through the scoped API', async () => {
+  const data = { project: 4, source_type: 'manual', source_id: 'openapi-contract:12', trigger: 'manual', idempotency_key: 'contract-job-request' }
+  await executions.createExecutionJob(data)
+  assert.deepEqual(calls, [{ method: 'post', url: '/executions/jobs/', data, params: undefined }])
+})
+
 test('OpenAPI contract wrappers cover CRUD, diff, coverage, preview, materialization and execution', async () => {
   await contracts.listOpenApiContractSpecs({ page: 2 })
   await contracts.getOpenApiContractSpec(12)

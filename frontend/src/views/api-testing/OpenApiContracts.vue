@@ -71,7 +71,7 @@
           <el-button link @click="selectedSpec = null">{{ t('common.close') }}</el-button>
         </div>
       </template>
-      <el-tabs v-model="activeOperation" @tab-change="clearOperationResult">
+      <el-tabs v-model="activeOperation">
         <el-tab-pane :label="t('execution.contracts.coverage')" name="coverage">
           <el-button :loading="operationLoading" :disabled="permissionDenied || operationPermissionDenied" @click="runCoverage">{{ t('execution.contracts.loadCoverage') }}</el-button>
         </el-tab-pane>
@@ -102,10 +102,16 @@
         <el-tab-pane :label="t('execution.contracts.execute')" name="execute">
           <el-form label-position="top" class="execute-form">
             <el-form-item :label="t('execution.contracts.job')">
-              <el-select v-model="executeForm.job_id" filterable :loading="jobsLoading" :placeholder="t('execution.contracts.selectJob')" @visible-change="visible => visible && loadJobs()">
-                <el-option v-for="job in jobs" :key="job.id" :label="`#${job.id} · ${job.source_type} · ${job.status}`" :value="job.id" />
-              </el-select>
+              <div class="job-picker">
+                <el-select v-model="executeForm.job_id" filterable :loading="jobsLoading" :disabled="creatingJob || operationLoading" :placeholder="t('execution.contracts.selectJob')" @visible-change="visible => visible && loadJobs()">
+                  <el-option v-for="job in jobs" :key="job.id" :label="`#${job.id} · ${job.source_type} · ${job.status}`" :value="job.id" />
+                </el-select>
+                <el-button :loading="creatingJob" :disabled="jobsLoading || operationLoading || permissionDenied || operationPermissionDenied" @click="createJob">{{ t('execution.contracts.createJob') }}</el-button>
+              </div>
             </el-form-item>
+            <el-alert v-if="jobsError" :title="jobsError" type="error" show-icon :closable="false" class="page-alert">
+              <template #default><el-button link type="primary" :disabled="creatingJob || operationLoading" @click="loadJobs">{{ t('execution.contracts.retryLoad') }}</el-button></template>
+            </el-alert>
             <el-form-item :label="t('execution.contracts.baseUrl')"><el-input v-model="executeForm.base_url" :placeholder="serverUrl" /></el-form-item>
             <el-form-item :label="t('execution.contracts.headers')"><el-input v-model="executeForm.headers_text" type="textarea" :rows="3" placeholder='{"Authorization":"Bearer ..."}' /></el-form-item>
             <el-form-item :label="t('execution.contracts.caseKinds')">
@@ -116,7 +122,7 @@
             <div class="execute-options">
               <el-form-item :label="t('execution.contracts.limit')"><el-input-number v-model="executeForm.limit" :min="1" :max="10" /></el-form-item>
               <el-form-item :label="t('execution.contracts.timeout')"><el-input-number v-model="executeForm.timeout" :min="0.1" :precision="1" :max="5" /></el-form-item>
-              <el-button type="primary" :loading="operationLoading" :disabled="!executeForm.job_id || permissionDenied || operationPermissionDenied" @click="executeContract">{{ t('execution.contracts.executeAction') }}</el-button>
+              <el-button type="primary" :loading="operationLoading" :disabled="!executeForm.job_id || jobsLoading || creatingJob || permissionDenied || operationPermissionDenied" @click="executeContract">{{ t('execution.contracts.executeAction') }}</el-button>
             </div>
           </el-form>
         </el-tab-pane>
@@ -151,7 +157,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import {
@@ -165,14 +171,21 @@ import {
   materializeOpenApiContractCases,
   updateOpenApiContractSpec,
 } from '@/api/contracts'
-import { listExecutionJobs, listExecutionProjects } from '@/api/executions'
+import { createExecutionJob, listExecutionJobs, listExecutionProjects } from '@/api/executions'
+import { useUserStore } from '@/stores/user'
 
 const { t } = useI18n()
+const userStore = useUserStore()
 const projects = ref([])
 const specs = ref([])
 const jobs = ref([])
 const loading = ref(false)
 const jobsLoading = ref(false)
+const creatingJob = ref(false)
+const jobsError = ref('')
+let operationRequestId = 0
+let jobsRequestId = 0
+let createJobRequestId = 0
 const saving = ref(false)
 const operationLoading = ref(false)
 const permissionDenied = ref(false)
@@ -300,9 +313,9 @@ const saveSpec = async () => {
   }
   saving.value = true
   try {
-    const payload = { project: form.value.project, name: form.value.name.trim(), version: form.value.version.trim(), document }
+    const payload = { name: form.value.name.trim(), version: form.value.version.trim(), document }
     if (editing.value) await updateOpenApiContractSpec(editing.value, payload)
-    else await createOpenApiContractSpec(payload)
+    else await createOpenApiContractSpec({ ...payload, project: form.value.project })
     dialogVisible.value = false
     await loadSpecs()
     ElMessage.success(t('execution.contracts.saveSuccess'))
@@ -327,25 +340,46 @@ const removeSpec = async row => {
 }
 const runOperation = async request => {
   if (!selectedSpec.value) return
+  const requestId = ++operationRequestId
+  const specId = selectedSpec.value.id
   operationLoading.value = true
   operationResult.value = null
   operationError.value = ''
   operationPermissionDenied.value = false
   try {
-    const response = await request(selectedSpec.value.id)
+    const response = await request(specId)
+    if (requestId !== operationRequestId) return
     operationResult.value = response.data
+    return response
   } catch (error) {
+    if (requestId !== operationRequestId) return
     operationError.value = errorText(error)
     operationPermissionDenied.value = [401, 403, 404].includes(error.response?.status)
   } finally {
-    operationLoading.value = false
+    if (requestId === operationRequestId) operationLoading.value = false
   }
 }
 const clearOperationResult = () => {
+  operationRequestId += 1
+  operationLoading.value = false
   operationResult.value = null
   operationError.value = ''
   operationPermissionDenied.value = false
 }
+const invalidateContext = () => {
+  clearOperationResult()
+  jobsRequestId += 1
+  createJobRequestId += 1
+  jobsLoading.value = false
+  creatingJob.value = false
+  jobsError.value = ''
+  jobs.value = []
+  executeForm.value.job_id = null
+}
+watch(() => [userStore.user?.id, selectedSpec.value?.id, selectedSpec.value?.project, selectedSpec.value?.version, selectedSpec.value?.document_hash, activeOperation.value], (current, previous) => {
+  if (current.some((value, index) => value !== previous[index])) invalidateContext()
+}, { flush: 'sync' })
+onBeforeUnmount(invalidateContext)
 const runCoverage = () => runOperation(getOpenApiContractCoverage)
 const runDiff = () => {
   if (!baselineId.value) return
@@ -361,21 +395,96 @@ const materializeCases = () => {
   if (!ensureCaseKindsSelected(caseKinds.value)) return
   return runOperation(id => materializeOpenApiContractCases(id, { kinds: caseKinds.value, limit: materializeLimit.value }))
 }
+const isEligibleJob = (job, project) => job.status === 'pending' && !job.final_attempt && Number(job.attempts_count) === 0 && Number(job.project) === Number(project)
 const loadJobs = async () => {
-  if (!selectedSpec.value || jobsLoading.value) return
+  if (!selectedSpec.value || jobsLoading.value || creatingJob.value || operationLoading.value) return
+  const requestId = ++jobsRequestId
+  const project = selectedSpec.value.project
   jobsLoading.value = true
+  jobsError.value = ''
   try {
-    const response = await listExecutionJobs({ project: selectedSpec.value.project, page: 1, page_size: 100, ordering: '-created_at' })
-    const rows = listRows(response).rows
-    jobs.value = rows.filter(job => !job.final_attempt && !['passed', 'succeeded', 'completed', 'failed', 'blocked', 'cancelled'].includes(job.final_status || job.status))
+    const params = { project, contract_eligible: true, status: 'pending', page_size: 100, ordering: '-created_at' }
+    const firstPage = listRows(await listExecutionJobs({ ...params, page: 1 }))
+    if (requestId !== jobsRequestId) return
+    const rows = [...firstPage.rows]
+    const lastPage = Math.ceil(firstPage.count / params.page_size)
+    for (let page = 2; page <= lastPage; page += 1) {
+      const nextPage = listRows(await listExecutionJobs({ ...params, page }))
+      if (requestId !== jobsRequestId) return
+      rows.push(...nextPage.rows)
+    }
+    jobs.value = rows.filter(job => isEligibleJob(job, project))
+    if (!jobs.value.some(job => job.id === executeForm.value.job_id)) executeForm.value.job_id = null
   } catch (error) {
-    operationError.value = errorText(error)
-    operationPermissionDenied.value = [401, 403, 404].includes(error.response?.status)
+    if (requestId === jobsRequestId) jobsError.value = errorText(error)
   } finally {
-    jobsLoading.value = false
+    if (requestId === jobsRequestId) jobsLoading.value = false
+  }
+}
+const createJob = async () => {
+  if (!selectedSpec.value || creatingJob.value || jobsLoading.value || operationLoading.value || permissionDenied.value || operationPermissionDenied.value) return
+  const requestId = ++createJobRequestId
+  const spec = selectedSpec.value
+  const actorId = userStore.user?.id
+  if (!actorId) {
+    jobsError.value = t('execution.contracts.authRequired')
+    return
+  }
+  const storageKey = `testhub:contract-job:${actorId}:${spec.project}:${spec.id}`
+  let storage
+  let idempotencyKey
+  try {
+    storage = globalThis.sessionStorage
+    idempotencyKey = storage.getItem(storageKey)
+    if (!idempotencyKey) {
+      const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      idempotencyKey = `openapi-contract:${actorId}:${spec.id}:${suffix}`
+      // Persist before sending: a lost reply must remain retryable after reload.
+      storage.setItem(storageKey, idempotencyKey)
+    }
+  } catch {
+    jobsError.value = t('execution.contracts.storageUnavailable')
+    return
+  }
+  creatingJob.value = true
+  jobsError.value = ''
+  try {
+    // This job is executed by the contract endpoint, not a legacy source adapter.
+    const response = await createExecutionJob({
+      project: spec.project,
+      source_type: 'manual',
+      source_id: `openapi-contract:${spec.id}`,
+      trigger: 'manual',
+      idempotency_key: idempotencyKey,
+    })
+    if (requestId !== createJobRequestId) return
+    try {
+      if (storage.getItem(storageKey) === idempotencyKey) storage.removeItem(storageKey)
+    } catch {
+      // The job already exists. Preserve its selection even if local cleanup fails.
+      jobsError.value = t('execution.contracts.storageUnavailable')
+    }
+    const job = response.data
+    if (!isEligibleJob(job, spec.project)) {
+      jobsError.value = t('execution.contracts.jobUnavailable')
+      return
+    }
+    jobs.value = [job, ...jobs.value.filter(item => item.id !== job.id)]
+    executeForm.value.job_id = job.id
+    ElMessage.success(t('execution.contracts.jobCreated'))
+  } catch (error) {
+    if (requestId === createJobRequestId) jobsError.value = errorText(error)
+  } finally {
+    if (requestId === createJobRequestId) creatingJob.value = false
   }
 }
 const executeContract = async () => {
+  if (operationLoading.value || creatingJob.value || jobsLoading.value || !selectedSpec.value) return
+  const jobId = executeForm.value.job_id
+  if (!jobs.value.some(job => job.id === jobId && isEligibleJob(job, selectedSpec.value.project))) {
+    jobsError.value = t('execution.contracts.selectJob')
+    return
+  }
   if (!ensureCaseKindsSelected(executeForm.value.kinds)) return
   let headers
   try {
@@ -385,14 +494,26 @@ const executeContract = async () => {
     ElMessage.error(t('execution.contracts.invalidHeaders'))
     return
   }
-  return runOperation(id => executeOpenApiContractSpec(id, {
-    job_id: executeForm.value.job_id,
+  const specId = selectedSpec.value.id
+  const pending = runOperation(id => executeOpenApiContractSpec(id, {
+    job_id: jobId,
     base_url: executeForm.value.base_url.trim(),
     headers,
     kinds: executeForm.value.kinds,
     limit: executeForm.value.limit,
     timeout: executeForm.value.timeout,
   }))
+  const requestId = operationRequestId
+  const response = await pending
+  const isCurrent = () => requestId === operationRequestId && selectedSpec.value?.id === specId && activeOperation.value === 'execute'
+  if (!isCurrent() || executeForm.value.job_id !== jobId) return
+  // A lost response may still have consumed the job. Do not replay a stale snapshot.
+  jobs.value = jobs.value.filter(job => job.id !== jobId)
+  executeForm.value.job_id = null
+  if (!response) {
+    await loadJobs()
+    if (isCurrent() && !jobsError.value && jobs.value.some(job => job.id === jobId)) executeForm.value.job_id = jobId
+  }
 }
 
 onMounted(reloadPage)
@@ -409,6 +530,8 @@ onMounted(reloadPage)
 .pagination { justify-content: flex-end; margin-top: 16px; }
 .operation-card { min-width: 0; }
 .execute-form { max-width: 840px; }
+.job-picker { display: flex; gap: 10px; width: 100%; }
+.job-picker .el-select { flex: 1; min-width: 0; }
 .execute-options { justify-content: flex-start; flex-wrap: wrap; }
 .result-output { max-height: 440px; overflow: auto; padding: 12px; background: var(--el-fill-color-light); border-radius: 4px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 768px) {

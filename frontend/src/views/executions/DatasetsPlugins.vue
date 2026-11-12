@@ -6,7 +6,7 @@
         <p>{{ $t('execution.datasets.subtitle') }}</p>
       </div>
       <el-button v-if="tab === 'datasets'" type="primary" @click="dialogVisible = true">{{ $t('execution.datasets.create') }}</el-button>
-      <el-button v-else-if="tab === 'matrices'" type="primary" :disabled="matrixPermissionDenied || !datasetOptions.length" @click="openMatrixCreate">{{ $t('execution.datasets.createMatrix') }}</el-button>
+      <el-button v-else-if="tab === 'matrices'" type="primary" :loading="datasetOptionsLoading" :disabled="matrixPermissionDenied || !datasetOptions.length" @click="openMatrixCreate">{{ $t('execution.datasets.createMatrix') }}</el-button>
     </div>
     <el-tabs v-model="tab" @tab-change="handleTabChange">
       <el-tab-pane :label="$t('execution.datasets.datasets')" name="datasets">
@@ -54,16 +54,19 @@
         <el-alert v-if="matrixError" :title="matrixError" :type="matrixPermissionDenied ? 'warning' : 'error'" show-icon :closable="false" class="matrix-alert">
           <template #default><el-button v-if="!matrixPermissionDenied" link type="primary" @click="loadMatrices">{{ $t('execution.datasets.retry') }}</el-button></template>
         </el-alert>
-        <el-alert v-if="!datasetOptions.length && !matrixLoading && !matrixError" :title="$t('execution.datasets.noDatasetOptions')" type="info" :closable="false" class="matrix-alert" />
+        <el-alert v-if="datasetOptionsError" :title="datasetOptionsError" :type="datasetOptionsPermissionDenied ? 'warning' : 'error'" show-icon :closable="false" class="matrix-alert">
+          <template #default><el-button v-if="!datasetOptionsPermissionDenied" link type="primary" @click="retryDatasetOptions">{{ $t('execution.datasets.retry') }}</el-button></template>
+        </el-alert>
+        <el-alert v-if="!datasetOptions.length && !datasetOptionsLoading && !datasetOptionsError && !matrixLoading && !matrixError" :title="$t('execution.datasets.noDatasetOptions')" type="info" :closable="false" class="matrix-alert" />
         <el-form :inline="true" class="matrix-filter" @submit.prevent="loadMatrices">
           <el-form-item :label="$t('execution.datasets.dataset')">
-            <el-select v-model="matrixDatasetFilter" clearable filterable :placeholder="$t('execution.datasets.allDatasets')" @change="changeMatrixDataset">
+            <el-select v-model="matrixDatasetFilter" clearable filterable :loading="datasetOptionsLoading" :placeholder="$t('execution.datasets.allDatasets')" @change="changeMatrixDataset">
               <el-option v-for="item in datasetOptions" :key="item.id" :label="`${item.name} (#${item.id})`" :value="item.id" />
             </el-select>
           </el-form-item>
           <el-button @click="loadMatrices">{{ $t('common.refresh') }}</el-button>
         </el-form>
-        <el-table :data="matrices" v-loading="matrixLoading" row-key="id">
+        <el-table :data="matrices" v-loading="matrixLoading || datasetOptionsLoading" row-key="id">
           <el-table-column prop="id" label="ID" width="70" />
           <el-table-column prop="name" :label="$t('execution.datasets.name')" min-width="180" />
           <el-table-column :label="$t('execution.datasets.dataset')" min-width="170"><template #default="{ row }">{{ datasetName(row.dataset) }}</template></el-table-column>
@@ -76,7 +79,7 @@
               <el-button link type="danger" :disabled="matrixPermissionDenied" @click="removeMatrix(row)">{{ $t('common.delete') }}</el-button>
             </template>
           </el-table-column>
-          <template #empty><el-empty :description="matrixLoading ? '' : $t('execution.datasets.noMatrices')" /></template>
+          <template #empty><el-empty :description="matrixLoading || datasetOptionsLoading || datasetOptionsError ? '' : $t('execution.datasets.noMatrices')" /></template>
         </el-table>
         <div class="pagination">
           <el-pagination
@@ -103,7 +106,7 @@
     <el-dialog v-model="matrixDialogVisible" :title="editingMatrix ? $t('execution.datasets.editMatrix') : $t('execution.datasets.createMatrix')" width="680px" destroy-on-close>
       <el-form label-position="top">
         <el-form-item :label="$t('execution.datasets.dataset')" required>
-          <el-select v-model="matrixForm.dataset" filterable :placeholder="$t('execution.datasets.selectDataset')">
+          <el-select v-model="matrixForm.dataset" filterable :loading="datasetOptionsLoading" :placeholder="$t('execution.datasets.selectDataset')">
             <el-option v-for="item in datasetOptions" :key="item.id" :label="`${item.name} (#${item.id})`" :value="item.id" />
           </el-select>
         </el-form-item>
@@ -146,6 +149,9 @@ const datasetPagination = ref({ page: 1, pageSize: 20, total: 0 })
 const pluginPagination = ref({ page: 1, pageSize: 20, total: 0 })
 const matrixPagination = ref({ page: 1, pageSize: 20, total: 0 })
 const datasetOptions = ref([])
+const datasetOptionsLoading = ref(false)
+const datasetOptionsError = ref('')
+const datasetOptionsPermissionDenied = ref(false)
 const matrices = ref([])
 const matrixLoading = ref(false)
 const matrixSaving = ref(false)
@@ -157,6 +163,7 @@ const editingMatrix = ref(null)
 const matrixForm = ref({ dataset: null, name: '', columnsText: '[]', rowsText: '[]', enabled: true })
 let matrixRequestId = 0
 let datasetRequestId = 0
+let datasetOptionsRequestId = 0
 let pluginRequestId = 0
 const form = ref({ name: '', project: null, matrix_text: '{}', secret_refs_text: '' })
 
@@ -229,18 +236,61 @@ const changeDatasetPageSize = pageSize => { datasetPagination.value.pageSize = p
 const changePluginPage = page => { if (page === pluginPagination.value.page) return; pluginPagination.value.page = page; loadPlugins() }
 const changePluginPageSize = pageSize => { pluginPagination.value.pageSize = pageSize; pluginPagination.value.page = 1; loadPlugins() }
 const datasetName = id => datasetOptions.value.find(item => Number(item.id) === Number(id))?.name || `#${id}`
+const ensureDatasetOption = id => {
+  if (id == null || datasetOptions.value.some(item => Number(item.id) === Number(id))) return
+  datasetOptions.value = [...datasetOptions.value, { id, name: t('execution.datasets.dataset') }]
+}
+const retainSelectedDatasetOptions = options => {
+  const selectedIds = [matrixDatasetFilter.value]
+  if (matrixDialogVisible.value && matrixForm.value.dataset != null) selectedIds.push(matrixForm.value.dataset)
+  for (const id of selectedIds) {
+    if (id == null || options.some(item => Number(item.id) === Number(id))) continue
+    const existing = datasetOptions.value.find(item => Number(item.id) === Number(id))
+    options.push(existing || { id, name: t('execution.datasets.dataset') })
+  }
+  return options
+}
 const loadDatasetOptions = async () => {
+  const requestId = ++datasetOptionsRequestId
+  const pageSize = 100
+  const pageConcurrency = 4
+  datasetOptionsLoading.value = true
+  datasetOptionsError.value = ''
+  datasetOptionsPermissionDenied.value = false
   try {
-    const response = await listExecutionDatasets({ page: 1, page_size: 100, ordering: 'project,name' })
-    datasetOptions.value = pageData(response).results
+    const fetchPage = page => listExecutionDatasets({ page, page_size: pageSize, ordering: 'project,name,id' })
+    const response = await fetchPage(1)
+    if (requestId !== datasetOptionsRequestId) return false
+    const { results, total } = pageData(response)
+    const options = [...results]
+    const pageCount = Math.max(1, Math.ceil(total / pageSize))
+    for (let firstPage = 2; firstPage <= pageCount; firstPage += pageConcurrency) {
+      const pageNumbers = Array.from(
+        { length: Math.min(pageConcurrency, pageCount - firstPage + 1) },
+        (_, index) => firstPage + index,
+      )
+      const pages = await Promise.all(pageNumbers.map(fetchPage))
+      if (requestId !== datasetOptionsRequestId) return false
+      for (const pageResponse of pages) options.push(...pageData(pageResponse).results)
+    }
+    if (requestId !== datasetOptionsRequestId) return false
+    datasetOptions.value = retainSelectedDatasetOptions(options)
     return true
   } catch (error) {
-    matrixError.value = [401, 403, 404].includes(error.response?.status)
+    if (requestId !== datasetOptionsRequestId) return false
+    datasetOptionsError.value = [401, 403, 404].includes(error.response?.status)
       ? t('execution.datasets.permissionDenied')
       : error.response?.data?.detail || error.message || t('execution.datasets.loadFailed')
-    matrixPermissionDenied.value = [401, 403, 404].includes(error.response?.status)
+    datasetOptionsPermissionDenied.value = [401, 403, 404].includes(error.response?.status)
     return false
+  } finally {
+    if (requestId === datasetOptionsRequestId) datasetOptionsLoading.value = false
   }
+}
+const retryDatasetOptions = async () => {
+  const loaded = await loadDatasetOptions()
+  if (loaded) await loadMatrices()
+  return loaded
 }
 const loadMatrices = async () => {
   const requestId = ++matrixRequestId
@@ -289,6 +339,7 @@ const openMatrixCreate = () => {
 }
 const openMatrixEdit = row => {
   editingMatrix.value = row.id
+  ensureDatasetOption(row.dataset)
   matrixForm.value = { dataset: row.dataset, name: row.name, columnsText: JSON.stringify(row.columns || [], null, 2), rowsText: JSON.stringify(row.rows || [], null, 2), enabled: row.enabled }
   matrixDialogVisible.value = true
 }

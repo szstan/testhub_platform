@@ -79,9 +79,13 @@ jobs:
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: |
+          # Optional browser cases run in backend-ui-automation; receipt integration runs in frontend.
           python -m pytest -q \
             --ignore=apps/app_automation/tests/test_app_flow.py \
-            --ignore=apps/app_automation/tests/test_executor.py
+            --ignore=apps/app_automation/tests/test_executor.py \
+            --ignore=apps/core/tests/test_scheduler_cancellation.py \
+            --ignore=apps/executions/tests/test_source_boundary_integrity.py \
+            --ignore=scripts/tests/test_release_integrity.py
 
       - name: Check OpenAPI contract compatibility
         env:
@@ -139,7 +143,7 @@ jobs:
             requirements-ui-optional.txt
 
       - name: Install web and optional UI dependencies
-        run: python -m pip install -r requirements-prod.txt -r requirements-ui-optional.txt
+        run: python -m pip install -r requirements-prod.txt -r requirements-ui-optional.txt pytest-asyncio==1.4.0
 
       - name: Validate pinned UI dependencies
         run: python scripts/validate_runtime_dependencies.py --requirements requirements-prod.txt requirements-ui-optional.txt
@@ -150,7 +154,10 @@ jobs:
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-        run: python -m pytest -q apps/ui_automation/tests
+        run: |
+          python -m pytest -q apps/ui_automation/tests \
+            apps/core/tests/test_scheduler_cancellation.py \
+            apps/executions/tests/test_source_boundary_integrity.py
 
   backend-migration-compatibility:
     runs-on: ubuntu-24.04
@@ -315,6 +322,12 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Run release integrity regressions with frontend dependencies
+        working-directory: ${{ github.workspace }}
+        run: |
+          python -m pip install pytest==8.4.1
+          python -m pytest -q -c /dev/null scripts/tests/test_release_integrity.py
 
       - name: Validate release packaging and staging checks
         working-directory: ${{ github.workspace }}

@@ -7,6 +7,7 @@ export const disableExecutionSourceBinding = (id) => api.post(`/executions/sourc
 export const getExecutionMetrics = (params = {}) => api.get('/executions/metrics/', { params })
 export const getExecutionEvidenceExplorer = (params = {}) => api.get('/executions/evidence-explorer/', { params })
 export const listExecutionJobs = (params = {}) => api.get('/executions/jobs/', { params })
+export const createExecutionJob = (data) => api.post('/executions/jobs/', data)
 export const importExecutionResults = (formData) => api.post('/executions/import-results/', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
 export const compareExecutionJobs = (jobId, baselineJobId) => api.post(`/executions/jobs/${jobId}/compare/`, { baseline_job_id: baselineJobId })
 export const evaluateExecutionReleaseGate = (jobId, data = {}) => api.post(`/executions/jobs/${jobId}/release-gate/`, data)
