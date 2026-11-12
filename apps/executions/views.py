@@ -777,6 +777,15 @@ class ExecutionJobViewSet(viewsets.ModelViewSet):
         ).distinct()
         if getattr(self.request.auth, 'project_id', None):
             queryset = queryset.filter(project_id=self.request.auth.project_id)
+        contract_eligible = self.request.query_params.get('contract_eligible')
+        if contract_eligible is not None:
+            value = contract_eligible.lower()
+            if value not in {'true', 'false', '1', '0'}:
+                raise ValidationError({'contract_eligible': '参数必须为布尔值'})
+            if value in {'true', '1'}:
+                queryset = queryset.filter(
+                    status='pending', final_attempt__isnull=True, attempts__isnull=True,
+                )
         return queryset
 
     def list(self, request, *args, **kwargs):
