@@ -229,6 +229,7 @@ export default {
     paginationInfo: '显示 {start}-{end} 条，共 {total} 条',
 
     // Detail Modal
+    failureReason: '失败原因',
     caseNumber: '用例编号',
     priority: '优先级',
     preconditions: '前置条件',

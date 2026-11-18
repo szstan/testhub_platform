@@ -229,6 +229,7 @@ export default {
     paginationInfo: 'Showing {start}-{end} of {total}',
 
     // Detail Modal
+    failureReason: 'Failure reason',
     caseNumber: 'Case No.',
     priority: 'Priority',
     preconditions: 'Preconditions',

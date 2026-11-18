@@ -1560,6 +1560,14 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                 logger.info(
                                     f"任务 {task.task_id} 使用生成配置: auto_review={enable_auto_review}, review_timeout={review_timeout}s")
+                                logger.info(
+                                    "开始调用用例生成模型: task_id=%s output_mode=%s "
+                                    "writer_model_config_id=%s reviewer_model_config_id=%s",
+                                    task.task_id,
+                                    task.output_mode,
+                                    task.writer_model_config_id,
+                                    task.reviewer_model_config_id,
+                                )
 
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
@@ -1934,7 +1942,16 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         loop.close()
 
                             except Exception as e:
-                                logger.error(f"生成任务执行失败: {e}")
+                                logger.exception(
+                                    "生成任务执行失败: task_id=%s status=%s progress=%s "
+                                    "output_mode=%s writer_model_config_id=%s reviewer_model_config_id=%s",
+                                    task.task_id,
+                                    task.status,
+                                    task.progress,
+                                    task.output_mode,
+                                    task.writer_model_config_id,
+                                    task.reviewer_model_config_id,
+                                )
                                 TestCaseGenerationTask.objects.filter(
                                     pk=task.pk,
                                 ).exclude(status='cancelled').update(
@@ -1947,7 +1964,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         thread.start()
 
                     except Exception as e:
-                        logger.error(f"启动生成任务失败: {e}")
+                        logger.exception("启动生成任务失败: task_id=%s", task.task_id)
                         TestCaseGenerationTask.objects.filter(
                             pk=task.pk,
                         ).exclude(status='cancelled').update(
@@ -1986,7 +2003,6 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         try:
             # DRF会根据lookup_field自动从URL提取task_id并调用get_object()
             task = self.get_object()
-            task = TestCaseGenerationTask.objects.select_for_update().get(pk=task.pk)
 
             return Response({
                 'task_id': task.task_id,

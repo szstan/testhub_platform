@@ -203,6 +203,32 @@
       </div>
     </div>
 
+    <!-- 生成任务失败详情弹窗 -->
+    <div v-if="selectedTaskDetail" class="testcase-detail-modal">
+      <div class="modal-content" role="dialog" aria-modal="true" @click.stop>
+        <div class="modal-header">
+          <h3>{{ selectedTaskDetail.title }}</h3>
+          <button class="close-btn" type="button" :aria-label="$t('generatedTestCases.cancel')" @click="closeTaskDetail">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="detail-item">
+            <label>{{ $t('generatedTestCases.taskId') }}</label>
+            <span>{{ selectedTaskDetail.task_id }}</span>
+          </div>
+          <div class="detail-item">
+            <label>{{ $t('generatedTestCases.status') }}</label>
+            <span class="status-tag" :class="selectedTaskDetail.status">
+              {{ selectedTaskDetail.status_display || getStatusText(selectedTaskDetail.status) }}
+            </span>
+          </div>
+          <div class="detail-item">
+            <label>{{ $t('generatedTestCases.failureReason') }}</label>
+            <pre class="task-error-message">{{ selectedTaskDetail.error_message || $t('generatedTestCases.unknownError') }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 测试用例详情弹窗 -->
     <div v-if="selectedTestCaseDetail" class="testcase-detail-modal">
       <div class="modal-content" @click.stop>
@@ -704,7 +730,13 @@ export default {
           params: { taskId: task.task_id }
         }).href
         window.open(url, '_blank')
+      } else if (task.status === 'failed') {
+        this.selectedTaskDetail = task
       }
+    },
+
+    closeTaskDetail() {
+      this.selectedTaskDetail = null
     },
 
     async batchAdoptTask(task) {
@@ -1687,6 +1719,13 @@ export default {
 .detail-item p {
   color: #666;
   line-height: 1.6;
+}
+
+.task-error-message {
+  max-height: 40vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .test-steps {
