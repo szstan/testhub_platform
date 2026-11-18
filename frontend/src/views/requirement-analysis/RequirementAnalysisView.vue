@@ -5,6 +5,11 @@
       <p>{{ $t('requirementAnalysis.subtitle') }}</p>
     </div>
 
+    <div v-if="generationError" class="generation-error" role="alert">
+      <strong>{{ $t('requirementAnalysis.generateFailed') }}</strong>
+      <p>{{ generationError }}</p>
+    </div>
+
     <!-- 配置引导弹出窗口 -->
     <div v-if="showConfigGuide && !checkingConfig" class="modal-overlay" @click.self="showConfigGuide = false" :key="modalKey">
       <div class="guide-config-modal">
@@ -368,6 +373,7 @@ export default {
       // 生成状态
       isGenerating: false,
       currentTaskId: null,
+      generationError: '',
       progressText: '',
       currentStep: 0,
       pollInterval: null,
@@ -743,6 +749,8 @@ export default {
       }
 
       this.isGenerating = true
+      this.currentTaskId = null
+      this.generationError = ''
       this.currentStep = 1
       this.progressText = this.$t('requirementAnalysis.creatingTask')
       this.streamedContent = ''  // 清空流式内容
@@ -981,7 +989,8 @@ export default {
       }
     },
 
-    handleGenerationError() {
+    async handleGenerationError() {
+      const failedTaskId = this.currentTaskId
       this.isGenerating = false
       if (this.eventSource) {
         this.eventSource.close()
@@ -991,6 +1000,26 @@ export default {
         clearInterval(this.pollInterval)
         this.pollInterval = null
       }
+
+      let errorMessage = this.$t('requirementAnalysis.unknownError')
+      if (failedTaskId) {
+        try {
+          const response = await api.get(
+            `/requirement-analysis/testcase-generation/${encodeURIComponent(failedTaskId)}/progress/`
+          )
+          if (this.currentTaskId !== failedTaskId) return
+
+          const taskError = response.data?.error_message
+          if (typeof taskError === 'string' && taskError.trim()) {
+            errorMessage = taskError.trim()
+          }
+        } catch (error) {
+          console.error('Failed to fetch generation failure details:', error)
+        }
+      }
+
+      if (this.currentTaskId !== failedTaskId) return
+      this.generationError = errorMessage
     },
 
     startPolling() {
@@ -1196,6 +1225,7 @@ export default {
       this.currentStep = 0;
       this.showResults = false;
       this.generationResult = null;
+      this.generationError = '';
 
       // 清空流式内容和最终版用例
       this.streamedContent = '';
@@ -1511,6 +1541,28 @@ export default {
 .page-header p {
   color: #666;
   font-size: 1.1rem;
+}
+
+.generation-error {
+  max-width: 1000px;
+  margin: -20px auto 24px;
+  padding: 14px 18px;
+  border: 1px solid #efb5b5;
+  border-left: 4px solid #c62828;
+  border-radius: 6px;
+  background: #fff5f5;
+  color: #7a1f1f;
+  overflow-wrap: anywhere;
+}
+
+.generation-error strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.generation-error p {
+  margin: 0;
+  white-space: pre-wrap;
 }
 
 /* 输出模式设置区域 - 全局 */

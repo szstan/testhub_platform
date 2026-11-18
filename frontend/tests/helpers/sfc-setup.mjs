@@ -9,7 +9,7 @@ import * as vue from 'vue'
 
 const frontend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 
-// Compile the real SFC setup, replacing only imports that would perform IO or
+// Compile the real SFC script, replacing only imports that would perform IO or
 // require a mounted application. Vue refs, computed values and watchers are real.
 export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
   const filename = resolve(frontend, relativePath)
@@ -60,8 +60,12 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
     module, exports: module.exports, __sfcMocks: mocks, console, crypto: globalThis.crypto, ...globals,
   }, { filename })
   const scope = vue.effectScope()
-  const state = scope.run(() => module.exports.default.setup({}, { expose() {} }))
+  const component = module.exports.default
+  const state = typeof component.setup === 'function'
+    ? scope.run(() => component.setup({}, { expose() {} }))
+    : null
   return {
+    component,
     state,
     messages,
     mount: () => Promise.all(mounted.map(callback => callback())),
