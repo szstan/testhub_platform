@@ -1549,6 +1549,12 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                     logger.info(f"任务 {task.task_id} 已取消或已被其他 worker 领取")
                                     return
                                 task.refresh_from_db()
+                                async_task = TestCaseGenerationTask.objects.select_related(
+                                    'writer_prompt_config',
+                                    'writer_model_config',
+                                    'reviewer_prompt_config',
+                                    'reviewer_model_config',
+                                ).get(pk=task.pk)
 
                                 # 读取生成行为配置
                                 from .models import GenerationConfig
@@ -1612,7 +1618,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         task.save()
 
                                         generated_cases = loop.run_until_complete(
-                                            AIModelService.generate_test_cases_stream(task, callback=stream_callback)
+                                            AIModelService.generate_test_cases_stream(async_task, callback=stream_callback)
                                         )
                                         from .ai_contracts import summarize_generation_output
                                         task.generation_log = json.dumps(
@@ -1665,7 +1671,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                     # 移除超时限制，允许大文档完整评审
                                                     review_feedback = loop.run_until_complete(
                                                         AIModelService.review_test_cases_stream(
-                                                            task, generated_cases, callback=review_stream_callback
+                                                            async_task, generated_cases, callback=review_stream_callback
                                                         )
                                                     )
                                                     # 保存最终评审内容
@@ -1711,7 +1717,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                             revised_cases = loop.run_until_complete(
                                                                 asyncio.wait_for(
                                                                     AIModelService.revise_test_cases_based_on_review(
-                                                                        task, generated_cases, task.review_feedback,
+                                                                        async_task, generated_cases, task.review_feedback,
                                                                         callback=final_callback
                                                                     ),
                                                                     timeout=review_timeout  # 使用配置的超时时间（秒）
@@ -1785,7 +1791,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         task.save()
 
                                         generated_cases = loop.run_until_complete(
-                                            AIModelService.generate_test_cases(task)
+                                            AIModelService.generate_test_cases(async_task)
                                         )
                                         from .ai_contracts import summarize_generation_output
                                         task.generation_log = json.dumps(
@@ -1809,7 +1815,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                 # 移除超时限制，允许大文档完整评审
                                                 try:
                                                     review_feedback = loop.run_until_complete(
-                                                        AIModelService.review_test_cases(task, generated_cases)
+                                                        AIModelService.review_test_cases(async_task, generated_cases)
                                                     )
                                                     task.review_feedback = review_feedback
                                                     logger.info(f"任务 {task.task_id} 评审完成")
@@ -1851,7 +1857,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                             revised_cases = loop.run_until_complete(
                                                                 asyncio.wait_for(
                                                                     AIModelService.revise_test_cases_based_on_review(
-                                                                        task, generated_cases, task.review_feedback,
+                                                                        async_task, generated_cases, task.review_feedback,
                                                                         callback=final_callback_full
                                                                     ),
                                                                     timeout=review_timeout  # 使用配置的超时时间（秒）
