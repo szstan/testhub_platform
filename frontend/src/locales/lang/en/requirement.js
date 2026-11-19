@@ -292,6 +292,12 @@ export default {
     adoptConfirm: 'Are you sure to adopt all cases for task "{title}"?',
     adoptSuccess: 'Adopted successfully',
     adoptFailed: 'Adopt failed',
+    taskAdoptionTitle: 'Adopt Generated Cases',
+    taskAdoptionCaseCount: '{count} unadopted cases will be adopted.',
+    taskAdoptionPartialSuccess: 'Adopted {count} cases; {remaining} remain.',
+    allCasesAlreadyAdopted: 'All generated cases are already adopted.',
+    noCasesToAdopt: 'This task has no canonical test cases to adopt.',
+    noAccessibleProjects: 'No accessible projects are available.',
     discardConfirm: 'Are you sure to discard all cases for task "{title}"?',
     discardSuccess: 'Discarded successfully',
     discardFailed: 'Discard failed',
@@ -542,6 +548,7 @@ export default {
     // Table Action Buttons
     viewDetail: '📖 View Detail',
     adopt: '✅ Adopt',
+    adopted: 'Adopted',
     discard: '❌ Discard',
 
     // Empty State
@@ -598,6 +605,9 @@ export default {
     allDiscardedSuccess: 'All test cases discarded, task deleted',
     caseDiscardedSuccess: 'Test case discarded',
     batchAdoptFailed: 'Batch adopt failed',
+    alreadyAdopted: 'The selected cases were already adopted.',
+    adoptPartialSuccess: 'Adopted {count} cases; {remaining} remain.',
+    noProjectsAvailable: 'No accessible projects are available.',
     batchDiscardFailed: 'Batch discard failed',
     adoptFailed: 'Failed to adopt test case',
     discardFailed: 'Failed to discard test case',

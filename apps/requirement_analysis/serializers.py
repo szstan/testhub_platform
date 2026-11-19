@@ -4,6 +4,7 @@ from .models import (
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
     GenerationConfig
 )
+from .ai_contracts import parse_generated_cases
 
 
 class RequirementDocumentSerializer(serializers.ModelSerializer):
@@ -276,6 +277,9 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
     reviewer_model_name = serializers.CharField(source='reviewer_model_config.name', read_only=True)
     writer_prompt_name = serializers.CharField(source='writer_prompt_config.name', read_only=True)
     reviewer_prompt_name = serializers.CharField(source='reviewer_prompt_config.name', read_only=True)
+    canonical_cases = serializers.SerializerMethodField()
+    is_saved_to_records = serializers.BooleanField(read_only=True)
+
     
     class Meta:
         model = TestCaseGenerationTask
@@ -283,11 +287,16 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
                  'progress', 'project', 'project_name', 'writer_model_config', 'writer_model_name', 
                  'reviewer_model_config', 'reviewer_model_name', 'writer_prompt_config', 'writer_prompt_name',
                  'reviewer_prompt_config', 'reviewer_prompt_name', 'generated_test_cases',
-                 'review_feedback', 'final_test_cases', 'generation_log', 'error_message',
+                 'review_feedback', 'final_test_cases', 'canonical_cases', 'adopted_case_ids',
+                 'is_saved_to_records', 'saved_at', 'generation_log', 'error_message',
                  'created_by', 'created_by_name', 'created_at', 'updated_at', 'completed_at']
         read_only_fields = ['task_id', 'status', 'progress', 'generated_test_cases',
-                          'review_feedback', 'final_test_cases', 'generation_log',
+                          'review_feedback', 'final_test_cases', 'canonical_cases', 'adopted_case_ids',
+                          'is_saved_to_records', 'saved_at', 'generation_log',
                           'error_message', 'created_by', 'completed_at']
+
+    def get_canonical_cases(self, obj):
+        return parse_generated_cases(obj.final_test_cases)
 
     def validate_project(self, value):
         if value is None:

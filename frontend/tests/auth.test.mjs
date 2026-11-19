@@ -133,6 +133,59 @@ test('concurrent 401s share one refresh and all retry successfully', { timeout: 
   assert.equal(expiredEvents, 0)
 })
 
+test('proactive refresh during a pending generation is single-flight and preserves the session', { timeout: 2000 }, async (t) => {
+  let now = 1900000000000
+  t.mock.method(Date, 'now', () => now)
+  const oldToken = jwt(now / 1000 + 30 * 60, 'generation-start')
+  store.applySession({ access: oldToken, user: fixtureUser })
+  const generationStarted = deferred()
+  const generationResponse = deferred()
+  const refreshStarted = deferred()
+  const rotation = deferred()
+  const newToken = jwt(now / 1000 + 60 * 60, 'refreshed')
+  let refreshes = 0
+  api.defaults.adapter = async (config) => {
+    if (config.url === '/auth/token/refresh/') {
+      refreshes++
+      refreshStarted.resolve()
+      await rotation.promise
+      return response(config, { access: newToken })
+    }
+    if (config.url === '/requirement-analysis/testcase-generation/generate/') {
+      assert.equal(config.headers.Authorization, `Bearer ${oldToken}`)
+      generationStarted.resolve()
+      await generationResponse.promise
+      return response(config, { task_id: 'generation-fixture' })
+    }
+    assert.equal(config.headers.Authorization, `Bearer ${newToken}`)
+    return response(config, { ok: true })
+  }
+
+  const generation = api.post('/requirement-analysis/testcase-generation/generate/', {})
+  await generationStarted.promise
+  now += 26 * 60 * 1000
+  const concurrent = [
+    api.get('/requirement-analysis/testcase-generation/progress/'),
+    api.get('/requirement-analysis/testcase-generation/status/'),
+  ]
+  await refreshStarted.promise
+  assert.equal(refreshes, 1)
+  assert.equal(store.isAuthenticated, true)
+  rotation.resolve()
+
+  const results = await Promise.all(concurrent)
+  assert.equal(results.every((row) => row.data.ok), true)
+  assert.equal(refreshes, 1)
+  assert.equal(store.accessToken, newToken)
+  assert.equal(store.isAuthenticated, true)
+  assert.equal(expiredEvents, 0)
+
+  generationResponse.resolve()
+  const generated = await generation
+  assert.equal(generated.data.task_id, 'generation-fixture')
+  assert.equal(expiredEvents, 0)
+})
+
 test('a late old-token 401 reuses the completed refresh without another rotation', { timeout: 2000 }, async () => {
   const exp = Math.floor(Date.now() / 1000) + 3600
   const oldToken = jwt(exp, 'old')

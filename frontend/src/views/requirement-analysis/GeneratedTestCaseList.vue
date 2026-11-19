@@ -124,6 +124,7 @@
                 <button
                   v-if="task.status === 'completed'"
                   class="adopt-btn"
+                  :disabled="isTaskAdoptionPreparing || isTaskAdopting || showTaskAdoptDialog"
                   @click="batchAdoptTask(task)">
                   {{ $t('generatedTestCases.batchAdopt') }}
                 </button>
@@ -402,12 +403,56 @@
         </div>
       </div>
     </div>
+    <div v-if="showTaskAdoptDialog" class="testcase-detail-modal">
+      <div class="modal-content" role="dialog" aria-modal="true" @click.stop>
+        <div class="modal-header">
+          <h3>{{ $t('generatedTestCases.taskAdoptionTitle') }}</h3>
+          <button
+            class="close-btn"
+            type="button"
+            :disabled="isTaskAdopting"
+            :aria-label="$t('generatedTestCases.cancel')"
+            @click="closeTaskAdoptionDialog">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="task-adoption-project">{{ $t('generatedTestCases.belongsToProject') }}</label>
+            <select id="task-adoption-project" v-model="taskAdoptionProjectId">
+              <option value="">{{ $t('generatedTestCases.selectProject') }}</option>
+              <option v-for="project in projects" :key="project.id" :value="project.id">
+                {{ project.name }}
+              </option>
+            </select>
+          </div>
+          <p class="task-adoption-count">
+            {{ $t('generatedTestCases.taskAdoptionCaseCount', { count: taskAdoptionCaseIds.length }) }}
+          </p>
+          <div class="form-actions task-adoption-actions">
+            <button
+              type="button"
+              class="confirm-btn"
+              :disabled="isTaskAdopting || !taskAdoptionProjectId"
+              @click="submitTaskAdoption">
+              {{ isTaskAdopting ? $t('generatedTestCases.adopting') : $t('generatedTestCases.confirmAdopt') }}
+            </button>
+            <button
+              type="button"
+              class="cancel-btn"
+              :disabled="isTaskAdopting"
+              @click="closeTaskAdoptionDialog">
+              {{ $t('generatedTestCases.cancel') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script>
 import api from '@/utils/api'
 import { ElMessage } from 'element-plus'
+import { buildCaseAdoptionPayload, chunkCaseIds } from '@/utils/generated-case-adoption.mjs'
 
 export default {
   name: 'GeneratedTestCaseList',
@@ -420,6 +465,14 @@ export default {
       selectedTestCaseDetail: null,
       showAdoptModal: false,
       isAdopting: false,
+      isTaskAdoptionPreparing: false,
+      isTaskAdopting: false,
+      showTaskAdoptDialog: false,
+      taskAdoptionTaskId: '',
+      taskAdoptionTaskTitle: '',
+      taskAdoptionBound: false,
+      taskAdoptionCaseIds: [],
+      taskAdoptionProjectId: '',
       projects: [],
       projectVersions: [],
       allVersions: [], // 存储所有版本列表
@@ -740,22 +793,110 @@ export default {
     },
 
     async batchAdoptTask(task) {
+      if (this.isTaskAdoptionPreparing || this.isTaskAdopting || this.showTaskAdoptDialog) return
       if (!confirm(this.$t('generatedTestCases.adoptConfirm', { title: task.title }))) {
         return
       }
 
+      this.isTaskAdoptionPreparing = true
       try {
-        // 调用后端API批量采纳该任务的所有测试用例
-        // await api.post(`/requirement-analysis/testcase-generation/${task.task_id}/batch-adopt/`)
-        await api.post(`/requirement-analysis/testcase-generation/${task.task_id}/batch_adopt/`)
-        ElMessage.success(this.$t('generatedTestCases.adoptSuccess'))
-        this.loadTasks()
+        const response = await api.get(`/requirement-analysis/testcase-generation/${task.task_id}/`)
+        const taskDetail = response.data
+        const canonicalCases = Array.isArray(taskDetail.canonical_cases) ? taskDetail.canonical_cases : []
+        const adoptedCaseIds = Array.isArray(taskDetail.adopted_case_ids) ? taskDetail.adopted_case_ids : []
+        const caseIds = [...new Set(canonicalCases
+          .filter(testCase => testCase && typeof testCase.case_id === 'string' && testCase.case_id.trim())
+          .map(testCase => testCase.case_id)
+          .filter(caseId => !adoptedCaseIds.includes(caseId)))]
+
+        if (caseIds.length === 0) {
+          ElMessage.info(adoptedCaseIds.length
+            ? this.$t('generatedTestCases.allCasesAlreadyAdopted')
+            : this.$t('generatedTestCases.noCasesToAdopt'))
+          return
+        }
+
+        this.taskAdoptionTaskId = task.task_id
+        this.taskAdoptionTaskTitle = task.title
+        this.taskAdoptionCaseIds = caseIds
+        this.taskAdoptionBound = Boolean(taskDetail.project || taskDetail.project_id)
+
+        if (this.taskAdoptionBound) {
+          await this.submitTaskAdoption()
+          return
+        }
+
+        if (this.projects.length === 0) await this.fetchProjects()
+        if (this.projects.length === 0) {
+          ElMessage.error(this.$t('generatedTestCases.noAccessibleProjects'))
+          this.resetTaskAdoption()
+          return
+        }
+
+        this.taskAdoptionProjectId = ''
+        this.showTaskAdoptDialog = true
       } catch (error) {
         console.error(this.$t('generatedTestCases.adoptFailed'), error)
-        ElMessage.error(this.$t('generatedTestCases.adoptFailed') + ': ' + (error.response?.data?.message || error.message))
+        const detail = error.response?.data?.error || error.response?.data?.detail || error.response?.data?.message || error.message
+        ElMessage.error(`${this.$t('generatedTestCases.adoptFailed')}: ${detail}`)
+      } finally {
+        this.isTaskAdoptionPreparing = false
       }
     },
 
+    async submitTaskAdoption() {
+      if (this.isTaskAdopting || this.taskAdoptionCaseIds.length === 0 || !this.taskAdoptionTaskId) return
+      if (!this.taskAdoptionBound && !this.taskAdoptionProjectId) {
+        ElMessage.warning(this.$t('generatedTestCases.selectProjectRequired'))
+        return
+      }
+
+      this.isTaskAdopting = true
+      try {
+        const projectId = this.taskAdoptionBound ? null : this.taskAdoptionProjectId
+        let result
+        for (const caseIds of chunkCaseIds(this.taskAdoptionCaseIds)) {
+          const response = await api.post(
+            `/requirement-analysis/testcase-generation/${this.taskAdoptionTaskId}/batch-adopt-selected/`,
+            buildCaseAdoptionPayload(caseIds, projectId)
+          )
+          result = response.data
+        }
+        if (result.already_adopted) {
+          ElMessage.info(this.$t('generatedTestCases.allCasesAlreadyAdopted'))
+        } else if (result.remaining_count > 0) {
+          ElMessage.success(this.$t('generatedTestCases.taskAdoptionPartialSuccess', {
+            count: result.adopted_count,
+            remaining: result.remaining_count
+          }))
+        } else {
+          ElMessage.success(this.$t('generatedTestCases.adoptSuccess'))
+        }
+        this.showTaskAdoptDialog = false
+        this.resetTaskAdoption()
+        await this.loadTasks()
+      } catch (error) {
+        console.error(this.$t('generatedTestCases.adoptFailed'), error)
+        const detail = error.response?.data?.error || error.response?.data?.detail || error.response?.data?.message || error.message
+        ElMessage.error(`${this.$t('generatedTestCases.adoptFailed')}: ${detail}`)
+      } finally {
+        this.isTaskAdopting = false
+      }
+    },
+
+    closeTaskAdoptionDialog() {
+      if (this.isTaskAdopting) return
+      this.showTaskAdoptDialog = false
+      this.resetTaskAdoption()
+    },
+
+    resetTaskAdoption() {
+      this.taskAdoptionTaskId = ''
+      this.taskAdoptionTaskTitle = ''
+      this.taskAdoptionBound = false
+      this.taskAdoptionCaseIds = []
+      this.taskAdoptionProjectId = ''
+    },
     async batchDiscardTask(task) {
       if (!confirm(this.$t('generatedTestCases.discardConfirm', { title: task.title }))) {
         return
@@ -789,7 +930,9 @@ export default {
     async fetchProjects() {
       try {
         const response = await api.get('/projects/list/')
-        this.projects = response.data.results || []
+        this.projects = Array.isArray(response.data.results)
+          ? response.data.results
+          : (Array.isArray(response.data) ? response.data : [])
       } catch (error) {
         console.error(this.$t('generatedTestCases.fetchProjectsFailed'), error)
       }

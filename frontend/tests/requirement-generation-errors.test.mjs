@@ -22,6 +22,10 @@ async function setup(api, clearedIntervals = []) {
 async function setupGeneratedTestCaseList(openedUrls = []) {
   const instance = await loadSfcSetup('src/views/requirement-analysis/GeneratedTestCaseList.vue', {
     '@/utils/api': { default: {} },
+    '@/utils/generated-case-adoption.mjs': {
+      buildCaseAdoptionPayload: () => ({}),
+      chunkCaseIds: caseIds => [caseIds],
+    },
   }, {
     window: { open: url => openedUrls.push(url) },
   })

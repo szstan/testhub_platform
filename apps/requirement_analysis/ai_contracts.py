@@ -156,6 +156,246 @@ def render_markdown(draft: Mapping[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _case_field(label: str) -> str | None:
+    normalized = re.sub(r"[\s_*-]+", "", label).strip("：:").lower()
+    if any(value in normalized for value in ("caseid", "用例id", "用例编号", "编号", "序号")):
+        return "case_id"
+    if any(value in normalized for value in ("title", "scenario", "测试目标", "测试场景", "用例名称", "场景", "标题")):
+        return "title"
+    if any(value in normalized for value in ("precondition", "前置条件", "前提条件", "前置", "前提")):
+        return "preconditions"
+    if any(value in normalized for value in ("steps", "teststeps", "测试步骤", "操作步骤", "执行步骤", "步骤")):
+        return "steps"
+    if any(value in normalized for value in ("expectedresult", "expected", "预期结果", "期望结果", "预期")):
+        return "expected_result"
+    if "priority" in normalized or "优先级" in normalized:
+        return "priority"
+    return None
+
+
+def _priority(value: Any) -> str:
+    normalized = str(value or "P2").strip().lower()
+    return {
+        "p0": "P0", "critical": "P0", "highest": "P0", "最高": "P0", "紧急": "P0",
+        "p1": "P1", "high": "P1", "高": "P1",
+        "p2": "P2", "medium": "P2", "normal": "P2", "中": "P2",
+        "p3": "P3", "low": "P3", "低": "P3",
+    }.get(normalized, "P2")
+
+
+def _case_steps(value: Any) -> list[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        source = [str(item) for item in value]
+    else:
+        source = re.split(r"\r?\n|<br\s*/?>", str(value or ""), flags=re.IGNORECASE)
+    steps = []
+    for item in source:
+        step = re.sub(r"^\s*(?:[-*+]\s*|\d+[.、)）]\s*)", "", item).strip()
+        if step:
+            steps.append(step)
+    return steps[:100]
+
+
+def _canonical_cases(raw_cases: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw_case in enumerate(raw_cases, start=1):
+        title = str(raw_case.get("title") or raw_case.get("scenario") or "").strip()
+        if not title:
+            continue
+        case_id = str(raw_case.get("case_id") or raw_case.get("caseId") or "").strip()
+        if not case_id:
+            case_id = f"CASE-{index:03d}"
+        base_case_id = case_id
+        suffix = 2
+        while case_id in seen_ids:
+            case_id = f"{base_case_id}-{suffix}"
+            suffix += 1
+        seen_ids.add(case_id)
+        preconditions = raw_case.get("preconditions", raw_case.get("precondition", ""))
+        if isinstance(preconditions, Sequence) and not isinstance(preconditions, (str, bytes, bytearray)):
+            preconditions = "\n".join(str(item).strip() for item in preconditions if str(item).strip())
+        cases.append({
+            "case_id": case_id,
+            "title": title,
+            "priority": _priority(raw_case.get("priority")),
+            "preconditions": str(preconditions or "").strip(),
+            "steps": _case_steps(raw_case.get("steps", raw_case.get("test_steps", ""))),
+            "expected_result": str(raw_case.get("expected_result", raw_case.get("expected", "")) or "").strip(),
+        })
+    return cases
+
+
+def _table_cells(line: str) -> list[str]:
+    escaped_pipe = "___CASE_PIPE___"
+    processed = line.strip().replace(r"\|", escaped_pipe)
+    if processed.startswith("|"):
+        processed = processed[1:]
+    if processed.endswith("|"):
+        processed = processed[:-1]
+    return [cell.replace(escaped_pipe, "|").replace("&#124;", "|").strip() for cell in processed.split("|")]
+
+
+def _parse_case_table(lines: list[str]) -> list[dict[str, Any]]:
+    for index, line in enumerate(lines[:-1]):
+        if "|" not in line or "|" not in lines[index + 1]:
+            continue
+        headers = _table_cells(line)
+        fields = [_case_field(header) for header in headers]
+        separator = re.fullmatch(r"\s*\|?\s*:?-{2,}[-:\s|]*\|?\s*", lines[index + 1])
+        if "title" not in fields or not separator:
+            continue
+        raw_cases = []
+        for row in lines[index + 2:]:
+            if "|" not in row:
+                break
+            cells = _table_cells(row)
+            if len(cells) < len(fields):
+                continue
+            raw_case = {}
+            for field, value in zip(fields, cells):
+                if field:
+                    raw_case[field] = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+            if raw_case.get("title"):
+                raw_cases.append(raw_case)
+        if raw_cases:
+            return raw_cases
+    return []
+
+
+def _read_case_fields(lines: Sequence[str]) -> dict[str, Any]:
+    values: dict[str, list[str]] = {}
+    active_field: str | None = None
+    for raw_line in lines:
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", raw_line).strip()
+        if not line:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            active_field = _case_field(heading.group(1))
+            continue
+        label = re.match(r"^(?:[-*+]\s*)?([^:：]{1,40})\s*[:：]\s*(.*)$", line)
+        if label:
+            field = _case_field(label.group(1))
+            if field:
+                active_field = field
+                if label.group(2).strip():
+                    values.setdefault(field, []).append(label.group(2).strip())
+                continue
+        if active_field:
+            values.setdefault(active_field, []).append(line)
+    result = {field: "\n".join(items).strip() for field, items in values.items()}
+    if "steps" in result:
+        result["steps"] = _case_steps(result["steps"])
+    return result
+
+
+def _parse_markdown_cases(lines: list[str]) -> list[dict[str, Any]]:
+    heading_rows = []
+    container_titles = {"test cases", "test case", "测试用例", "测试用例列表", "测试结果", "用例列表"}
+    for index, line in enumerate(lines):
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line.strip())
+        if not heading:
+            continue
+        level, label = len(heading.group(1)), heading.group(2).strip()
+        case_id = ""
+        title = label
+        id_match = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,79})\s*[:：]\s*(.+)$", label)
+        if id_match:
+            case_id, title = id_match.groups()
+        marker = bool(re.search(r"测试用例|test\s*case|用例\s*\d+", label, re.IGNORECASE))
+        if level <= 2 and label.casefold() not in container_titles:
+            heading_rows.append((index, case_id, title))
+        elif level == 3 and (case_id or marker):
+            heading_rows.append((index, case_id, title))
+
+    raw_cases = []
+    for position, (line_index, case_id, title) in enumerate(heading_rows):
+        end = heading_rows[position + 1][0] if position + 1 < len(heading_rows) else len(lines)
+        fields = _read_case_fields(lines[line_index + 1:end])
+        if not case_id and not (fields.get("steps") or fields.get("expected_result") or fields.get("preconditions")):
+            continue
+        raw_cases.append({"case_id": case_id, "title": title, **fields})
+    return raw_cases
+
+
+def _parse_legacy_text(lines: list[str]) -> list[dict[str, Any]]:
+    raw_cases: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    active_field: str | None = None
+    known_labels = {"case_id", "title", "preconditions", "steps", "expected_result", "priority"}
+    for raw_line in lines:
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", raw_line).strip()
+        if not line:
+            continue
+        start = re.match(r"^(?:测试用例|用例|test\s*case)\s*(?:编号|id)?\s*([A-Za-z0-9_-]+)?\s*[:：-]\s*(.+)$", line, re.IGNORECASE)
+        id_start = re.match(r"^((?:TC|AI|CASE|TEST)[-_]?[A-Za-z0-9_-]+)\s*[:：]\s*(.+)$", line, re.IGNORECASE)
+        numbered_start = re.match(r"^(\d{1,3})[.、)]\s+(.+)$", line)
+        new_case = start or id_start
+        if new_case:
+            if current:
+                raw_cases.append(current)
+            if start:
+                current = {"case_id": start.group(1) or "", "title": start.group(2).strip()}
+            else:
+                current = {"case_id": id_start.group(1), "title": id_start.group(2).strip()}
+            active_field = None
+            continue
+        if numbered_start and (current is None or active_field != "steps"):
+            if current:
+                raw_cases.append(current)
+            current = {"case_id": "", "title": numbered_start.group(2).strip()}
+            active_field = None
+            continue
+        label = re.match(r"^(?:[-*+]\s*)?([^:：]{1,40})\s*[:：]\s*(.*)$", line)
+        if label:
+            field = _case_field(label.group(1))
+            if field in known_labels:
+                if current is None:
+                    continue
+                active_field = field
+                current.setdefault(field, "")
+                if label.group(2).strip():
+                    current[field] = (str(current[field]) + "\n" + label.group(2).strip()).strip()
+                continue
+        if current and active_field:
+            if active_field == "steps":
+                existing_steps = current.get(active_field, [])
+                if not isinstance(existing_steps, list):
+                    existing_steps = [str(existing_steps)] if existing_steps else []
+                current[active_field] = existing_steps + [line]
+            else:
+                current[active_field] = (str(current.get(active_field, "")) + "\n" + line).strip()
+    if current:
+        raw_cases.append(current)
+    return raw_cases
+
+
+def parse_generated_cases(content: Any) -> list[dict[str, Any]]:
+    """Parse current Markdown and supported legacy output into canonical cases."""
+
+    if isinstance(content, (Mapping, list)):
+        try:
+            draft = parse_draft(content)
+        except AIContractError:
+            return []
+        return _canonical_cases(draft["cases"])
+    if not isinstance(content, str) or not content.strip():
+        return []
+
+    try:
+        return _canonical_cases(parse_draft(content)["cases"])
+    except AIContractError:
+        pass
+
+    text = re.sub(r"^\s*```(?:markdown|md|text)?\s*|\s*```\s*$", "", content.strip(), flags=re.IGNORECASE)
+    lines = [line.rstrip() for line in text.splitlines()]
+    for raw_cases in (_parse_case_table(lines), _parse_markdown_cases(lines), _parse_legacy_text(lines)):
+        if raw_cases:
+            return _canonical_cases(raw_cases)
+    return []
+
+
 class NormalizedGenerationOutput(str):
     """String-compatible output carrying source and audit metadata."""
 

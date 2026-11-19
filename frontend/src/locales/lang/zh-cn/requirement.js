@@ -292,6 +292,12 @@ export default {
     adoptConfirm: '确定要全部采纳任务 "{title}" 的所有用例吗？',
     adoptSuccess: '采纳成功',
     adoptFailed: '采纳失败',
+    taskAdoptionTitle: '采纳生成用例',
+    taskAdoptionCaseCount: '将采纳 {count} 条尚未采纳的用例。',
+    taskAdoptionPartialSuccess: '已采纳 {count} 条用例，剩余 {remaining} 条。',
+    allCasesAlreadyAdopted: '该任务的生成用例均已采纳。',
+    noCasesToAdopt: '该任务没有可采纳的规范测试用例。',
+    noAccessibleProjects: '当前没有可访问的项目。',
     discardConfirm: '确定要弃用任务 "{title}" 的所有用例吗？',
     discardSuccess: '弃用成功',
     discardFailed: '弃用失败',
@@ -542,6 +548,7 @@ export default {
     // 表格操作按钮
     viewDetail: '📖 查看详情',
     adopt: '✅ 采纳',
+    adopted: '已采纳',
     discard: '❌ 弃用',
 
     // 空状态
@@ -598,6 +605,9 @@ export default {
     allDiscardedSuccess: '所有测试用例已弃用，任务已删除',
     caseDiscardedSuccess: '测试用例已弃用',
     batchAdoptFailed: '批量采纳失败',
+    alreadyAdopted: '选中的用例已被采纳。',
+    adoptPartialSuccess: '已采纳 {count} 条用例，剩余 {remaining} 条。',
+    noProjectsAvailable: '当前没有可访问的项目。',
     batchDiscardFailed: '批量弃用失败',
     adoptFailed: '采纳用例失败',
     discardFailed: '弃用用例失败',

@@ -62,6 +62,7 @@
             <input
               type="checkbox"
               :checked="isAllSelected"
+              :disabled="adoptableCases.length === 0 || isAdopting || isPreparingAdoption || showProjectDialog"
               @change="toggleSelectAll">
             {{ $t('taskDetail.selectAll') }}
           </label>
@@ -72,7 +73,7 @@
         <div class="batch-buttons">
           <button
             class="batch-adopt-btn"
-            :disabled="selectedCases.length === 0"
+            :disabled="selectedCases.length === 0 || isAdopting || isPreparingAdoption || showProjectDialog"
             @click="batchAdopt">
             {{ $t('taskDetail.batchAdopt', { count: selectedCases.length }) }}
           </button>
@@ -102,15 +103,19 @@
           <div 
             v-for="(testCase, index) in paginatedTestCases" 
             :key="testCase.id || index"
-            class="table-row">
+            class="table-row"
+            :class="{ adopted: isCaseAdopted(testCase) }">
             <div class="body-cell checkbox-cell">
-              <input 
-                type="checkbox" 
-                :value="testCase"
-                v-model="selectedCases"
-                @change="updateSelectAll">
+              <input
+                type="checkbox"
+                :value="testCase.caseId"
+                v-model="selectedCaseIds"
+                :disabled="isCaseAdopted(testCase) || isAdopting || isPreparingAdoption || showProjectDialog">
             </div>
-            <div class="body-cell">{{ testCase.caseId || `TC${String(index + 1).padStart(3, '0')}` }}</div>
+            <div class="body-cell">
+              {{ testCase.caseId }}
+              <span v-if="isCaseAdopted(testCase)" class="adopted-case-tag">{{ $t('taskDetail.adopted') }}</span>
+            </div>
             <div class="body-cell">{{ testCase.scenario }}</div>
             <div class="body-cell text-truncate">
               {{ formatTextForList(testCase.precondition) }}
@@ -127,7 +132,11 @@
             <div class="body-cell">
               <div class="action-buttons">
                 <button class="view-btn" @click="viewCaseDetail(testCase, index)">{{ $t('taskDetail.viewDetail') }}</button>
-                <button class="adopt-btn" @click="adoptSingleCase(testCase, index)">{{ $t('taskDetail.adopt') }}</button>
+                <button
+                  v-if="!isCaseAdopted(testCase)"
+                  class="adopt-btn"
+                  :disabled="isAdopting || isPreparingAdoption || showProjectDialog"
+                  @click="adoptSingleCase(testCase, index)">{{ $t('taskDetail.adopt') }}</button>
                 <button class="discard-btn" @click="discardSingleCase(testCase, index)">{{ $t('taskDetail.discard') }}</button>
               </div>
             </div>
@@ -250,6 +259,40 @@
         </div>
       </div>
     </div>
+    <el-dialog
+      v-model="showProjectDialog"
+      :title="$t('taskDetail.confirmAdoptTitle')"
+      width="420px"
+      :close-on-click-modal="!isAdopting"
+      :close-on-press-escape="!isAdopting"
+      :show-close="!isAdopting"
+      @close="cancelProjectAdoption">
+      <el-form>
+        <el-form-item :label="$t('generatedTestCases.belongsToProject')" required>
+          <el-select
+            v-model="selectedProjectId"
+            :placeholder="$t('generatedTestCases.selectProject')"
+            style="width: 100%">
+            <el-option
+              v-for="project in projects"
+              :key="project.id"
+              :label="project.name"
+              :value="project.id" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="isAdopting" @click="cancelProjectAdoption">
+          {{ $t('taskDetail.btnCancelOperation') }}
+        </el-button>
+        <el-button
+          type="primary"
+          :disabled="isAdopting"
+          @click="confirmProjectAdoption">
+          {{ isAdopting ? $t('generatedTestCases.adopting') : $t('taskDetail.btnConfirm') }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -258,6 +301,12 @@ import api from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { DocumentCopy } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx'
+import {
+  buildCaseAdoptionPayload,
+  chunkCaseIds,
+  normalizeCanonicalCases,
+  serializeCaseTable
+} from '@/utils/generated-case-adoption.mjs'
 
 export default {
   name: 'TaskDetail',
@@ -266,7 +315,14 @@ export default {
       taskId: '',
       task: {},
       testCases: [],
-      selectedCases: [],
+      selectedCaseIds: [],
+      adoptedCaseIds: [],
+      projects: [],
+      pendingAdoptionCaseIds: [],
+      selectedProjectId: '',
+      isAdopting: false,
+      isPreparingAdoption: false,
+      showProjectDialog: false,
       isLoading: true,
       showCaseDetail: false,
       selectedCase: {},
@@ -289,10 +345,20 @@ export default {
   },
 
   computed: {
-    isAllSelected() {
-      return this.testCases.length > 0 && this.selectedCases.length === this.testCases.length
+    adoptableCases() {
+      return this.testCases.filter(testCase => !this.isCaseAdopted(testCase))
     },
 
+    selectedCases() {
+      return this.testCases.filter(testCase =>
+        this.selectedCaseIds.includes(testCase.caseId) && !this.isCaseAdopted(testCase)
+      )
+    },
+
+    isAllSelected() {
+      return this.adoptableCases.length > 0 &&
+        this.adoptableCases.every(testCase => this.selectedCaseIds.includes(testCase.caseId))
+    },
     totalPages() {
       return Math.ceil(this.testCases.length / this.pageSize)
     },
@@ -346,11 +412,11 @@ export default {
         // 获取任务基本信息
         const taskResponse = await api.get(`/requirement-analysis/testcase-generation/${this.taskId}/`)
         this.task = taskResponse.data
-
-        // 解析最终测试用例
-        if (this.task.final_test_cases) {
-          this.testCases = this.parseTestCases(this.task.final_test_cases)
-        }
+        this.adoptedCaseIds = Array.isArray(this.task.adopted_case_ids)
+          ? this.task.adopted_case_ids
+          : []
+        this.testCases = normalizeCanonicalCases(this.task.canonical_cases)
+        this.selectedCaseIds = []
       } catch (error) {
         console.error('Failed to load task details:', error)
         ElMessage.error(this.$t('taskDetail.loadFailed'))
@@ -506,20 +572,18 @@ export default {
       return formatted
     },
 
-    toggleSelectAll() {
-      if (this.isAllSelected) {
-        this.selectedCases = []
-      } else {
-        this.selectedCases = [...this.testCases]
-      }
+    isCaseAdopted(testCase) {
+      return this.adoptedCaseIds.includes(testCase.caseId)
     },
 
-    updateSelectAll() {
-      // 这个方法会在单个checkbox变化时触发，用于更新全选状态
-      // Vue的v-model会自动处理selectedCases数组的更新
+    toggleSelectAll() {
+      this.selectedCaseIds = this.isAllSelected
+        ? []
+        : this.adoptableCases.map(testCase => testCase.caseId)
     },
 
     async batchAdopt() {
+      if (this.isAdopting || this.isPreparingAdoption || this.showProjectDialog) return
       if (this.selectedCases.length === 0) {
         ElMessage.warning(this.$t('taskDetail.pleaseSelectFirst', { action: this.$t('taskDetail.adopt') }))
         return
@@ -539,31 +603,98 @@ export default {
         return
       }
 
+      await this.beginAdoption(this.selectedCases.map(testCase => testCase.caseId))
+    },
+
+    async beginAdoption(caseIds) {
+      if (this.isAdopting || this.isPreparingAdoption || this.showProjectDialog) return
+      this.pendingAdoptionCaseIds = [...new Set(caseIds)]
+      if (this.task.project) {
+        await this.submitAdoption()
+        return
+      }
+
+      this.isPreparingAdoption = true
       try {
-        const casesData = this.selectedCases.map((testCase, index) => ({
-          title: testCase.scenario || `Test Case ${index + 1}`,
-          description: testCase.scenario || '',
-          preconditions: testCase.precondition || '',
-          steps: testCase.steps || '',
-          expected_result: testCase.expected || '',
-          priority: this.mapPriority(testCase.priority),
-          test_type: 'functional',
-          status: 'draft'
-        }))
-
-        await api.post(`/requirement-analysis/testcase-generation/${this.taskId}/batch-adopt-selected/`, {
-          test_cases: casesData
-        })
-
-        ElMessage.success(this.$t('taskDetail.adoptSuccess', { count: this.selectedCases.length }))
-        this.selectedCases = []
-
-        // Keep adopted cases in the list for multiple adoptions
-        // this.testCases = this.testCases.filter(tc => !this.selectedCases.includes(tc))
-
+        const response = await api.get('/projects/list/')
+        this.projects = Array.isArray(response.data.results)
+          ? response.data.results
+          : (Array.isArray(response.data) ? response.data : [])
       } catch (error) {
-        console.error('Batch adopt failed:', error)
-        ElMessage.error(this.$t('taskDetail.batchAdoptFailed') + ': ' + (error.response?.data?.message || error.message))
+        this.pendingAdoptionCaseIds = []
+        const detail = error.response?.data?.error || error.message
+        ElMessage.error(`${this.$t('generatedTestCases.fetchProjectsFailed')}: ${detail}`)
+        return
+      } finally {
+        this.isPreparingAdoption = false
+      }
+
+      if (this.projects.length === 0) {
+        this.pendingAdoptionCaseIds = []
+        ElMessage.error(this.$t('taskDetail.noProjectsAvailable'))
+        return
+      }
+      this.selectedProjectId = ''
+      this.showProjectDialog = true
+    },
+
+    async confirmProjectAdoption() {
+      if (!this.selectedProjectId) {
+        ElMessage.warning(this.$t('generatedTestCases.selectProjectRequired'))
+        return
+      }
+      if (await this.submitAdoption()) {
+        this.showProjectDialog = false
+      }
+    },
+
+    cancelProjectAdoption() {
+      if (this.isAdopting) return
+      this.showProjectDialog = false
+      this.pendingAdoptionCaseIds = []
+      this.selectedProjectId = ''
+    },
+
+    async submitAdoption() {
+      if (this.isAdopting || this.isPreparingAdoption || this.pendingAdoptionCaseIds.length === 0) return false
+      this.isAdopting = true
+      try {
+        const projectId = this.task.project ? null : this.selectedProjectId
+        let result
+        for (const caseIds of chunkCaseIds(this.pendingAdoptionCaseIds)) {
+          const response = await api.post(
+            `/requirement-analysis/testcase-generation/${this.taskId}/batch-adopt-selected/`,
+            buildCaseAdoptionPayload(caseIds, projectId)
+          )
+          result = response.data
+          this.adoptedCaseIds = Array.isArray(result.adopted_case_ids)
+            ? result.adopted_case_ids
+            : this.adoptedCaseIds
+          this.task.adopted_case_ids = this.adoptedCaseIds
+          this.task.is_saved_to_records = this.adoptedCaseIds.length > 0
+          this.selectedCaseIds = this.selectedCaseIds.filter(caseId => !this.adoptedCaseIds.includes(caseId))
+        }
+
+        if (result.already_adopted) {
+          ElMessage.info(this.$t('taskDetail.alreadyAdopted'))
+        } else if (result.remaining_count > 0) {
+          ElMessage.success(this.$t('taskDetail.adoptPartialSuccess', {
+            count: result.adopted_count,
+            remaining: result.remaining_count
+          }))
+        } else {
+          ElMessage.success(this.$t('taskDetail.adoptSuccess', { count: result.adopted_count }))
+        }
+        this.pendingAdoptionCaseIds = []
+        this.selectedProjectId = ''
+        return true
+      } catch (error) {
+        console.error('Case adoption failed:', error)
+        const detail = error.response?.data?.error || error.response?.data?.detail || error.message
+        ElMessage.error(`${this.$t('taskDetail.batchAdoptFailed')}: ${detail}`)
+        return false
+      } finally {
+        this.isAdopting = false
       }
     },
 
@@ -611,12 +742,9 @@ export default {
         } else {
           ElMessage.success(this.$t('taskDetail.discardSuccess', { count: response.data.discarded_count }))
 
-          // 重新解析更新后的测试用例
-          if (response.data.updated_test_cases) {
-            this.testCases = this.parseTestCases(response.data.updated_test_cases)
-            this.selectedCases = []
-            this.currentPage = 1 // 重置到第一页
-          }
+          await this.loadTaskDetail()
+          this.selectedCaseIds = []
+          this.currentPage = 1
         }
 
       } catch (error) {
@@ -727,7 +855,6 @@ export default {
     generateTestCasesString() {
       if (this.testCases.length === 0) return ''
 
-      // 表头
       const headers = [
         this.$t('taskDetail.tableCaseId'),
         this.$t('taskDetail.tableScenario'),
@@ -736,23 +863,15 @@ export default {
         this.$t('taskDetail.tableExpected'),
         this.$t('taskDetail.tablePriority')
       ]
-      let result = headers.join(' | ') + '\n'
-      result += '|'.repeat(headers.length) + '\n'
-
-      // 数据行
-      this.testCases.forEach((testCase, index) => {
-        const row = [
-          testCase.caseId || `TC${String(index + 1).padStart(3, '0')}`,
-          testCase.scenario || '',
-          testCase.precondition || '',
-          testCase.steps || '',
-          testCase.expected || '',
-          testCase.priority || 'P2'
-        ]
-        result += row.join(' | ') + '\n'
-      })
-
-      return result
+      const rows = this.testCases.map((testCase, index) => ([
+        testCase.caseId || `TC${String(index + 1).padStart(3, '0')}`,
+        testCase.scenario || '',
+        testCase.precondition || '',
+        testCase.steps || '',
+        testCase.expected || '',
+        testCase.priority || 'P2'
+      ]))
+      return serializeCaseTable(headers, rows)
     },
 
     // 将HTML的<br>标签转换为换行符
@@ -767,7 +886,8 @@ export default {
       return text.replace(/\n/g, '<br>')
     },
 
-    async adoptSingleCase(testCase, index) {
+    async adoptSingleCase(testCase) {
+      if (this.isAdopting || this.isPreparingAdoption || this.showProjectDialog || this.isCaseAdopted(testCase)) return
       try {
         await ElMessageBox.confirm(
           this.$t('taskDetail.confirmAdoptSingle', { scenario: testCase.scenario }),
@@ -782,28 +902,7 @@ export default {
         return
       }
 
-      try {
-        const caseData = {
-          title: testCase.scenario || `测试用例${index + 1}`,
-          description: testCase.scenario || '',
-          preconditions: testCase.precondition || '',
-          steps: testCase.steps || '',
-          expected_result: testCase.expected || '',
-          priority: this.mapPriority(testCase.priority),
-          test_type: 'functional',
-          status: 'draft'
-        }
-
-        await api.post('/testcases/', caseData)
-        ElMessage.success(this.$t('taskDetail.adoptSuccess', { count: 1 }))
-
-        // 不再移除已采纳的用例，保留在列表中供多次采纳
-        // this.testCases.splice(this.testCases.indexOf(testCase), 1)
-
-      } catch (error) {
-        console.error('Adopt case failed:', error)
-        ElMessage.error(this.$t('taskDetail.adoptFailed') + ': ' + (error.response?.data?.message || error.message))
-      }
+      await this.beginAdoption([testCase.caseId])
     },
 
     async discardSingleCase(testCase, index) {
@@ -838,15 +937,9 @@ export default {
         } else {
           ElMessage.success(this.$t('taskDetail.caseDiscardedSuccess'))
 
-          // 重新解析更新后的测试用例
-          if (response.data.updated_test_cases) {
-            this.testCases = this.parseTestCases(response.data.updated_test_cases)
-
-            // 如果当前页没有数据了，回到上一页
-            if (this.currentPage > 1 && this.paginatedTestCases.length === 0) {
-              this.currentPage--
-            }
-          }
+          await this.loadTaskDetail()
+          this.selectedCaseIds = []
+          this.currentPage = Math.min(this.currentPage, Math.max(this.totalPages, 1))
         }
 
       } catch (error) {
@@ -1226,6 +1319,20 @@ export default {
 
 .table-row:hover {
   background: #f8f9fa;
+}
+
+.table-row.adopted {
+  background: #f1f7f2;
+}
+
+.adopted-case-tag {
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #e2f3e8;
+  color: #276749;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .header-cell, .body-cell {

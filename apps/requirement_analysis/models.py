@@ -409,6 +409,9 @@ class TestCaseGenerationTask(models.Model):
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
     is_saved_to_records = models.BooleanField(default=False, verbose_name='是否已保存到记录')
+    adopted_case_ids = models.JSONField(default=list, blank=True, verbose_name='已采纳用例编号')
+    celery_task_id = models.CharField(max_length=100, blank=True, default='', verbose_name='Celery任务ID')
+    worker_claim_id = models.CharField(max_length=64, blank=True, default='', verbose_name='Worker执行认领ID')
     saved_at = models.DateTimeField(null=True, blank=True, verbose_name='保存到记录时间')
 
     class Meta:
@@ -826,8 +829,7 @@ class AIModelService:
             return response['choices'][0]['message']['content']
         except Exception as e:
             logger.error(f"评审测试用例时出错: {e}")
-            # 返回一个默认的评审结果
-            return f"评审过程中出现错误: {str(e)}\n\n建议：测试用例结构完整，可以使用。"
+            raise
 
     @staticmethod
     async def generate_test_cases_stream(
@@ -972,7 +974,7 @@ class AIModelService:
                 chunk_count += 1
         except Exception as e:
             logger.error(f"流式评审测试用例时出错: {e}")
-            return f"评审过程中出现错误: {str(e)}\n\n建议：测试用例结构完整，可以使用。"
+            raise
         finally:
             # 确保生成器被正确关闭
             try:
@@ -1066,8 +1068,7 @@ class AIModelService:
                 chunk_count += 1
         except Exception as e:
             logger.error(f"根据评审意见改进测试用例时出错: {e}")
-            # 改进失败时返回原始用例
-            return original_test_cases
+            raise
         finally:
             # 确保生成器被正确关闭
             try:

@@ -1,4 +1,4 @@
-"""Run durable API/UI/APP/performance schedule dispatches.
+"""Run durable API/UI/APP/performance dispatches and generation recovery.
 
 The command is intentionally a poller only. Every due row is claimed with a
 DB-backed lease before any external/Celery work is started; no process-local
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = '运行所有模块的定时任务调度器（API测试 + UI自动化 + APP自动化 + 性能测试）'
+    help = '运行所有模块的定时任务调度器（API测试 + UI自动化 + APP自动化 + 性能测试 + 用例生成恢复）'
 
     def add_arguments(self, parser):
         parser.add_argument('--interval', type=int, default=60, help='检查间隔（秒），默认60秒')
@@ -36,7 +36,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS('=' * 60))
         self.stdout.write(self.style.SUCCESS('启动统一定时任务调度器'))
         self.stdout.write(self.style.SUCCESS(f'检查间隔: {interval}秒'))
-        self.stdout.write(self.style.SUCCESS('调度模块: API测试 + UI自动化 + APP自动化 + 性能测试'))
+        self.stdout.write(self.style.SUCCESS('调度模块: API测试 + UI自动化 + APP自动化 + 性能测试 + 用例生成恢复'))
         self.stdout.write(self.style.SUCCESS('=' * 60))
 
         while True:
@@ -45,6 +45,7 @@ class Command(BaseCommand):
                 now = timezone.localtime(timezone.now())
                 self.stdout.write(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开始检查任务...")
                 retry_count = self.consume_retry_outbox()
+                generation_recovery_count = self.recover_stale_generation_tasks()
                 self.reconcile_execution_claims()
                 self.dispatch_pending_notifications()
                 self.reconcile_performance_callbacks()
@@ -54,11 +55,12 @@ class Command(BaseCommand):
                     self.schedule_app_tasks(),
                     self.schedule_perf_tasks(),
                 )
-                total_count = sum(counts) + retry_count
+                total_count = sum(counts) + retry_count + generation_recovery_count
                 if total_count:
                     self.stdout.write(self.style.SUCCESS(
                         f'✓ 本次调度执行了 {total_count} 个任务 '
-                        f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, retry: {retry_count})'))
+                        f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, '
+                        f'retry: {retry_count}, generation recovery: {generation_recovery_count})'))
                 else:
                     self.stdout.write('  没有需要执行的任务')
                 if run_once:
@@ -108,6 +110,19 @@ class Command(BaseCommand):
             return reconciled
         except Exception as exc:  # noqa: BLE001 - scheduler loop remains available
             logger.error('performance unified completion reconciliation failed: %s', exc, exc_info=True)
+            return 0
+
+    def recover_stale_generation_tasks(self):
+        try:
+            from apps.requirement_analysis.tasks import recover_stale_generation_tasks
+
+            result = recover_stale_generation_tasks.run()
+            requeued = int((result or {}).get('requeued', 0))
+            if requeued:
+                logger.info('stale requirement-generation tasks requeued: %s', requeued)
+            return requeued
+        except Exception as exc:  # noqa: BLE001 - recovery cannot stop other scheduling
+            logger.error('requirement-generation recovery failed: %s', exc, exc_info=True)
             return 0
 
     def consume_retry_outbox(self):

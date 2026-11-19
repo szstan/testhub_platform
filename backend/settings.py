@@ -414,6 +414,21 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_TASK_TRACK_STARTED = config('CELERY_TASK_TRACK_STARTED', default=True, cast=bool)
 CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
+# The documented Celery worker consumes the built-in ``celery`` queue.
+REQUIREMENT_GENERATION_QUEUE = 'celery'
+REQUIREMENT_GENERATION_WRITER_TIMEOUT_SECONDS = config(
+    'REQUIREMENT_GENERATION_WRITER_TIMEOUT_SECONDS', default=900, cast=int,
+)
+REQUIREMENT_GENERATION_PROVIDER_RETRIES = config(
+    'REQUIREMENT_GENERATION_PROVIDER_RETRIES', default=1, cast=int,
+)
+REQUIREMENT_GENERATION_STALE_AFTER_SECONDS = config(
+    'REQUIREMENT_GENERATION_STALE_AFTER_SECONDS', default=8160, cast=int,
+)
+CELERY_TASK_ROUTES = {
+    'apps.requirement_analysis.tasks.generate_test_case_task': {'queue': REQUIREMENT_GENERATION_QUEUE},
+    'apps.requirement_analysis.tasks.recover_stale_generation_tasks': {'queue': REQUIREMENT_GENERATION_QUEUE},
+}
 # Durable unified-execution dispatch routes. Format: ``api=package.task,ui=package.task``.
 # An empty default is fail-closed: the API reports unsupported until a
 # source-specific worker task contract is explicitly deployed.
