@@ -1203,12 +1203,76 @@ const clearCollectionChildren = (collection) => {
   }
 }
 
+let requestLoadGeneration = 0
+
 const loadRequests = async () => {
-  if (!selectedProject.value) return
+  const projectId = selectedProject.value
+  if (!projectId) return
+
+  const loadGeneration = ++requestLoadGeneration
 
   try {
-    const response = await api.get('/api-testing/requests/')
-    const requests = response.data.results || response.data || []
+    const requestsById = new Map()
+    const requestsWithoutId = []
+    const pageKey = pageParams => JSON.stringify(
+      Object.entries(pageParams).map(([key, value]) => [key, String(value)]).sort(([a], [b]) => a.localeCompare(b))
+    )
+    let params = { project: projectId, page: 1 }
+    const visitedPages = new Set([pageKey(params)])
+    let expectedCount = null
+    let pagesLoaded = 0
+
+    while (true) {
+      if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+
+      const response = await api.get('/api-testing/requests/', { params })
+      if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+
+      const data = response.data
+      if (Array.isArray(data)) {
+        data.forEach(request => {
+          if (request?.id == null) requestsWithoutId.push(request)
+          else requestsById.set(request.id, request)
+        })
+        break
+      }
+      if (!Array.isArray(data?.results)) {
+        throw new Error('请求列表响应格式异常')
+      }
+
+      pagesLoaded += 1
+      if (data.count != null && Number.isFinite(Number(data.count))) {
+        expectedCount = Number(data.count)
+      }
+
+      data.results.forEach(request => {
+        if (request?.id == null) requestsWithoutId.push(request)
+        else requestsById.set(request.id, request)
+      })
+
+      if (!data.next) {
+        const loadedCount = requestsById.size + requestsWithoutId.length
+        if (expectedCount != null && loadedCount < expectedCount) {
+          throw new Error('请求列表分页数据不完整')
+        }
+        break
+      }
+      if (pagesLoaded >= 1000) {
+        throw new Error('请求列表分页超过最大页数')
+      }
+
+      const nextUrl = new URL(data.next, 'http://testhub.local')
+      const nextParams = Object.fromEntries(nextUrl.searchParams.entries())
+      const nextPageKey = pageKey(nextParams)
+      if (!nextUrl.search || visitedPages.has(nextPageKey)) {
+        throw new Error('请求列表分页链接无效或重复')
+      }
+      visitedPages.add(nextPageKey)
+      params = nextParams
+    }
+
+    if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+    const requests = [...requestsById.values(), ...requestsWithoutId]
 
     // 清空所有集合的子节点（请求）
     collections.value.forEach(collection => {
@@ -1241,6 +1305,7 @@ const loadRequests = async () => {
       }
     })
   } catch (error) {
+    if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
     ElMessage.error('加载请求失败')
     console.error('加载请求失败:', error)
   }
@@ -2717,6 +2782,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  requestLoadGeneration += 1
   // 移除全局点击事件监听器
   document.removeEventListener('click', handleGlobalClick)
   document.removeEventListener('contextmenu', handleGlobalClick)
