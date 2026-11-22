@@ -20,7 +20,7 @@ from .models import (
     ScheduledTask, TaskExecutionLog, NotificationLog,
     TaskNotificationSetting, OperationLog, AIServiceConfig,
 )
-from .utils import can_use_environment, redact_assertion_results
+from .utils import can_access_api_project, can_use_environment, redact_assertion_results
 
 User = get_user_model()
 
@@ -203,6 +203,12 @@ class TestSuiteSerializer(serializers.ModelSerializer):
         user = getattr(request, 'user', None)
         project = attrs.get('project', getattr(self.instance, 'project', None))
         environment = attrs.get('environment', getattr(self.instance, 'environment', None))
+        if not can_access_api_project(project, user):
+            raise serializers.ValidationError({'project': '无权使用目标项目'})
+        if self.instance and self.instance.testsuiterequest_set.exclude(
+            request__collection__project_id=project.pk
+        ).exists():
+            raise serializers.ValidationError({'project': '测试套件中的所有请求必须属于目标项目'})
         if environment and not can_use_environment(environment, user, project=project):
             raise serializers.ValidationError({'environment': '无权使用该执行环境'})
         return attrs

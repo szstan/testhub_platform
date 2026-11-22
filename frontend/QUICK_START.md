@@ -9,13 +9,13 @@ cd frontend
 ./deploy.sh start
 ```
 
-访问：http://localhost
+访问：http://localhost:8003
 
 ### 开发环境
 
 ```bash
 cd frontend
-./deploy.sh dev
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 访问：http://localhost:3000
@@ -37,7 +37,9 @@ cd frontend
 ./deploy.sh start
 
 # 方式2: 使用 docker compose
-docker compose up -d --build
+npm ci
+npm run build
+docker compose up -d
 ```
 
 **特点：**
@@ -45,16 +47,12 @@ docker compose up -d --build
 - ✅ Nginx 静态文件服务
 - ✅ Gzip 压缩
 - ✅ 资源缓存
-- 🌐 端口：80
+- 🌐 端口：8003
 
 #### 开发模式（推荐用于开发）
 
 ```bash
-# 方式1: 使用脚本
-./deploy.sh dev
-
-# 方式2: 使用 docker compose
-docker compose -f docker compose.dev.yml up -d --build
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 **特点：**
@@ -79,7 +77,7 @@ docker compose logs -f
 
 ### 4. 访问应用
 
-- **生产环境**: http://localhost
+- **生产环境**: http://localhost:8003
 - **开发环境**: http://localhost:3000
 
 ## 🛠️ 常用操作
@@ -128,7 +126,7 @@ docker compose down -v --rmi local
 
 ### 修改端口
 
-编辑 `docker compose.yml`：
+编辑 `docker-compose.yml` 中 `frontend.ports`：
 
 ```yaml
 services:
@@ -139,7 +137,7 @@ services:
 
 ### 配置 API 地址
 
-编辑 `nginx.conf`：
+编辑 `nginx.conf` 中 `/api/` 的 `proxy_pass`：
 
 ```nginx
 location /api/ {
@@ -147,16 +145,9 @@ location /api/ {
 }
 ```
 
-### 添加环境变量
+### 开发代理目标
 
-编辑 `docker compose.yml`：
-
-```yaml
-services:
-  frontend:
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8000
-```
+开发 Compose 文件通过 `VITE_API_PROXY_TARGET` 将 Vite 代理指向 `http://host.docker.internal:8000`。如后端地址或端口不同，请修改 `docker-compose.dev.yml` 中的值。生产镜像提供预构建静态文件，运行时容器环境变量不会更改前端 bundle；生产 API 目标由 `nginx.conf` 控制。
 
 ## ❓ 常见问题
 
@@ -164,7 +155,7 @@ services:
 
 ```bash
 # 查看端口占用
-lsof -i :80
+lsof -i :8003
 
 # 修改端口或停止占用进程
 ```
@@ -190,7 +181,7 @@ docker compose logs frontend
 
 ```bash
 # 重启容器
-docker compose -f docker compose.dev.yml restart
+docker compose -f docker-compose.dev.yml restart
 ```
 
 ## 📚 更多信息
@@ -208,8 +199,8 @@ docker compose -f docker compose.dev.yml restart
 ## 💡 提示
 
 - 生产环境建议使用 `./deploy.sh start`
-- 开发环境建议使用 `./deploy.sh dev`
+- 开发环境建议使用 `docker compose -f docker-compose.dev.yml up -d --build`
 - 使用 `./deploy.sh` 可以打开交互式菜单
-- 所有操作都可以通过脚本或 docker compose 命令完成
+- 生产操作通过脚本或生产 Compose 文件完成；开发环境使用开发 Compose 文件
 
 祝你使用愉快！🎉

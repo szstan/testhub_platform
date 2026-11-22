@@ -121,6 +121,13 @@ class DefectViewSet(viewsets.ModelViewSet):
         'add_comment': {'assignee', 'reporter'},
         'upload_attachment': {'assignee', 'reporter'},
     }
+    BULK_ACTION_PERMISSIONS = {
+        'assign': ({'owner', 'admin', 'tester'}, ACTION_SELF_ROLES['assign']),
+        'close': ({'owner', 'admin', 'tester'}, ACTION_SELF_ROLES['close']),
+        'reopen': ({'owner', 'admin', 'tester', 'developer'}, ACTION_SELF_ROLES['reopen']),
+        'set_priority': ({'owner', 'admin', 'developer', 'tester'}, None),
+        'set_version': ({'owner', 'admin', 'developer', 'tester'}, None),
+    }
 
     def get_serializer_class(self):
         if self.action in ('create', 'update', 'partial_update'):
@@ -600,6 +607,14 @@ class DefectViewSet(viewsets.ModelViewSet):
     def apply_bulk_action(self, defect, data):
         action_name = data['action']
         comment = data.get('comment', '')
+        permission = self.BULK_ACTION_PERMISSIONS.get(action_name)
+        if permission is None:
+            return {'success': False, 'error': '不支持的批量动作'}
+        allowed_roles, self_roles = permission
+        role_error = self.ensure_defect_action_permission(defect, allowed_roles, self_roles=self_roles)
+        if role_error:
+            return {'success': False, 'error': role_error.data.get('error', '无权执行该操作')}
+
         if action_name == 'assign':
             assignee = self.get_user(data.get('assignee_id'), required=True)
             if isinstance(assignee, Response):

@@ -226,3 +226,58 @@ def test_openapi_contract_detects_inline_request_response_and_parameter_schema_c
     assert 'schema type changed: POST /items/ parameter query:limit string->integer' in changes
     assert 'schema type changed: POST /items/ request body application/json.id string->integer' in changes
     assert 'schema type changed: POST /items/ response 200 application/json.id string->integer' in changes
+
+
+def test_openapi_contract_detects_tightened_request_constraints():
+    previous = {
+        'paths': {'/items/': {'post': {
+            'parameters': [{'in': 'query', 'name': 'limit', 'schema': {
+                'type': 'integer', 'minimum': 0, 'maximum': 100,
+            }}],
+            'requestBody': {'content': {'application/json': {'schema': {
+                'type': 'object', 'properties': {
+                    'name': {'type': 'string', 'maxLength': 100},
+                    'code': {'type': 'string'},
+                },
+            }}}},
+            'responses': {'200': {}},
+        }}},
+    }
+    current = {
+        'paths': {'/items/': {'post': {
+            'parameters': [{'in': 'query', 'name': 'limit', 'schema': {
+                'type': 'integer', 'minimum': 1, 'maximum': 50,
+            }}],
+            'requestBody': {'content': {'application/json': {'schema': {
+                'type': 'object', 'properties': {
+                    'name': {'type': 'string', 'maxLength': 20},
+                    'code': {'type': 'string', 'pattern': '^[A-Z]+$'},
+                },
+            }}}},
+            'responses': {'200': {}},
+        }}},
+    }
+
+    changes = find_breaking_changes(previous, current)
+
+    assert 'validation constraint tightened: POST /items/ parameter query:limit.minimum 0->1' in changes
+    assert 'validation constraint tightened: POST /items/ parameter query:limit.maximum 100->50' in changes
+    assert 'validation constraint tightened: POST /items/ request body application/json.name.maxLength 100->20' in changes
+    assert 'validation pattern changed: POST /items/ request body application/json.code.pattern' in changes
+
+
+def test_openapi_contract_allows_widened_constraints():
+    previous = {
+        'components': {'schemas': {'Item': {'type': 'object', 'properties': {
+            'name': {'type': 'string', 'maxLength': 10, 'pattern': '^[a-z]+$'},
+            'quantity': {'type': 'integer', 'minimum': 1},
+        }}}},
+    }
+    current = {
+        'components': {'schemas': {'Item': {'type': 'object', 'properties': {
+            'name': {'type': 'string', 'maxLength': 100},
+            'quantity': {'type': 'integer', 'minimum': 0},
+        }}}},
+    }
+
+    assert find_breaking_changes(previous, current) == []

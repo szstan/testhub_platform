@@ -87,6 +87,14 @@ jobs:
             --ignore=apps/executions/tests/test_source_boundary_integrity.py \
             --ignore=scripts/tests/test_release_integrity.py
 
+      - name: Test analytics ingestion throttling
+        env:
+          SECRET_KEY: ci-only-not-for-production
+          DEBUG: 'True'
+          ALLOWED_HOSTS: 127.0.0.1,localhost
+          ANALYTICS_ENABLED: 'True'
+        run: python -m pytest -q --create-db apps/analytics/tests.py
+
       - name: Check OpenAPI contract compatibility
         env:
           APP_ENV: development
@@ -311,6 +319,10 @@ jobs:
       - name: Test frontend execution workflows
         working-directory: ${{ github.workspace }}
         run: npm --prefix frontend run test:execution-workflows
+
+      - name: Test frontend interface management pagination
+        working-directory: ${{ github.workspace }}
+        run: npm --prefix frontend run test:interface-management-pagination
 
       - name: Lint frontend
         run: npm run lint

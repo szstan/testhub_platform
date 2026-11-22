@@ -264,7 +264,6 @@
                     v-model="formData"
                     :placeholder-key="$t('apiTesting.interface.key')"
                     :placeholder-value="$t('apiTesting.interface.value')"
-                    :show-file="true"
                   />
                 </div>
 
@@ -1087,18 +1086,94 @@ const onSearch = async (value) => {
 }
 
 const selectSearchResult = (item) => {
+  detailLoadGeneration += 1
+  resetBodyState()
+  response.value = null
   selectedRequest.value = item
   searchKeyword.value = ''
   filteredCollections.value = []
 }
 
+let requestLoadGeneration = 0
+let projectLoadGeneration = 0
+let detailLoadGeneration = 0
+
+const resetBodyState = () => {
+  bodyType.value = 'none'
+  rawType.value = 'text'
+  formData.value = []
+  formUrlEncoded.value = []
+  rawBody.value = ''
+}
+
+const isCurrentProjectLoad = (projectId, generation) =>
+  generation === projectLoadGeneration && projectId === selectedProject.value
+
+const fetchAllPages = async (endpoint, initialParams = {}) => {
+  const resultsById = new Map()
+  const resultsWithoutId = []
+  const pageKey = params => JSON.stringify(
+    Object.entries(params).map(([key, value]) => [key, String(value)]).sort(([a], [b]) => a.localeCompare(b))
+  )
+  let params = { ...initialParams }
+  const visitedPages = new Set([pageKey(params)])
+  let expectedCount = null
+  let pagesLoaded = 0
+
+  while (true) {
+    const response = await api.get(endpoint, { params })
+    const data = response.data
+    if (Array.isArray(data)) return data
+    if (!Array.isArray(data?.results)) throw new Error('列表分页数据格式异常')
+
+    pagesLoaded += 1
+    if (data.count != null && Number.isFinite(Number(data.count))) {
+      expectedCount = Number(data.count)
+    }
+    data.results.forEach(item => {
+      if (item?.id == null) resultsWithoutId.push(item)
+      else resultsById.set(item.id, item)
+    })
+
+    if (!data.next) {
+      const loadedCount = resultsById.size + resultsWithoutId.length
+      if (expectedCount != null && loadedCount < expectedCount) {
+        throw new Error('列表分页数据不完整')
+      }
+      return [...resultsById.values(), ...resultsWithoutId]
+    }
+    if (pagesLoaded >= 1000) throw new Error('列表分页超过最大页数')
+
+    const nextUrl = new URL(data.next, 'http://testhub.local')
+    if (!nextUrl.search) throw new Error('列表分页链接无效')
+    const nextParams = { ...initialParams, ...Object.fromEntries(nextUrl.searchParams.entries()) }
+    const nextPageKey = pageKey(nextParams)
+    if (visitedPages.has(nextPageKey)) throw new Error('列表分页链接重复')
+    visitedPages.add(nextPageKey)
+    params = nextParams
+  }
+}
+
 const onProjectChange = async (projectId) => {
+  const generation = ++projectLoadGeneration
+  detailLoadGeneration += 1
+  selectedRequest.value = null
+  response.value = null
+  selectedEnvironment.value = null
+  collections.value = []
+  flatCollections.value = []
+  environments.value = []
+  filteredCollections.value = []
+  searchKeyword.value = ''
   if (!projectId) return
 
   try {
-    await loadCollections(projectId)
-    await loadEnvironments(projectId)
+    await Promise.all([
+      loadCollections(projectId, generation),
+      loadEnvironments(projectId, generation)
+    ])
   } catch (error) {
+    if (!isCurrentProjectLoad(projectId, generation)) return
     ElMessage.error('切换项目失败')
     console.error('切换项目失败:', error)
   }
@@ -1106,55 +1181,58 @@ const onProjectChange = async (projectId) => {
 
 const loadProjects = async () => {
   try {
-    const response = await api.get('/api-testing/projects/')
-    // 后端可能返回分页格式 { results: [...] } 或直接返回数组
-    projects.value = response.data.results || response.data || []
-    if (projects.value.length > 0) {
-      selectedProject.value = projects.value[0].id
-      await loadCollections(selectedProject.value)
-      await loadEnvironments(selectedProject.value)
+    projects.value = await fetchAllPages('/api-testing/projects/')
+    selectedProject.value = projects.value[0]?.id ?? null
+    const generation = ++projectLoadGeneration
+    detailLoadGeneration += 1
+    if (!selectedProject.value) {
+      collections.value = []
+      flatCollections.value = []
+      environments.value = []
+      selectedRequest.value = null
+      response.value = null
+      return
     }
+    await Promise.all([
+      loadCollections(selectedProject.value, generation),
+      loadEnvironments(selectedProject.value, generation)
+    ])
   } catch (error) {
     ElMessage.error('加载项目失败')
     console.error('加载项目失败:', error)
   }
 }
 
-const loadCollections = async (projectId) => {
-  try {
-    const response = await api.get('/api-testing/collections/', {
-      params: {
-        project: projectId
-      }
-    })
-    // 后端可能返回分页格式 { results: [...] } 或直接返回数组
-    const collectionsData = response.data.results || response.data || []
+const loadCollections = async (projectId, generation = projectLoadGeneration) => {
+  if (!isCurrentProjectLoad(projectId, generation)) return
 
-    // 构建树形结构
+  try {
+    const collectionsData = await fetchAllPages('/api-testing/collections/', { project: projectId })
+    if (!isCurrentProjectLoad(projectId, generation)) return
+
     collections.value = buildTree(collectionsData)
     flatCollections.value = collectionsData
-
-    // 加载请求
-    await loadRequests()
+    await loadRequests(generation)
   } catch (error) {
+    if (!isCurrentProjectLoad(projectId, generation)) return
     ElMessage.error('加载集合失败')
     console.error('加载集合失败:', error)
   }
 }
 
-const loadEnvironments = async (projectId) => {
+const loadEnvironments = async (projectId, generation = projectLoadGeneration) => {
+  if (!isCurrentProjectLoad(projectId, generation)) return
+
   try {
-    // 不传递 project 参数，让后端返回所有可访问的环境（全局 + 当前用户项目），
-    // 否则 DjangoFilterBackend 的 project 过滤会把 project 为 null 的全局环境过滤掉。
-    const response = await api.get('/api-testing/environments/', {})
-    // 后端可能返回分页格式 { results: [...] } 或直接返回数组
-    const allEnvironments = response.data.results || response.data || []
-    // 过滤出全局环境 + 当前项目的局部环境
+    // Load every page before filtering so later pages cannot hide local environments.
+    const allEnvironments = await fetchAllPages('/api-testing/environments/')
+    if (!isCurrentProjectLoad(projectId, generation)) return
     environments.value = allEnvironments.filter(env =>
       env.scope === 'GLOBAL' ||
-      (env.scope === 'LOCAL' && (!projectId || env.project === projectId))
+      (env.scope === 'LOCAL' && env.project === projectId)
     )
   } catch (error) {
+    if (!isCurrentProjectLoad(projectId, generation)) return
     ElMessage.error('加载环境失败')
     console.error('加载环境失败:', error)
   }
@@ -1203,13 +1281,13 @@ const clearCollectionChildren = (collection) => {
   }
 }
 
-let requestLoadGeneration = 0
-
-const loadRequests = async () => {
+const loadRequests = async (projectGeneration = projectLoadGeneration) => {
   const projectId = selectedProject.value
-  if (!projectId) return
+  if (!projectId || !isCurrentProjectLoad(projectId, projectGeneration)) return
 
   const loadGeneration = ++requestLoadGeneration
+  const isCurrentLoad = () =>
+    loadGeneration === requestLoadGeneration && isCurrentProjectLoad(projectId, projectGeneration)
 
   try {
     const requestsById = new Map()
@@ -1223,10 +1301,10 @@ const loadRequests = async () => {
     let pagesLoaded = 0
 
     while (true) {
-      if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+      if (!isCurrentLoad()) return
 
       const response = await api.get('/api-testing/requests/', { params })
-      if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+      if (!isCurrentLoad()) return
 
       const data = response.data
       if (Array.isArray(data)) {
@@ -1271,7 +1349,7 @@ const loadRequests = async () => {
       params = nextParams
     }
 
-    if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+    if (!isCurrentLoad()) return
     const requests = [...requestsById.values(), ...requestsWithoutId]
 
     // 清空所有集合的子节点（请求）
@@ -1305,7 +1383,7 @@ const loadRequests = async () => {
       }
     })
   } catch (error) {
-    if (loadGeneration !== requestLoadGeneration || projectId !== selectedProject.value) return
+    if (!isCurrentLoad()) return
     ElMessage.error('加载请求失败')
     console.error('加载请求失败:', error)
   }
@@ -1325,81 +1403,55 @@ const flattenCollections = (items, parent = null) => {
 }
 
 const onNodeClick = async (data) => {
-  if (data.type === 'request') {
-    try {
-      const apiResponse = await api.get(`/api-testing/requests/${data.id}/`)
-      const requestData = apiResponse.data
+  const detailGeneration = ++detailLoadGeneration
+  if (data.type !== 'request') return
 
-      // 初始化currentHeaders
-      currentHeaders.value = requestData.headers || {}
+  try {
+    const apiResponse = await api.get(`/api-testing/requests/${data.id}/`)
+    if (detailGeneration !== detailLoadGeneration) return
+    const requestData = apiResponse.data
+    resetBodyState()
 
-      // 将 params 从字典格式转换为数组格式
-      if (requestData.params && typeof requestData.params === 'object' && !Array.isArray(requestData.params)) {
-        const paramsArray = []
-        Object.keys(requestData.params).forEach(key => {
-          if (key && requestData.params[key] !== undefined) {
-            paramsArray.push({
-              enabled: true,
-              key,
-              value: requestData.params[key],
-              description: '',
-              type: 'text'
-            })
-          }
-        })
-        requestData.params = paramsArray
-      }
+    currentHeaders.value = requestData.headers || {}
 
-      // 将 headers 从字典格式转换为数组格式
-      if (requestData.headers && typeof requestData.headers === 'object' && !Array.isArray(requestData.headers)) {
-        const headersArray = []
-        Object.keys(requestData.headers).forEach(key => {
-          if (key && requestData.headers[key] !== undefined) {
-            headersArray.push({
-              enabled: true,
-              key,
-              value: requestData.headers[key],
-              description: '',
-              type: 'text'
-            })
-          }
-        })
-        requestData.headers = headersArray
-      }
-
-      // 解析body数据
-      if (requestData.body && requestData.body.type) {
-        if (requestData.body.type === 'json' && requestData.body.data) {
-          bodyType.value = 'raw'
-          rawType.value = 'json'
-          rawBody.value = JSON.stringify(requestData.body.data, null, 2)
-        } else if (requestData.body.type === 'raw' && requestData.body.data) {
-          bodyType.value = 'raw'
-          rawType.value = 'text'
-          rawBody.value = requestData.body.data
-        } else if (requestData.body.type === 'form-data') {
-          bodyType.value = 'form-data'
-          formData.value = requestData.body.data || []
-        } else if (requestData.body.type === 'x-www-form-urlencoded') {
-          bodyType.value = 'x-www-form-urlencoded'
-          formUrlEncoded.value = requestData.body.data || []
-        } else if (requestData.body.type === 'binary') {
-          bodyType.value = 'binary'
-        } else {
-          bodyType.value = 'none'
-          rawBody.value = ''
-        }
-      } else {
-        bodyType.value = 'none'
-        rawBody.value = ''
-      }
-
-      response.value = null
-      selectedRequest.value = requestData
-    } catch (error) {
-      ElMessage.error('加载请求失败')
-      console.error('加载请求失败:', error)
+    if (requestData.params && typeof requestData.params === 'object' && !Array.isArray(requestData.params)) {
+      requestData.params = Object.entries(requestData.params)
+        .filter(([key, value]) => key && value !== undefined)
+        .map(([key, value]) => ({ enabled: true, key, value, description: '', type: 'text' }))
     }
+
+    if (requestData.headers && typeof requestData.headers === 'object' && !Array.isArray(requestData.headers)) {
+      requestData.headers = Object.entries(requestData.headers)
+        .filter(([key, value]) => key && value !== undefined)
+        .map(([key, value]) => ({ enabled: true, key, value, description: '', type: 'text' }))
+    }
+
+    if (requestData.body?.type === 'json') {
+      bodyType.value = 'raw'
+      rawType.value = 'json'
+      rawBody.value = Object.prototype.hasOwnProperty.call(requestData.body, 'data')
+        ? JSON.stringify(requestData.body.data, null, 2)
+        : ''
+    } else if (requestData.body?.type === 'raw') {
+      bodyType.value = 'raw'
+      rawType.value = 'text'
+      rawBody.value = requestData.body.data ?? ''
+    } else if (requestData.body?.type === 'form-data') {
+      bodyType.value = 'form-data'
+      formData.value = requestData.body.data || []
+    } else if (requestData.body?.type === 'x-www-form-urlencoded') {
+      bodyType.value = 'x-www-form-urlencoded'
+      formUrlEncoded.value = requestData.body.data || []
+    } else if (requestData.body?.type === 'binary') {
+      bodyType.value = 'binary'
+    }
+
+    response.value = null
+    selectedRequest.value = requestData
+  } catch (error) {
+    if (detailGeneration !== detailLoadGeneration) return
+    ElMessage.error('加载请求失败')
+    console.error('加载请求失败:', error)
   }
 }
 
@@ -1425,6 +1477,10 @@ const createEmptyRequest = () => {
     return
   }
 
+  detailLoadGeneration += 1
+  resetBodyState()
+  response.value = null
+  currentHeaders.value = {}
   const newRequest = {
     id: null,
     collection: null,
@@ -1436,7 +1492,8 @@ const createEmptyRequest = () => {
     pre_request_script: '',
     post_request_script: '',
     assertions: [],
-    request_type: 'HTTP'
+    request_type: 'HTTP',
+    body: { type: 'none', data: null }
   }
 
   selectedRequest.value = newRequest
@@ -1480,6 +1537,10 @@ const addRequest = () => {
     return
   }
 
+  detailLoadGeneration += 1
+  resetBodyState()
+  response.value = null
+  currentHeaders.value = {}
   const newRequest = {
     id: null,
     collection: parentNode.id,
@@ -1491,7 +1552,8 @@ const addRequest = () => {
     pre_request_script: '',
     post_request_script: '',
     assertions: [],
-    request_type: 'HTTP'
+    request_type: 'HTTP',
+    body: { type: 'none', data: null }
   }
 
   selectedRequest.value = newRequest
@@ -1795,6 +1857,10 @@ const getStatusType = (status) => {
 const sendRequest = async () => {
   if (!selectedRequest.value || !selectedRequest.value.url) {
     ElMessage.warning('请填写请求URL')
+    return
+  }
+  if (selectedRequest.value.id == null) {
+    ElMessage.warning('请先保存接口再发送请求')
     return
   }
 

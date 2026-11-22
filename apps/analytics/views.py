@@ -4,12 +4,26 @@ from django.conf import settings
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from .models import AnalyticsEvent
 from .serializers import AnalyticsEventCreateSerializer
 
 logger = logging.getLogger(__name__)
+
+
+class AnalyticsEventThrottle(SimpleRateThrottle):
+    scope = 'analytics_ingest'
+    rate = '60/minute'
+
+    def get_cache_key(self, request, view):
+        user = getattr(request, 'user', None)
+        if user is not None and getattr(user, 'is_authenticated', False):
+            ident = f'user:{user.pk}'
+        else:
+            ident = self.get_ident(request)
+        return self.cache_format % {'scope': self.scope, 'ident': ident}
 
 
 def get_client_ip(request):
@@ -21,6 +35,7 @@ def get_client_ip(request):
 
 class AnalyticsEventIngestView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [AnalyticsEventThrottle]
 
     def post(self, request):
         payload = request.data

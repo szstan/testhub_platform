@@ -216,6 +216,40 @@ class UiAuthorizationBoundaryTests(TestCase):
         self.assertEqual(allowed_stop.status_code, 200)
         self.assertTrue(STOP_SIGNALS.pop(record.id))
 
+    def test_locator_strategies_are_readable_but_only_admins_can_write(self):
+        client = APIClient()
+        strategies_url = '/api/ui-automation/locator-strategies/'
+        client.force_authenticate(user=self.member)
+
+        readable = client.get(strategies_url)
+        self.assertEqual(readable.status_code, 200)
+
+        denied_create = client.post(strategies_url, {'name': 'custom'}, format='json')
+        self.assertEqual(denied_create.status_code, 403)
+        denied_update = client.patch(
+            f'{strategies_url}{self.strategy.id}/',
+            {'name': 'changed-by-member'},
+            format='json',
+        )
+        self.assertEqual(denied_update.status_code, 403)
+        denied_delete = client.delete(f'{strategies_url}{self.strategy.id}/')
+        self.assertEqual(denied_delete.status_code, 403)
+        self.strategy.refresh_from_db()
+        self.assertEqual(self.strategy.name, 'css')
+
+        admin = User.objects.create_superuser(
+            username='ui-strategy-admin', email='ui-strategy-admin@example.com', password='pass'
+        )
+        client.force_authenticate(user=admin)
+        allowed_create = client.post(strategies_url, {'name': 'custom'}, format='json')
+        self.assertEqual(allowed_create.status_code, 201, allowed_create.data)
+        allowed_update = client.patch(
+            f'{strategies_url}{self.strategy.id}/',
+            {'name': 'xpath'},
+            format='json',
+        )
+        self.assertEqual(allowed_update.status_code, 200, allowed_update.data)
+
     def test_projectless_ai_execution_cannot_reference_another_users_case(self):
         ai_case = AICase.objects.create(
             name="private-ai", task_description="private task", created_by=self.owner

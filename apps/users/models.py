@@ -16,6 +16,14 @@ class User(AbstractUser):
         db_table = 'users_user'
         verbose_name = '用户'
         verbose_name_plural = '用户'
+        indexes = [models.Index(fields=['phone'], name='users_user_phone_idx')]
+
+
+class UserPhoneWriteLock(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True)
+
+    class Meta:
+        db_table = 'users_phone_write_lock'
 
 
 class RegistrationStatsProxy(User):

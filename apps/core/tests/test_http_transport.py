@@ -114,6 +114,26 @@ def test_requests_connection_uses_validated_numeric_address(monkeypatch, address
     assert ipaddress.ip_address(connect.call_args.args[0][0]).version == version
 
 
+def test_requests_connection_uses_prevalidated_address_without_dns(monkeypatch):
+    getaddrinfo = Mock(side_effect=AssertionError("hostname DNS must not be repeated"))
+    connect = Mock(return_value=_FakeSocket())
+    monkeypatch.setattr(network.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(urllib3_connection.connection, "create_connection", connect)
+
+    adapter = _PinnedHTTPAdapter(
+        pinned_host="public.example.test",
+        pinned_addresses=("93.184.216.34",),
+    )
+    request = requests.Request("GET", "http://public.example.test/").prepare()
+    pool = adapter.get_connection_with_tls_context(request, verify=True)
+    assert pool.conn_kw["pinned_addresses"] == ("93.184.216.34",)
+    connection = pool._new_conn()
+    assert isinstance(connection._new_conn(), _FakeSocket)
+    adapter.close()
+    getaddrinfo.assert_not_called()
+    assert connect.call_args.args[0] == ("93.184.216.34", 80)
+
+
 def test_requests_blocks_rebound_dns_before_socket_connect(monkeypatch):
     monkeypatch.setattr(
         network.socket,

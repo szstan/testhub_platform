@@ -6,6 +6,8 @@
 token_path=obj.token，_login 取不到 token 误判 DOWN。
 修复：配置路径取不到时按常见路径自动回退。
 """
+import socket
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -570,3 +572,95 @@ def test_run_assertions_partial_direct():
     assert passed == 1
     assert total == 2
     assert len(failures) == 1
+
+
+@pytest.mark.parametrize(("target_type", "port"), [("DOCKER", 2375), ("SL651", 10000)])
+def test_run_probe_rejects_private_cfg_host_override(monkeypatch, target_type, port):
+    target = SimpleNamespace(
+        type=target_type, host="public.example.test", url="", method="GET", port=port,
+    )
+
+    def resolve(host, resolved_port, **kwargs):
+        address = "10.20.30.40" if host == "internal.example.test" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, resolved_port))]
+
+    monkeypatch.setattr("apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS", False)
+    monkeypatch.setattr("apps.monitor.utils.probes.socket.getaddrinfo", resolve)
+    with mock.patch("apps.monitor.utils.probes.guarded_get") as guarded_get, \
+            mock.patch("apps.monitor.utils.probes.socket.create_connection") as connect:
+        result = run_probe(target, {"host": "internal.example.test"})
+
+    assert result.ok is False
+    assert "受限地址" in result.message
+    guarded_get.assert_not_called()
+    connect.assert_not_called()
+
+
+def test_docker_uses_the_resolved_validated_address(monkeypatch):
+    target = SimpleNamespace(type="DOCKER", host="docker.example.test", url="", port=None)
+    response = mock.Mock(status_code=200, text="[]")
+    response.json.return_value = []
+
+    monkeypatch.setattr("apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS", False)
+    monkeypatch.setattr(
+        "apps.monitor.utils.probes.socket.getaddrinfo",
+        lambda host, port, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))
+        ],
+    )
+    with mock.patch("apps.monitor.utils.probes.guarded_get", return_value=response) as guarded_get:
+        result = run_probe(target, {"host": "docker.example.test", "port": 2375})
+
+    assert result.ok is True
+    assert guarded_get.call_args.kwargs["pinned_addresses"] == ("93.184.216.34",)
+
+
+def test_sl651_connects_to_the_prevalidated_address_without_dns_reresolution(monkeypatch):
+    target = SimpleNamespace(type="SL651", host="target.example.test", url="", port=10000)
+    resolve_calls = []
+    sock = mock.Mock()
+    sock.recv.return_value = b"\x06"
+
+    def resolve(host, port, **kwargs):
+        resolve_calls.append((host, port))
+        if host == "override.example.test":
+            address = "10.0.0.9" if sum(h == host for h, _ in resolve_calls) > 1 else "93.184.216.35"
+        else:
+            address = "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port))]
+
+    monkeypatch.setattr("apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS", False)
+    monkeypatch.setattr("apps.monitor.utils.probes.socket.getaddrinfo", resolve)
+    with mock.patch("apps.monitor.utils.probes.socket.create_connection", return_value=sock) as connect:
+        result = run_probe(target, {"host": "override.example.test", "port": 10001})
+
+    assert result.ok is True
+    assert [call for call in resolve_calls if call[0] == "override.example.test"] == [
+        ("override.example.test", 10001),
+    ]
+    connect.assert_called_once_with(("93.184.216.35", 10001), timeout=15)
+
+
+def test_sl651_respects_allow_private_targets(monkeypatch):
+    target = SimpleNamespace(type="SL651", host="10.0.0.8", url="", port=10000)
+    sock = mock.Mock()
+    sock.recv.return_value = b"\x06"
+    monkeypatch.setattr("apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS", True)
+    with mock.patch("apps.monitor.utils.probes.socket.create_connection", return_value=sock) as connect:
+        result = run_probe(target, {})
+
+    assert result.ok is True
+    connect.assert_called_once_with(("10.0.0.8", 10000), timeout=15)
+
+
+def test_docker_respects_allow_private_targets(monkeypatch):
+    target = SimpleNamespace(type="DOCKER", host="10.0.0.8", url="", port=None)
+    response = mock.Mock(status_code=200, text="[]")
+    response.json.return_value = []
+    monkeypatch.setattr("apps.monitor.utils.probes.settings.MONITOR_ALLOW_PRIVATE_TARGETS", True)
+    with mock.patch("apps.monitor.utils.probes.guarded_get", return_value=response) as guarded_get:
+        result = run_probe(target, {"port": 2375})
+
+    assert result.ok is True
+    assert guarded_get.call_args.kwargs["allow_private"] is True
+    assert guarded_get.call_args.kwargs["pinned_addresses"] == ("10.0.0.8",)

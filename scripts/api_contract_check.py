@@ -88,6 +88,78 @@ def _resolve_ref(schema: Any, document: dict[str, Any] | None) -> Any:
     return current
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _numeric_bound(schema: dict[str, Any], inclusive_key: str, exclusive_key: str):
+    exclusive_value = schema.get(exclusive_key)
+    if isinstance(exclusive_value, bool):
+        inclusive_value = schema.get(inclusive_key)
+        if _is_number(inclusive_value):
+            return inclusive_value, exclusive_value
+        return None
+    if _is_number(exclusive_value):
+        return exclusive_value, True
+    inclusive_value = schema.get(inclusive_key)
+    if _is_number(inclusive_value):
+        return inclusive_value, False
+    return None
+
+
+def _bound_tightened(old_bound, new_bound, lower: bool) -> bool:
+    if old_bound is None:
+        return new_bound is not None
+    if new_bound is None:
+        return False
+    old_value, old_exclusive = old_bound
+    new_value, new_exclusive = new_bound
+    if lower:
+        return new_value > old_value or (new_value == old_value and new_exclusive and not old_exclusive)
+    return new_value < old_value or (new_value == old_value and new_exclusive and not old_exclusive)
+
+
+def _format_bound(bound) -> str:
+    if bound is None:
+        return 'unbounded'
+    value, exclusive = bound
+    return f'{value} exclusive' if exclusive else str(value)
+
+
+def _compare_validation_constraints(
+    old_schema: dict[str, Any], new_schema: dict[str, Any], label: str, breaks: list[str]
+) -> None:
+    for keyword, baseline in (('minLength', 0), ('minItems', 0), ('minProperties', 0)):
+        old_value = old_schema.get(keyword, baseline)
+        new_value = new_schema.get(keyword)
+        if _is_number(new_value) and _is_number(old_value) and new_value > old_value:
+            breaks.append(f"validation constraint tightened: {label}.{keyword} {old_value}->{new_value}")
+
+    for keyword in ('maxLength', 'maxItems', 'maxProperties'):
+        old_value = old_schema.get(keyword)
+        new_value = new_schema.get(keyword)
+        if _is_number(new_value) and (old_value is None or (_is_number(old_value) and new_value < old_value)):
+            old_display = old_value if old_value is not None else 'unbounded'
+            breaks.append(f"validation constraint tightened: {label}.{keyword} {old_display}->{new_value}")
+
+    for inclusive_key, exclusive_key, lower in (
+        ('minimum', 'exclusiveMinimum', True),
+        ('maximum', 'exclusiveMaximum', False),
+    ):
+        old_bound = _numeric_bound(old_schema, inclusive_key, exclusive_key)
+        new_bound = _numeric_bound(new_schema, inclusive_key, exclusive_key)
+        if _bound_tightened(old_bound, new_bound, lower):
+            breaks.append(
+                f"validation constraint tightened: {label}.{inclusive_key} "
+                f"{_format_bound(old_bound)}->{_format_bound(new_bound)}"
+            )
+
+    old_pattern = old_schema.get('pattern')
+    new_pattern = new_schema.get('pattern')
+    if new_pattern is not None and new_pattern != old_pattern:
+        breaks.append(f"validation pattern changed: {label}.pattern")
+
+
 def _compare_schema(
     old_schema: Any,
     new_schema: Any,
@@ -109,6 +181,7 @@ def _compare_schema(
     new_type = _schema_type(new_schema)
     if old_type and new_type and old_type != new_type:
         breaks.append(f"schema type changed: {label} {old_type}->{new_type}")
+    _compare_validation_constraints(old_schema, new_schema, label, breaks)
     old_properties = old_schema.get("properties") or {}
     new_properties = new_schema.get("properties") or {}
     old_required = _required_properties(old_schema)

@@ -14,6 +14,35 @@ function parseEnvBoolean(value) {
 
 const ANALYTICS_ENABLED = parseEnvBoolean(import.meta.env.VITE_ANALYTICS_ENABLED)
 const SESSION_STORAGE_KEY = 'testhub_analytics_session_id'
+const SENSITIVE_ANALYTICS_KEYS = new Set(['code', 'auth_code', 'authorization_code', 'oauth_code'])
+
+const isSensitiveAnalyticsKey = key =>
+  SENSITIVE_ANALYTICS_KEYS.has(String(key).trim().toLowerCase().replaceAll('-', '_'))
+
+function sanitizeAnalyticsPath(path = '') {
+  if (typeof path !== 'string' || !path) return ''
+
+  const isAbsoluteUrl = /^[a-z][a-z\d+.-]*:\/\//i.test(path)
+  try {
+    const url = new URL(path, 'http://testhub.local')
+    for (const key of [...url.searchParams.keys()]) {
+      if (isSensitiveAnalyticsKey(key)) url.searchParams.delete(key)
+    }
+    const safePath = `${url.pathname}${url.search}`
+    return isAbsoluteUrl ? `${url.origin}${safePath}` : safePath
+  } catch {
+    return path
+  }
+}
+
+function sanitizeRouteQuery(source) {
+  if (!source || typeof source !== 'object') return {}
+  return Object.entries(source).reduce((acc, [key, value]) => {
+    if (isSensitiveAnalyticsKey(key) || value == null) return acc
+    acc[key] = value
+    return acc
+  }, {})
+}
 
 function getSessionId() {
   if (typeof window === 'undefined') {
@@ -40,7 +69,7 @@ function sanitizeSimpleObject(source) {
   }
 
   return Object.entries(source).reduce((acc, [key, value]) => {
-    if (value == null) {
+    if (value == null || isSensitiveAnalyticsKey(key)) {
       return acc
     }
 
@@ -75,14 +104,15 @@ export function track(eventName, payload = {}) {
     return Promise.resolve(false)
   }
 
+  const pagePath = sanitizeAnalyticsPath(payload.page_path || window.location.pathname)
   const data = {
     event_name: eventName,
     event_type: payload.event_type || 'custom',
-    module: payload.module || resolveModule(payload.page_path || window.location.pathname),
-    page_path: payload.page_path || window.location.pathname,
+    module: payload.module || resolveModule(pagePath),
+    page_path: pagePath,
     route_name: payload.route_name || '',
-    referrer_path: payload.referrer_path || '',
-    target_path: payload.target_path || '',
+    referrer_path: sanitizeAnalyticsPath(payload.referrer_path || ''),
+    target_path: sanitizeAnalyticsPath(payload.target_path || ''),
     session_id: payload.session_id || getSessionId(),
     metadata: sanitizeSimpleObject(payload.metadata),
   }
@@ -111,8 +141,8 @@ export function trackPageView(to, from) {
     referrer_path: from?.fullPath || '',
     metadata: {
       path: to.path || '',
-      params: JSON.stringify(sanitizeSimpleObject(to.params)),
-      query: JSON.stringify(sanitizeSimpleObject(to.query)),
+      params: JSON.stringify(sanitizeRouteQuery(to.params)),
+      query: JSON.stringify(sanitizeRouteQuery(to.query)),
     },
   })
 }

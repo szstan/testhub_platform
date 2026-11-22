@@ -172,6 +172,60 @@ class DefectApiTests(APITestCase):
 
         self.assertEqual(assign_response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_bulk_actions_enforce_project_roles_and_allow_matching_self_roles(self):
+        close_defect = Defect.objects.create(
+            title='不能越权关闭',
+            project=self.project,
+            reporter=self.tester,
+            status='verified',
+        )
+        metadata_defect = Defect.objects.create(
+            title='不能越权修改元数据',
+            project=self.project,
+            reporter=self.tester,
+            priority='p2',
+        )
+        self.client.force_authenticate(self.viewer)
+
+        denied_close = self.client.post(
+            reverse('defects-bulk-action'),
+            {'action': 'close', 'defect_ids': [close_defect.id]},
+            format='json',
+        )
+        self.assertEqual(denied_close.status_code, status.HTTP_200_OK)
+        self.assertFalse(denied_close.data['results'][0]['success'])
+        close_defect.refresh_from_db()
+        self.assertEqual(close_defect.status, 'verified')
+        self.assertFalse(DefectTransition.objects.filter(defect=close_defect).exists())
+
+        denied_priority = self.client.post(
+            reverse('defects-bulk-action'),
+            {'action': 'set_priority', 'defect_ids': [metadata_defect.id], 'priority': 'p1'},
+            format='json',
+        )
+        self.assertEqual(denied_priority.status_code, status.HTTP_200_OK)
+        self.assertFalse(denied_priority.data['results'][0]['success'])
+        metadata_defect.refresh_from_db()
+        self.assertEqual(metadata_defect.priority, 'p2')
+
+        foreign_project = Project.objects.create(name='Foreign reporter project', owner=self.tester)
+        reporter_defect = Defect.objects.create(
+            title='提交人可关闭自己的缺陷',
+            project=foreign_project,
+            reporter=self.other_user,
+            status='verified',
+        )
+        self.client.force_authenticate(self.other_user)
+        allowed_close = self.client.post(
+            reverse('defects-bulk-action'),
+            {'action': 'close', 'defect_ids': [reporter_defect.id]},
+            format='json',
+        )
+        self.assertEqual(allowed_close.status_code, status.HTTP_200_OK)
+        self.assertTrue(allowed_close.data['results'][0]['success'])
+        reporter_defect.refresh_from_db()
+        self.assertEqual(reporter_defect.status, 'closed')
+
     def test_summary(self):
         Defect.objects.create(title='阻塞缺陷', project=self.project, reporter=self.tester, severity='blocker')
         Defect.objects.create(title='已关闭缺陷', project=self.project, reporter=self.tester, status='closed')

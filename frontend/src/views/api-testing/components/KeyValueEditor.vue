@@ -26,7 +26,6 @@
 
         <div class="column value-column">
           <el-input
-            v-if="!showFile || row.type !== 'file'"
             v-model="row.value"
             :placeholder="placeholderValue"
             size="small"
@@ -42,20 +41,11 @@
               />
             </template>
           </el-input>
-          <el-upload
-            v-else
-            :auto-upload="false"
-            :show-file-list="false"
-            @change="(file) => handleFileChange(index, file)"
-          >
-            <el-button size="small">{{ $t('apiTesting.component.keyValueEditor.selectFile') }}</el-button>
-          </el-upload>
-          <el-tooltip :content="$t('apiTesting.component.keyValueEditor.insertDynamicVariable')" placement="top" v-if="!showFile || row.type !== 'file'">
+          <el-tooltip :content="$t('apiTesting.component.keyValueEditor.insertDynamicVariable')" placement="top">
             <el-button size="small" style="margin-left: 5px" @click="openVariableHelper(index)" class="variable-helper-btn">
               <el-icon><MagicStick /></el-icon>
             </el-button>
           </el-tooltip>
-          <span v-if="row.file" class="file-name">{{ row.file.name }}</span>
         </div>
 
         <div class="column description-column">
@@ -68,17 +58,6 @@
         </div>
         
         <div class="column action-column">
-          <el-select
-            v-if="showFile"
-            v-model="row.type"
-            size="small"
-            style="width: 70px; margin-right: 5px;"
-            @change="updateValue"
-          >
-            <el-option label="Text" value="text" />
-            <el-option label="File" value="file" />
-          </el-select>
-          
           <el-button
             size="small"
             type="danger"
@@ -162,10 +141,6 @@ const props = defineProps({
   placeholderValue: {
     type: String,
     default: 'Value'
-  },
-  showFile: {
-    type: Boolean,
-    default: false
   }
 })
 
@@ -348,8 +323,7 @@ const initializeRows = () => {
       key: item.key || '',
       value: item.value || '',
       description: item.description || '',
-      type: item.type || 'text',
-      file: item.file || null
+      type: item.type || 'text'
     })))
   } else {
     console.log('Data is object, converting...')
@@ -361,8 +335,7 @@ const initializeRows = () => {
           key,
           value: data[key],
           description: '',
-          type: 'text',
-          file: null
+          type: 'text'
         })
       }
     })
@@ -375,8 +348,7 @@ const initializeRows = () => {
       key: '',
       value: '',
       description: '',
-      type: 'text',
-      file: null
+      type: 'text'
     })
   }
   
@@ -420,12 +392,6 @@ const removeRow = (index) => {
     rows.value.splice(index, 1)
     updateValue()
   }
-}
-
-const handleFileChange = (index, file) => {
-  rows.value[index].file = file
-  rows.value[index].value = file.name
-  updateValue()
 }
 
 const openDataFactorySelector = (index) => {
@@ -602,12 +568,6 @@ defineExpose({
 .variable-helper-btn:hover {
   background-color: #5daf34;
   border-color: #5daf34;
-}
-
-.file-name {
-  font-size: 12px;
-  color: #606266;
-  margin-left: 8px;
 }
 
 .footer {

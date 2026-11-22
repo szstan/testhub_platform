@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from apps.core.http_transport import guarded_get, guarded_request
-from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+from apps.core.network import UnsafeOutboundURL, resolve_outbound_addresses, validate_outbound_url
 from django.conf import settings
 from jsonpath_ng import parse as jsonpath_parse
 from jsonpath_ng.exceptions import JsonPathParserError
@@ -110,8 +110,34 @@ def _clip(s, n=300):
 
 
 
+def _normalize_host(host):
+    text = str(host or '').strip().strip('[]')
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text.lower().rstrip('.')
+
+
+def _extract_host(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        ipaddress.ip_address(text.strip('[]'))
+        return text.strip('[]')
+    except ValueError:
+        pass
+    try:
+        parsed = urlparse(text if '://' in text else f'//{text}')
+        return parsed.hostname
+    except ValueError:
+        return None
+
+
 def _probe_hosts(target, cfg):
     values = [getattr(target, 'url', None), getattr(target, 'host', None)]
+    if getattr(target, 'type', None) in {'DOCKER', 'SL651'}:
+        values.append((cfg or {}).get('host'))
     values.extend((cfg or {}).get(key) for key in ('url', 'base_url', 'login_url', 'endpoint'))
     login = (cfg or {}).get('login') or {}
     if isinstance(login, dict):
@@ -122,35 +148,30 @@ def _probe_hosts(target, cfg):
     db = (cfg or {}).get('db') or {}
     if isinstance(db, dict):
         values.append(db.get('host'))
-    hosts = set()
-    for value in values:
-        if not value:
-            continue
-        text = str(value).strip()
-        parsed = urlparse(text if '://' in text else f'//{text}')
-        if parsed.hostname:
-            hosts.add(parsed.hostname)
-    return hosts
+    return {host for value in values if (host := _extract_host(value))}
 
 
-def _destination_error(host):
-    if getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False):
-        return None
+def _destination_addresses(host, port=None):
+    allow_private = bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False))
     try:
-        addresses = {host}
-        try:
-            addresses = {item[4][0] for item in socket.getaddrinfo(
-                host, None, type=socket.SOCK_STREAM)}
-        except socket.gaierror:
-            return f'目标主机 {host} 无法解析，已拒绝探测'
-        for address in addresses:
-            ip = ipaddress.ip_address(address)
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-                return f'目标主机 {host} 解析到受限地址 {ip}，已拒绝探测'
-    except ValueError:
-        return f'目标主机 {host} 地址格式非法，已拒绝探测'
-    return None
+        resolved_port = int(port or 0)
+        if resolved_port and not 1 <= resolved_port <= 65535:
+            return (), f'目标主机 {host} 端口无效，已拒绝探测'
+        return resolve_outbound_addresses(
+            host, resolved_port, allow_private=allow_private,
+        ), None
+    except UnsafeOutboundURL as exc:
+        if '无法解析' in str(exc):
+            return (), f'目标主机 {host} 无法解析，已拒绝探测'
+        if '格式非法' in str(exc):
+            return (), f'目标主机 {host} 地址格式非法，已拒绝探测'
+        return (), f'目标主机 {host} 解析到受限地址，已拒绝探测'
+    except (TypeError, ValueError):
+        return (), f'目标主机 {host} 端口格式非法，已拒绝探测'
+
+
+def _destination_error(host, port=None):
+    return _destination_addresses(host, port)[1]
 
 
 def _safe_json_dict(resp):
@@ -704,7 +725,7 @@ def probe_online(target, cfg):
         return ProbeResult(False, f"在线率探测失败：{err}", elapsed)
 
 
-def probe_docker(target, cfg):
+def probe_docker(target, cfg, pinned_addresses=None):
     """容器状态：HTTP 访问 Docker daemon API（2375），校验容器 running + 重启次数。
 
     不依赖 docker SDK，直接走 HTTP（与 docker SDK 的 TCP 客户端等价）。
@@ -716,20 +737,27 @@ def probe_docker(target, cfg):
     max_restart = int(cfg.get("max_restart", 3))
     timeout = int(cfg.get("timeout", 10))
     scheme = "https" if tls else "http"
-    url = f"{scheme}://{host}:{port}/containers/json?all=1"
+    authority = f"[{host}]" if ':' in str(host) and not str(host).startswith('[') else host
+    url = f"{scheme}://{authority}:{port}/containers/json?all=1"
 
+    if pinned_addresses is None:
+        pinned_addresses, error = _destination_addresses(host, port)
+        if error:
+            return ProbeResult(False, 'Docker 目标地址不允许访问')
     try:
-        url = validate_outbound_url(
-            url,
-            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
-        )
+        # Address policy was checked above; this call performs URL syntax checks
+        # without resolving the hostname a second time.
+        url = validate_outbound_url(url, allow_private=True)
     except UnsafeOutboundURL:
         return ProbeResult(False, 'Docker 目标地址不允许访问')
 
     t0 = time.monotonic()
     try:
-        resp = guarded_get(url, timeout=timeout, verify=True, allow_redirects=False,
-                           allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)))
+        resp = guarded_get(
+            url, timeout=timeout, verify=True, allow_redirects=False,
+            allow_private=bool(getattr(settings, 'MONITOR_ALLOW_PRIVATE_TARGETS', False)),
+            pinned_addresses=pinned_addresses,
+        )
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code != 200:
             return ProbeResult(False, f"Docker API HTTP {resp.status_code}", ms, resp.status_code,
@@ -771,15 +799,21 @@ def probe_docker(target, cfg):
         return ProbeResult(False, f"连接 Docker 失败：{_friendly_http_error(e)}", int((time.monotonic() - t0) * 1000))
 
 
-def _sl651_db_check(db):
+def _sl651_db_check(db, validated_addresses=None):
     """SL651 数据库工况检查：最新记录新鲜度 + 在线状态。返回 (ok, msg, detail)。"""
     try:
         import pymysql
     except ImportError:
         return False, "pymysql 未安装", {}
     try:
+        db_host = db["host"]
+        addresses = (validated_addresses or {}).get(_normalize_host(db_host))
+        if addresses is None:
+            addresses, error = _destination_addresses(db_host, int(db.get("port") or 3306))
+            if error:
+                return False, '数据库目标地址不允许访问', {}
         conn = pymysql.connect(
-            host=db["host"], port=int(db["port"]), user=db["user"],
+            host=addresses[0], port=int(db["port"]), user=db["user"],
             password=db.get("password", ""), database=db["db"],
             connect_timeout=int(db.get("connect_timeout", 10)), charset="utf8mb4",
         )
@@ -830,7 +864,7 @@ def _sl651_db_check(db):
         return False, f"数据库检查异常: {e}", {}
 
 
-def probe_sl651(target, cfg):
+def probe_sl651(target, cfg, validated_addresses=None):
     """遥测链路：TCP 建连 → 发测试报文 → 等 ACK；可选 MySQL 工况检查。"""
     host = cfg.get("host") or target.host
     port = int(cfg.get("port") or target.port or 10000)
@@ -838,11 +872,26 @@ def probe_sl651(target, cfg):
     rw_timeout = int(cfg.get("rw_timeout", 15))
     ack_wait = int(cfg.get("ack_wait_timeout", 15))
     frame_hex = cfg.get("frame") or DEFAULT_SL651_FRAME
+    addresses = (validated_addresses or {}).get(_normalize_host(host))
+    if addresses is None:
+        addresses, error = _destination_addresses(host, port)
+        if error:
+            return ProbeResult(False, 'SL651 目标地址不允许访问')
 
     t0 = time.monotonic()
     sock = None
     try:
-        sock = socket.create_connection((host, port), timeout=connect_timeout)
+        connect_error = None
+        for address in addresses:
+            try:
+                sock = socket.create_connection((address, port), timeout=connect_timeout)
+                break
+            except OSError as exc:
+                connect_error = exc
+        if sock is None:
+            if connect_error:
+                raise connect_error
+            raise OSError('没有可连接的目标地址')
         sock.settimeout(rw_timeout)
         frame = bytes.fromhex(frame_hex)
         sock.sendall(frame)
@@ -871,7 +920,7 @@ def probe_sl651(target, cfg):
         ms = int((time.monotonic() - t0) * 1000)
         db = cfg.get("db")
         if db:
-            db_ok, db_msg, db_detail = _sl651_db_check(db)
+            db_ok, db_msg, db_detail = _sl651_db_check(db, validated_addresses)
             if not db_ok:
                 return ProbeResult(False, f"TCP 链路正常但数据库工况异常: {db_msg}", ms,
                                     detail={"reply_len": len(reply_data), "db": db_detail})
@@ -902,13 +951,60 @@ DISPATCH = {
 
 
 def run_probe(target, cfg):
-    """按 target.type 分发到对应探针，并在所有入口统一执行出站安全校验。"""
+    """按 target.type 分发到对应探针，并统一校验及固定出站解析结果。"""
     cfg = cfg or {}
+    target_type = getattr(target, 'type', None)
+    fn = DISPATCH.get(target_type)
+    if not fn:
+        return ProbeResult(False, f"未知探测类型: {target_type}")
+
+    pinned_host = None
+    pinned_port = None
+    db_host = None
+    db_port = None
+    if target_type in {'DOCKER', 'SL651'}:
+        raw_host = cfg.get('host') or getattr(target, 'host', None)
+        pinned_host = _extract_host(raw_host)
+        if not pinned_host:
+            return ProbeResult(False, '缺少目标主机')
+        try:
+            default_port = 2375 if target_type == 'DOCKER' else 10000
+            pinned_port = int(cfg.get('port') or getattr(target, 'port', None) or default_port)
+        except (TypeError, ValueError):
+            return ProbeResult(False, '探测端口格式非法')
+        if target_type == 'SL651':
+            db = cfg.get('db') or {}
+            if isinstance(db, dict) and db.get('host'):
+                db_host = _extract_host(db.get('host'))
+                try:
+                    db_port = int(db.get('port') or 3306)
+                except (TypeError, ValueError):
+                    return ProbeResult(False, '数据库端口格式非法')
+
+    resolved_addresses = {}
     for host in _probe_hosts(target, cfg):
-        error = _destination_error(host)
+        key = _normalize_host(host)
+        if key in resolved_addresses:
+            continue
+        if key == _normalize_host(pinned_host):
+            port = pinned_port
+        elif db_host and key == _normalize_host(db_host):
+            port = db_port
+        else:
+            port = None
+        addresses, error = _destination_addresses(host, port)
         if error:
             return ProbeResult(False, error)
-    fn = DISPATCH.get(target.type)
-    if not fn:
-        return ProbeResult(False, f"未知探测类型: {target.type}")
+        resolved_addresses[key] = addresses
+
+    if pinned_host and _normalize_host(pinned_host) not in resolved_addresses:
+        addresses, error = _destination_addresses(pinned_host, pinned_port)
+        if error:
+            return ProbeResult(False, error)
+        resolved_addresses[_normalize_host(pinned_host)] = addresses
+
+    if target_type == 'DOCKER':
+        return fn(target, cfg, pinned_addresses=resolved_addresses[_normalize_host(pinned_host)])
+    if target_type == 'SL651':
+        return fn(target, cfg, validated_addresses=resolved_addresses)
     return fn(target, cfg)

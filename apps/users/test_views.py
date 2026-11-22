@@ -58,16 +58,20 @@ def test_register(request):
             return JsonResponse({'success': False, 'error': error}, status=400)
 
         # 创建用户
-        user = User.objects.create_user(
-            username=data.get('username'),
-            email=data.get('email', ''),
-            password=data.get('password'),
-            first_name=data.get('first_name', ''),
-            last_name=data.get('last_name', ''),
-            phone=phone,
-            department=data.get('department', ''),
-            position=data.get('position', '')
-        )
+        from .registration import DuplicatePhoneError, create_user_with_unique_phone
+        try:
+            user = create_user_with_unique_phone(
+                username=data.get('username'),
+                email=data.get('email', ''),
+                password=data.get('password'),
+                first_name=data.get('first_name', ''),
+                last_name=data.get('last_name', ''),
+                phone=phone,
+                department=data.get('department', ''),
+                position=data.get('position', '')
+            )
+        except DuplicatePhoneError:
+            return JsonResponse({'success': False, 'error': '该手机号已被注册'}, status=400)
 
         # 生成 JWT token
         from rest_framework_simplejwt.tokens import RefreshToken

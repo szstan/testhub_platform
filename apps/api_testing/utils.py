@@ -3,6 +3,7 @@ import re
 import time
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from apps.core.http_transport import guarded_request
@@ -18,6 +19,18 @@ from .variable_resolver import VariableResolver
 
 
 _JSONPATH_KEY_RE = re.compile(r"(?:\.{1,2}([A-Za-z_][A-Za-z0-9_-]*)|\[['\"]([^'\"]+)['\"]\])")
+
+
+def can_access_api_project(project, user, allow_admin=True):
+    """Check whether a user can access an API project under the configured policy."""
+    if project is None or not user or not getattr(user, 'is_authenticated', False):
+        return False
+    if allow_admin and (getattr(user, 'is_staff', False) or getattr(user, 'is_superuser', False)):
+        return True
+    return bool(
+        project.owner_id == user.pk
+        or project.members.filter(pk=user.pk).exists()
+    )
 
 
 def can_use_environment(environment, user, project=None):
@@ -222,7 +235,7 @@ def _resolved_request(api_request, environment, variable_overrides=None):
 
 def execute_test_suite(test_suite, environment, executed_by, *, cancel_check=None, variable_overrides=None):
     """Execute enabled suite requests and forward cancellation to each request."""
-    from .models import TestExecution
+    from .models import TestExecution, TestSuite
 
     execution = None
     results = []
@@ -242,18 +255,32 @@ def execute_test_suite(test_suite, environment, executed_by, *, cancel_check=Non
 
     try:
         check_cancelled()
-        if not can_use_environment(environment, executed_by, project=test_suite.project):
-            return {'success': False, 'error': '无权使用该执行环境'}
+        with transaction.atomic():
+            initial_project_id = test_suite.project_id
+            locked_suite = TestSuite.objects.select_for_update().filter(pk=test_suite.pk).first()
+            if locked_suite is None:
+                return {'success': False, 'error': '测试套件不存在'}
+            if locked_suite.project_id != initial_project_id:
+                return {'success': False, 'error': '测试套件所属项目已变更，请重新选择'}
+            test_suite = locked_suite
+            if not can_access_api_project(test_suite.project, executed_by):
+                return {'success': False, 'error': '无权访问该测试套件'}
+            if not can_use_environment(environment, executed_by, project=test_suite.project):
+                return {'success': False, 'error': '无权使用该执行环境'}
 
-        execution = TestExecution.objects.create(
-            test_suite=test_suite,
-            status='RUNNING',
-            start_time=timezone.now(),
-            executed_by=executed_by,
-        )
-        suite_requests = test_suite.testsuiterequest_set.filter(enabled=True).order_by('order')
-        execution.total_requests = suite_requests.count()
-        execution.save()
+            execution = TestExecution.objects.create(
+                test_suite=test_suite,
+                status='RUNNING',
+                start_time=timezone.now(),
+                executed_by=executed_by,
+            )
+            suite_requests = list(
+                test_suite.testsuiterequest_set.filter(enabled=True)
+                .select_related('request')
+                .order_by('order')
+            )
+            execution.total_requests = len(suite_requests)
+            execution.save(update_fields=['total_requests'])
 
         for suite_request in suite_requests:
             check_cancelled()

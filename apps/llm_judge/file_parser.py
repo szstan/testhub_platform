@@ -20,6 +20,8 @@ import csv
 import io
 import json
 import logging
+import zipfile
+from itertools import islice
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,75 @@ CONTEXT_COLS = {'上下文', 'context', 'Context', '背景'}
 
 MAX_CASES = 5000
 MAX_PREVIEW = 10
+MAX_XLSX_ROWS = 50_000
+MAX_XLSX_COLUMNS = 100
+MAX_XLSX_ZIP_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_XLSX_ZIP_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_XLSX_ZIP_MEMBERS = 1000
+_XLSX_ZIP_READ_CHUNK_BYTES = 64 * 1024
+MAX_PARSE_ERRORS = 100
+_ERROR_OVERFLOW = '错误数量超过上限，后续错误已省略'
+
+
+def _validate_xlsx_zip_resources(content_bytes: bytes) -> None:
+    with zipfile.ZipFile(io.BytesIO(content_bytes)) as archive:
+        members = archive.infolist()
+        if len(members) > MAX_XLSX_ZIP_MEMBERS:
+            raise ValueError(f'XLSX ZIP 文件数超过上限 {MAX_XLSX_ZIP_MEMBERS}')
+
+        declared_total = 0
+        for member in members:
+            if member.file_size > MAX_XLSX_ZIP_MEMBER_BYTES:
+                raise ValueError(
+                    f'XLSX ZIP 单个文件解压后超过上限 {MAX_XLSX_ZIP_MEMBER_BYTES} 字节'
+                )
+            declared_total += member.file_size
+            if declared_total > MAX_XLSX_ZIP_TOTAL_BYTES:
+                raise ValueError(
+                    f'XLSX ZIP 总解压大小超过上限 {MAX_XLSX_ZIP_TOTAL_BYTES} 字节'
+                )
+
+        actual_total = 0
+        for member in members:
+            actual_member = 0
+            with archive.open(member) as stream:
+                while True:
+                    read_size = min(
+                        _XLSX_ZIP_READ_CHUNK_BYTES,
+                        MAX_XLSX_ZIP_MEMBER_BYTES - actual_member + 1,
+                        MAX_XLSX_ZIP_TOTAL_BYTES - actual_total + 1,
+                    )
+                    chunk = stream.read(read_size)
+                    if not chunk:
+                        break
+                    actual_member += len(chunk)
+                    actual_total += len(chunk)
+                    if actual_member > MAX_XLSX_ZIP_MEMBER_BYTES:
+                        raise ValueError(
+                            f'XLSX ZIP 单个文件解压后超过上限 {MAX_XLSX_ZIP_MEMBER_BYTES} 字节'
+                        )
+                    if actual_total > MAX_XLSX_ZIP_TOTAL_BYTES:
+                        raise ValueError(
+                            f'XLSX ZIP 总解压大小超过上限 {MAX_XLSX_ZIP_TOTAL_BYTES} 字节'
+                        )
+            if actual_member != member.file_size:
+                raise ValueError('XLSX ZIP 成员解压大小与声明不一致')
+
+
+def _append_bounded_error(errors: list[str], message: str) -> None:
+    if len(errors) < MAX_PARSE_ERRORS - 1:
+        errors.append(message)
+    elif len(errors) == MAX_PARSE_ERRORS - 1:
+        errors.append(_ERROR_OVERFLOW)
+
+
+def _finalize_bounded_errors(errors: list[str], limit_errors: list[str]) -> list[str]:
+    if len(errors) + len(limit_errors) <= MAX_PARSE_ERRORS:
+        return errors + limit_errors
+    if len(limit_errors) >= MAX_PARSE_ERRORS:
+        return limit_errors[:MAX_PARSE_ERRORS]
+    keep_count = max(0, MAX_PARSE_ERRORS - len(limit_errors) - 1)
+    return errors[:keep_count] + [_ERROR_OVERFLOW] + limit_errors
 
 
 def _norm_header(h: Any) -> str:
@@ -217,93 +288,133 @@ def parse_xlsx(content_bytes: bytes, filename: str = '') -> dict:
         return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
                 'errors': ['缺少 openpyxl 依赖，无法解析 XLSX。请安装: pip install openpyxl'],
                 'preview': [], 'cases': []}
+
     errors: list[str] = []
     cases: list[dict] = []
     total_rows = 0
+    wb = None
     try:
+        _validate_xlsx_zip_resources(content_bytes)
         wb = openpyxl.load_workbook(io.BytesIO(content_bytes), data_only=True, read_only=True)
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        wb.close()
+        if ws.max_column is not None and ws.max_column > MAX_XLSX_COLUMNS:
+            return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
+                    'errors': [f'XLSX 列数超过上限 {MAX_XLSX_COLUMNS}'], 'preview': [], 'cases': []}
+
+        row_limit_hit = bool(ws.max_row and ws.max_row > MAX_XLSX_ROWS + 1)
+        rows = iter(ws.iter_rows(
+            values_only=True, max_row=MAX_XLSX_ROWS + 2,
+            max_col=MAX_XLSX_COLUMNS + 1,
+        ))
+        header_row = next(rows, None)
+        if header_row is None:
+            return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
+                    'errors': ['文件为空'], 'preview': [], 'cases': []}
+        if len(header_row) > MAX_XLSX_COLUMNS and header_row[MAX_XLSX_COLUMNS] not in (None, ''):
+            return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
+                    'errors': [f'XLSX 列数超过上限 {MAX_XLSX_COLUMNS}'], 'preview': [], 'cases': []}
+
+        header = [_norm_header(value) for value in header_row[:MAX_XLSX_COLUMNS]]
+        q_idx = a_idx = gt_idx = auto_idx = ctx_idx = -1
+        for i, value in enumerate(header):
+            if q_idx < 0 and value in QUESTION_COLS:
+                q_idx = i
+            elif a_idx < 0 and value in ANSWER_COLS:
+                a_idx = i
+            elif gt_idx < 0 and value in GT_COLS:
+                gt_idx = i
+            elif auto_idx < 0 and value in AUTO_GT_COLS:
+                auto_idx = i
+            elif ctx_idx < 0 and value in CONTEXT_COLS:
+                ctx_idx = i
+        if q_idx < 0 or a_idx < 0:
+            return {'filename': filename, 'total_rows': min(max((ws.max_row or 1) - 1, 0), MAX_XLSX_ROWS),
+                    'valid_rows': 0, 'errors': ['XLSX 表头缺少「问题」和「答案」列'],
+                    'preview': [], 'cases': []}
+
+        case_limit_hit = False
+        column_limit_hit = False
+        for row_number, row in enumerate(islice(rows, MAX_XLSX_ROWS + 1), 2):
+            if row_number > MAX_XLSX_ROWS + 1:
+                row_limit_hit = True
+                break
+            total_rows += 1
+            if len(row) > MAX_XLSX_COLUMNS and row[MAX_XLSX_COLUMNS] not in (None, ''):
+                column_limit_hit = True
+                break
+            row = row[:MAX_XLSX_COLUMNS]
+            if row is None or all((value is None or str(value).strip() == '' for value in row)):
+                continue
+
+            def _get(idx):
+                if not 0 <= idx < len(row):
+                    return ''
+                return '' if row[idx] is None else row[idx]
+
+            question = str(_get(q_idx)).strip()
+            answer = str(_get(a_idx)).strip()
+            if not question or not answer:
+                _append_bounded_error(errors, f'第{row_number}行：问题或答案为空')
+                continue
+            case = {'question': question, 'answer': answer}
+            if gt_idx >= 0:
+                gt = _to_json_gt(_get(gt_idx))
+                if gt:
+                    case['ground_truth'] = gt
+                    case['auto_gt'] = False
+                else:
+                    case['auto_gt'] = True
+            else:
+                case['auto_gt'] = True
+            if auto_idx >= 0:
+                auto_v = _to_bool(_get(auto_idx))
+                if auto_v:
+                    case['auto_gt'] = True
+                    case.pop('ground_truth', None)
+                else:
+                    case['auto_gt'] = False
+                    if not case.get('ground_truth'):
+                        _append_bounded_error(
+                            errors,
+                            f'第{row_number}行：已标记为手动 GT（自动匹配=否）但参考答案为空',
+                        )
+                        continue
+            if ctx_idx >= 0:
+                ctx_raw = str(_get(ctx_idx)).strip()
+                if ctx_raw:
+                    try:
+                        case['context'] = json.loads(ctx_raw)
+                    except Exception:
+                        case['context'] = {'text': ctx_raw}
+            if len(cases) >= MAX_CASES:
+                case_limit_hit = True
+                break
+            cases.append(case)
+
+        limit_errors = []
+        if column_limit_hit:
+            limit_errors.append(f'XLSX 列数超过上限 {MAX_XLSX_COLUMNS}，已停止解析')
+        if row_limit_hit:
+            limit_errors.append(f'XLSX 行数超过上限 {MAX_XLSX_ROWS}，已截取前 {MAX_XLSX_ROWS} 行')
+        if case_limit_hit:
+            limit_errors.append(f'用例数超过上限 {MAX_CASES}，已截取前 {MAX_CASES} 条')
+        errors = _finalize_bounded_errors(errors, limit_errors)
+
+        valid = len(cases)
+        return {
+            'filename': filename,
+            'total_rows': total_rows,
+            'valid_rows': valid,
+            'errors': errors,
+            'preview': cases[:MAX_PREVIEW],
+            'cases': cases,
+        }
     except Exception as e:
         return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
                 'errors': [f'XLSX 解析失败: {e}'], 'preview': [], 'cases': []}
-
-    if not rows:
-        return {'filename': filename, 'total_rows': 0, 'valid_rows': 0,
-                'errors': ['文件为空'], 'preview': [], 'cases': []}
-
-    header = [_norm_header(h) for h in rows[0]]
-    q_idx = a_idx = gt_idx = auto_idx = ctx_idx = -1
-    for i, h in enumerate(header):
-        if q_idx < 0 and h in QUESTION_COLS:
-            q_idx = i
-        elif a_idx < 0 and h in ANSWER_COLS:
-            a_idx = i
-        elif gt_idx < 0 and h in GT_COLS:
-            gt_idx = i
-        elif auto_idx < 0 and h in AUTO_GT_COLS:
-            auto_idx = i
-        elif ctx_idx < 0 and h in CONTEXT_COLS:
-            ctx_idx = i
-    if q_idx < 0 or a_idx < 0:
-        return {'filename': filename, 'total_rows': len(rows), 'valid_rows': 0,
-                'errors': ['XLSX 表头缺少「问题」和「答案」列'], 'preview': [], 'cases': []}
-
-    for i, row in enumerate(rows[1:], 2):
-        total_rows += 1
-        if row is None or all((c is None or str(c).strip() == '' for c in row)):
-            continue
-        def _get(idx):
-            return row[idx] if 0 <= idx < len(row) else ''
-        question = str(_get(q_idx)).strip()
-        answer = str(_get(a_idx)).strip()
-        if not question or not answer:
-            errors.append(f'第{i}行：问题或答案为空')
-            continue
-        case = {'question': question, 'answer': answer}
-        if gt_idx >= 0:
-            gt = _to_json_gt(_get(gt_idx))
-            if gt:
-                case['ground_truth'] = gt
-                case['auto_gt'] = False
-            else:
-                case['auto_gt'] = True
-        else:
-            case['auto_gt'] = True
-        # auto 列优先：显式指定后覆盖默认推断；auto=False 且无 GT 时给出错误
-        if auto_idx >= 0:
-            auto_v = _to_bool(_get(auto_idx))
-            if auto_v:
-                case['auto_gt'] = True
-                case.pop('ground_truth', None)
-            else:
-                case['auto_gt'] = False
-                if not case.get('ground_truth'):
-                    errors.append(f'第{i}行：已标记为手动 GT（自动匹配=否）但参考答案为空')
-                    continue
-        if ctx_idx >= 0:
-            ctx_raw = str(_get(ctx_idx)).strip()
-            if ctx_raw:
-                try:
-                    case['context'] = json.loads(ctx_raw)
-                except Exception:
-                    case['context'] = {'text': ctx_raw}
-        cases.append(case)
-        if len(cases) >= MAX_CASES:
-            break
-
-    valid = len(cases)
-    if valid >= MAX_CASES and total_rows > MAX_CASES:
-        errors.append(f'用例数超过上限 {MAX_CASES}，已截取前 {MAX_CASES} 条')
-    return {
-        'filename': filename,
-        'total_rows': total_rows,
-        'valid_rows': valid,
-        'errors': errors,
-        'preview': cases[:MAX_PREVIEW],
-        'cases': cases,
-    }
+    finally:
+        if wb is not None:
+            wb.close()
 
 
 def detect_and_parse(filename: str, content_bytes: bytes | str) -> dict:

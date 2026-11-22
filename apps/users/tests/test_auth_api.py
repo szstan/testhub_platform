@@ -1,13 +1,29 @@
 import base64
 import re
 import uuid
+from contextlib import contextmanager
+from threading import Barrier, Event, Thread
 from unittest.mock import Mock, patch
 
 import pytest
 import redis
 from django.contrib.auth import get_user_model
-from rest_framework import status
+from django.db import close_old_connections, connection
+from rest_framework import serializers, status
 from rest_framework.test import APIClient
+
+from apps.users.models import UserPhoneWriteLock
+from apps.users.registration import (
+    DuplicatePhoneError,
+    create_user_with_unique_phone,
+    phone_write_lock_id,
+    serialized_phone_write,
+)
+from apps.users.serializers import (
+    UserCreateSerializer,
+    UserSelfUpdateSerializer,
+    UserSerializer,
+)
 
 
 pytestmark = pytest.mark.django_db
@@ -102,6 +118,384 @@ def test_send_register_code_rejects_invalid_captcha(api_client):
         'error': '图形验证码错误或已过期',
     }
     validate_captcha.assert_called_once_with('captcha-token', 'wrong-code')
+
+
+def test_registration_rechecks_duplicate_phone_after_serializer_validation():
+    phone = '13900139000'
+    first = UserCreateSerializer(data={
+        'username': 'racing-phone-first',
+        'email': 'first@example.com',
+        'password': 'StrongPass123',
+        'password_confirm': 'StrongPass123',
+        'phone': phone,
+    })
+    second = UserCreateSerializer(data={
+        'username': 'racing-phone-second',
+        'email': 'second@example.com',
+        'password': 'StrongPass123',
+        'password_confirm': 'StrongPass123',
+        'phone': phone,
+    })
+    first.is_valid(raise_exception=True)
+    second.is_valid(raise_exception=True)
+
+    first.save()
+    with pytest.raises(serializers.ValidationError):
+        second.save()
+
+    assert User.objects.filter(phone=phone).count() == 1
+
+
+def test_phone_registration_rechecks_duplicate_phone_after_serializer_validation(api_client):
+    phone = '13900139000'
+
+    def create_racing_user(**user_data):
+        User.objects.create_user(
+            username='racing-api-registration-owner',
+            password='StrongPass123',
+            phone=user_data['phone'],
+        )
+        return create_user_with_unique_phone(**user_data)
+
+    with patch('apps.users.serializers.create_user_with_unique_phone', side_effect=create_racing_user):
+        response = api_client.post(
+            '/api/auth/register/',
+            {
+                'username': 'racing-api-registration-loser',
+                'email': 'racing-api@example.com',
+                'password': 'StrongPass123',
+                'password_confirm': 'StrongPass123',
+                'phone': phone,
+            },
+            format='json',
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert User.objects.filter(phone=phone).count() == 1
+    assert not User.objects.filter(username='racing-api-registration-loser').exists()
+
+
+def test_legacy_registration_route_rechecks_duplicate_phone_after_sms_validation(api_client):
+    phone = '13900139001'
+
+    def claim_phone_before_create(*args, **kwargs):
+        User.objects.create_user(
+            username='racing-legacy-registration-owner',
+            password='StrongPass123',
+            phone=phone,
+        )
+        return True, ''
+
+    with patch('apps.users.sms.validate_verify_code', side_effect=claim_phone_before_create):
+        response = api_client.post(
+            '/api/auth/test-register/',
+            {
+                'username': 'racing-legacy-registration-loser',
+                'email': 'racing-legacy@example.com',
+                'password': 'StrongPass123',
+                'phone': phone,
+                'verify_code': '123456',
+                'verify_code_token': 'token',
+            },
+            format='json',
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert User.objects.filter(phone=phone).count() == 1
+    assert not User.objects.filter(username='racing-legacy-registration-loser').exists()
+
+
+@pytest.mark.parametrize('serializer_class', [UserSerializer, UserSelfUpdateSerializer])
+def test_stale_partial_profile_updates_do_not_restore_re_registered_phone(serializer_class):
+    old_phone = '13900139000'
+    new_phone = '13900139002'
+    user = User.objects.create_user(username='stale-profile-owner', phone=old_phone)
+    stale_instance = User.objects.get(pk=user.pk)
+    serializer = serializer_class(
+        stale_instance,
+        data={'first_name': f'Updated by {serializer_class.__name__}'},
+        partial=True,
+    )
+    assert serializer.is_valid(), serializer.errors
+
+    current = User.objects.get(pk=user.pk)
+    phone_change = UserSerializer(current, data={'phone': new_phone}, partial=True)
+    assert phone_change.is_valid(), phone_change.errors
+    phone_change.save()
+    create_user_with_unique_phone(
+        username=f'old-phone-registrant-{serializer_class.__name__}',
+        password='StrongPass123',
+        phone=old_phone,
+    )
+
+    serializer.save()
+    persisted = User.objects.get(pk=user.pk)
+    assert persisted.phone == new_phone
+    assert persisted.first_name == f'Updated by {serializer_class.__name__}'
+    assert User.objects.filter(phone=old_phone).count() == 1
+
+
+@pytest.mark.parametrize('stale_phone', ['13900139000', '13900139006'])
+def test_stale_explicit_phone_update_does_not_restore_or_replace_newer_phone(stale_phone):
+    old_phone = '13900139000'
+    new_phone = '13900139002'
+    user = User.objects.create_user(username='stale-phone-owner', phone=old_phone)
+    stale = UserSerializer(User.objects.get(pk=user.pk), data={'phone': stale_phone}, partial=True)
+    assert stale.is_valid(), stale.errors
+
+    latest = UserSerializer(User.objects.get(pk=user.pk), data={'phone': new_phone}, partial=True)
+    assert latest.is_valid(), latest.errors
+    latest.save()
+    create_user_with_unique_phone(username='released-stale-phone', phone=old_phone)
+
+    with pytest.raises(serializers.ValidationError):
+        stale.save()
+    user.refresh_from_db()
+    assert user.phone == new_phone
+    assert User.objects.filter(phone=old_phone).count() == 1
+
+
+def test_phone_change_and_clear_release_numbers_for_registration():
+    old_phone = '13900139003'
+    new_phone = '13900139004'
+    user = User.objects.create_user(username='phone-change-owner', phone=old_phone)
+
+    change = UserSerializer(user, data={'phone': new_phone}, partial=True)
+    assert change.is_valid(), change.errors
+    change.save()
+
+    create_user_with_unique_phone(
+        username='released-old-phone',
+        password='StrongPass123',
+        phone=old_phone,
+    )
+    clear = UserSerializer(change.instance, data={'phone': ''}, partial=True)
+    assert clear.is_valid(), clear.errors
+    clear.save()
+    create_user_with_unique_phone(
+        username='released-new-phone',
+        password='StrongPass123',
+        phone=new_phone,
+    )
+
+    user.refresh_from_db()
+    assert user.phone == ''
+    assert User.objects.filter(phone=old_phone).count() == 1
+    assert User.objects.filter(phone=new_phone).count() == 1
+
+
+def test_registration_hashes_password_before_acquiring_phone_lock():
+    from django.contrib.auth.hashers import make_password as real_make_password
+    from apps.users import registration
+
+    events = []
+    real_serialized_write = registration.serialized_phone_write
+
+    @contextmanager
+    def tracked_phone_write(*phones):
+        events.append('lock')
+        with real_serialized_write(*phones):
+            yield
+
+    def tracked_make_password(*args, **kwargs):
+        events.append('hash')
+        return real_make_password(*args, **kwargs)
+
+    with (
+        patch('apps.users.registration.serialized_phone_write', tracked_phone_write),
+        patch('apps.users.registration.make_password', tracked_make_password),
+    ):
+        create_user_with_unique_phone(
+            username='hash-before-phone-lock',
+            password='StrongPass123',
+            phone='13900139005',
+        )
+
+    assert events == ['hash', 'lock']
+
+
+def test_phone_write_stripes_keep_distinct_phone_keys_independent():
+    first_phone = '13000000001'
+    second_phone = '13000000002'
+    first_lock = phone_write_lock_id(first_phone)
+    second_lock = phone_write_lock_id(second_phone)
+    assert first_lock != second_lock
+
+    with serialized_phone_write(first_phone):
+        with serialized_phone_write(second_phone):
+            locked_rows = set(
+                UserPhoneWriteLock.objects.filter(pk__in=(first_lock, second_lock))
+                .values_list('pk', flat=True)
+            )
+    assert locked_rows == {first_lock, second_lock}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_mysql_phone_write_stripes_do_not_block_distinct_numbers():
+    if connection.vendor != 'mysql':
+        pytest.skip('SQLite does not implement select_for_update row locks')
+
+    first_phone = '13000000001'
+    second_phone = '13000000002'
+    assert phone_write_lock_id(first_phone) != phone_write_lock_id(second_phone)
+
+    first_entered = Event()
+    second_entered = Event()
+    release_first = Event()
+    errors = []
+
+    def hold_first_phone_lock():
+        close_old_connections()
+        try:
+            with serialized_phone_write(first_phone):
+                first_entered.set()
+                if not release_first.wait(timeout=10):
+                    errors.append(TimeoutError('first phone lock was not released'))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            close_old_connections()
+
+    def acquire_second_phone_lock():
+        close_old_connections()
+        try:
+            with serialized_phone_write(second_phone):
+                second_entered.set()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            close_old_connections()
+
+    first_thread = Thread(target=hold_first_phone_lock)
+    second_thread = Thread(target=acquire_second_phone_lock)
+    first_thread.start()
+    try:
+        assert first_entered.wait(timeout=5)
+        second_thread.start()
+        assert second_entered.wait(timeout=3)
+    finally:
+        release_first.set()
+        first_thread.join(timeout=10)
+        if second_thread.ident is not None:
+            second_thread.join(timeout=10)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not errors
+
+
+@pytest.mark.django_db(transaction=True)
+def test_mysql_simultaneous_registrations_with_same_phone_allow_only_one():
+    if connection.vendor != 'mysql':
+        pytest.skip('SQLite does not implement select_for_update row locks')
+
+    phone = '13000000003'
+    start = Barrier(2, timeout=10)
+    results = []
+    errors = []
+
+    def register(username):
+        close_old_connections()
+        try:
+            start.wait()
+            create_user_with_unique_phone(username=username, password='StrongPass123', phone=phone)
+            results.append('created')
+        except DuplicatePhoneError:
+            results.append('duplicate')
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            close_old_connections()
+
+    threads = [Thread(target=register, args=(f'same-phone-racer-{number}',)) for number in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert sorted(results) == ['created', 'duplicate']
+    assert User.objects.filter(phone=phone).count() == 1
+
+
+def test_public_registration_rejects_duplicate_phone_and_allows_legacy_blank_values(api_client, active_user):
+    User.objects.create_user(username='legacy-null-phone', password='StrongPass123', phone=None)
+    User.objects.create_user(username='legacy-blank-phone', password='StrongPass123', phone='')
+
+    duplicate = api_client.post(
+        '/api/auth/register/',
+        {
+            'username': 'duplicate-phone-user',
+            'email': 'duplicate@example.com',
+            'password': 'StrongPass123',
+            'password_confirm': 'StrongPass123',
+            'phone': active_user.phone,
+        },
+        format='json',
+    )
+    assert duplicate.status_code == status.HTTP_400_BAD_REQUEST
+    assert '该手机号已被注册' in str(duplicate.json())
+    assert User.objects.filter(phone=active_user.phone).count() == 1
+
+    blank_phone = api_client.post(
+        '/api/auth/register/',
+        {
+            'username': 'blank-phone-user',
+            'email': 'blank@example.com',
+            'password': 'StrongPass123',
+            'password_confirm': 'StrongPass123',
+            'phone': '',
+        },
+        format='json',
+    )
+    assert blank_phone.status_code == status.HTTP_201_CREATED, blank_phone.json()
+    assert User.objects.filter(phone='').count() == 2
+
+
+def test_admin_user_update_allows_unchanged_legacy_duplicate_phone():
+    phone = '13900139000'
+    user = User.objects.create_user(username='legacy-duplicate-admin-one', phone=phone)
+    User.objects.create_user(username='legacy-duplicate-admin-two', phone=phone)
+
+    serializer = UserSerializer(user, data={'phone': phone, 'first_name': 'Updated'}, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    serializer.save()
+
+    assert User.objects.filter(phone=phone).count() == 2
+    user.refresh_from_db()
+    assert user.first_name == 'Updated'
+
+
+def test_legacy_duplicate_phone_is_rejected_by_sms_code_and_login(api_client):
+    phone = '13900139000'
+    User.objects.create_user(username='legacy-phone-one', password='StrongPass123', phone=phone)
+    User.objects.create_user(username='legacy-phone-two', password='StrongPass123', phone=phone)
+
+    with patch('apps.users.views.send_register_verify_code') as send_code:
+        send_response = api_client.post(
+            '/api/auth/send-register-code/',
+            {
+                'phone': phone,
+                'captcha_token': 'captcha-token',
+                'captcha_code': 'ABCD',
+                'mode': 'login',
+            },
+            format='json',
+        )
+    assert send_response.status_code == status.HTTP_409_CONFLICT
+    assert '多个账号' in send_response.json()['error']
+    send_code.assert_not_called()
+
+    with patch('apps.users.views.validate_verify_code', return_value=(True, '')):
+        login_response = api_client.post(
+            '/api/auth/sms-login/',
+            {'phone': phone, 'verify_code_token': 'token', 'verify_code': '123456'},
+            format='json',
+        )
+    assert login_response.status_code == status.HTTP_409_CONFLICT
+    assert '多个账号' in login_response.json()['error']
+    assert 'access' not in login_response.json()
 
 
 def test_login_rejects_unknown_user_without_disclosing_account_state(api_client):

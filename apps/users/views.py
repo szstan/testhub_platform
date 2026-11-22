@@ -222,10 +222,14 @@ def send_register_code(request):
     if not captcha_token or not captcha_code:
         return Response({'success': False, 'error': '请输入图形验证码'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # 登录模式：校验手机号是否已注册
+    # 登录模式：手机号必须唯一，以免短信验证码无法确定账号
     if mode == 'login':
-        if not User.objects.filter(phone=phone).exists():
+        matching_users = User.objects.filter(phone=phone)
+        user_count = matching_users.count()
+        if not user_count:
             return Response({'success': False, 'error': '该手机号未注册，请先注册'}, status=status.HTTP_400_BAD_REQUEST)
+        if user_count > 1:
+            return Response({'success': False, 'error': '该手机号关联多个账号，请联系管理员处理'}, status=status.HTTP_409_CONFLICT)
 
     # 注册模式：校验手机号未被注册
     if mode == 'register':
@@ -264,10 +268,16 @@ def sms_login_view(request):
         return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
 
     # 查找用户
-    try:
-        user = User.objects.get(phone=phone)
-    except User.DoesNotExist:
+    matching_users = User.objects.filter(phone=phone)
+    user_count = matching_users.count()
+    if user_count > 1:
+        return Response(
+            {'error': '该手机号关联多个账号，请联系管理员处理'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    if not user_count:
         return Response({'error': '该手机号未注册，请先注册'}, status=status.HTTP_400_BAD_REQUEST)
+    user = matching_users.first()
 
     if not user.is_active:
         return Response({'error': '用户已被禁用'}, status=status.HTTP_400_BAD_REQUEST)

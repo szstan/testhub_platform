@@ -20,6 +20,9 @@ const curlconverterBrowserParser = {
   },
 }
 
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8000'
+const wsProxyTarget = apiProxyTarget.replace(/^http/, 'ws')
+
 export default defineConfig({
   envDir: resolve(__dirname, '..'),
   plugins: [
@@ -103,27 +106,27 @@ export default defineConfig({
     },
     proxy: {
       '^/api/': {
-        target: 'http://127.0.0.1:8000',
+        target: apiProxyTarget,
         changeOrigin: true,
         secure: false,
       },
       '^/media/': {
-        target: 'http://127.0.0.1:8000',
+        target: apiProxyTarget,
         changeOrigin: true,
         secure: false,
       },
       '^/app-automation-templates/': {
-        target: 'http://127.0.0.1:8000',
+        target: apiProxyTarget,
         changeOrigin: true,
         secure: false,
       },
       '^/app-automation-reports/': {
-        target: 'http://127.0.0.1:8000',
+        target: apiProxyTarget,
         changeOrigin: true,
         secure: false,
       },
       '^/ws/': {
-        target: 'ws://127.0.0.1:8000',
+        target: wsProxyTarget,
         ws: true,
         changeOrigin: true,
         configure: (proxy) => {

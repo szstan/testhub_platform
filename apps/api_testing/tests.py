@@ -18,15 +18,21 @@ from apps.api_testing.models import (
     TaskExecutionLog,
     TaskNotificationSetting,
     TestExecution as ApiTestExecution,
+    TestSuiteRequest as ApiTestSuiteRequest,
     TestSuite as ApiTestSuite,
 )
 from apps.api_testing.serializers import (
+    ApiCollectionSerializer as ApiTestCollectionSerializer,
+    ApiRequestSerializer as ApiTestRequestSerializer,
     RequestHistorySerializer,
     ScheduledTaskSerializer,
     TestSuiteSerializer as ApiTestSuiteSerializer,
 )
 from apps.api_testing.utils import execute_api_request, execute_assertions, execute_test_suite
-from apps.api_testing.views import TestExecutionViewSet as ApiTestExecutionViewSet
+from apps.api_testing.views import (
+    TestExecutionViewSet as ApiTestExecutionViewSet,
+    TestSuiteViewSet as ApiTestSuiteViewSet,
+)
 from apps.core.models import UnifiedNotificationConfig
 from apps.executions.models import ExecutionAttempt, ExecutionJob, ExecutionStepResult
 from apps.executions.state_machine import AttemptStatus, StepStatus
@@ -759,6 +765,438 @@ def test_api_request_endpoint_persists_only_redacted_response_evidence():
     history = RequestHistory.objects.get(pk=result.data['id'])
     assert secret not in history.response_data['body']
     assert history.assertions_results[0]['actual'] == '[REDACTED]'
+
+
+@pytest.mark.django_db
+def test_api_suite_cannot_move_with_foreign_requests_or_environment():
+    owner = User.objects.create_user(username='suite-move-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-target-owner', password='pass')
+    target_member = User.objects.create_user(username='suite-target-member', password='pass')
+    source_member = User.objects.create_user(username='suite-source-member', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    source.members.add(source_member)
+    target = ApiProject.objects.create(
+        name='Suite Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner, target_member)
+    collection = ApiCollection.objects.create(name='source collection', project=source)
+    api_request = ApiRequest.objects.create(
+        collection=collection,
+        name='private source request',
+        method='GET',
+        url='https://source.example.test/private',
+        headers={'Authorization': 'source-secret'},
+        created_by=owner,
+    )
+    suite = ApiTestSuite.objects.create(project=source, name='source suite', created_by=owner)
+    ApiTestSuiteRequest.objects.create(test_suite=suite, request=api_request)
+    source_environment = Environment.objects.create(
+        name='source local', scope='LOCAL', project=source, created_by=owner,
+    )
+
+    client = APIClient()
+    suite_url = f'/api/api-testing/test-suites/{suite.pk}/'
+    empty_suite = ApiTestSuite.objects.create(project=source, name='empty suite', created_by=owner)
+    client.force_authenticate(user=source_member)
+    denied_empty_move = client.patch(
+        f'/api/api-testing/test-suites/{empty_suite.pk}/',
+        {'project': target.pk},
+        format='json',
+    )
+    assert denied_empty_move.status_code == 400, denied_empty_move.data
+    assert 'project' in denied_empty_move.data
+    empty_suite.refresh_from_db()
+    assert empty_suite.project_id == source.pk
+
+    client.force_authenticate(user=owner)
+    patched = client.patch(suite_url, {'project': target.pk}, format='json')
+    assert patched.status_code == 400, patched.data
+    assert 'project' in patched.data
+    replaced = client.put(
+        suite_url,
+        {'name': suite.name, 'project': target.pk},
+        format='json',
+    )
+    assert replaced.status_code == 400, replaced.data
+    assert 'project' in replaced.data
+    suite.refresh_from_db()
+    assert suite.project_id == source.pk
+
+    environment_suite = ApiTestSuite.objects.create(
+        project=source,
+        name='environment suite',
+        environment=source_environment,
+        created_by=owner,
+    )
+    environment_move = client.patch(
+        f'/api/api-testing/test-suites/{environment_suite.pk}/',
+        {'project': target.pk},
+        format='json',
+    )
+    assert environment_move.status_code == 400, environment_move.data
+    assert 'environment' in environment_move.data
+    environment_suite.refresh_from_db()
+    assert environment_suite.project_id == source.pk
+
+    client.force_authenticate(user=target_member)
+    hidden_suite = client.get(suite_url)
+    assert hidden_suite.status_code == 404
+    with patch('apps.api_testing.views.guarded_request') as guarded_request:
+        denied_execution = client.post(f'{suite_url}execute/', {}, format='json')
+    assert denied_execution.status_code == 404
+    guarded_request.assert_not_called()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_suite_move_rechecks_requests_added_after_serializer_validation():
+    owner = User.objects.create_user(username='suite-interleave-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-interleave-target', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Interleave Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite Interleave Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner)
+    collection = ApiCollection.objects.create(name='source collection', project=source)
+    old_request = ApiRequest.objects.create(
+        collection=collection,
+        name='old-project request',
+        method='GET',
+        url='https://source.example.test/interleave',
+        created_by=owner,
+    )
+    suite = ApiTestSuite.objects.create(project=source, name='suite', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_is_valid = ApiTestSuiteSerializer.is_valid
+    interleaved = False
+
+    def add_request_after_validation(serializer, *args, **kwargs):
+        nonlocal interleaved
+        valid = original_is_valid(serializer, *args, **kwargs)
+        if (
+            valid
+            and not interleaved
+            and serializer.instance
+            and serializer.instance.pk == suite.pk
+            and serializer.initial_data.get('project') == target.pk
+        ):
+            interleaved = True
+            add_response = client.post(
+                f'/api/api-testing/test-suites/{suite.pk}/add-requests/',
+                {'request_ids': [old_request.pk]},
+                format='json',
+            )
+            assert add_response.status_code == 200, add_response.data
+        return valid
+
+    # The add endpoint commits between serializer validation and perform_update.
+    # SQLite ignores select_for_update(), so this checks the re-read invariant, not lock blocking.
+    with patch.object(ApiTestSuiteSerializer, 'is_valid', new=add_request_after_validation):
+        response = client.patch(
+            f'/api/api-testing/test-suites/{suite.pk}/',
+            {'project': target.pk},
+            format='json',
+        )
+
+    assert interleaved
+    assert response.status_code == 400, response.data
+    assert 'project' in response.data
+    suite.refresh_from_db()
+    assert suite.project_id == source.pk
+    assert ApiTestSuiteRequest.objects.filter(test_suite=suite, request=old_request).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_suite_add_rechecks_project_after_stale_suite_lookup():
+    owner = User.objects.create_user(username='suite-stale-add-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-stale-add-target', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Stale Add Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite Stale Add Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner)
+    source_collection = ApiCollection.objects.create(name='source collection', project=source)
+    target_collection = ApiCollection.objects.create(name='target collection', project=target)
+    old_request = ApiRequest.objects.create(
+        collection=source_collection, name='old request', method='GET',
+        url='https://source.example.test/items', created_by=owner,
+    )
+    target_request = ApiRequest.objects.create(
+        collection=target_collection, name='target request', method='GET',
+        url='https://target.example.test/items', created_by=target_owner,
+    )
+    suite = ApiTestSuite.objects.create(project=source, name='suite', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_get_object = ApiTestSuiteViewSet.get_object
+    moved = False
+
+    def move_after_lookup(view):
+        nonlocal moved
+        suite_instance = original_get_object(view)
+        if view.action == 'add_requests' and not moved:
+            moved = True
+            ApiTestSuite.objects.filter(pk=suite_instance.pk).update(project=target)
+        return suite_instance
+
+    # Simulate a concurrent move after get_object() but before the locking read.
+    # SQLite cannot verify select_for_update() blocking; MySQL integration is needed for that.
+    with patch.object(ApiTestSuiteViewSet, 'get_object', new=move_after_lookup):
+        stale_add = client.post(
+            f'/api/api-testing/test-suites/{suite.pk}/add-requests/',
+            {'request_ids': [old_request.pk]},
+            format='json',
+        )
+        current_add = client.post(
+            f'/api/api-testing/test-suites/{suite.pk}/add-requests/',
+            {'request_ids': [target_request.pk]},
+            format='json',
+        )
+
+    assert moved
+    assert stale_add.status_code == 400, stale_add.data
+    assert not ApiTestSuiteRequest.objects.filter(test_suite=suite, request=old_request).exists()
+    assert current_add.status_code == 200, current_add.data
+    suite.refresh_from_db()
+    assert suite.project_id == target.pk
+    assert ApiTestSuiteRequest.objects.filter(test_suite=suite, request=target_request).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_suite_update_rejects_stale_source_instance():
+    owner = User.objects.create_user(username='suite-stale-update-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-stale-update-target', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Stale Update Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite Stale Update Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner)
+    suite = ApiTestSuite.objects.create(project=source, name='original name', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_is_valid = ApiTestSuiteSerializer.is_valid
+    moved = False
+
+    def move_after_validation(serializer, *args, **kwargs):
+        nonlocal moved
+        valid = original_is_valid(serializer, *args, **kwargs)
+        if valid and not moved and serializer.instance and serializer.instance.pk == suite.pk:
+            moved = True
+            ApiTestSuite.objects.filter(pk=suite.pk).update(project=target)
+        return valid
+
+    # A stale model instance must not overwrite a project changed after validation.
+    with patch.object(ApiTestSuiteSerializer, 'is_valid', new=move_after_validation):
+        response = client.patch(
+            f'/api/api-testing/test-suites/{suite.pk}/',
+            {'name': 'stale update'},
+            format='json',
+        )
+
+    assert moved
+    assert response.status_code == 400, response.data
+    assert 'project' in response.data
+    suite.refresh_from_db()
+    assert suite.project_id == target.pk
+    assert suite.name == 'original name'
+
+
+@pytest.mark.parametrize('admin_flag', ['is_staff', 'is_superuser'])
+@pytest.mark.django_db
+def test_api_suite_creation_preserves_admin_project_access(admin_flag):
+    admin = User.objects.create_user(username=f'suite-{admin_flag}', password='pass')
+    setattr(admin, admin_flag, True)
+    admin.save(update_fields=[admin_flag])
+    owner = User.objects.create_user(username=f'suite-{admin_flag}-owner', password='pass')
+    project = ApiProject.objects.create(
+        name=f'Suite Admin Project {admin_flag}', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    client = APIClient()
+    client.force_authenticate(user=admin)
+
+    response = client.post(
+        '/api/api-testing/test-suites/',
+        {'name': 'admin-created suite', 'project': project.pk},
+        format='json',
+    )
+
+    assert response.status_code == 201, response.data
+    assert ApiTestSuite.objects.filter(pk=response.data['id'], project=project, created_by=admin).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_suite_move_rejects_execution_created_after_validation():
+    owner = User.objects.create_user(username='suite-history-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-history-target', password='pass')
+    target_member = User.objects.create_user(username='suite-history-target-member', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite History Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite History Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner, target_member)
+    suite = ApiTestSuite.objects.create(project=source, name='suite with history', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_is_valid = ApiTestSuiteSerializer.is_valid
+    execution_id = None
+
+    def execute_after_validation(serializer, *args, **kwargs):
+        nonlocal execution_id
+        valid = original_is_valid(serializer, *args, **kwargs)
+        if (
+            valid
+            and execution_id is None
+            and serializer.instance
+            and serializer.instance.pk == suite.pk
+            and serializer.initial_data.get('project') == target.pk
+        ):
+            execution_response = client.post(
+                f'/api/api-testing/test-suites/{suite.pk}/execute/', {}, format='json',
+            )
+            assert execution_response.status_code == 200, execution_response.data
+            execution_id = execution_response.data['id']
+        return valid
+
+    with patch.object(ApiTestSuiteSerializer, 'is_valid', new=execute_after_validation):
+        move_response = client.patch(
+            f'/api/api-testing/test-suites/{suite.pk}/',
+            {'project': target.pk},
+            format='json',
+        )
+
+    assert execution_id is not None
+    assert move_response.status_code == 400, move_response.data
+    assert 'project' in move_response.data
+    suite.refresh_from_db()
+    assert suite.project_id == source.pk
+    assert ApiTestExecution.objects.filter(pk=execution_id, test_suite=suite).exists()
+
+    client.force_authenticate(user=owner)
+    assert client.get(f'/api/api-testing/test-executions/{execution_id}/').status_code == 200
+    client.force_authenticate(user=target_member)
+    assert client.get(f'/api/api-testing/test-executions/{execution_id}/').status_code == 404
+
+    empty_suite = ApiTestSuite.objects.create(project=source, name='empty suite', created_by=owner)
+    client.force_authenticate(user=owner)
+    empty_move = client.patch(
+        f'/api/api-testing/test-suites/{empty_suite.pk}/',
+        {'project': target.pk},
+        format='json',
+    )
+    assert empty_move.status_code == 200, empty_move.data
+    empty_suite.refresh_from_db()
+    assert empty_suite.project_id == target.pk
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_request_move_rechecks_suite_links_after_validation():
+    owner = User.objects.create_user(username='suite-linked-request-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-linked-request-target', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Linked Request Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite Linked Request Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner)
+    source_collection = ApiCollection.objects.create(name='source', project=source)
+    target_collection = ApiCollection.objects.create(name='target', project=target)
+    api_request = ApiRequest.objects.create(
+        collection=source_collection, name='request', method='GET',
+        url='https://source.example.test/items', created_by=owner,
+    )
+    suite = ApiTestSuite.objects.create(project=source, name='suite', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_is_valid = ApiTestRequestSerializer.is_valid
+    interleaved = False
+
+    def add_after_request_validation(serializer, *args, **kwargs):
+        nonlocal interleaved
+        valid = original_is_valid(serializer, *args, **kwargs)
+        if valid and not interleaved and serializer.instance and serializer.instance.pk == api_request.pk:
+            interleaved = True
+            add_response = client.post(
+                f'/api/api-testing/test-suites/{suite.pk}/add-requests/',
+                {'request_ids': [api_request.pk]},
+                format='json',
+            )
+            assert add_response.status_code == 200, add_response.data
+        return valid
+
+    with patch.object(ApiTestRequestSerializer, 'is_valid', new=add_after_request_validation):
+        response = client.patch(
+            f'/api/api-testing/requests/{api_request.pk}/',
+            {'collection': target_collection.pk},
+            format='json',
+        )
+
+    assert interleaved
+    assert response.status_code == 400, response.data
+    assert 'collection' in response.data
+    api_request.refresh_from_db()
+    assert api_request.collection_id == source_collection.pk
+    assert ApiTestSuiteRequest.objects.filter(test_suite=suite, request=api_request).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_collection_move_rechecks_suite_links_after_validation():
+    owner = User.objects.create_user(username='suite-linked-collection-owner', password='pass')
+    target_owner = User.objects.create_user(username='suite-linked-collection-target', password='pass')
+    source = ApiProject.objects.create(
+        name='Suite Linked Collection Source', project_type='HTTP', status='IN_PROGRESS', owner=owner,
+    )
+    target = ApiProject.objects.create(
+        name='Suite Linked Collection Target', project_type='HTTP', status='IN_PROGRESS', owner=target_owner,
+    )
+    target.members.add(owner)
+    collection = ApiCollection.objects.create(name='source', project=source)
+    api_request = ApiRequest.objects.create(
+        collection=collection, name='request', method='GET',
+        url='https://source.example.test/items', created_by=owner,
+    )
+    suite = ApiTestSuite.objects.create(project=source, name='suite', created_by=owner)
+    client = APIClient()
+    client.force_authenticate(user=owner)
+    original_is_valid = ApiTestCollectionSerializer.is_valid
+    interleaved = False
+
+    def add_after_collection_validation(serializer, *args, **kwargs):
+        nonlocal interleaved
+        valid = original_is_valid(serializer, *args, **kwargs)
+        if valid and not interleaved and serializer.instance and serializer.instance.pk == collection.pk:
+            interleaved = True
+            add_response = client.post(
+                f'/api/api-testing/test-suites/{suite.pk}/add-requests/',
+                {'request_ids': [api_request.pk]},
+                format='json',
+            )
+            assert add_response.status_code == 200, add_response.data
+        return valid
+
+    with patch.object(ApiTestCollectionSerializer, 'is_valid', new=add_after_collection_validation):
+        response = client.patch(
+            f'/api/api-testing/collections/{collection.pk}/',
+            {'project': target.pk},
+            format='json',
+        )
+
+    assert interleaved
+    assert response.status_code == 400, response.data
+    assert 'project' in response.data
+    collection.refresh_from_db()
+    assert collection.project_id == source.pk
+    assert ApiTestSuiteRequest.objects.filter(test_suite=suite, request=api_request).exists()
 
 
 def test_execute_api_request_runs_cancel_check_before_network():

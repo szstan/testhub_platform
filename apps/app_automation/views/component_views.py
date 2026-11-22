@@ -49,8 +49,16 @@ class AppComponentViewSet(viewsets.ModelViewSet):
             'data': serializer.data
         })
 
+    def _require_admin(self, request):
+        if not is_app_admin(request.user):
+            return Response({'detail': '仅管理员可以修改全局组件'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
     def create(self, request, *args, **kwargs):
         """创建组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
@@ -61,6 +69,9 @@ class AppComponentViewSet(viewsets.ModelViewSet):
 
     def update(self, request, *args, **kwargs):
         """更新组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=kwargs.pop('partial', False))
         serializer.is_valid(raise_exception=True)
@@ -72,6 +83,9 @@ class AppComponentViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         """删除组件"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         instance = self.get_object()
         self.perform_destroy(instance)
         return Response({
@@ -159,6 +173,23 @@ class AppComponentPackageViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = AppPagination
 
+    def _require_admin(self, request):
+        if not is_app_admin(request.user):
+            return Response({'detail': '仅管理员可以管理全局组件包'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def update(self, request, *args, **kwargs):
+        denial = self._require_admin(request)
+        if denial:
+            return denial
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        denial = self._require_admin(request)
+        if denial:
+            return denial
+        return super().destroy(request, *args, **kwargs)
+
     def _parse_manifest(self, request) -> dict:
         """解析组件包清单"""
         if 'file' in request.FILES:
@@ -185,6 +216,9 @@ class AppComponentPackageViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """导入组件包"""
+        denial = self._require_admin(request)
+        if denial:
+            return denial
         try:
             manifest = self._parse_manifest(request)
         except Exception as error:
@@ -243,6 +277,7 @@ class AppComponentPackageViewSet(viewsets.ModelViewSet):
                 updated_count += 1
 
             if errors:
+                transaction.set_rollback(True)
                 return Response({
                     'success': False,
                     'message': '组件包包含错误: ' + ', '.join(errors),

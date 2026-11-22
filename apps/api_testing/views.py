@@ -1,13 +1,13 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
-from django.db import models
+from django.db import models, transaction
 from apps.core.http_transport import guarded_post, guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from apps.quality_intelligence.services.redaction import redact_payload
@@ -47,7 +47,7 @@ from .serializers import (
 
 logger = logging.getLogger(__name__)
 
-from .utils import can_use_environment, execute_assertions, redact_response_data
+from .utils import can_access_api_project, can_use_environment, execute_assertions, redact_response_data
 from .operation_logger import log_operation
 from .variable_resolver import VariableResolver
 from .serializers import (
@@ -273,15 +273,35 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新集合时校验项目归属并记录日志。"""
-        project = serializer.validated_data.get('project', serializer.instance.project)
+        """Lock collection changes and preserve linked-suite project consistency."""
+        initial_instance = serializer.instance
         user = self.request.user
-        if not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
-            raise PermissionDenied('无权使用该项目')
-        parent = serializer.validated_data.get('parent', serializer.instance.parent)
-        if parent and parent.project_id != project.id:
-            raise PermissionDenied('父集合必须属于同一项目')
-        instance = serializer.save()
+        with transaction.atomic():
+            instance = ApiCollection.objects.select_for_update().filter(pk=initial_instance.pk).first()
+            if instance is None:
+                raise Http404
+            if not can_access_api_project(instance.project, user, allow_admin=False):
+                raise Http404
+            if instance.project_id != initial_instance.project_id:
+                raise ValidationError({'project': '集合所属项目已变更，请刷新后重试'})
+
+            project = serializer.validated_data.get('project', instance.project)
+            if not can_access_api_project(project, user):
+                raise PermissionDenied('无权使用该项目')
+            parent = serializer.validated_data.get('parent', instance.parent)
+            if parent and parent.project_id != project.id:
+                raise PermissionDenied('父集合必须属于同一项目')
+            if (
+                project.pk != instance.project_id
+                and TestSuiteRequest.objects.filter(request__collection_id=instance.pk).exists()
+            ):
+                raise ValidationError({'project': '集合中的请求已关联测试套件，不能跨项目迁移'})
+
+            serializer.instance = instance
+            if 'project' in serializer.validated_data:
+                serializer.validated_data['project'] = project
+            instance = serializer.save()
+
         log_operation(
             operation_type='edit',
             resource_type='collection',
@@ -357,12 +377,64 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新接口时校验集合归属并记录日志。"""
-        collection = serializer.validated_data.get('collection', serializer.instance.collection)
+        """Lock collection and request rows before validating a request move."""
+        initial_instance = serializer.instance
         user = self.request.user
-        if collection and not (user.is_staff or user.is_superuser or collection.project.owner_id == user.id or collection.project.members.filter(pk=user.pk).exists()):
-            raise PermissionDenied('无权使用该项目')
-        instance = serializer.save()
+        if 'collection' in serializer.validated_data:
+            target_collection = serializer.validated_data['collection']
+            target_collection_id = target_collection.pk if target_collection else None
+        else:
+            target_collection_id = initial_instance.collection_id
+        collection_ids = sorted({
+            collection_id
+            for collection_id in (initial_instance.collection_id, target_collection_id)
+            if collection_id is not None
+        })
+
+        with transaction.atomic():
+            # Match add_requests and collection moves: collections are locked before requests.
+            collections = {
+                collection.pk: collection
+                for collection in ApiCollection.objects.select_for_update()
+                .filter(pk__in=collection_ids)
+                .order_by('pk')
+            }
+            if len(collections) != len(collection_ids):
+                raise ValidationError({'collection': '请求所属集合已变更，请刷新后重试'})
+
+            instance = ApiRequest.objects.select_for_update().filter(pk=initial_instance.pk).first()
+            if instance is None:
+                raise Http404
+            if instance.collection_id != initial_instance.collection_id:
+                raise ValidationError({'collection': '请求所属集合已变更，请刷新后重试'})
+
+            source_collection = collections.get(instance.collection_id)
+            if source_collection and not can_access_api_project(
+                source_collection.project, user, allow_admin=False,
+            ):
+                raise Http404
+            if source_collection is None and instance.created_by_id != user.pk:
+                raise Http404
+
+            target_collection = collections.get(target_collection_id)
+            if target_collection_id is not None and target_collection is None:
+                raise ValidationError({'collection': '目标集合不存在'})
+            if target_collection and not can_access_api_project(target_collection.project, user):
+                raise PermissionDenied('无权使用该项目')
+
+            source_project_id = source_collection.project_id if source_collection else None
+            target_project_id = target_collection.project_id if target_collection else None
+            if (
+                source_project_id != target_project_id
+                and TestSuiteRequest.objects.filter(request_id=instance.pk).exists()
+            ):
+                raise ValidationError({'collection': '已关联测试套件的请求不能跨项目迁移'})
+
+            serializer.instance = instance
+            if 'collection' in serializer.validated_data:
+                serializer.validated_data['collection'] = target_collection
+            instance = serializer.save()
+
         log_operation(
             operation_type='edit',
             resource_type='request',
@@ -740,28 +812,34 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         """执行测试套件"""
-        test_suite = self.get_object()
-        if not can_use_environment(test_suite.environment, request.user, project=test_suite.project):
-            return Response({'error': '无权使用该执行环境'}, status=status.HTTP_403_FORBIDDEN)
-        
+        initial_suite = self.get_object()
+        execution = None
+
         try:
-            # 创建执行记录
-            execution = TestExecution.objects.create(
-                test_suite=test_suite,
-                status='RUNNING',
-                start_time=timezone.now(),
-                executed_by=request.user
-            )
-            
-            # 获取套件中的请求
-            suite_requests = TestSuiteRequest.objects.filter(
-                test_suite=test_suite,
-                enabled=True
-            ).order_by('order')
-            
-            execution.total_requests = suite_requests.count()
-            execution.save()
-            
+            with transaction.atomic():
+                test_suite = TestSuite.objects.select_for_update().filter(pk=initial_suite.pk).first()
+                if test_suite is None:
+                    raise Http404
+                if not can_access_api_project(test_suite.project, request.user, allow_admin=False):
+                    raise Http404
+                if not can_use_environment(test_suite.environment, request.user, project=test_suite.project):
+                    return Response({'error': '无权使用该执行环境'}, status=status.HTTP_403_FORBIDDEN)
+
+                execution = TestExecution.objects.create(
+                    test_suite=test_suite,
+                    status='RUNNING',
+                    start_time=timezone.now(),
+                    executed_by=request.user
+                )
+                suite_requests = list(
+                    TestSuiteRequest.objects.filter(
+                        test_suite=test_suite,
+                        enabled=True
+                    ).select_related('request').order_by('order')
+                )
+                execution.total_requests = len(suite_requests)
+                execution.save(update_fields=['total_requests'])
+
             results = []
             passed_count = 0
             failed_count = 0
@@ -928,17 +1006,20 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
             
             return Response(TestExecutionSerializer(execution).data)
             
+        except Http404:
+            raise
         except Exception as e:
-            execution.status = 'FAILED'
-            execution.end_time = timezone.now()
-            execution.save()
+            if execution is not None:
+                execution.status = 'FAILED'
+                execution.end_time = timezone.now()
+                execution.save()
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def perform_create(self, serializer):
         """创建测试套件时记录日志并校验项目/环境归属。"""
         project = serializer.validated_data.get('project')
         user = self.request.user
-        if not project or not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
+        if not can_access_api_project(project, user):
             raise PermissionDenied('无权使用该项目')
         environment = serializer.validated_data.get('environment')
         if environment and not can_use_environment(environment, user, project=project):
@@ -953,15 +1034,34 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        """更新测试套件时记录日志并校验项目/环境归属。"""
-        project = serializer.validated_data.get('project', serializer.instance.project)
+        """Lock and revalidate suite ownership and linked requests before moving it."""
+        initial_instance = serializer.instance
         user = self.request.user
-        if not (user.is_staff or user.is_superuser or project.owner_id == user.id or project.members.filter(pk=user.pk).exists()):
-            raise PermissionDenied('无权使用该项目')
-        environment = serializer.validated_data.get('environment', serializer.instance.environment)
-        if environment and not can_use_environment(environment, user, project=project):
-            raise PermissionDenied('无权使用该执行环境')
-        instance = serializer.save()
+        with transaction.atomic():
+            instance = TestSuite.objects.select_for_update().filter(pk=initial_instance.pk).first()
+            if instance is None:
+                raise Http404
+            if not can_access_api_project(instance.project, user, allow_admin=False):
+                raise Http404
+            if instance.project_id != initial_instance.project_id:
+                raise ValidationError({'project': '测试套件所属项目已变更，请刷新后重试'})
+
+            project = serializer.validated_data.get('project', instance.project)
+            if not can_access_api_project(project, user):
+                raise PermissionDenied('无权使用该项目')
+            if instance.testsuiterequest_set.exclude(
+                request__collection__project_id=project.pk
+            ).exists():
+                raise ValidationError({'project': '测试套件中的所有请求必须属于目标项目'})
+            if project.pk != instance.project_id and instance.executions.exists():
+                raise ValidationError({'project': '已有执行记录的测试套件不能迁移项目'})
+
+            environment = serializer.validated_data.get('environment', instance.environment)
+            if environment and not can_use_environment(environment, user, project=project):
+                raise PermissionDenied('无权使用该执行环境')
+            serializer.instance = instance
+            instance = serializer.save()
+
         log_operation(
             operation_type='edit',
             resource_type='suite',
@@ -984,32 +1084,78 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='add-requests')
     def add_requests(self, request, pk=None):
         """添加请求到测试套件"""
-        test_suite = self.get_object()
+        initial_suite = self.get_object()
         request_ids = request.data.get('request_ids', [])
-        
+        user = request.user
+
         try:
-            for request_id in request_ids:
-                api_request = ApiRequest.objects.filter(
-                    id=request_id,
-                    collection__project=test_suite.project,
-                ).filter(
-                    models.Q(collection__project__owner=request.user)
-                    | models.Q(collection__project__members=request.user)
-                ).first()
-                if api_request is None:
-                    raise ValueError('请求不存在、跨项目或无权限')
-                TestSuiteRequest.objects.get_or_create(
-                    test_suite=test_suite,
-                    request=api_request,
-                    defaults={
-                        'order': TestSuiteRequest.objects.filter(test_suite=test_suite).count(),
-                        'enabled': True,
-                        'assertions': []
-                    }
+            if not isinstance(request_ids, list):
+                raise ValueError('request_ids must be a list')
+            try:
+                request_ids = [ApiRequest._meta.pk.to_python(request_id) for request_id in request_ids]
+            except (TypeError, ValueError):
+                raise ValueError('请求不存在、跨项目或无权限')
+
+            with transaction.atomic():
+                test_suite = TestSuite.objects.select_for_update().filter(pk=initial_suite.pk).first()
+                if test_suite is None:
+                    raise Http404
+                if not can_access_api_project(test_suite.project, user, allow_admin=False):
+                    raise Http404
+
+                # Lock collections and requests in stable order after the suite row.
+                request_locations = dict(
+                    ApiRequest.objects.filter(pk__in=request_ids).values_list('pk', 'collection_id')
                 )
-            
+                requested_ids = set(request_ids)
+                if len(request_locations) != len(requested_ids) or any(
+                    request_locations.get(request_id) is None for request_id in requested_ids
+                ):
+                    raise ValueError('请求不存在、跨项目或无权限')
+
+                collection_ids = sorted(set(request_locations.values()))
+                collections = {
+                    collection.pk: collection
+                    for collection in ApiCollection.objects.select_for_update()
+                    .filter(pk__in=collection_ids)
+                    .order_by('pk')
+                }
+                if len(collections) != len(collection_ids):
+                    raise ValueError('请求不存在、跨项目或无权限')
+
+                api_requests = {
+                    api_request.pk: api_request
+                    for api_request in ApiRequest.objects.select_for_update()
+                    .filter(pk__in=requested_ids)
+                    .order_by('pk')
+                }
+                if len(api_requests) != len(requested_ids):
+                    raise ValueError('请求不存在、跨项目或无权限')
+
+                for request_id in request_ids:
+                    api_request = api_requests[request_id]
+                    collection = collections.get(api_request.collection_id)
+                    if (
+                        api_request.collection_id != request_locations[request_id]
+                        or collection is None
+                        or collection.project_id != test_suite.project_id
+                        or not can_access_api_project(collection.project, user, allow_admin=False)
+                    ):
+                        raise ValueError('请求不存在、跨项目或无权限')
+                    TestSuiteRequest.objects.get_or_create(
+                        test_suite=test_suite,
+                        request=api_request,
+                        defaults={
+                            'order': TestSuiteRequest.objects.filter(test_suite=test_suite).count(),
+                            'enabled': True,
+                            'assertions': []
+                        }
+                    )
+
             return Response({'message': '添加成功'})
-            
+
+        except Http404:
+            raise
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
     
