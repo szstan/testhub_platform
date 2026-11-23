@@ -30,6 +30,7 @@ class ExecutionResult:
     PASSED = 'passed'
     FAILED = 'failed'
     SKIPPED = 'skipped'
+    UNVERIFIED = 'unverified'
 
 
 class ElementType:

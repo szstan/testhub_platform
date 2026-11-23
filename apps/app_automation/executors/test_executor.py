@@ -451,6 +451,7 @@ class AppTestExecutor:
             failed = 0
             skipped = 0
             broken = 0
+            unverified = 0
 
             logger.debug(f"解析Allure目录 {results_dir} ，找到文件: {result_files}")
             for result_file in result_files:
@@ -458,7 +459,15 @@ class AppTestExecutor:
                     with open(result_file, 'r', encoding='utf-8') as f:
                         data = json.load(f)
 
-                        status = data.get('status', '').lower()
+                        status = str(data.get('status', '')).lower()
+                        labels = data.get('labels') or []
+                        if isinstance(labels, list) and any(
+                            isinstance(label, dict)
+                            and label.get('name') == 'testhub_verification'
+                            and label.get('value') == 'unverified'
+                            for label in labels
+                        ):
+                            unverified += 1
                         total += 1
 
                         if status == 'passed':
@@ -477,6 +486,9 @@ class AppTestExecutor:
                             logger.debug(f"未知测试状态 '{status}' 视为失败: {result_file}")
 
                 except Exception as e:
+                    total += 1
+                    failed += 1
+                    broken += 1
                     logger.warning(f"解析结果文件失败: {result_file}, 错误: {e}")
             
             logger.info(f"测试结果统计: 总数={total}, 通过={passed}, 失败={failed}, 跳过={skipped}, broken={broken}")
@@ -487,6 +499,7 @@ class AppTestExecutor:
                 'failed': failed,
                 'skipped': skipped,
                 'broken': broken,
+                'unverified': unverified,
             }
             
         except Exception as e:
@@ -497,6 +510,7 @@ class AppTestExecutor:
                 'failed': 0,
                 'skipped': 0,
                 'broken': 0,
+                'unverified': 0,
             }
     
     def calculate_progress(self, execution_id: Optional[int] = None) -> int:

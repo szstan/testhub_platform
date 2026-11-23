@@ -108,7 +108,7 @@
               {{ $t('appAutomation.common.stop') }}
             </el-button>
             <el-button
-              v-if="row.report_path"
+              v-if="row.report_access_token"
               type="primary"
               size="small"
               text
@@ -166,11 +166,13 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getExecutionList,
+  getExecutionDetail,
   stopExecution as apiStopExecution,
   getAppProjects
 } from '@/api/app-automation'
 import { Search, Refresh } from '@element-plus/icons-vue'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -244,18 +246,12 @@ const stopExecution = async (execution) => {
   }
 }
 
-const viewReport = (execution) => {
-  if (!execution || !execution.id) {
-    ElMessage.warning(t('appAutomation.execution.invalidExecutionId'))
-    return
+const viewReport = async (execution) => {
+  const result = await openAppExecutionReport(execution?.id, { fetchExecution: getExecutionDetail })
+  if (!result.opened) {
+    const key = result.reason === 'blocked' ? 'reportPopupBlocked' : result.reason === 'failed' ? 'reportOpenFailed' : 'reportUnavailable'
+    ElMessage.warning(t(`appAutomation.common.${key}`))
   }
-  
-  const reportUrl = getAppReportUrl(execution)
-  if (!reportUrl) {
-    ElMessage.warning(t('appAutomation.execution.reportNotExist'))
-    return
-  }
-  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 const viewError = (execution) => {

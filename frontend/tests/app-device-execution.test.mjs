@@ -10,6 +10,7 @@ import * as deviceExecution from '../src/utils/app-automation-device-execution.m
 
 const frontend = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const instances = []
+const reportAccess = { openAppExecutionReport: async () => ({ opened: true }) }
 afterEach(() => instances.splice(0).forEach(instance => instance.dispose()))
 
 const availableDevice = { id: 11, device_id: 'serial-11', name: 'Device 11', status: 'online', locked_by: null }
@@ -72,6 +73,7 @@ async function setupCaseList({
       getAppReportUrl: () => '',
     },
     '@/utils/websocket': { buildWebSocketUrl: () => '', issueWebSocketTicket },
+    '@/utils/app-automation-report.mjs': reportAccess,
     '@/utils/app-automation-device-execution.mjs': deviceExecution,
     '@/stores/user': { useUserStore: () => userStore },
   }, { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, confirm })
@@ -83,6 +85,7 @@ async function setupExecutionList({ stopExecution, confirm } = {}) {
   const calls = []
   const api = {
     getExecutionList: async () => ({ data: { results: [] } }),
+    getExecutionDetail: async () => ({ data: {} }),
     stopExecution: stopExecution || (async id => {
       calls.push(['stop', id])
       return { data: { success: true, stopping: false } }
@@ -92,6 +95,7 @@ async function setupExecutionList({ stopExecution, confirm } = {}) {
   const instance = await loadSfcSetup('src/views/app-automation/executions/ExecutionList.vue', {
     '@element-plus/icons-vue': { Search: {}, Refresh: {} },
     '@/api/app-automation': api,
+    '@/utils/app-automation-report.mjs': reportAccess,
     '@/utils/app-automation-helpers': {
       getExecutionStatusType: () => 'info',
       getExecutionStatusText: value => value,
@@ -120,6 +124,7 @@ async function setupSuiteList({ getAppDevice, runTestSuite, userStore = createUs
       return { data: { success: true, message: 'submitted', device: executionDevice } }
     }),
     getTestSuiteExecutions: async () => ({ data: { data: [] } }),
+    getExecutionDetail: async () => ({ data: {} }),
     getTestCaseList: async () => ({ data: { results: [] } }),
     getDeviceList: async () => ({ data: { results: [availableDevice] } }),
     getAppDevice: getAppDevice || (async id => {
@@ -140,6 +145,7 @@ async function setupSuiteList({ getAppDevice, runTestSuite, userStore = createUs
       formatDateTime: value => value,
       getAppReportUrl: () => '',
     },
+    '@/utils/app-automation-report.mjs': reportAccess,
     '@/utils/app-automation-device-execution.mjs': deviceExecution,
     '@/stores/user': { useUserStore: () => userStore },
   }, { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, confirm })

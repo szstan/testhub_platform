@@ -31,15 +31,17 @@ const EXECUTION_STATUS_TYPE = {
 // ========== 测试结果映射（用例通过/失败） ==========
 
 const EXECUTION_RESULT_KEY = {
-  'passed':  'appAutomation.status.passed',
-  'failed':  'appAutomation.status.failed',
-  'skipped': 'appAutomation.status.skipped',
+  'passed':     'appAutomation.status.passed',
+  'failed':     'appAutomation.status.failed',
+  'skipped':    'appAutomation.status.skipped',
+  'unverified': 'appAutomation.status.unverified',
 }
 
 const EXECUTION_RESULT_TYPE = {
-  'passed':  'success',
-  'failed':  'danger',
-  'skipped': 'warning',
+  'passed':     'success',
+  'failed':     'danger',
+  'skipped':    'warning',
+  'unverified': 'warning',
 }
 
 const DEVICE_STATUS_KEY = {

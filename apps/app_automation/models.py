@@ -431,6 +431,7 @@ class AppTestSuite(models.Model):
         ('passed', '通过'),
         ('failed', '失败'),
         ('skipped', '跳过'),
+        ('unverified', '未验证'),
     ]
 
     project = models.ForeignKey(
@@ -578,6 +579,7 @@ class AppTestExecution(models.Model):
         (ExecutionResult.PASSED, '通过'),
         (ExecutionResult.FAILED, '失败'),
         (ExecutionResult.SKIPPED, '跳过'),
+        (ExecutionResult.UNVERIFIED, '未验证'),
     ]
     
     test_case = models.ForeignKey(

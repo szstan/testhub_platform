@@ -309,13 +309,15 @@ import {
   updateSuiteTestCaseOrder,
   runTestSuite,
   getTestSuiteExecutions,
+  getExecutionDetail,
   getTestCaseList,
   getDeviceList,
   getPackageList,
   getAppProjects,
   getAppDevice,
 } from '@/api/app-automation'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
 import {
   canSelectAppExecutionDevice,
   getAppExecutionErrorMessage,
@@ -700,17 +702,12 @@ const showSuiteExecutions = async (suite) => {
   }
 }
 
-const viewReport = (execution) => {
-  if (!execution.report_path) {
-    ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
-    return
+const viewReport = async (execution) => {
+  const result = await openAppExecutionReport(execution?.id, { fetchExecution: getExecutionDetail })
+  if (!result.opened) {
+    const key = result.reason === 'blocked' ? 'reportPopupBlocked' : result.reason === 'failed' ? 'reportOpenFailed' : 'reportUnavailable'
+    ElMessage.warning(t(`appAutomation.common.${key}`))
   }
-  const reportUrl = getAppReportUrl(execution)
-  if (!reportUrl) {
-    ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
-    return
-  }
-  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 // ===== 工具方法 =====
@@ -724,6 +721,7 @@ const getSuiteDisplayStatus = (row) => {
   if (result === 'passed') return { type: 'success', text: t('appAutomation.status.passed') }
   if (result === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
   if (result === 'skipped') return { type: 'warning', text: t('appAutomation.status.skipped') }
+  if (result === 'unverified') return { type: 'warning', text: t('appAutomation.status.unverified') }
   // 向后兼容旧值
   if (status === 'success') return { type: 'success', text: t('appAutomation.status.passed') }
   if (status === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
@@ -732,7 +730,8 @@ const getSuiteDisplayStatus = (row) => {
 
 const getProgressStatus = (row) => {
   if (row.status === 'completed') {
-    return row.result === 'failed' ? 'exception' : 'success'
+    if (row.result === 'failed') return 'exception'
+    return row.result === 'passed' ? 'success' : undefined
   }
   if (row.status === 'error') return 'exception'
   return undefined

@@ -112,6 +112,7 @@ class UiFlowRunner:
         
         # 初始化上下文
         self._init_context(variables, runtime)
+        self._assertions_executed = 0
         
         # 执行所有步骤
         total_steps = len(ui_flow)
@@ -169,6 +170,7 @@ class UiFlowRunner:
             'total': total_steps,
             'passed': passed_steps,
             'failed': failed_steps,
+            'assertions': self._assertions_executed,
             'outputs': self.context.get('outputs', {}),
         }
     
@@ -326,11 +328,13 @@ class UiFlowRunner:
         handler = action_map.get(action)
         if handler:
             handler(step)
+            if action in {'assert', 'foreach_assert'}:
+                self._assertions_executed = getattr(self, '_assertions_executed', 0) + 1
         else:
             # action_map 中找不到，尝试作为自定义组件查找
             if self._try_execute_as_custom(step, action):
                 return
-            logger.warning(f"未知的动作类型: {action} (步骤: {step.get('name', 'unknown')})")
+            raise ValueError(f"未知的动作类型: {action} (步骤: {step.get('name', 'unknown')})")
 
     # ---------- 自定义组件展开 ----------
 
@@ -375,8 +379,7 @@ class UiFlowRunner:
             sub_steps = comp_def.get('steps', [])
         
         if not sub_steps or not isinstance(sub_steps, list):
-            logger.warning(f"自定义组件 '{comp_name}' 没有步骤，跳过")
-            return
+            raise ValueError(f"自定义组件 '{comp_name}' 没有可执行步骤")
         
         # 深拷贝，避免修改原始定义
         sub_steps = copy.deepcopy(sub_steps)
@@ -428,8 +431,16 @@ class UiFlowRunner:
             return
         if step is not None:
             try:
+                from apps.quality_intelligence.services.redaction import redact_payload
+                safe_step = redact_payload(copy.deepcopy(step))
+                if str(step.get('type', '')).lower() in {'input', 'text', 'set_variable'}:
+                    for item in (safe_step, safe_step.get('config', {})):
+                        if isinstance(item, dict):
+                            for key in ('value', 'text'):
+                                if key in item:
+                                    item[key] = '[REDACTED]'
                 allure.attach(
-                    json.dumps(step, ensure_ascii=False, indent=2),
+                    json.dumps(safe_step, ensure_ascii=False, indent=2),
                     name=f"{name}-step",
                     attachment_type=allure.attachment_type.JSON
                 )
@@ -573,9 +584,10 @@ class UiFlowRunner:
     def _action_double_click(self, step: Dict[str, Any]):
         """双击动作"""
         target = self._interaction_target(self._resolve_selector(step))
-        if target:
-            logger.info(f"执行双击: {target}")
-            double_click(target)
+        if target is None:
+            raise ValueError('双击步骤无法解析目标元素')
+        logger.info(f"执行双击: {target}")
+        double_click(target)
     
     def _action_swipe(self, step: Dict[str, Any]):
         """滑动动作"""
@@ -618,6 +630,8 @@ class UiFlowRunner:
         """等待：有 selector 时等待元素出现，没有时纯等待 timeout 秒"""
         target = self._resolve_selector(step)
         timeout = step.get('timeout', step.get('duration', 3))
+        if target is None and (step.get('element_id') or step.get('selector')):
+            raise ValueError('等待步骤无法解析已配置的目标元素')
         
         if target:
             if isinstance(target, (tuple, list)):
@@ -641,7 +655,7 @@ class UiFlowRunner:
     def _action_text(self, step: Dict[str, Any]):
         """输入文本"""
         text_value = step.get('text', '')
-        logger.info(f"输入文本: {text_value}")
+        logger.info('执行文本输入，内容已隐藏')
         airtest_text(text_value)
     
     def _action_set_variable(self, step: Dict[str, Any]):
@@ -652,7 +666,7 @@ class UiFlowRunner:
         
         if name:
             self._set_variable(name, value, scope)
-            logger.info(f"设置变量: {scope}.{name} = {value}")
+            logger.info(f"设置变量: {scope}.{name}")
     
     def _action_assert(self, step: Dict[str, Any]):
         """
@@ -852,8 +866,10 @@ class UiFlowRunner:
         """存在性断言：判断图片元素是否存在于屏幕上"""
         target = self._resolve_selector(step)
         expected_exists = step.get('expected_exists', True)
-        
-        result = exists(target) is not None
+        if target is None:
+            raise ValueError('存在性断言无法解析目标元素')
+
+        result = bool(exists(target))
         
         if expected_exists and not result:
             raise AssertionError(f"期望元素存在，但实际不存在")
@@ -879,7 +895,7 @@ class UiFlowRunner:
         target = Template(image_path, threshold=threshold)
         result = exists(target)
         
-        if result is None:
+        if not result:
             raise AssertionError(f"图片断言失败: 未在屏幕上找到图片 '{expected_image}' (阈值: {threshold})")
         
         logger.info(f"图片断言成功: 在屏幕上找到图片 '{expected_image}', 位置: {result}")
@@ -893,6 +909,8 @@ class UiFlowRunner:
     def _action_input(self, step: Dict[str, Any]):
         """输入文本"""
         target = self._interaction_target(self._resolve_selector(step))
+        if target is None and (step.get('element_id') or step.get('selector')):
+            raise ValueError('输入步骤无法解析已配置的目标元素')
         value = step.get('value', '')
         
         # 解析变量表达式（如随机数函数）
@@ -905,7 +923,7 @@ class UiFlowRunner:
             touch(target)
             time.sleep(0.3)
         
-        logger.info(f"输入文本: {value}")
+        logger.info('执行文本输入，内容已隐藏')
         airtest_text(value)
         
         # 如果需要发送回车键（用于搜索）
@@ -925,9 +943,10 @@ class UiFlowRunner:
         target = self._interaction_target(self._resolve_selector(step))
         duration = step.get('duration', 2)
         
-        if target:
-            logger.info(f"长按: {target}, 时长: {duration}秒")
-            touch(target, duration=duration)
+        if target is None:
+            raise ValueError('长按步骤无法解析目标元素')
+        logger.info(f"长按: {target}, 时长: {duration}秒")
+        touch(target, duration=duration)
     
     def _action_drag(self, step: Dict[str, Any]):
         """拖拽：从起点拖拽到终点"""
@@ -949,9 +968,10 @@ class UiFlowRunner:
         
         duration = step.get('duration', 0.8)
         
-        if start and end:
-            logger.info(f"拖拽: {start} -> {end}")
-            swipe(start, end, duration=duration)
+        if start is None or end is None:
+            raise ValueError('拖拽步骤无法解析起点或终点')
+        logger.info(f"拖拽: {start} -> {end}")
+        swipe(start, end, duration=duration)
     
     def _action_swipe_to(self, step: Dict[str, Any]):
         """滑动直到目标元素出现"""
@@ -961,6 +981,8 @@ class UiFlowRunner:
             'image_scope': step.get('image_scope', 'common')
         }
         target = self._resolve_selector(target_config)
+        if target is None:
+            raise ValueError('滑动查找步骤无法解析目标元素')
         
         direction = step.get('direction', 'up')
         max_swipes = step.get('max_swipes', 5)
@@ -989,7 +1011,7 @@ class UiFlowRunner:
             
             time.sleep(interval)
         
-        logger.warning(f"滑动 {max_swipes} 次后仍未找到目标元素")
+        raise AssertionError(f"滑动 {max_swipes} 次后仍未找到目标元素")
     
     def _action_image_exists_click(self, step: Dict[str, Any]):
         """主定位存在则点击主定位，否则点击备用定位"""
@@ -1017,6 +1039,8 @@ class UiFlowRunner:
         elif fallback_target:
             logger.info(f"主定位不存在，点击备用定位")
             touch(fallback_target)
+        else:
+            raise ValueError('主定位不存在且备用定位不可用')
     
     def _action_image_exists_click_chain(self, step: Dict[str, Any]):
         """主定位存在则依次点击主定位和备用定位，否则只点击备用定位"""
@@ -1465,8 +1489,7 @@ class UiFlowRunner:
     def _action_foreach_assert(self, step: Dict[str, Any]):
         """循环点击断言（OCR）"""
         if not OCR_AVAILABLE:
-            logger.warning("foreach_assert 需要 OCR 支持，请安装 easyocr")
-            return
+            raise RuntimeError('foreach_assert 需要 OCR 支持，请安装 easyocr')
         
         try:
             # 从 config 中获取配置

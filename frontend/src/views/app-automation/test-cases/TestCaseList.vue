@@ -184,6 +184,12 @@
         </div>
       </template>
 
+      <el-alert
+        :title="$t('appAutomation.common.verificationHint')"
+        type="info"
+        :closable="false"
+        show-icon
+      />
       <el-table
         v-loading="executionsLoading"
         :data="executionData.results"
@@ -272,7 +278,8 @@ import {
   batchExecuteTestCases,
 } from '@/api/app-automation'
 import { getDeviceList } from '@/api/app-automation'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
 import { buildWebSocketUrl, issueWebSocketTicket } from '@/utils/websocket'
 import {
   canSelectAppExecutionDevice,
@@ -473,17 +480,12 @@ const viewAllExecutions = () => {
   router.push({ path: '/app-automation/executions' })
 }
 
-const viewReport = (execution) => {
-  if (!execution.report_path) {
-    ElMessage.info(t('appAutomation.testCase.reportNotExist'))
-    return
+const viewReport = async (execution) => {
+  const result = await openAppExecutionReport(execution?.id, { fetchExecution: getExecutionDetail })
+  if (!result.opened) {
+    const key = result.reason === 'blocked' ? 'reportPopupBlocked' : result.reason === 'failed' ? 'reportOpenFailed' : 'reportUnavailable'
+    ElMessage.warning(t(`appAutomation.common.${key}`))
   }
-  const reportUrl = getAppReportUrl(execution)
-  if (!reportUrl) {
-    ElMessage.info(t('appAutomation.testCase.reportNotExist'))
-    return
-  }
-  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 // 停止测试
@@ -902,7 +904,8 @@ const calculateProgress = (execution) => {
 // 获取进度条状态（基于测试结果）
 const getProgressStatus = (row) => {
   if (row.status === 'completed') {
-    return row.result === 'failed' ? 'exception' : 'success'
+    if (row.result === 'failed') return 'exception'
+    return row.result === 'passed' ? 'success' : undefined
   }
   if (row.status === 'error') return 'exception'
   return undefined

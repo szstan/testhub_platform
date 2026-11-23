@@ -18,6 +18,37 @@ from apps.quality_intelligence.services.redaction import redact_text
 logger = logging.getLogger(__name__)
 
 
+def classify_app_test_result(report_result):
+    """Do not claim a verified pass when the process or its test evidence disagrees."""
+    if not isinstance(report_result, dict):
+        return 'error', None, '测试结果不可用'
+    stats = report_result.get('test_results') or {}
+    try:
+        total = int(stats.get('total', 0) or 0)
+        passed = int(stats.get('passed', 0) or 0)
+        failed = int(stats.get('failed', 0) or 0)
+        skipped = int(stats.get('skipped', 0) or 0)
+        unverified = int(stats.get('unverified', 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 'error', None, '测试结果格式无效'
+    if min(total, passed, failed, skipped, unverified) < 0:
+        return 'error', None, '测试结果格式无效'
+    if failed:
+        return 'completed', 'failed', ''
+    exit_code = report_result.get('exit_code')
+    if report_result.get('success') is False or (exit_code is not None and exit_code != 0):
+        return 'error', None, '测试进程异常退出，无法确认执行结果'
+    if not total:
+        return 'error', None, '未获得有效测试结果'
+    if unverified:
+        return 'completed', 'unverified', ''
+    if skipped >= total:
+        return 'completed', 'skipped', ''
+    if skipped or passed < total:
+        return 'completed', 'unverified', ''
+    return 'completed', 'passed', ''
+
+
 def settle_undispatched_app_executions(
     execution_ids,
     error,
@@ -475,14 +506,8 @@ def execute_app_test_task(
             report_path=execution.report_path
         )
         
-        # 3. 完成测试 — 分离任务状态和测试结果
-        execution.status = 'completed'
-        if execution.total_steps == 0:
-            execution.result = 'skipped'
-        elif execution.failed_steps == 0:
-            execution.result = 'passed'
-        else:
-            execution.result = 'failed'
+        # 3. 完成测试 — 结合进程退出状态、断言与 Allure 结果。
+        execution.status, execution.result, execution.error_message = classify_app_test_result(report_result)
         execution.finished_at = timezone.now()
         execution.duration = (execution.finished_at - execution.started_at).total_seconds()
         execution.progress = 100
@@ -491,8 +516,9 @@ def execute_app_test_task(
             status='running',
             stop_requested=False,
         ).update(
-            status='completed',
+            status=execution.status,
             result=execution.result,
+            error_message=execution.error_message,
             finished_at=execution.finished_at,
             duration=execution.duration,
             progress=100,
@@ -510,7 +536,7 @@ def execute_app_test_task(
             execution_id,
             status=execution.status,
             progress=100,
-            message='执行完成',
+            message=execution.error_message if execution.status == 'error' else '执行完成',
             report_path=execution.report_path,
             finished_at=execution.finished_at,
             result=execution.result,
@@ -643,6 +669,8 @@ def execute_app_suite_task(
     unified_cancel_check = cancel_check
     passed = 0
     failed = 0
+    unverified = 0
+    skipped = 0
     heartbeat = None
     device_heartbeat = None
     executions = []
@@ -813,13 +841,7 @@ def execute_app_suite_task(
                 if test_results.get('broken', 0):
                     logger.info(f"检测到 broken 用例 {test_results.get('broken')} 个（已计入失败统计）。")
 
-                execution.status = 'completed'
-                if execution.total_steps == 0:
-                    execution.result = 'skipped'
-                elif execution.failed_steps == 0:
-                    execution.result = 'passed'
-                else:
-                    execution.result = 'failed'
+                execution.status, execution.result, execution.error_message = classify_app_test_result(report_result)
                 execution.finished_at = timezone.now()
                 execution.duration = (execution.finished_at - execution.started_at).total_seconds()
                 execution.progress = 100
@@ -828,8 +850,9 @@ def execute_app_suite_task(
                     status='running',
                     stop_requested=False,
                 ).update(
-                    status='completed',
+                    status=execution.status,
                     result=execution.result,
+                    error_message=execution.error_message,
                     finished_at=execution.finished_at,
                     duration=execution.duration,
                     progress=100,
@@ -846,12 +869,16 @@ def execute_app_suite_task(
 
                 if execution.result == 'passed':
                     passed += 1
+                elif execution.result == 'unverified':
+                    unverified += 1
+                elif execution.result == 'skipped':
+                    skipped += 1
                 else:
                     failed += 1
 
                 send_execution_update(
                     execution.id, status=execution.status, progress=100,
-                    message='执行完成',
+                    message=execution.error_message if execution.status == 'error' else '执行完成',
                     report_path=execution.report_path,
                     finished_at=execution.finished_at,
                     result=execution.result,
@@ -887,12 +914,14 @@ def execute_app_suite_task(
         cancel_check()
         if suite:
             suite.execution_status = 'completed'
-            if passed == 0 and failed == 0:
-                suite.execution_result = 'skipped'
-            elif failed == 0:
+            if failed:
+                suite.execution_result = 'failed'
+            elif unverified or (passed and skipped):
+                suite.execution_result = 'unverified'
+            elif passed:
                 suite.execution_result = 'passed'
             else:
-                suite.execution_result = 'failed'
+                suite.execution_result = 'skipped'
             suite.passed_count = passed
             suite.failed_count = failed
             suite.last_run_at = timezone.now()
@@ -906,11 +935,11 @@ def execute_app_suite_task(
         # 定时任务通知和 durable schedule completion
         if scheduled_task_id:
             try:
-                is_success = failed == 0
+                is_success = bool(passed) and failed == 0 and unverified == 0 and skipped == 0
                 result = {
                     'status': suite.execution_status if suite else 'completed',
                     'result': suite.execution_result if suite else None,
-                    'message': f'通过: {passed}, 失败: {failed}',
+                    'message': f'通过: {passed}, 失败: {failed}, 未验证: {unverified}, 跳过: {skipped}',
                 }
                 _record_scheduled_result(
                     scheduled_task_id,

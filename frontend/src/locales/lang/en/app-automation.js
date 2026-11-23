@@ -55,6 +55,10 @@ export default {
     deleteFailed: 'Delete failed',
     deleteConfirm: 'Are you sure to delete? This action cannot be undone.',
     confirmDelete: 'Confirm Delete',
+    reportPopupBlocked: 'Your browser blocked the new window. Allow pop-ups and try again.',
+    reportOpenFailed: 'Unable to open the report. Check access and try again.',
+    reportUnavailable: 'No report is available for this execution.',
+    verificationHint: 'A historical pass means steps completed without errors. Add an assertion to verify the business outcome; new runs without an assertion are marked unverified.',
     // Relative time
     justNow: 'Just now',
     minutesAgo: '{n} min ago',
@@ -71,6 +75,7 @@ export default {
     running: 'Running',
     passed: 'Passed',
     failed: 'Failed',
+    unverified: 'Unverified',
     error: 'Error',
     stopped: 'Stopped',
     aborted: 'Aborted',

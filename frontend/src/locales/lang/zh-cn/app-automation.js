@@ -55,6 +55,10 @@ export default {
     deleteFailed: '删除失败',
     deleteConfirm: '确定要删除吗？此操作不可恢复。',
     confirmDelete: '确认删除',
+    reportPopupBlocked: '浏览器阻止了新窗口，请允许弹出窗口后重试',
+    reportOpenFailed: '无法打开报告，请检查权限后重试',
+    reportUnavailable: '该执行记录暂无可查看的报告',
+    verificationHint: '历史记录的“通过”表示步骤未报错；验证登录等业务结果需要添加断言。未执行断言的新记录会显示“未验证”。',
     // 相对时间
     justNow: '刚刚',
     minutesAgo: '{n}分钟前',
@@ -71,6 +75,7 @@ export default {
     running: '执行中',
     passed: '通过',
     failed: '失败',
+    unverified: '未验证',
     error: '错误',
     stopped: '已停止',
     aborted: '已中止',

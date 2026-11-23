@@ -140,10 +140,16 @@ class TestAppFlow:
             assert result['failed'] == 0, f"UI Flow 执行失败，失败步骤: {result['failed']}"
             assert result['passed'] > 0, "没有执行任何步骤"
         
+        assertions = result.get('assertions', 0)
+        verification = 'verified' if assertions > 0 else 'unverified'
+        allure.dynamic.label('testhub_verification', verification)
         allure.attach(
             f"总步骤: {result['total']}\n"
             f"通过: {result['passed']}\n"
-            f"失败: {result['failed']}",
+            f"失败: {result['failed']}\n"
+            f"已执行断言: {assertions}",
             name="执行统计",
             attachment_type=allure.attachment_type.TEXT
         )
+        if not assertions:
+            pytest.skip('步骤已执行，但没有业务结果断言；请添加断言后再判断通过或失败')

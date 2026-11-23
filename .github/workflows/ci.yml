@@ -275,7 +275,7 @@ jobs:
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
         run: |
-          python -m pytest -q             apps/app_automation/tests/test_security_boundaries.py             apps/app_automation/tests/test_execution_views.py             apps/app_automation/tests/test_executor.py             apps/app_automation/tests/test_websocket_events.py             apps/app_automation/tests/test_manual_execution_lease.py             apps/app_automation/tests/test_execution_admission.py             apps/app_automation/tests/test_execution_stop_recovery.py             apps/app_automation/tests/test_region_interactions.py
+          python -m pytest -q             apps/app_automation/tests/test_security_boundaries.py             apps/app_automation/tests/test_execution_views.py             apps/app_automation/tests/test_executor.py             apps/app_automation/tests/test_websocket_events.py             apps/app_automation/tests/test_manual_execution_lease.py             apps/app_automation/tests/test_execution_admission.py             apps/app_automation/tests/test_execution_stop_recovery.py             apps/app_automation/tests/test_region_interactions.py apps/app_automation/tests/test_result_truth.py
 
       - name: Run APP UI Flow safety gate
         env:
@@ -331,7 +331,7 @@ jobs:
 
       - name: Test APP execution and scene translations
         working-directory: ${{ github.workspace }}
-        run: node --test --test-concurrency=1 frontend/tests/app-device-execution.test.mjs frontend/tests/app-automation-locales-compiler.test.mjs
+        run: node --test --test-concurrency=1 frontend/tests/app-device-execution.test.mjs frontend/tests/app-automation-locales-compiler.test.mjs frontend/tests/app-report-access.test.mjs frontend/tests/app-verdict-status.test.mjs
 
       - name: Lint frontend
         run: npm run lint
