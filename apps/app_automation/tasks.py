@@ -12,40 +12,71 @@ from channels.layers import get_channel_layer
 from apps.core.cancellation import combine_cancel_checks
 from apps.core.http_transport import guarded_post
 from apps.core.scheduler import ScheduleLeaseHeartbeat, load_claimed_task
+from apps.quality_intelligence.services.redaction import redact_text
 
 
 logger = logging.getLogger(__name__)
 
 
-def settle_undispatched_app_executions(execution_ids, error, *, suite_id=None):
-    """Mark rows created before a failed broker publish as terminal."""
-    from .models import AppTestExecution, AppTestSuite
+def settle_undispatched_app_executions(
+    execution_ids,
+    error,
+    *,
+    suite_id=None,
+    device_id=None,
+    lease_owner=None,
+    lease_generation=None,
+    release_device_lease=False,
+):
+    """Fail an unclaimed publish and release only the lease it acquired."""
+    from .models import AppDevice, AppTestExecution, AppTestSuite
+    from .execution_admission import release_device_if_idle
 
-    execution_ids = list(execution_ids or [])
+    execution_ids = list(dict.fromkeys(execution_ids or []))
     now = timezone.now()
-    message = str(error)[:4000]
+    message = redact_text(str(error), max_length=1000)
     settled_count = 0
-    if execution_ids:
-        settled_count = AppTestExecution.objects.filter(
-            pk__in=execution_ids,
-            status__in=['pending', 'running'],
-        ).update(
-            status='error',
-            result=None,
-            error_message=message,
-            finished_at=now,
-            updated_at=now,
+    with transaction.atomic():
+        if device_id is None and execution_ids:
+            device_id = AppTestExecution.objects.filter(pk__in=execution_ids).values_list(
+                'device_id', flat=True
+            ).first()
+        if device_id is not None:
+            AppDevice.objects.select_for_update().filter(pk=device_id).first()
+
+        executions = list(
+            AppTestExecution.objects.select_for_update().filter(pk__in=execution_ids)
         )
-    if suite_id:
-        suite_executions = AppTestExecution.objects.filter(test_suite_id=suite_id)
-        AppTestSuite.objects.filter(pk=suite_id).update(
-            execution_status='error',
-            execution_result=None,
-            passed_count=suite_executions.filter(status='completed', result='passed').count(),
-            failed_count=suite_executions.filter(status='error').count() or settled_count,
-            last_run_at=now,
-            updated_at=now,
+        may_be_running = any(
+            execution.status == 'running'
+            or (execution.started_at is not None and execution.status in {'pending', 'stopped'})
+            for execution in executions
         )
+        if not may_be_running:
+            settled_count = AppTestExecution.objects.filter(
+                pk__in=execution_ids,
+                status='pending',
+            ).update(
+                status='error',
+                result=None,
+                error_message=message,
+                finished_at=now,
+                updated_at=now,
+            )
+            if suite_id:
+                suite_executions = AppTestExecution.objects.filter(test_suite_id=suite_id)
+                AppTestSuite.objects.filter(pk=suite_id).update(
+                    execution_status='error',
+                    execution_result=None,
+                    passed_count=suite_executions.filter(status='completed', result='passed').count(),
+                    failed_count=suite_executions.filter(status='error').count() or settled_count,
+                    last_run_at=now,
+                    updated_at=now,
+                )
+            if release_device_lease and device_id is not None and lease_owner is not None:
+                release_device_if_idle(device_id, lease_owner, lease_generation)
+
+    return settled_count
 
 
 def _record_scheduled_result(task_id, success, result, scheduler_lease_token=''):
@@ -329,10 +360,9 @@ def execute_app_test_task(
     from .device_pool import (
         DeviceLeaseError,
         DeviceLeaseHeartbeat,
-        assert_device_execution_lease,
-        release_device_execution_lease,
     )
-    from .executors.test_executor import AppTestExecutor
+    from .execution_admission import claim_app_execution_batch, release_device_if_idle, settle_app_execution_failure
+    from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
     
     execution = None
     device = None
@@ -340,17 +370,23 @@ def execute_app_test_task(
     unified_cancel_check = cancel_check
     heartbeat = None
     device_heartbeat = None
+    worker_claimed = False
+    unsafe_termination = False
+    original_worker_cwd = os.getcwd()
     
     try:
-        # 获取执行记录
         execution = AppTestExecution.objects.select_related('device', 'user', 'test_case').get(id=execution_id)
         test_case = execution.test_case
         if lease_generation is not None and execution.device_lease_generation != lease_generation:
             raise DeviceLeaseError('入队设备租约世代与执行记录不匹配')
         if bound_generation is None:
             bound_generation = execution.device_lease_generation
-        
+
         device = execution.device
+        if not claim_app_execution_batch([execution.pk]):
+            return
+        worker_claimed = True
+        execution.refresh_from_db()
         _assert_scheduled_task_scope(
             scheduled_task_id=scheduled_task_id,
             project_id=test_case.project_id,
@@ -369,11 +405,6 @@ def execute_app_test_task(
                 lease_seconds=lease_seconds,
             ).start()
 
-        with transaction.atomic():
-            device = AppDevice.objects.select_for_update().get(pk=execution.device_id)
-            assert_device_execution_lease(
-                device.pk, execution.user, bound_generation, execution_id=execution.pk
-            )
         device_heartbeat = DeviceLeaseHeartbeat(
             device.pk,
             execution.user,
@@ -381,7 +412,14 @@ def execute_app_test_task(
             execution_id=execution.pk,
             lease_seconds=lease_seconds,
         ).start()
-        cancel_checks = [device_heartbeat.raise_if_lost]
+
+        def execution_not_stopped():
+            if not AppTestExecution.objects.filter(
+                pk=execution.pk, status='running', stop_requested=False
+            ).exists():
+                raise RuntimeError('APP执行已停止或不再处于运行状态')
+
+        cancel_checks = [device_heartbeat.raise_if_lost, execution_not_stopped]
         if unified_cancel_check is not None:
             cancel_checks.append(unified_cancel_check)
         if heartbeat is not None:
@@ -389,15 +427,11 @@ def execute_app_test_task(
         cancel_check = combine_cancel_checks(*cancel_checks)
         cancel_check()
 
-        execution.status = 'running'
-        execution.started_at = timezone.now()
-        execution.progress = 0
-        execution.save()
         send_execution_update(execution_id, status='running', progress=0, message='任务开始执行')
-        logger.info(f"开始执行APP测试: {test_case.name}")
-        
+        logger.info('开始执行APP测试: %s', test_case.name)
+
         execution.progress = 10
-        execution.save()
+        execution.save(update_fields=['progress'])
         send_execution_update(execution_id, status='running', progress=10, message='正在准备测试环境')
         
         if package_name:
@@ -432,7 +466,7 @@ def execute_app_test_task(
             logger.info(f"检测到 broken 用例 {test_results.get('broken')} 个（已计入失败统计）。")
         
         execution.progress = 95
-        execution.save()
+        execution.save(update_fields=['progress', 'report_path', 'total_steps', 'passed_steps', 'failed_steps'])
         send_execution_update(
             execution_id,
             status='running',
@@ -452,7 +486,26 @@ def execute_app_test_task(
         execution.finished_at = timezone.now()
         execution.duration = (execution.finished_at - execution.started_at).total_seconds()
         execution.progress = 100
-        execution.save()
+        updated = AppTestExecution.objects.filter(
+            pk=execution.pk,
+            status='running',
+            stop_requested=False,
+        ).update(
+            status='completed',
+            result=execution.result,
+            finished_at=execution.finished_at,
+            duration=execution.duration,
+            progress=100,
+            report_path=execution.report_path,
+            total_steps=execution.total_steps,
+            passed_steps=execution.passed_steps,
+            failed_steps=execution.failed_steps,
+            updated_at=timezone.now(),
+        )
+        if not updated:
+            cancel_check()
+            return
+        execution.refresh_from_db()
         send_execution_update(
             execution_id,
             status=execution.status,
@@ -488,33 +541,36 @@ def execute_app_test_task(
         logger.error(f"执行记录不存在: {execution_id}")
     except Exception as e:
         logger.error(f"执行APP测试失败: {str(e)}", exc_info=True)
-        
-        if execution:
-            execution.status = 'error'       # 任务异常（非用例失败）
-            execution.result = None           # 没有测试结果
-            execution.error_message = str(e)
-            execution.finished_at = timezone.now()
-            if execution.started_at:
-                execution.duration = (execution.finished_at - execution.started_at).total_seconds()
-            execution.save()
-            send_execution_update(
-                execution_id,
-                status='error',
-                progress=execution.progress or 0,
-                message=str(e),
-                report_path=execution.report_path,
-                finished_at=execution.finished_at,
-                result=None,
-            )
-            
-            # 尝试生成报告
-            try:
-                executor = AppTestExecutor()
-                executor._generate_allure_report(execution_id=execution_id)
-            except Exception:
-                pass
+        unsafe_termination = isinstance(e, AppTestProcessTerminationError)
+        if unsafe_termination:
+            os.chdir(original_worker_cwd)
+            if execution:
+                AppTestExecution.objects.filter(pk=execution.pk, status='running').update(
+                    stop_requested=True, error_message=str(e), updated_at=timezone.now()
+                )
 
-        if scheduled_task_id and scheduler_lease_token:
+        if execution and not unsafe_termination:
+            settled_ids = settle_app_execution_failure(
+                [execution.pk], e, include_running=worker_claimed
+            )
+            if settled_ids:
+                execution.refresh_from_db()
+                send_execution_update(
+                    execution_id,
+                    status=execution.status,
+                    progress=execution.progress or 0,
+                    message='任务已停止' if execution.status == 'stopped' else str(e),
+                    report_path=execution.report_path,
+                    finished_at=execution.finished_at,
+                    result=None,
+                )
+                try:
+                    executor = AppTestExecutor()
+                    executor._generate_allure_report(execution_id=execution_id)
+                except Exception:
+                    pass
+
+        if scheduled_task_id and scheduler_lease_token and not unsafe_termination:
             try:
                 _record_scheduled_result(
                     scheduled_task_id,
@@ -529,11 +585,17 @@ def execute_app_test_task(
             device_heartbeat.stop()
         if heartbeat is not None:
             heartbeat.stop()
-        if release_device_lease and scheduled_task_id and device and execution and execution.user:
-            try:
-                release_device_execution_lease(device.pk, execution.user, bound_generation)
-            except Exception as e:
-                logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
+        if release_device_lease and not unsafe_termination and device and execution and execution.user:
+            should_release = bool(scheduled_task_id) or (
+                worker_claimed and AppTestExecution.objects.filter(
+                    pk=execution.pk, stop_requested=True
+                ).exists()
+            )
+            if should_release:
+                try:
+                    release_device_if_idle(device.pk, execution.user, bound_generation)
+                except Exception as e:
+                    logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
 
 
 @shared_task
@@ -549,6 +611,7 @@ def execute_app_suite_task(
     device_lease_owner_id: int = None,
     release_device_lease: bool = True,
     cancel_check=None,
+    dispatch_id: str = '',
 ):
     """
     异步执行APP测试套件（顺序执行多个用例）
@@ -564,10 +627,14 @@ def execute_app_suite_task(
     from .device_pool import (
         DeviceLeaseError,
         DeviceLeaseHeartbeat,
-        assert_device_execution_lease,
-        release_device_execution_lease,
     )
-    from .executors.test_executor import AppTestExecutor
+    from .execution_admission import (
+        claim_app_execution_batch,
+        release_device_if_idle,
+        settle_app_execution_failure,
+        start_next_app_execution,
+    )
+    from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
 
     suite = None
     device = None
@@ -579,6 +646,9 @@ def execute_app_suite_task(
     heartbeat = None
     device_heartbeat = None
     executions = []
+    worker_claimed = False
+    unsafe_termination = False
+    original_worker_cwd = os.getcwd()
 
     try:
         if device_id is not None:
@@ -604,9 +674,8 @@ def execute_app_suite_task(
             device = first_execution.device
             user = first_execution.user
 
-        suite = AppTestSuite.objects.get(id=suite_id)
         if not executions:
-            raise RuntimeError(f'套件 {suite_id} 未找到执行记录')
+            raise RuntimeError(f'执行批次 {suite_id or dispatch_id or "unknown"} 未找到执行记录')
 
         generations = {item.device_lease_generation for item in executions}
         if lease_generation is not None:
@@ -619,16 +688,30 @@ def execute_app_suite_task(
             item.device_id != executions[0].device_id
             or item.user_id != executions[0].user_id
             or item.device_lease_generation != bound_generation
+            or (dispatch_id and item.task_id != dispatch_id)
             for item in executions
         ):
-            raise DeviceLeaseError('套件执行记录未绑定到同一设备租约')
+            raise DeviceLeaseError('套件执行记录未绑定到同一设备租约或派发批次')
+
+        if not claim_app_execution_batch(execution_ids, suite_id=suite_id):
+            return
+        worker_claimed = True
+        executions = list(
+            AppTestExecution.objects.filter(pk__in=execution_ids)
+            .select_related('test_case', 'test_case__app_package', 'device', 'user')
+        )
+        exec_map = {item.pk: item for item in executions}
+        executions = [exec_map[execution_id] for execution_id in execution_ids]
+        device = executions[0].device
+        user = executions[0].user
+        suite = AppTestSuite.objects.get(pk=suite_id) if suite_id is not None else None
 
         _assert_scheduled_task_scope(
             scheduled_task_id=scheduled_task_id,
-            project_id=suite.project_id,
+            project_id=suite.project_id if suite else executions[0].test_case.project_id,
             device_id=executions[0].device_id,
             app_package_id=executions[0].test_case.app_package_id if executions[0].test_case else None,
-            test_suite_id=suite.id,
+            test_suite_id=suite.id if suite else None,
         )
         if scheduled_task_id and scheduler_lease_token:
             load_claimed_task(
@@ -641,12 +724,6 @@ def execute_app_suite_task(
                 lease_seconds=lease_seconds,
             ).start()
 
-        user = executions[0].user
-        with transaction.atomic():
-            device = AppDevice.objects.select_for_update().get(pk=executions[0].device_id)
-            assert_device_execution_lease(
-                device.pk, user, bound_generation, execution_id=executions[0].pk
-            )
         device_heartbeat = DeviceLeaseHeartbeat(
             device.pk,
             user,
@@ -661,26 +738,40 @@ def execute_app_suite_task(
             cancel_checks.append(heartbeat.raise_if_lost)
         cancel_check = combine_cancel_checks(*cancel_checks)
         cancel_check()
-        logger.info(f"套件执行开始: {suite.name}, 设备: {device.device_id}, 共 {len(executions)} 个用例")
+        if suite:
+            logger.info('套件执行开始: %s, 设备: %s, 共 %s 个用例',
+                        suite.name, device.device_id, len(executions))
+        else:
+            logger.info('APP批量执行开始: 设备 %s, 共 %s 个用例', device.device_id, len(executions))
 
+        batch_ids = [item.pk for item in executions]
         for idx, execution in enumerate(executions):
-            cancel_check()
+            if idx:
+                if not start_next_app_execution(execution.pk, batch_ids):
+                    execution.refresh_from_db()
+                    if execution.status in {'stopped', 'error'}:
+                        raise RuntimeError('APP执行批次已停止或已结算')
+                    continue
+                execution.refresh_from_db()
+            def execution_not_stopped():
+                if not AppTestExecution.objects.filter(
+                    pk=execution.pk, status='running', stop_requested=False
+                ).exists():
+                    raise RuntimeError('APP执行已停止或不再处于运行状态')
+
+            case_cancel_check = combine_cancel_checks(cancel_check, execution_not_stopped)
+            case_cancel_check()
             test_case = execution.test_case
             if not test_case:
-                execution.status = 'error'
-                execution.result = None
-                execution.error_message = '用例不存在'
-                execution.finished_at = timezone.now()
-                execution.save()
+                now = timezone.now()
+                AppTestExecution.objects.filter(pk=execution.pk, status='running').update(
+                    status='error', result=None, error_message='用例不存在',
+                    finished_at=now, updated_at=now,
+                )
                 failed += 1
                 continue
 
             try:
-                # 更新为运行中
-                execution.status = 'running'
-                execution.started_at = timezone.now()
-                execution.progress = 0
-                execution.save()
                 send_execution_update(
                     execution.id, status='running', progress=0,
                     message=f'开始执行 ({idx + 1}/{len(executions)})'
@@ -693,7 +784,7 @@ def execute_app_suite_task(
                     final_pkg = test_case.app_package.package_name if test_case.app_package else ""
 
                 execution.progress = 10
-                execution.save()
+                execution.save(update_fields=['progress'])
                 send_execution_update(
                     execution.id, status='running', progress=10,
                     message='正在准备测试环境'
@@ -706,9 +797,9 @@ def execute_app_suite_task(
                     package_name=final_pkg,
                     execution_id=execution.id,
                     username=execution.user.username if execution.user else 'unknown',
-                    cancel_check=cancel_check,
+                    cancel_check=case_cancel_check,
                 )
-                cancel_check()
+                case_cancel_check()
 
                 execution.refresh_from_db()
 
@@ -732,7 +823,26 @@ def execute_app_suite_task(
                 execution.finished_at = timezone.now()
                 execution.duration = (execution.finished_at - execution.started_at).total_seconds()
                 execution.progress = 100
-                execution.save()
+                updated = AppTestExecution.objects.filter(
+                    pk=execution.pk,
+                    status='running',
+                    stop_requested=False,
+                ).update(
+                    status='completed',
+                    result=execution.result,
+                    finished_at=execution.finished_at,
+                    duration=execution.duration,
+                    progress=100,
+                    report_path=execution.report_path,
+                    total_steps=execution.total_steps,
+                    passed_steps=execution.passed_steps,
+                    failed_steps=execution.failed_steps,
+                    updated_at=timezone.now(),
+                )
+                if not updated:
+                    case_cancel_check()
+                    continue
+                execution.refresh_from_db()
 
                 if execution.result == 'passed':
                     passed += 1
@@ -750,15 +860,21 @@ def execute_app_suite_task(
                 logger.info(f"用例 {test_case.name} 执行完成: status={execution.status}, result={execution.result}")
 
             except Exception as e:
-                cancel_check()
-                logger.error(f"用例 {test_case.name} 执行失败: {str(e)}", exc_info=True)
-                execution.status = 'error'
-                execution.result = None
-                execution.error_message = str(e)
-                execution.finished_at = timezone.now()
-                if execution.started_at:
-                    execution.duration = (execution.finished_at - execution.started_at).total_seconds()
-                execution.save()
+                if isinstance(e, AppTestProcessTerminationError):
+                    raise
+                case_cancel_check()
+                logger.error('用例 %s 执行失败: %s', test_case.name, e, exc_info=True)
+                now = timezone.now()
+                settled = AppTestExecution.objects.filter(
+                    pk=execution.pk,
+                    status='running',
+                ).update(
+                    status='error', result=None, error_message=str(e),
+                    finished_at=now, updated_at=now,
+                )
+                if not settled:
+                    continue
+                execution.refresh_from_db()
                 failed += 1
                 send_execution_update(
                     execution.id, status='error',
@@ -769,28 +885,31 @@ def execute_app_suite_task(
                 )
 
         cancel_check()
-        # 更新套件统计
-        suite.execution_status = 'completed'
-        if passed == 0 and failed == 0:
-            suite.execution_result = 'skipped'
-        elif failed == 0:
-            suite.execution_result = 'passed'
+        if suite:
+            suite.execution_status = 'completed'
+            if passed == 0 and failed == 0:
+                suite.execution_result = 'skipped'
+            elif failed == 0:
+                suite.execution_result = 'passed'
+            else:
+                suite.execution_result = 'failed'
+            suite.passed_count = passed
+            suite.failed_count = failed
+            suite.last_run_at = timezone.now()
+            suite.save(update_fields=[
+                'execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'
+            ])
+            logger.info('套件执行完成: %s, 通过: %s, 失败: %s', suite.name, passed, failed)
         else:
-            suite.execution_result = 'failed'
-        suite.passed_count = passed
-        suite.failed_count = failed
-        suite.last_run_at = timezone.now()
-        suite.save(update_fields=['execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'])
-
-        logger.info(f"套件执行完成: {suite.name}, 通过: {passed}, 失败: {failed}")
+            logger.info('APP批量执行完成: 通过 %s, 失败 %s', passed, failed)
 
         # 定时任务通知和 durable schedule completion
         if scheduled_task_id:
             try:
                 is_success = failed == 0
                 result = {
-                    'status': suite.execution_status,
-                    'result': suite.execution_result,
+                    'status': suite.execution_status if suite else 'completed',
+                    'result': suite.execution_result if suite else None,
                     'message': f'通过: {passed}, 失败: {failed}',
                 }
                 _record_scheduled_result(
@@ -804,21 +923,36 @@ def execute_app_suite_task(
                 logger.error(f"更新定时任务状态失败: {ne}")
 
     except Exception as e:
-        logger.error(f"执行套件失败: {str(e)}", exc_info=True)
-        # Cancellation must settle the interrupted case and cases that were
-        # never started; a stale running row must not survive lease loss.
-        AppTestExecution.objects.filter(
-            pk__in=[item.pk for item in executions], status__in=['pending', 'running']
-        ).update(status='error', result=None, error_message=str(e)[:4000], finished_at=timezone.now())
-        if suite:
+        logger.error('执行APP批次失败: %s', e, exc_info=True)
+        unsafe_termination = isinstance(e, AppTestProcessTerminationError)
+        if unsafe_termination:
+            os.chdir(original_worker_cwd)
+            AppTestExecution.objects.filter(
+                pk__in=[item.pk for item in executions], status='running'
+            ).update(stop_requested=True, error_message=str(e), updated_at=timezone.now())
+        settled_ids = settle_app_execution_failure(
+            [item.pk for item in executions], e, include_running=worker_claimed and not unsafe_termination
+        )
+        for settled in AppTestExecution.objects.filter(pk__in=settled_ids):
+            send_execution_update(
+                settled.pk,
+                status=settled.status,
+                progress=settled.progress or 0,
+                message='任务已停止' if settled.status == 'stopped' else str(e),
+                finished_at=settled.finished_at,
+                result=None,
+            )
+        if suite and settled_ids and not unsafe_termination:
             suite.execution_status = 'error'
             suite.execution_result = None
-            suite.failed_count = failed
+            suite.failed_count = max(failed, len(settled_ids))
             suite.passed_count = passed
             suite.last_run_at = timezone.now()
-            suite.save(update_fields=['execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'])
+            suite.save(update_fields=[
+                'execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'
+            ])
 
-        if scheduled_task_id and scheduler_lease_token:
+        if scheduled_task_id and scheduler_lease_token and not unsafe_termination:
             try:
                 _record_scheduled_result(
                     scheduled_task_id,
@@ -833,11 +967,44 @@ def execute_app_suite_task(
             device_heartbeat.stop()
         if heartbeat is not None:
             heartbeat.stop()
-        if release_device_lease and scheduled_task_id and device and user:
-            try:
-                release_device_execution_lease(device.pk, user, bound_generation)
-            except Exception as e:
-                logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
+        if release_device_lease and not unsafe_termination and device and user:
+            should_release = bool(scheduled_task_id) or (
+                worker_claimed and AppTestExecution.objects.filter(
+                    pk__in=[item.pk for item in executions], stop_requested=True
+                ).exists()
+            )
+            if should_release:
+                try:
+                    release_device_if_idle(device.pk, user, bound_generation)
+                except Exception as e:
+                    logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
+
+
+@shared_task
+def execute_app_batch_task(
+    dispatch_id,
+    package_name=None,
+    lease_generation=None,
+    release_device_lease=False,
+):
+    """Run all durable rows for one batch in their persisted insertion order."""
+    from .models import AppTestExecution
+
+    execution_ids = list(
+        AppTestExecution.objects.filter(task_id=dispatch_id)
+        .order_by('pk')
+        .values_list('pk', flat=True)
+    )
+    if not execution_ids:
+        return {'status': 'ignored'}
+    return execute_app_suite_task.run(
+        suite_id=None,
+        execution_ids=execution_ids,
+        package_name=package_name,
+        lease_generation=lease_generation,
+        release_device_lease=release_device_lease,
+        dispatch_id=dispatch_id,
+    )
 
 
 @shared_task

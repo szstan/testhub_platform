@@ -49,8 +49,14 @@ def test_ui_worker_applies_browser_variant_and_waits_for_all(worker_job):
 
 
 def test_app_source_carries_generation_zero_and_releases_its_lease(worker_job):
+    from django.utils import timezone
+    from apps.app_automation.models import AppDevice
+
     actor = worker_job.requested_by
-    device = SimpleNamespace(pk=3, lease_generation=0)
+    device = AppDevice.objects.create(
+        device_id='source-worker-generation-zero', status='locked', locked_by=actor,
+        locked_at=timezone.now(), lease_generation=0,
+    )
     execution = SimpleNamespace(pk=9, result='passed', status='success', refresh_from_db=lambda: None)
     source = SimpleNamespace(app_package=SimpleNamespace(package_name='test.package'))
     binding = SimpleNamespace(metadata={'approved': True})

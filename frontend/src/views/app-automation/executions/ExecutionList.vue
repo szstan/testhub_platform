@@ -97,10 +97,12 @@
         <el-table-column :label="$t('appAutomation.common.operation')" width="180" fixed="right">
           <template #default="{ row }">
             <el-button
-              v-if="row.status === 'running'"
+              v-if="(row.status === 'pending' || row.status === 'running') && !row.stop_requested"
               type="warning"
               size="small"
               text
+              :loading="stoppingExecutionIds.has(row.id)"
+              :disabled="stoppingExecutionIds.has(row.id)"
               @click="stopExecution(row)"
             >
               {{ $t('appAutomation.common.stop') }}
@@ -175,6 +177,7 @@ const { t } = useI18n()
 
 const loading = ref(false)
 const executions = ref([])
+const stoppingExecutionIds = ref(new Set())
 const searchQuery = ref('')
 const statusFilter = ref('')
 const projectFilter = ref(null)
@@ -209,6 +212,9 @@ const loadExecutions = async () => {
 }
 
 const stopExecution = async (execution) => {
+  if (!execution?.id || !['pending', 'running'].includes(execution.status) || execution.stop_requested) return
+  if (stoppingExecutionIds.value.has(execution.id)) return
+  stoppingExecutionIds.value.add(execution.id)
   try {
     await ElMessageBox.confirm(
       t('appAutomation.execution.stopConfirm'),
@@ -219,16 +225,22 @@ const stopExecution = async (execution) => {
         type: 'warning'
       }
     )
-    
+
     const res = await apiStopExecution(execution.id)
     if (res.data.success) {
-      ElMessage.success(t('appAutomation.execution.executionStopped'))
+      ElMessage.success(t(res.data.stopping
+        ? 'appAutomation.execution.stoppingExecution'
+        : 'appAutomation.execution.executionStopped'))
       loadExecutions()
+    } else {
+      ElMessage.error(res.data.message || t('appAutomation.execution.stopFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
-      ElMessage.error(t('appAutomation.execution.stopFailed') + ': ' + (error.message || t('appAutomation.execution.unknownError')))
+      ElMessage.error(error?.response?.data?.message || error.message || t('appAutomation.execution.stopFailed'))
     }
+  } finally {
+    stoppingExecutionIds.value.delete(execution.id)
   }
 }
 

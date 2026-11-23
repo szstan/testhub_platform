@@ -50,7 +50,9 @@ def test_token_heartbeat_cannot_revive_expired_lease(app_lease):
 
 @pytest.mark.django_db
 def test_stale_model_unlock_cannot_release_same_owner_replacement(app_lease):
-    user, stale, _, *_ = app_lease
+    user, stale, _, _, execution = app_lease
+    execution.status = 'error'
+    execution.save(update_fields=['status'])
     assert release_device_execution_lease(stale.pk, user, stale.lease_generation)
     replacement, _ = acquire_device(user)
     assert not stale.unlock()
@@ -61,7 +63,9 @@ def test_stale_model_unlock_cannot_release_same_owner_replacement(app_lease):
 
 @pytest.mark.django_db
 def test_new_manual_lock_increments_generation_from_database(app_lease):
-    user, stale, _, *_ = app_lease
+    user, stale, _, _, execution = app_lease
+    execution.status = 'error'
+    execution.save(update_fields=['status'])
     assert release_device_execution_lease(stale.pk, user, stale.lease_generation)
     stale.lock(user)
     assert stale.lease_generation == 2
@@ -111,8 +115,12 @@ def test_suite_worker_rejects_same_owner_stale_generation_without_runner(app_lea
     execution.test_suite = suite
     execution.save(update_fields=['test_suite'])
     stale_generation = device.lease_generation
+    execution.status = 'error'
+    execution.save(update_fields=['status'])
     release_device_execution_lease(device.pk, user, stale_generation)
     replacement, _ = acquire_device(user)
+    execution.status = 'pending'
+    execution.save(update_fields=['status'])
     with (
         patch('apps.app_automation.executors.test_executor.AppTestExecutor') as runner,
         patch('apps.app_automation.tasks.send_execution_update'),
@@ -152,14 +160,15 @@ def test_suite_worker_early_failure_releases_preacquired_device_lease(app_lease,
     )
 
     device.refresh_from_db()
-    assert device.locked_by_id is None
     if missing_suite:
         execution.refresh_from_db()
         assert execution.status == 'error'
         assert execution.finished_at is not None
+        assert device.locked_by_id is None
     else:
         suite.refresh_from_db()
-        assert suite.execution_status == 'error'
+        assert suite.execution_status == 'not_run'
+        assert device.locked_by_id == user.pk
 
 
 @pytest.mark.django_db
@@ -201,20 +210,22 @@ def test_suite_enqueue_persists_generation_without_sending_token(app_lease):
     from rest_framework.test import APIClient
     from apps.app_automation.models import AppTestSuiteCase
 
-    user, device, token, case, _ = app_lease
+    user, device, token, case, initial_execution = app_lease
+    initial_execution.status = 'error'
+    initial_execution.save(update_fields=['status'])
     suite = AppTestSuite.objects.create(name='queued lease suite', project=case.project)
     AppTestSuiteCase.objects.create(test_suite=suite, test_case=case)
     client = APIClient()
     client.force_authenticate(user=user)
-    with patch('apps.app_automation.tasks.execute_app_suite_task.delay', return_value=Mock(id='queued')) as delay:
+    with patch('apps.app_automation.tasks.execute_app_suite_task.apply_async', return_value=Mock(id='queued')) as dispatch:
         response = client.post(
             f'/api/app-automation/test-suites/{suite.pk}/run/',
             {'device_id': device.device_id, 'lease_token': token}, format='json',
         )
     assert response.status_code == 200
-    generation = delay.call_args.kwargs['lease_generation']
+    generation = dispatch.call_args.kwargs['kwargs']['lease_generation']
     assert generation == device.lease_generation
-    assert token not in str(delay.call_args)
+    assert token not in str(dispatch.call_args)
     created = AppTestExecution.objects.get(pk=response.data['data']['execution_ids'][0])
     assert created.device_lease_generation == generation
 
@@ -247,7 +258,9 @@ def test_manual_suite_broker_failure_settles_rows_and_suite(app_lease):
     from rest_framework.test import APIClient
     from apps.app_automation.models import AppScheduledTask, AppTestSuiteCase
 
-    user, device, token, case, _ = app_lease
+    user, device, token, case, initial_execution = app_lease
+    initial_execution.status = 'error'
+    initial_execution.save(update_fields=['status'])
     suite = AppTestSuite.objects.create(name='manual enqueue failure', project=case.project)
     AppTestSuiteCase.objects.create(test_suite=suite, test_case=case)
     schedule = AppScheduledTask.objects.create(
@@ -259,7 +272,7 @@ def test_manual_suite_broker_failure_settles_rows_and_suite(app_lease):
     client.force_authenticate(user=user)
 
     with patch(
-        'apps.app_automation.tasks.execute_app_suite_task.delay',
+        'apps.app_automation.tasks.execute_app_suite_task.apply_async',
         side_effect=RuntimeError('broker offline'),
     ):
         response = client.post(
@@ -274,7 +287,7 @@ def test_manual_suite_broker_failure_settles_rows_and_suite(app_lease):
     schedule.refresh_from_db()
     assert execution.status == 'error'
     assert execution.finished_at is not None
-    assert 'broker offline' in execution.error_message
+    assert '无法提交执行任务' in execution.error_message
     assert suite.execution_status == 'error'
     assert schedule.failed_runs == 1
 
@@ -284,7 +297,9 @@ def test_scheduler_suite_broker_failure_settles_rows_suite_and_releases_device(a
     from apps.app_automation.models import AppScheduledTask, AppTestSuiteCase
     from apps.core.management.commands.run_all_scheduled_tasks import Command
 
-    user, device, _, case, _ = app_lease
+    user, device, _, case, initial_execution = app_lease
+    initial_execution.status = 'error'
+    initial_execution.save(update_fields=['status'])
     suite = AppTestSuite.objects.create(name='scheduler enqueue failure', project=case.project)
     AppTestSuiteCase.objects.create(test_suite=suite, test_case=case)
     release_device_execution_lease(device.pk, user, device.lease_generation)
@@ -298,7 +313,7 @@ def test_scheduler_suite_broker_failure_settles_rows_suite_and_releases_device(a
     command.lease_seconds = 60
 
     with patch(
-        'apps.app_automation.tasks.execute_app_suite_task.delay',
+        'apps.app_automation.tasks.execute_app_suite_task.apply_async',
         side_effect=RuntimeError('broker offline'),
     ):
         assert command.schedule_app_tasks() == 0
@@ -321,7 +336,9 @@ def test_manual_schedule_checks_lease_under_transaction_and_enqueues_generation(
     from apps.app_automation.device_pool import validate_device_lease
     from apps.app_automation.models import AppScheduledTask
 
-    user, device, token, case, _ = app_lease
+    user, device, token, case, initial_execution = app_lease
+    initial_execution.status = 'error'
+    initial_execution.save(update_fields=['status'])
     schedule = AppScheduledTask.objects.create(
         name='manual run lease', project=case.project, task_type='TEST_CASE',
         device=device, test_case=case, created_by=user, trigger_type='INTERVAL', interval_seconds=60,
@@ -335,13 +352,13 @@ def test_manual_schedule_checks_lease_under_transaction_and_enqueues_generation(
 
     with (
         patch('apps.app_automation.views.scheduled_task_views.validate_device_lease', side_effect=validate),
-        patch('apps.app_automation.tasks.execute_app_test_task.delay', return_value=Mock(id='manual')) as delay,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async', return_value=Mock(id='manual')) as dispatch,
     ):
         response = client.post(
             f'/api/app-automation/scheduled-tasks/{schedule.pk}/run_now/',
             {'lease_token': token}, format='json',
         )
     assert response.status_code == 200
-    assert delay.call_args.kwargs['lease_generation'] == device.lease_generation
-    assert delay.call_args.kwargs['release_device_lease'] is False
-    assert token not in str(delay.call_args)
+    assert dispatch.call_args.kwargs['kwargs']['lease_generation'] == device.lease_generation
+    assert dispatch.call_args.kwargs['kwargs']['release_device_lease'] is False
+    assert token not in str(dispatch.call_args)

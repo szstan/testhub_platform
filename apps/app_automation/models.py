@@ -615,6 +615,8 @@ class AppTestExecution(models.Model):
     device_lease_generation = models.PositiveBigIntegerField(
         null=True, blank=True, verbose_name='设备租约世代'
     )
+    stop_requested = models.BooleanField(default=False, verbose_name='是否请求停止')
+    release_device_lease_on_stop = models.BooleanField(default=False, verbose_name='停止时释放执行租约')
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,

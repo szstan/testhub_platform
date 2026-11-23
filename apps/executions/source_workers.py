@@ -226,8 +226,15 @@ def _app_source(reference, binding, actor):
 
 
 def _app_execute(source, reference, binding, actor, cancel_check=None):
-    from apps.app_automation.device_pool import acquire_device, release_device
-    from apps.app_automation.models import AppTestExecution
+    from uuid import uuid4
+    from django.db import transaction
+    from apps.app_automation.device_pool import (
+        acquire_device,
+        assert_device_execution_lease,
+        release_device,
+    )
+    from apps.app_automation.execution_admission import assert_device_execution_idle, settle_app_execution_failure
+    from apps.app_automation.models import AppDevice, AppTestExecution
     from apps.app_automation.tasks import execute_app_suite_task, execute_app_test_task
     metadata = dict(binding.metadata or {})
     if metadata.get('approved') is not True:
@@ -238,39 +245,87 @@ def _app_execute(source, reference, binding, actor, cancel_check=None):
     if cancel_check:
         cancel_check()
     device, lease_token = acquire_device(actor, capabilities=capabilities, lease_seconds=int(metadata.get('lease_seconds') or 3600))
+    dispatch_id = uuid4().hex
+    ids = []
     try:
+        with transaction.atomic():
+            device = AppDevice.objects.select_for_update().get(pk=device.pk)
+            assert_device_execution_lease(device.pk, actor, device.lease_generation)
+            assert_device_execution_idle(device.pk)
+            if reference.kind == 'case':
+                execution = AppTestExecution.objects.create(
+                    test_case=source,
+                    device=device,
+                    user=actor,
+                    status='pending',
+                    task_id=dispatch_id,
+                    device_lease_generation=device.lease_generation,
+                )
+                ids = [execution.pk]
+            else:
+                cases = list(source.suite_cases.select_related('test_case__app_package'))
+                if not cases:
+                    raise SourceBindingError('APP suite has no test cases')
+                packages = {item.test_case.app_package.package_name for item in cases if item.test_case.app_package}
+                if len(packages) > 1:
+                    raise SourceBindingError('APP suite contains multiple app packages')
+                executions = [AppTestExecution.objects.create(
+                    test_case=item.test_case,
+                    test_suite=source,
+                    device=device,
+                    user=actor,
+                    status='pending',
+                    task_id=dispatch_id,
+                    device_lease_generation=device.lease_generation,
+                ) for item in cases]
+                ids = [item.pk for item in executions]
+
         if reference.kind == 'case':
             if cancel_check:
                 cancel_check()
-            execution = AppTestExecution.objects.create(test_case=source, device=device, user=actor,
-                                                       status='pending', device_lease_generation=device.lease_generation)
-            if cancel_check:
-                cancel_check()
-            execute_app_test_task.run(execution.pk, package_name=source.app_package.package_name if source.app_package else '',
-                                      lease_generation=device.lease_generation, release_device_lease=False,
-                                      cancel_check=cancel_check)
+            execute_app_test_task.run(
+                execution.pk,
+                package_name=source.app_package.package_name if source.app_package else '',
+                lease_generation=device.lease_generation,
+                release_device_lease=False,
+                cancel_check=cancel_check,
+            )
             execution.refresh_from_db()
-            return execution.result == 'passed', {'status': execution.status, 'result': execution.result,
-                                                   'execution_id': execution.pk, 'device_id': device.pk}
-        cases = list(source.suite_cases.select_related('test_case__app_package'))
-        if not cases:
-            raise SourceBindingError('APP suite has no test cases')
-        packages = {item.test_case.app_package.package_name for item in cases if item.test_case.app_package}
-        if len(packages) > 1:
-            raise SourceBindingError('APP suite contains multiple app packages')
-        executions = [AppTestExecution.objects.create(test_case=item.test_case, test_suite=source, device=device,
-                                                     user=actor, status='pending', device_lease_generation=device.lease_generation) for item in cases]
-        ids = [item.pk for item in executions]
-        if cancel_check:
-            cancel_check()
-        execute_app_suite_task.run(suite_id=source.pk, execution_ids=ids, package_name=next(iter(packages), ''),
-                                   lease_generation=device.lease_generation, release_device_lease=False,
-                                   cancel_check=cancel_check)
+            return execution.result == 'passed', {
+                'status': execution.status,
+                'result': execution.result,
+                'execution_id': execution.pk,
+                'device_id': device.pk,
+            }
+
+        execute_app_suite_task.run(
+            suite_id=source.pk,
+            execution_ids=ids,
+            package_name=next(iter(packages), ''),
+            lease_generation=device.lease_generation,
+            release_device_lease=False,
+            dispatch_id=dispatch_id,
+            cancel_check=cancel_check,
+        )
         source.refresh_from_db()
-        return source.execution_result == 'passed', {'status': source.execution_status, 'result': source.execution_result,
-                                                      'execution_ids': ids, 'device_id': device.pk}
+        return source.execution_result == 'passed', {
+            'status': source.execution_status,
+            'result': source.execution_result,
+            'execution_ids': ids,
+            'device_id': device.pk,
+        }
+    except Exception as exc:
+        if ids:
+            settle_app_execution_failure(ids, exc, include_running=False)
+        raise
     finally:
-        release_device(device.pk, actor, lease_token)
+        # A worker that could not confirm process termination retains its active row.
+        with transaction.atomic():
+            AppDevice.objects.select_for_update().filter(pk=device.pk).first()
+            if not AppTestExecution.objects.filter(
+                device_id=device.pk, status__in=['pending', 'running']
+            ).exists():
+                release_device(device.pk, actor, lease_token)
 
 
 def _performance_execute(job, attempt, reference, binding, actor, claim_id, cancel_check):

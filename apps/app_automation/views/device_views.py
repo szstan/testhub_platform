@@ -3,6 +3,7 @@
 import subprocess
 import base64
 import ipaddress
+import os
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,6 +13,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from apps.quality_intelligence.services.redaction import redact_text
 import logging
 
 from .test_case_views import AppPagination
@@ -58,16 +60,36 @@ def _remote_device_allowed(ip_address):
 
 
 def get_adb_path() -> str:
-    """
-    获取 ADB 路径：优先使用数据库配置，否则使用默认值 'adb'
-    """
+    """Prefer an explicit UI setting, then the deployed APP_ADB_PATH."""
+    configured_path = ''
     try:
         from ..models import AppTestConfig
         config = AppTestConfig.objects.first()
-        return config.adb_path if config else 'adb'
+        configured_path = (config.adb_path or '').strip() if config else ''
     except Exception as e:
-        logger.warning(f"获取 ADB 配置失败，使用默认路径: {e}")
-        return 'adb'
+        logger.warning("获取 ADB 配置失败，使用环境配置或默认路径: %s", redact_text(str(e), max_length=300))
+
+    if configured_path and configured_path.lower() not in {'adb', 'adb.exe'}:
+        return configured_path
+    return os.environ.get('APP_ADB_PATH', '').strip() or configured_path or 'adb'
+
+
+def _adb_screenshot_failure(stderr):
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', errors='replace')
+    detail = ' '.join(''.join(char if char.isprintable() else ' ' for char in str(stderr or '')).split())
+    lowered = detail.lower()
+    if 'unauthorized' in lowered:
+        message = '设备未授权，请在设备上允许 USB 调试授权后重试'
+    elif 'offline' in lowered:
+        message = '设备已离线，请在设备管理中检查连接并重新连接'
+    elif 'no devices' in lowered or ('device' in lowered and 'not found' in lowered):
+        message = 'ADB 未找到该设备，请在设备管理中刷新或重新连接'
+    elif 'cannot connect' in lowered or 'cannot connect to daemon' in lowered:
+        message = '无法连接 ADB 服务，请检查后端运行环境及设备连接'
+    else:
+        message = 'ADB 截图命令失败，请检查设备连接和后端日志'
+    return message, redact_text(detail, max_length=500)
 
 
 class AppDeviceViewSet(viewsets.ModelViewSet):
@@ -423,6 +445,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             )
             
             if not result.stdout:
+                logger.warning("设备 %s 截图失败: ADB 未返回截图数据", device.device_id)
                 return Response({
                     'code': 500,
                     'msg': '截图失败：无返回数据',
@@ -453,10 +476,32 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 'msg': '截图超时，请检查设备连接',
                 'success': False
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            logger.error(f"设备 {device.device_id} 截图失败: {str(e)}")
+        except FileNotFoundError:
+            logger.error("设备 %s 截图失败: 找不到 ADB 可执行文件", device.device_id)
             return Response({
                 'code': 500,
-                'msg': f'截图失败: {str(e)}',
+                'msg': '找不到 ADB，请检查 APP 自动化配置或 APP_ADB_PATH',
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except PermissionError:
+            logger.error("设备 %s 截图失败: ADB 可执行文件无权限", device.device_id)
+            return Response({
+                'code': 500,
+                'msg': 'ADB 无执行权限，请检查后端运行用户及文件权限',
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except subprocess.CalledProcessError as e:
+            message, detail = _adb_screenshot_failure(e.stderr)
+            logger.error("设备 %s 截图失败: ADB 退出码 %s，错误: %s", device.device_id, e.returncode, detail or '无')
+            return Response({
+                'code': 500,
+                'msg': message,
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error("设备 %s 截图失败: %s", device.device_id, redact_text(str(e), max_length=500))
+            return Response({
+                'code': 500,
+                'msg': '截图失败，请检查设备连接和后端日志',
                 'success': False
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

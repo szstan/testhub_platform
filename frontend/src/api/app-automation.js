@@ -73,6 +73,13 @@ export function getDeviceList(params) {
   })
 }
 
+export function getAppDevice(id) {
+  return request({
+    url: `/app-automation/devices/${id}/`,
+    method: 'get'
+  })
+}
+
 /**
  * 获取设备截图
  */
@@ -80,7 +87,8 @@ export function captureDeviceScreenshot(id) {
   return request({
     url: `/app-automation/devices/${id}/screenshot/`,
     method: 'post',
-    timeout: 15000 // 截图可能需要较长时间
+    timeout: 15000, // 截图可能需要较长时间
+    suppressServerErrorToast: true
   })
 }
 
@@ -353,6 +361,14 @@ export function deleteTestCase(id) {
 export function executeTestCase(id, data) {
   return request({
     url: `/app-automation/test-cases/${id}/execute/`,
+    method: 'post',
+    data
+  })
+}
+
+export function batchExecuteTestCases(data) {
+  return request({
+    url: '/app-automation/test-cases/batch-execute/',
     method: 'post',
     data
   })

@@ -23,6 +23,10 @@ class AppTestWorkerError(RuntimeError):
     """APP worker runtime is not safe to use for an execution."""
 
 
+class AppTestProcessTerminationError(AppTestWorkerError):
+    """The child process could not be confirmed stopped; keep its device busy."""
+
+
 class AppTestExecutor:
     """APP测试执行器，封装 pytest 执行逻辑"""
 
@@ -195,9 +199,11 @@ class AppTestExecutor:
                 'error': str(e),
             }
         finally:
-            if self._current_process is not None:
-                self.stop()
-            os.chdir(original_cwd)
+            try:
+                if self._current_process is not None:
+                    self.stop()
+            finally:
+                os.chdir(original_cwd)
     
     @staticmethod
     def _read_log_tail(log_file, important_patterns, *, max_lines=50, max_line_chars=16384):
@@ -526,17 +532,25 @@ class AppTestExecutor:
             return 0
     
     def stop(self):
-        """停止当前执行的测试"""
-        if self._current_process:
+        """Stop the child, retaining the device reservation if exit is uncertain."""
+        process = self._current_process
+        if process is None:
+            return
+        try:
             try:
-                self._current_process.terminate()
-                self._current_process.wait(timeout=5)
+                process.terminate()
+                process.wait(timeout=5)
                 logger.info("测试执行已停止")
             except subprocess.TimeoutExpired:
-                self._current_process.kill()
-                self._current_process.wait(timeout=5)
+                process.kill()
+                process.wait(timeout=5)
                 logger.warning("测试执行被强制终止")
-            except Exception as e:
-                logger.error(f"停止测试失败: {str(e)}")
-            finally:
-                self._current_process = None
+        except Exception as exc:
+            try:
+                exited = process.poll() is not None
+            except Exception:
+                exited = False
+            if not exited:
+                logger.error("无法确认测试进程已退出，保留设备占用", exc_info=True)
+                raise AppTestProcessTerminationError('无法确认测试进程已退出，请检查设备和执行进程') from exc
+        self._current_process = None

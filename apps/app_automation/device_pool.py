@@ -102,12 +102,15 @@ def _reclaim_expired(device: AppDevice, now=None):
 
 
 def _acquire_locked_device(device, user, *, now, lease_seconds):
+    from .execution_admission import assert_device_execution_idle
+
     if _reclaim_expired(device, now):
         device.save(update_fields=_lease_fields())
     if _lease_is_active(device, now):
         raise DeviceLeaseError('设备已有有效租约')
     if device.locked_by_id is not None or device.lease_token_hash or device.status == DeviceStatus.LOCKED:
         raise DeviceLeaseError('设备锁状态不明确，拒绝重新分配')
+    assert_device_execution_idle(device.pk)
     raw_token = secrets.token_urlsafe(32)
     seconds = max(int(lease_seconds or 3600), 30)
     max_seconds = max(int(device.max_allocation_time or 0), 30)

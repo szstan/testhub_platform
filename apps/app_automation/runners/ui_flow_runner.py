@@ -6,6 +6,7 @@ import os
 import time
 import logging
 import json
+import math
 import re
 import copy
 from typing import Any, Dict, List, Optional
@@ -547,9 +548,22 @@ class UiFlowRunner:
             logger.error(f"解析元素失败: element_id={element_id}, 错误: {e}", exc_info=True)
             return None
     
+    @staticmethod
+    def _interaction_target(target):
+        """Use the center of a rectangular region for point-based gestures."""
+        if not isinstance(target, (tuple, list)) or len(target) != 4:
+            return target
+        try:
+            x1, y1, x2, y2 = (float(value) for value in target)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('区域坐标无效，请检查元素配置') from exc
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or x1 == x2 or y1 == y2:
+            raise ValueError('区域坐标无效，请重新框选区域')
+        return (int((x1 + x2) / 2), int((y1 + y2) / 2))
+
     def _action_touch(self, step: Dict[str, Any]):
         """点击动作"""
-        target = self._resolve_selector(step)
+        target = self._interaction_target(self._resolve_selector(step))
         if target is None:
             step_name = step.get('name', step.get('type', 'unknown'))
             raise ValueError(f"步骤 '{step_name}' 无法解析选择器，请检查元素配置（selector 或 element_id）")
@@ -558,7 +572,7 @@ class UiFlowRunner:
     
     def _action_double_click(self, step: Dict[str, Any]):
         """双击动作"""
-        target = self._resolve_selector(step)
+        target = self._interaction_target(self._resolve_selector(step))
         if target:
             logger.info(f"执行双击: {target}")
             double_click(target)
@@ -606,6 +620,8 @@ class UiFlowRunner:
         timeout = step.get('timeout', step.get('duration', 3))
         
         if target:
+            if isinstance(target, (tuple, list)):
+                raise ValueError('等待元素出现需要图片元素；坐标或区域可用于点击，纯等待请清空定位')
             logger.info(f"等待元素出现: {target}, 超时: {timeout}s")
             wait(target, timeout=timeout)
         else:
@@ -876,7 +892,7 @@ class UiFlowRunner:
     
     def _action_input(self, step: Dict[str, Any]):
         """输入文本"""
-        target = self._resolve_selector(step)
+        target = self._interaction_target(self._resolve_selector(step))
         value = step.get('value', '')
         
         # 解析变量表达式（如随机数函数）
@@ -906,7 +922,7 @@ class UiFlowRunner:
     
     def _action_long_press(self, step: Dict[str, Any]):
         """长按"""
-        target = self._resolve_selector(step)
+        target = self._interaction_target(self._resolve_selector(step))
         duration = step.get('duration', 2)
         
         if target:
@@ -921,7 +937,7 @@ class UiFlowRunner:
             'selector_type': step.get('start_selector_type', 'image'),
             'image_scope': step.get('image_scope', 'common')
         }
-        start = self._resolve_selector(start_config)
+        start = self._interaction_target(self._resolve_selector(start_config))
         
         # 解析终点
         end_config = {
@@ -929,7 +945,7 @@ class UiFlowRunner:
             'selector_type': step.get('end_selector_type', 'image'),
             'image_scope': step.get('image_scope', 'common')
         }
-        end = self._resolve_selector(end_config)
+        end = self._interaction_target(self._resolve_selector(end_config))
         
         duration = step.get('duration', 0.8)
         

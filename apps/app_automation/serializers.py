@@ -87,12 +87,13 @@ class AppTestConfigSerializer(serializers.ModelSerializer):
 class AppDeviceSerializer(serializers.ModelSerializer):
     """APP设备序列化器"""
     locked_by_name = serializers.SerializerMethodField()
+    lease_requires_token = serializers.SerializerMethodField()
     
     class Meta:
         model = AppDevice
         fields = [
             'id', 'device_id', 'name', 'status', 'android_version', 'connection_type',
-            'ip_address', 'port', 'locked_by', 'locked_by_name', 'locked_at',
+            'ip_address', 'port', 'locked_by', 'locked_by_name', 'lease_requires_token', 'locked_at',
             'max_allocation_time', 'lease_acquired_at', 'lease_expires_at',
             'last_heartbeat_at', 'capabilities', 'health_status', 'maintenance_mode',
             'last_seen_at', 'device_specs', 'description', 'location',
@@ -105,6 +106,9 @@ class AppDeviceSerializer(serializers.ModelSerializer):
     
     def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None
+
+    def get_lease_requires_token(self, obj) -> bool:
+        return bool(obj.lease_token_hash)
 
 
 class AppElementSerializer(serializers.ModelSerializer):
@@ -250,7 +254,10 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AppTestExecution
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at', 'started_at', 'finished_at', 'duration')
+        read_only_fields = (
+            'created_at', 'updated_at', 'started_at', 'finished_at', 'duration',
+            'stop_requested', 'release_device_lease_on_stop',
+        )
 
 
 class AppComponentSerializer(serializers.ModelSerializer):

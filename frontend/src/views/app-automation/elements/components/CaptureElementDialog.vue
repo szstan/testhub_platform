@@ -386,6 +386,13 @@ const loadDevices = async () => {
 }
 
 // 从设备截图
+const getScreenshotErrorMessage = (data, fallback) => {
+  const backendMessage = [data?.msg, data?.message, data?.detail]
+    .find(value => typeof value === 'string' && value.trim())
+  const safeMessage = typeof backendMessage === 'string' ? backendMessage.trim().slice(0, 500) : ''
+  return safeMessage || fallback
+}
+
 const captureScreen = async () => {
   if (!selectedDevice.value) {
     ElMessage.warning(t('appAutomation.element.capture.messages.selectDeviceRequired'))
@@ -399,15 +406,21 @@ const captureScreen = async () => {
     if (data.success && data.data) {
       capturedImage.value = data.data.content || data.content || ''
       if (!capturedImage.value) {
-        throw new Error(t('appAutomation.element.capture.messages.emptyScreenshot'))
+        ElMessage.error(t('appAutomation.element.capture.messages.emptyScreenshot'))
+        return
       }
       ElMessage.success(t('appAutomation.element.capture.messages.captureSuccess'))
     } else {
-      ElMessage.error(data.message || t('appAutomation.element.capture.messages.captureFailed'))
+      ElMessage.error(getScreenshotErrorMessage(
+        data,
+        t('appAutomation.element.capture.messages.captureFailed')
+      ))
     }
   } catch (error) {
-    console.error('截图失败:', error)
-    ElMessage.error(t('appAutomation.element.capture.messages.captureFailed'))
+    ElMessage.error(getScreenshotErrorMessage(
+      error.response?.data,
+      t('appAutomation.element.capture.messages.captureFailed')
+    ))
   } finally {
     capturing.value = false
   }

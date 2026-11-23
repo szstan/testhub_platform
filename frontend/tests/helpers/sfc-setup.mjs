@@ -19,22 +19,29 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
   const script = compileScript(descriptor, { id: relativePath })
   const mounted = []
   const beforeUnmount = []
+  const unmounted = []
   const messages = []
   const mocks = {
     vue: {
       ...vue,
       onMounted: callback => mounted.push(callback),
       onBeforeUnmount: callback => beforeUnmount.push(callback),
+      onUnmounted: callback => unmounted.push(callback),
     },
-    'vue-i18n': { useI18n: () => ({ t: key => key }) },
+    'vue-i18n': { useI18n: () => ({ t: (key, params) => params?.message ? `${key}: ${params.message}` : key }) },
     'element-plus': {
       ElMessage: Object.fromEntries(['error', 'warning', 'success'].map(type => [type, text => messages.push({ type, text })])),
-      ElMessageBox: { confirm: async () => true },
+      ElMessageBox: { confirm: globals.confirm || (async () => true) },
     },
     ...imports,
   }
   const bundle = await build({
-    stdin: { contents: script.content, resolveDir: dirname(filename), sourcefile: filename, loader: 'js' },
+    stdin: {
+      contents: script.content,
+      resolveDir: dirname(filename),
+      sourcefile: filename,
+      loader: descriptor.scriptSetup?.lang === 'ts' || descriptor.script?.lang === 'ts' ? 'ts' : 'js',
+    },
     bundle: true,
     write: false,
     platform: 'node',
@@ -71,6 +78,7 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
     mount: () => Promise.all(mounted.map(callback => callback())),
     dispose() {
       beforeUnmount.forEach(callback => callback())
+      unmounted.forEach(callback => callback())
       scope.stop()
     },
   }

@@ -47,13 +47,14 @@
                 filterable
                 style="width: 100%"
                 :loading="devicesLoading"
+                :disabled="executionSubmitting"
               >
                 <el-option
                   v-for="device in availableDevices"
                   :key="device.id"
-                  :label="`${device.name} (${device.device_id})`"
+                  :label="`${device.name || device.device_id} (${device.device_id})` + (device.lease_requires_token ? ` - ${$t('appAutomation.device.messages.executionTokenLeaseBadge')}` : '')"
                   :value="device.id"
-                  :disabled="device.status !== 'available' && device.status !== 'online'"
+                  :disabled="!canSelectAppExecutionDevice(device, userStore.user?.id)"
                 />
               </el-select>
             </el-form-item>
@@ -66,6 +67,7 @@
                 clearable
                 filterable
                 style="width: 100%"
+                :disabled="executionSubmitting"
               >
                 <el-option
                   v-for="pkg in appPackages"
@@ -95,16 +97,24 @@
             </el-form-item>
           </el-col>
         </el-row>
+        <el-alert
+          v-if="selectedExecutionDevice?.lease_requires_token"
+          class="device-lease-warning"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="$t('appAutomation.device.messages.executionTokenLeaseUnavailable')"
+        />
       </el-form>
     </el-card>
 
     <!-- 批量操作栏 -->
     <div v-if="selectedCases.length > 0" class="batch-bar">
       <span>{{ $t('appAutomation.testCase.selectedCasesCount', { count: selectedCases.length }) }}</span>
-      <el-button type="success" size="small" @click="batchRun">
+      <el-button type="success" size="small" :disabled="executionSubmitting" @click="batchRun">
         {{ $t('appAutomation.testCase.batchRun') }}
       </el-button>
-      <el-button size="small" @click="clearSelection">
+      <el-button size="small" :disabled="executionSubmitting" @click="clearSelection">
         {{ $t('appAutomation.testCase.cancelSelection') }}
       </el-button>
     </div>
@@ -118,7 +128,7 @@
       :empty-text="$t('appAutomation.testCase.noTestCases')"
       @selection-change="handleSelectionChange"
     >
-      <el-table-column type="selection" width="50" />
+      <el-table-column type="selection" width="50" :selectable="() => !executionSubmitting" />
       <el-table-column prop="name" :label="$t('appAutomation.testCase.caseName')" min-width="200" />
       <el-table-column :label="$t('appAutomation.testCase.sceneDescription')" min-width="250">
         <template #default="{ row }">
@@ -132,7 +142,7 @@
       </el-table-column>
       <el-table-column :label="$t('appAutomation.common.operation')" width="200">
         <template #default="{ row }">
-          <el-button link type="success" size="small" @click="runCase(row)">
+          <el-button link type="success" size="small" :disabled="executionSubmitting" @click="runCase(row)">
             {{ $t('appAutomation.common.run') }}
           </el-button>
           <el-button link type="primary" size="small" @click="editCase(row)">
@@ -225,10 +235,12 @@
               {{ $t('appAutomation.testCase.viewReport') }}
             </el-button>
             <el-button
-              v-if="row.status === 'running'"
+              v-if="(row.status === 'pending' || row.status === 'running') && !row.stop_requested"
               link
               type="danger"
               size="small"
+              :loading="stoppingExecutionIds.has(row.id)"
+              :disabled="stoppingExecutionIds.has(row.id)"
               @click="stopTest(row)"
             >
               {{ $t('appAutomation.common.stop') }}
@@ -241,7 +253,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
@@ -255,19 +267,32 @@ import {
   stopExecution as apiStopExecution,
   getPackageList,
   getAppProjects,
-  getWsStatus
+  getWsStatus,
+  getAppDevice,
+  batchExecuteTestCases,
 } from '@/api/app-automation'
 import { getDeviceList } from '@/api/app-automation'
 import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
 import { buildWebSocketUrl, issueWebSocketTicket } from '@/utils/websocket'
+import {
+  canSelectAppExecutionDevice,
+  getAppExecutionErrorMessage,
+  normalizeAppDevice,
+  normalizeAppDeviceList,
+  prepareAppDeviceForExecution,
+} from '@/utils/app-automation-device-execution.mjs'
+import { useUserStore } from '@/stores/user'
 
 const router = useRouter()
+const userStore = useUserStore()
 const { t } = useI18n()
 
 // 响应式数据
 const loading = ref(false)
 const devicesLoading = ref(false)
 const executionsLoading = ref(false)
+const executionSubmitting = ref(false)
+const stoppingExecutionIds = ref(new Set())
 const availableDevices = ref([])
 const appPackages = ref([])
 const searchQuery = ref('')
@@ -278,6 +303,9 @@ const form = ref({
   deviceId: null,
   packageId: null
 })
+const selectedExecutionDevice = computed(() =>
+  availableDevices.value.find(device => String(device.id) === String(form.value.deviceId))
+)
 
 // 用例列表数据
 const testCases = ref([])
@@ -315,17 +343,43 @@ const loadDevices = async () => {
   devicesLoading.value = true
   try {
     const res = await getDeviceList({ page_size: 100 })
-    const data = res.data
-    if (data.success !== undefined) {
-      availableDevices.value = data.data?.results || data.data || []
-    } else {
-      availableDevices.value = data.results || data || []
-    }
-  } catch (error) {
-    console.error('加载设备失败:', error)
+    availableDevices.value = normalizeAppDeviceList(res.data)
+  } catch {
     availableDevices.value = []
   } finally {
     devicesLoading.value = false
+  }
+}
+
+const refreshExecutionDevice = async deviceId => {
+  const res = await getAppDevice(deviceId)
+  return normalizeAppDevice(res.data)
+}
+
+const updateExecutionDevice = device => {
+  if (!device?.id) return
+  const index = availableDevices.value.findIndex(item => String(item.id) === String(device.id))
+  if (index >= 0) availableDevices.value[index] = device
+  else availableDevices.value.push(device)
+}
+
+const captureExecutionIdentity = () => ({
+  userId: userStore.user?.id,
+  sessionGeneration: typeof userStore.getSessionGeneration === 'function'
+    ? userStore.getSessionGeneration()
+    : undefined,
+})
+
+const isExecutionIdentityCurrent = identity =>
+  String(userStore.user?.id) === String(identity.userId) &&
+  (identity.sessionGeneration === undefined || (
+    typeof userStore.getSessionGeneration === 'function' &&
+    userStore.getSessionGeneration() === identity.sessionGeneration
+  ))
+
+const verifyExecutionUser = identity => {
+  if (!isExecutionIdentityCurrent(identity)) {
+    throw new Error(t('appAutomation.device.messages.executionUserChanged'))
   }
 }
 
@@ -339,7 +393,7 @@ const loadPackages = async () => {
       appPackages.value = data.results || data || []
     }
   } catch (error) {
-    console.error('加载应用包名失败:', error)
+    console.error('加载应用包名失败')
     appPackages.value = []
   }
 }
@@ -365,7 +419,7 @@ const loadTestCases = async () => {
       caseTotal.value = data.count || 0
     }
   } catch (error) {
-    console.error('加载测试用例失败:', error)
+    console.error('加载测试用例失败')
     testCases.value = []
     caseTotal.value = 0
   } finally {
@@ -403,7 +457,7 @@ const loadExecutions = async () => {
       }
     })
   } catch (error) {
-    console.error('加载执行记录失败:', error)
+    console.error('加载执行记录失败')
     executionData.value = { count: 0, results: [] }
   } finally {
     executionsLoading.value = false
@@ -434,6 +488,9 @@ const viewReport = (execution) => {
 
 // 停止测试
 const stopTest = async (execution) => {
+  if (!execution?.id || !['pending', 'running'].includes(execution.status) || execution.stop_requested) return
+  if (stoppingExecutionIds.value.has(execution.id)) return
+  stoppingExecutionIds.value.add(execution.id)
   try {
     await ElMessageBox.confirm(
       t('appAutomation.testCase.stopConfirm'),
@@ -447,54 +504,83 @@ const stopTest = async (execution) => {
 
     const res = await apiStopExecution(execution.id)
     if (res.data.success) {
-      ElMessage.success(t('appAutomation.testCase.stoppedExecution'))
+      ElMessage.success(t(res.data.stopping
+        ? 'appAutomation.testCase.stoppingExecution'
+        : 'appAutomation.testCase.stoppedExecution'))
       loadExecutions()
     } else {
       ElMessage.error(res.data.message || t('appAutomation.testCase.stopFailed'))
     }
   } catch (error) {
-    // 用户取消
+    if (error !== 'cancel') {
+      ElMessage.error(getAppExecutionErrorMessage(error, t('appAutomation.testCase.stopFailed')))
+    }
+  } finally {
+    stoppingExecutionIds.value.delete(execution.id)
   }
 }
 
 // 运行测试用例
 const runCase = async (testCase) => {
-  if (!form.value.deviceId) {
+  if (executionSubmitting.value) return
+  const selectedDeviceId = form.value.deviceId
+  const executionIdentity = captureExecutionIdentity()
+  const executionUserId = executionIdentity.userId
+  const selectedCaseId = testCase.id
+  const selectedPackageName = appPackages.value.find(pkg => pkg.id === form.value.packageId)?.package_name
+  if (!selectedDeviceId) {
     ElMessage.warning(t('appAutomation.testCase.pleaseSelectDevice'))
     return
   }
 
+  executionSubmitting.value = true
   try {
+    const device = await prepareAppDeviceForExecution({
+      selectedId: selectedDeviceId,
+      userId: executionUserId,
+      sessionGeneration: executionIdentity.sessionGeneration,
+      getCurrentUserId: () => userStore.user?.id,
+      getCurrentSessionGeneration: () => userStore.getSessionGeneration?.(),
+      getDevice: refreshExecutionDevice,
+      onDeviceRefreshed: updateExecutionDevice,
+      t,
+    })
+    verifyExecutionUser(executionIdentity)
     const params = {
-      device_id: availableDevices.value.find(d => d.id === form.value.deviceId)?.device_id
+      device_id: device.device_id,
+      auto_lock: true,
+      expected_user_id: executionUserId,
     }
+    if (selectedPackageName) params.package_name = selectedPackageName
 
-    if (form.value.packageId) {
-      const selected = appPackages.value.find(pkg => pkg.id === form.value.packageId)
-      if (selected) {
-        params.package_name = selected.package_name
-      }
-    }
+    const res = await apiExecuteTestCase(selectedCaseId, params)
+    verifyExecutionUser(executionIdentity)
+    const data = res.data || {}
+    const result = data.data || data
+    const executionId = data.execution?.id || data.execution_id || result.execution?.id || result.execution_id
 
-    const res = await apiExecuteTestCase(testCase.id, params)
-    const data = res.data
-
-    if (data.success || data.execution_id) {
+    if (data.success === false || result.success === false) {
+      ElMessage.error(t('appAutomation.testCase.executionFailed', { message: data.message || result.message || t('appAutomation.testCase.unknownError') }))
+    } else if (data.success || result.success || executionId) {
+      updateExecutionDevice(data.device)
       ElMessage.success(t('appAutomation.testCase.submitted'))
-      const executionId = data.execution?.id || data.execution_id
       if (executionId) {
         trackExecution(executionId)
         checkExecutionStatus(executionId)
       }
-      // 刷新执行记录
       setTimeout(() => {
-        loadExecutions()
+        if (isExecutionIdentityCurrent(executionIdentity)) loadExecutions()
       }, 1000)
     } else {
       ElMessage.error(t('appAutomation.testCase.executionFailed', { message: data.message || t('appAutomation.testCase.unknownError') }))
     }
   } catch (error) {
-    ElMessage.error(t('appAutomation.testCase.executionFailed', { message: error.message || t('appAutomation.testCase.unknownError') }))
+    const message = isExecutionIdentityCurrent(executionIdentity)
+      ? getAppExecutionErrorMessage(error, t('appAutomation.testCase.unknownError'))
+      : t('appAutomation.device.messages.executionUserChanged')
+    ElMessage.error(t('appAutomation.testCase.executionFailed', { message }))
+  } finally {
+    executionSubmitting.value = false
   }
 }
 
@@ -508,7 +594,7 @@ const checkExecutionStatus = (executionId) => {
         ElMessage.warning(t('appAutomation.testCase.taskNotStarted'))
       }
     } catch (error) {
-      console.error('检查执行状态失败:', error)
+      console.error('检查执行状态失败')
     }
   }, 3000)
 }
@@ -591,7 +677,7 @@ const startPolling = (executionId) => {
         }
       }
     } catch (e) {
-      console.error('轮询执行状态失败:', e)
+      console.error('轮询执行状态失败')
     }
   }, 3000)
 }
@@ -673,7 +759,7 @@ const connectWebSocket = async (executionId) => {
         closeWebSocket(executionId)
       }
     } catch (error) {
-      console.error('处理 WebSocket 消息失败:', error)
+      console.error('处理 WebSocket 消息失败')
     }
   }
 
@@ -719,47 +805,78 @@ const clearSelection = () => {
 }
 
 const batchRun = async () => {
-  if (!form.value.deviceId) {
+  if (executionSubmitting.value) return
+  const selectedDeviceId = form.value.deviceId
+  const executionIdentity = captureExecutionIdentity()
+  const executionUserId = executionIdentity.userId
+  const selectedCaseIds = selectedCases.value.map(testCase => testCase.id)
+  const selectedPackageName = appPackages.value.find(pkg => pkg.id === form.value.packageId)?.package_name
+  if (!selectedDeviceId) {
     ElMessage.warning(t('appAutomation.testCase.pleaseSelectDevice'))
     return
   }
-  if (selectedCases.value.length === 0) {
+  if (selectedCaseIds.length === 0) {
     ElMessage.warning(t('appAutomation.testCase.pleaseSelectAtLeastOneCase'))
     return
   }
 
+  const submittedSelectionIsCurrent = () =>
+    selectedCases.value.length === selectedCaseIds.length &&
+    selectedCases.value.every((testCase, index) => String(testCase.id) === String(selectedCaseIds[index]))
+
+  executionSubmitting.value = true
   try {
     await ElMessageBox.confirm(
-      t('appAutomation.testCase.batchRunConfirm', { count: selectedCases.value.length }),
+      t('appAutomation.testCase.batchRunConfirm', { count: selectedCaseIds.length }),
       t('appAutomation.testCase.confirmBatchRun'),
       { confirmButtonText: t('appAutomation.common.execute'), cancelButtonText: t('appAutomation.common.cancel'), type: 'info' }
     )
+    verifyExecutionUser(executionIdentity)
 
-    const deviceIdStr = availableDevices.value.find(d => d.id === form.value.deviceId)?.device_id
-    let packageName = null
-    if (form.value.packageId) {
-      const selected = appPackages.value.find(pkg => pkg.id === form.value.packageId)
-      if (selected) packageName = selected.package_name
+    const device = await prepareAppDeviceForExecution({
+      selectedId: selectedDeviceId,
+      userId: executionUserId,
+      sessionGeneration: executionIdentity.sessionGeneration,
+      getCurrentUserId: () => userStore.user?.id,
+      getCurrentSessionGeneration: () => userStore.getSessionGeneration?.(),
+      getDevice: refreshExecutionDevice,
+      onDeviceRefreshed: updateExecutionDevice,
+      t,
+    })
+    verifyExecutionUser(executionIdentity)
+
+    const params = {
+      case_ids: selectedCaseIds,
+      device_id: device.device_id,
+      auto_lock: true,
+      expected_user_id: executionUserId,
+    }
+    if (selectedPackageName) params.package_name = selectedPackageName
+
+    const res = await batchExecuteTestCases(params)
+    verifyExecutionUser(executionIdentity)
+    const data = res.data || {}
+    const result = data.data || {}
+    if (data.success === false || (!data.success && !Array.isArray(result.execution_ids))) {
+      throw new Error(data.message || t('appAutomation.testCase.unknownError'))
     }
 
-    // 逐个提交执行
-    let submitted = 0
-    for (const tc of selectedCases.value) {
-      try {
-        const params = { device_id: deviceIdStr }
-        if (packageName) params.package_name = packageName
-        await apiExecuteTestCase(tc.id, params)
-        submitted++
-      } catch (error) {
-        console.error(`执行用例 ${tc.name} 失败:`, error)
-      }
-    }
-
-    ElMessage.success(t('appAutomation.testCase.submittedCount', { count: submitted }))
-    clearSelection()
-    setTimeout(() => loadExecutions(), 1500)
+    updateExecutionDevice(data.device)
+    const submittedCount = result.test_case_count ?? selectedCaseIds.length
+    ElMessage.success(t('appAutomation.testCase.submittedCount', { count: submittedCount }))
+    if (submittedSelectionIsCurrent()) clearSelection()
+    setTimeout(() => {
+      if (isExecutionIdentityCurrent(executionIdentity)) loadExecutions()
+    }, 1500)
   } catch (error) {
-    // 用户取消
+    if (error !== 'cancel') {
+      const message = isExecutionIdentityCurrent(executionIdentity)
+        ? getAppExecutionErrorMessage(error, t('appAutomation.testCase.unknownError'))
+        : t('appAutomation.device.messages.executionUserChanged')
+      ElMessage.error(t('appAutomation.testCase.executionFailed', { message }))
+    }
+  } finally {
+    executionSubmitting.value = false
   }
 }
 
