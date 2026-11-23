@@ -133,6 +133,47 @@ export function unlockDevice(id) {
   })
 }
 
+/** Acquire a short-lived, token-fenced lease for an explicitly started recorder. */
+export function acquireRecorderLease(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/recorder-lease/`,
+    method: 'post',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Release only the recorder lease represented by the supplied token. */
+export function releaseRecorderLease(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/recorder-lease/`,
+    method: 'delete',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Renew the current user's device lock while the recorder remains open. */
+export function heartbeatDevice(id, data = {}) {
+  return request({
+    url: `/app-automation/devices/${id}/heartbeat/`,
+    method: 'post',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Send one allowlisted interaction after explicit recorder activation. */
+export function recordDeviceInteraction(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/record-interaction/`,
+    method: 'post',
+    data,
+    timeout: 15000,
+    suppressServerErrorToast: true
+  })
+}
+
 // 断开远程设备连接
 export function disconnectDevice(id) {
   return request({

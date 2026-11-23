@@ -66,6 +66,47 @@ export default {
     daysAgo: '{n}天前'
   },
 
+  sceneData: {
+    title: '项目数据与复用组件',
+    selectProject: '请先选择项目',
+    datasets: '数据集',
+    components: '复用组件',
+    datasetHelp: '上传 CSV 或 XLSX，创建不可修改的数据集版本。',
+    datasetName: '数据集名称',
+    chooseFile: '选择文件',
+    sensitiveColumns: '敏感列名，多个用逗号分隔',
+    upload: '上传数据集',
+    secretHelp: '敏感列使用服务端配置的 secret:// 别名，勿上传明文密钥。',
+    sensitiveVariable: '敏感变量',
+    emptyDatasets: '当前项目暂无数据集',
+    name: '名称',
+    version: '版本',
+    rows: '数据行数',
+    componentHelp: '将当前场景步骤保存为项目内的新组件版本。',
+    componentName: '组件名称',
+    componentType: '组件类型，例如 login_flow',
+    type: '类型',
+    parameterSchema: '参数定义 JSON 对象，可留空对象',
+    requiredParameters: '必填参数名，多个用逗号分隔',
+    parameterHelp: '步骤可引用组件参数；敏感值请通过场景变量引用，不能写入明文。',
+    saveVersion: '保存新版本',
+    emptyComponents: '当前项目暂无复用组件',
+    insert: '插入场景',
+    datasetRequired: '请输入名称并选择不超过 5 MiB 的文件',
+    componentRequired: '请填写组件名称、类型和版本',
+    invalidComponent: '参数定义或场景步骤无效',
+    datasetSaved: '数据集版本已创建',
+    componentSaved: '组件版本已创建',
+    loadFailed: '加载项目数据失败',
+    saveFailed: '保存失败，请检查配置',
+    runWithData: '数据驱动',
+    runMode: '执行范围',
+    singleRow: '单行',
+    allRows: '全部行',
+    rowNumber: '数据行号（从 1 开始）',
+    sequentialHint: '数据行将使用同一设备顺序执行，每行生成独立执行记录。'
+  },
+
   // 状态
   status: {
     notStarted: '未开始',
@@ -195,6 +236,8 @@ export default {
     lock: '锁定',
     unlock: '解锁',
     reconnect: '重连',
+    recoverPendingAction: '恢复待处理动作',
+    clearMaintenance: '解除维护模式',
     port: '端口',
     portPlaceholder: '默认5555',
     ipAddressPlaceholder: '请输入远程设备IP地址',
@@ -239,6 +282,12 @@ export default {
       executionTokenLeaseBadge: '令牌租约，网页不可用',
       executionLockFailed: '锁定设备失败，请检查设备状态',
       executionLockUnverified: '无法确认设备锁定状态，请刷新后重试',
+      recoverPendingActionConfirm: '确认恢复设备 {name} 的待处理动作？请先人工核实设备状态，并确认设备上没有活动工作进程。此操作只清除待处理动作标记，设备仍保持维护模式。',
+      pendingActionRecovered: '待处理动作标记已清除，设备仍处于维护模式',
+      recoverPendingActionFailed: '恢复待处理动作失败',
+      clearMaintenanceConfirm: '确认解除设备 {name} 的维护模式？请人工核实设备状态，并确认没有待处理动作；解除后设备可能重新进入可分配设备池。',
+      maintenanceCleared: '设备维护模式已解除',
+      clearMaintenanceFailed: '解除设备维护模式失败',
       disconnectConfirm: '确定要断开设备 {name} 的连接吗？',
       lockConfirm: '确定要锁定设备 {name} 吗？',
       unlockConfirm: '确定要解锁设备 {name} 吗？',
@@ -522,6 +571,77 @@ export default {
     submittedCount: '已提交 {count} 个用例执行'
   },
 
+  recorder: {
+    title: '设备录制器',
+    device: '设备',
+    selectDevice: '选择空闲设备',
+    refreshDevices: '刷新设备列表',
+    noDevices: '暂无可显示的设备',
+    noSelection: '选择设备以打开录制器',
+    owner: '锁定所有权',
+    ownerAvailable: '可用，当前无人持有',
+    ownerSession: '由当前录制会话锁定',
+    ownerNamed: '由 {name} 锁定',
+    ownerUnknown: '已被其他所有者锁定',
+    ownerMaintenance: '不可用：设备处于维护模式',
+    deviceStates: {
+      available: '可用',
+      online: '在线',
+      locked: '已锁定',
+      offline: '离线'
+    },
+    start: '开始录制',
+    stop: '停止录制',
+    refresh: '刷新截图',
+    mode: '交互模式',
+    modes: { tap: '点击', swipe: '滑动', key: '按键' },
+    empty: '开始录制后可通过截图与设备交互',
+    screen: '设备截图',
+    keys: 'Android 按键',
+    keyNames: { back: '返回', home: '主页', enter: '确认' },
+    stagedSteps: '已录制步骤',
+    clear: '清空暂存列表',
+    actions: { tap: '点击', swipe: '滑动', key: '按键' },
+    status: {
+      idle: '录制已关闭，设备输入已禁用。',
+      loading: '正在加载截图…',
+      recording: '录制已启用；仅在用户交互后才会向设备发送输入。',
+      error: '录制器操作失败。'
+    },
+    stepNames: { click: '录制的点击', swipe: '录制的滑动', key: '录制的按键事件' },
+    errors: {
+      signIn: '请先登录再开始录制。',
+      deviceListFailed: '无法加载设备列表。',
+      deviceUnavailable: '所选设备已离线或不可用。',
+      deviceBusy: '所选设备已锁定或正忙，请刷新设备列表。',
+      lockFailed: '无法获取设备锁。',
+      lockUnverified: '无法验证设备锁，录制保持关闭。',
+      leaseLost: '设备租约已失效，录制已关闭。',
+      accountChanged: '登录账号已变化，录制已关闭。',
+      maintenance: '设备因状态未确认而进入维护模式，录制已关闭。',
+      serviceUnavailable: '设备服务不可用。',
+      conflict: '设备正忙或账号校验失败，录制已关闭。',
+      screenshotFailed: '无法加载设备截图。',
+      interactionFailed: '设备交互失败，未暂存该步骤。',
+      releaseFailed: '录制已停止，但无法释放设备锁。'
+    }
+  },
+
+  // Single-step diagnostics
+  stepDiagnostics: {
+    title: '单步诊断',
+    run: '诊断当前步骤',
+    saveFirst: '请先保存用例后再诊断。',
+    stopRecording: '请先停止设备录制。',
+    selectRootStep: '请选择一个顶层步骤。',
+    selectDevice: '请先选择设备。',
+    ready: '确认后将单独执行步骤：{step}',
+    viewResult: '查看执行结果',
+    accountChanged: '登录账号或会话已变化，已取消单步诊断。',
+    submitted: '单步诊断已提交。',
+    failed: '单步诊断失败。'
+  },
+
   // sceneBuilder
   sceneBuilder: {
     custom: '自定义',
@@ -556,7 +676,10 @@ export default {
       baseComponents: '基础组件',
       noBaseComponents: '暂无基础组件',
       customComponents: '自定义组件',
-      noCustomComponents: '暂无自定义组件'
+      noCustomComponents: '暂无自定义组件',
+      searchPlaceholder: '按名称、类型、分类或描述搜索',
+      noSearchResults: '没有匹配的组件',
+      uncategorized: '未分类'
     },
     steps: {
       title: '场景步骤',
@@ -568,6 +691,12 @@ export default {
       addSubStep: '添加子步骤',
       step: '步骤',
       duplicateName: '{name}-复制'
+    },
+    nested: {
+      selectComponent: '选择步骤组件',
+      addStep: '添加步骤',
+      empty: '暂无步骤',
+      maxDepthReached: '已达到嵌套流程的最大深度'
     },
     config: {
       title: '组件配置',
@@ -593,6 +722,9 @@ export default {
       clear: '清除',
       pleaseSelect: '请选择',
       noSchema: '该组件未配置 schema',
+      expressionMode: '表达式',
+      literalMode: '字面量',
+      expressionPlaceholder: '输入完整的场景变量引用',
       vipInitTemplate: 'VIP初始化'
     },
     dialog: {
@@ -634,6 +766,12 @@ export default {
       tags: '标签',
       preview: '预览',
       apply: '应用'
+    },
+    selectorTypes: {
+      resourceId: '资源 ID',
+      text: '文本',
+      contentDesc: '无障碍描述',
+      className: '控件类名'
     },
     fieldGroup: {
       selector: '定位',
@@ -787,7 +925,21 @@ export default {
       imageMissingPath: '该图片元素缺少文件路径',
       elementTypeNotApplicable: '元素类型 {type} 不适用于 {target}',
       noValidFieldGroup: '未指定有效的字段组',
-      clearedLink: '已清除 {target} 关联'
+      clearedLink: '已清除 {target} 关联',
+      invalidJson: 'JSON 格式无效',
+      invalidJsonShape: 'JSON 类型与字段要求不符',
+      invalidJsonAt: 'JSON 格式无效：{path}',
+      invalidJsonShapeAt: 'JSON 类型与字段要求不符：{path}',
+      invalidTypedParameter: '参数必须是匹配类型的字面量或精确场景变量引用',
+      invalidTypedParameterAt: '参数必须是匹配类型的字面量或精确场景变量引用：{path}',
+      literalValueRequired: '请先输入匹配类型的字面量再切换模式',
+      requiredFieldAt: '请填写必填字段：{path}',
+      variableNameRequiredAt: '请填写第 {index} 个场景变量的名称',
+      invalidVariableJson: '变量「{name}」的 JSON 格式无效',
+      invalidVariableJsonShape: '变量「{name}」的 JSON 类型与变量类型不符',
+      unsavedConfirm: '当前场景有未保存的更改，确定离开吗？',
+      unsavedTitle: '未保存的更改',
+      resetConfirm: '重置将清除当前场景的编辑内容，确定继续吗？'
     }
   },
 

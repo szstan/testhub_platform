@@ -183,3 +183,56 @@ def test_suite_with_unverified_case_is_not_reported_as_passed():
     suite.refresh_from_db()
     assert suite.execution_result == 'unverified'
     assert suite.passed_count == 1 and suite.failed_count == 0
+
+
+@pytest.mark.django_db
+def test_suite_assertion_failure_clears_completed_worker_marker():
+    owner = get_user_model().objects.create_user(username='suite-assertion-owner')
+    project = AppProject.objects.create(name='suite assertion project', owner=owner)
+    case = AppTestCase.objects.create(name='assertion case', project=project, created_by=owner)
+    suite = AppTestSuite.objects.create(name='assertion suite', project=project, created_by=owner)
+    device = AppDevice.objects.create(device_id='suite-assertion-device', status='online')
+    device.lock(owner)
+    execution = AppTestExecution.objects.create(
+        test_case=case,
+        test_suite=suite,
+        device=device,
+        user=owner,
+        device_lease_generation=device.lease_generation,
+    )
+
+    def failed_assertion(*args, before_device_io, **kwargs):
+        from apps.app_automation.execution_admission import clear_device_action_pending
+
+        before_device_io()
+        clear_device_action_pending(execution.pk)
+        return {
+            'success': False,
+            'exit_code': 1,
+            'report_path': 'synthetic-report',
+            'test_results': {
+                'total': 1, 'passed': 0, 'failed': 1, 'broken': 0,
+                'skipped': 0, 'unverified': 0,
+            },
+        }
+
+    with (
+        patch('apps.app_automation.device_pool.Thread'),
+        patch('apps.app_automation.tasks.send_execution_update'),
+        patch('apps.app_automation.executors.test_executor.AppTestExecutor') as executor,
+    ):
+        executor.return_value.run_tests.side_effect = failed_assertion
+        execute_app_suite_task.run(
+            suite.pk,
+            [execution.pk],
+            lease_generation=device.lease_generation,
+            release_device_lease=False,
+        )
+
+    execution.refresh_from_db()
+    suite.refresh_from_db()
+    assert execution.status == 'completed'
+    assert execution.result == 'failed'
+    assert execution.device_action_pending is False
+    assert suite.execution_result == 'failed'
+    assert suite.failed_count == 1

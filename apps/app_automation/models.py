@@ -101,12 +101,16 @@ class AppDevice(models.Model):
     lease_acquired_at = models.DateTimeField(null=True, blank=True, verbose_name='租约开始时间')
     lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='租约过期时间')
     last_heartbeat_at = models.DateTimeField(null=True, blank=True, verbose_name='最后心跳时间')
+    lease_max_seconds = models.PositiveIntegerField(
+        null=True, blank=True, default=None, verbose_name='租约续期上限(秒)',
+    )
 
     # 设备规格和资源池治理信息
     device_specs = models.JSONField(default=dict, verbose_name='设备规格', help_text='RAM, CPU, 分辨率等信息')
     capabilities = models.JSONField(default=dict, blank=True, verbose_name='设备能力')
     health_status = models.CharField(max_length=20, default='unknown', verbose_name='健康状态')
     maintenance_mode = models.BooleanField(default=False, verbose_name='维护模式')
+    device_action_pending = models.BooleanField(default=False, verbose_name='设备动作待安全恢复')
     last_seen_at = models.DateTimeField(null=True, blank=True, verbose_name='最后在线时间')
     description = models.TextField(blank=True, default='', verbose_name='设备描述')
     location = models.CharField(max_length=200, blank=True, default='', verbose_name='设备位置')
@@ -335,6 +339,48 @@ class AppCustomComponent(models.Model):
         return f"{self.name} ({self.type})"
 
 
+class AppDataSet(models.Model):
+    """Immutable project-scoped data version used by queued scene executions."""
+
+    project = models.ForeignKey(AppProject, on_delete=models.CASCADE, related_name='data_sets')
+    name = models.CharField(max_length=100)
+    version = models.PositiveIntegerField(default=1)
+    columns = models.JSONField(default=list)
+    rows = models.JSONField(default=list)
+    sensitive_columns = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='created_app_data_sets')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'app_scene_data_sets'
+        ordering = ['name', '-version']
+        constraints = [models.UniqueConstraint(fields=['project', 'name', 'version'],
+                                               name='app_dataset_project_name_version_uniq')]
+
+
+class AppProjectComponent(models.Model):
+    """Versioned reusable scene component visible only within its project."""
+
+    project = models.ForeignKey(AppProject, on_delete=models.CASCADE, related_name='scene_components')
+    name = models.CharField(max_length=100)
+    type = models.CharField(max_length=50)
+    version = models.CharField(max_length=32)
+    description = models.TextField(blank=True, default='')
+    schema = models.JSONField(default=dict)
+    default_config = models.JSONField(default=dict)
+    steps = models.JSONField(default=list)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='created_app_scene_components')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'app_project_components'
+        ordering = ['name', '-created_at']
+        constraints = [models.UniqueConstraint(fields=['project', 'type', 'version'],
+                                               name='app_component_project_type_version_uniq')]
+
+
 class AppComponentPackage(models.Model):
     """APP UI组件包(用于导入/安装组件定义)"""
     SOURCE_CHOICES = [
@@ -538,6 +584,10 @@ class AppTestCase(models.Model):
     )
     ui_flow = models.JSONField(default=dict, verbose_name='UI流程定义', help_text='UI Flow JSON配置')
     variables = models.JSONField(default=list, verbose_name='变量定义', help_text='测试变量列表')
+    runtime_config = models.JSONField(
+        default=dict, blank=True, verbose_name='场景运行时配置',
+        help_text='重试参数及 OCR 配置；GPU 选项仅作用于执行服务端，不代表移动设备兼容性',
+    )
     
     # 用例配置
     timeout = models.IntegerField(default=300, verbose_name='超时时间(秒)', help_text='默认5分钟')
@@ -614,11 +664,17 @@ class AppTestExecution(models.Model):
         related_name='app_test_executions', 
         verbose_name='执行用户'
     )
+    dataset = models.ForeignKey(
+        AppDataSet, on_delete=models.PROTECT, null=True, blank=True,
+        related_name='executions', verbose_name='数据集版本',
+    )
+    dataset_row_index = models.PositiveIntegerField(null=True, blank=True, verbose_name='数据集行号')
     device_lease_generation = models.PositiveBigIntegerField(
         null=True, blank=True, verbose_name='设备租约世代'
     )
     stop_requested = models.BooleanField(default=False, verbose_name='是否请求停止')
     release_device_lease_on_stop = models.BooleanField(default=False, verbose_name='停止时释放执行租约')
+    device_action_pending = models.BooleanField(default=False, verbose_name='设备动作待安全恢复')
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,

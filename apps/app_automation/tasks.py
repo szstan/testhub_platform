@@ -12,10 +12,81 @@ from channels.layers import get_channel_layer
 from apps.core.cancellation import combine_cancel_checks
 from apps.core.http_transport import guarded_post
 from apps.core.scheduler import ScheduleLeaseHeartbeat, load_claimed_task
-from apps.quality_intelligence.services.redaction import redact_text
 
 
 logger = logging.getLogger(__name__)
+
+_DIAGNOSTIC_CASE_CHANGED_MESSAGE = '测试用例已变更，请重新提交单步诊断'
+_SAFE_UNDISPATCHED_MESSAGES = {
+    '无法提交执行任务，请检查任务队列',
+    '设备已有其他待执行或正在执行的任务',
+    _DIAGNOSTIC_CASE_CHANGED_MESSAGE,
+}
+_SAFE_PROGRESS_MESSAGES = {
+    '任务开始执行',
+    '正在准备测试环境',
+    '正在生成测试报告',
+    '执行完成',
+    '任务已停止',
+    '用例不存在',
+    '测试结果不可用',
+    '测试结果格式无效',
+    '测试进程异常退出，无法确认执行结果',
+    '测试进程无法确认退出，设备占用已保留；请检查执行进程',
+    '设备租约已失效，请重新获取租约后重试',
+    'APP worker运行失败，请检查依赖、ADB和Allure配置后重试',
+    'APP执行失败，请检查设备状态和工作进程配置后重试',
+    _DIAGNOSTIC_CASE_CHANGED_MESSAGE,
+    'step complete',
+}
+
+
+def _safe_app_error_message(error):
+    if type(error) is str and error in _SAFE_UNDISPATCHED_MESSAGES:
+        return error
+
+    from .device_pool import DeviceLeaseError
+    from .executors.test_executor import AppTestProcessTerminationError, AppTestWorkerError
+    from .scene_execution import ScenePreparationError, SCENE_CASE_CHANGED_MESSAGE
+
+    if (
+        isinstance(error, ScenePreparationError)
+        and error.args == (SCENE_CASE_CHANGED_MESSAGE,)
+    ):
+        return SCENE_CASE_CHANGED_MESSAGE
+    if isinstance(error, AppTestProcessTerminationError):
+        return '测试进程无法确认退出，设备占用已保留；请检查执行进程'
+    if isinstance(error, DeviceLeaseError):
+        return '设备租约已失效，请重新获取租约后重试'
+    if isinstance(error, AppTestWorkerError):
+        return 'APP worker运行失败，请检查依赖、ADB和Allure配置后重试'
+    return 'APP执行失败，请检查设备状态和工作进程配置后重试'
+
+
+def _safe_progress_message(message):
+    if type(message) is not str:
+        return None if message is None else '执行进度已更新'
+    if message in _SAFE_PROGRESS_MESSAGES:
+        return message
+
+    if message.startswith('步骤 ') and ': ' in message:
+        progress, detail = message.split(': ', 1)
+        counts = progress.removeprefix('步骤 ').split('/', 1)
+        outcome = detail.rsplit(' - ', 1)
+        if (
+            len(counts) == 2
+            and all(part.isdecimal() for part in counts)
+            and len(outcome) == 2
+            and outcome[1] in {'通过', '失败'}
+        ):
+            return f'{progress} - {outcome[1]}'
+
+    if message.startswith('开始执行 (') and message.endswith(')'):
+        counts = message[len('开始执行 ('):-1].split('/', 1)
+        if len(counts) == 2 and all(part.isdecimal() for part in counts):
+            return message
+
+    return '执行进度已更新'
 
 
 def classify_app_test_result(report_result):
@@ -49,6 +120,26 @@ def classify_app_test_result(report_result):
     return 'completed', 'passed', ''
 
 
+def worker_io_completed_normally(report_result):
+    """Recognize only explicit worker completion or pre-spawn evidence."""
+    if not isinstance(report_result, dict):
+        return False
+    exit_code = report_result.get('exit_code')
+    if (
+        type(exit_code) is int
+        and exit_code == 0
+        and report_result.get('pytest_process_started') is True
+        and report_result.get('pytest_process_completed') is True
+    ):
+        return True
+    return (
+        exit_code is None
+        and report_result.get('device_io_admitted') is True
+        and report_result.get('pytest_process_started') is False
+        and report_result.get('pytest_process_completed') is False
+    )
+
+
 def settle_undispatched_app_executions(
     execution_ids,
     error,
@@ -65,7 +156,7 @@ def settle_undispatched_app_executions(
 
     execution_ids = list(dict.fromkeys(execution_ids or []))
     now = timezone.now()
-    message = redact_text(str(error), max_length=1000)
+    message = _safe_app_error_message(error)
     settled_count = 0
     with transaction.atomic():
         if device_id is None and execution_ids:
@@ -184,7 +275,7 @@ def send_scheduled_task_notification(task_id, success):
         last_result = task.last_result or {}
         result_message = last_result.get('message', '')
         local_run_time = timezone.localtime(task.last_run_time).strftime('%Y-%m-%d %H:%M:%S') if task.last_run_time else '未知'
-        device_name = (task.device.name or task.device.device_id) if task.device else '未指定'
+        device_name = task.device.name or '未命名设备' if task.device else '未指定'
 
         detail_content = (
             f"任务名称: {task.name}\n\n"
@@ -205,7 +296,9 @@ def send_scheduled_task_notification(task_id, success):
             _send_app_email_notification(task, detail_content, status_text)
 
     except Exception as e:
-        logger.error(f"发送APP定时任务通知失败: {e}", exc_info=True)
+        logger.error(
+            "APP scheduled task notification failed (error_type=%s)", type(e).__name__
+        )
 
 
 def _send_app_webhook_notification(task, detail_content, status_text):
@@ -224,7 +317,7 @@ def _send_app_webhook_notification(task, detail_content, status_text):
             is_active=True
         )
     except Exception as e:
-        logger.error(f"获取通知配置失败: {e}")
+        logger.error("Notification configuration lookup failed (error_type=%s)", type(e).__name__)
         return
 
     all_bots = []
@@ -281,7 +374,7 @@ def _send_app_webhook_notification(task, detail_content, status_text):
                 notification_content=redact_payload(json.dumps(message_data, ensure_ascii=False)),
                 status=log_status,
                 error_message='' if log_status == 'success' else f'HTTP {resp.status_code}',
-                response_info=redact_payload({'status_code': resp.status_code, 'response': resp.text[:500]}),
+                response_info={'status_code': resp.status_code},
                 sent_at=timezone.now()
             )
         except Exception:
@@ -322,13 +415,13 @@ def _send_app_email_notification(task, detail_content, status_text):
             notification_content=detail_content, status='success', sent_at=timezone.now()
         )
     except Exception as e:
-        logger.error(f"发送邮件失败: {e}", exc_info=True)
+        logger.error("Email notification failed (error_type=%s)", type(e).__name__)
         AppNotificationLog.objects.create(
             task=task, task_name=task.name, task_type=task.task_type,
             notification_type='task_execution', sender_name='系统邮件通知',
             sender_email='',
             recipient_info=[{'email': e} for e in recipients],
-            notification_content=f"发送失败: {e}", status='failed', error_message=str(e)
+            notification_content="发送失败: 邮件发送失败", status='failed', error_message='邮件发送失败'
         )
 
 
@@ -346,10 +439,10 @@ def send_execution_update(execution_id, status=None, progress=None, message=None
         payload = {
             "type": "execution_update",
             "execution_id": int(execution_id),
-            "status": status,
-            "result": result,
-            "progress": progress,
-            "message": message,
+            "status": status if type(status) is str and status in {'running', 'completed', 'error', 'stopped'} else None,
+            "result": result if type(result) is str and result in {'passed', 'failed', 'unverified', 'skipped'} else None,
+            "progress": progress if type(progress) is int and 0 <= progress <= 100 else None,
+            "message": _safe_progress_message(message),
             "report_path": bool(report_path),
             "finished_at": finished_at.isoformat() if finished_at else None,
         }
@@ -377,6 +470,8 @@ def execute_app_test_task(
     lease_generation: int = None,
     release_device_lease: bool = True,
     cancel_check=None,
+    step_index: int = None,
+    expected_case_updated_at: str = None,
 ):
     """
     异步执行APP测试任务
@@ -392,7 +487,13 @@ def execute_app_test_task(
         DeviceLeaseError,
         DeviceLeaseHeartbeat,
     )
-    from .execution_admission import claim_app_execution_batch, release_device_if_idle, settle_app_execution_failure
+    from .execution_admission import (
+        claim_app_execution_batch,
+        clear_device_action_pending,
+        mark_device_action_pending,
+        release_device_if_idle,
+        settle_app_execution_failure,
+    )
     from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
     
     execution = None
@@ -408,6 +509,10 @@ def execute_app_test_task(
     try:
         execution = AppTestExecution.objects.select_related('device', 'user', 'test_case').get(id=execution_id)
         test_case = execution.test_case
+        diagnostic_requested = step_index is not None or expected_case_updated_at is not None
+        if diagnostic_requested:
+            from .scene_execution import validate_diagnostic_selection
+            validate_diagnostic_selection(test_case, step_index, expected_case_updated_at)
         if lease_generation is not None and execution.device_lease_generation != lease_generation:
             raise DeviceLeaseError('入队设备租约世代与执行记录不匹配')
         if bound_generation is None:
@@ -418,6 +523,9 @@ def execute_app_test_task(
             return
         worker_claimed = True
         execution.refresh_from_db()
+        if diagnostic_requested:
+            test_case.refresh_from_db(fields=['ui_flow', 'updated_at'])
+            validate_diagnostic_selection(test_case, step_index, expected_case_updated_at)
         _assert_scheduled_task_scope(
             scheduled_task_id=scheduled_task_id,
             project_id=test_case.project_id,
@@ -459,7 +567,7 @@ def execute_app_test_task(
         cancel_check()
 
         send_execution_update(execution_id, status='running', progress=0, message='任务开始执行')
-        logger.info('开始执行APP测试: %s', test_case.name)
+        logger.info('开始执行APP测试')
 
         execution.progress = 10
         execution.save(update_fields=['progress'])
@@ -471,6 +579,12 @@ def execute_app_test_task(
             final_package_name = test_case.app_package.package_name if test_case.app_package else ""
 
         executor = AppTestExecutor()
+        diagnostic_kwargs = {}
+        if step_index is not None:
+            diagnostic_kwargs = {
+                'step_index': step_index,
+                'expected_case_updated_at': expected_case_updated_at,
+            }
         report_result = executor.run_tests(
             test_case_id=test_case.id,
             device_id=device.device_id,
@@ -478,15 +592,19 @@ def execute_app_test_task(
             execution_id=execution_id,
             username=execution.user.username if execution.user else 'unknown',
             cancel_check=cancel_check,
+            before_device_io=lambda: mark_device_action_pending(execution.pk),
+            **diagnostic_kwargs,
         )
         cancel_check()
+        if worker_io_completed_normally(report_result):
+            clear_device_action_pending(execution.pk)
         
         # 从数据库重新读取最新进度（子进程中的回调可能已经更新过）
         execution.refresh_from_db()
         
         if report_result.get('report_path'):
             execution.report_path = report_result['report_path']
-            logger.info(f"报告已生成: {report_result['report_path']}")
+            logger.info("APP test report generated")
         
         test_results = report_result.get('test_results', {})
         execution.total_steps = test_results.get('total', 0)
@@ -542,7 +660,7 @@ def execute_app_test_task(
             result=execution.result,
         )
         
-        logger.info(f"APP测试执行完成: {test_case.name}, 状态: {execution.status}, 结果: {execution.result}")
+        logger.info('APP测试执行完成: 状态: %s, 结果: %s', execution.status, execution.result)
 
         # 定时任务通知和 durable schedule completion
         if scheduled_task_id:
@@ -551,7 +669,7 @@ def execute_app_test_task(
                 result = {
                     'status': execution.status,
                     'result': execution.result,
-                    'message': f'{test_case.name} - {execution.result or execution.status}',
+                    'message': f'APP test execution: {execution.result or execution.status}',
                 }
                 _record_scheduled_result(
                     scheduled_task_id,
@@ -561,23 +679,26 @@ def execute_app_test_task(
                 )
                 send_scheduled_task_notification(scheduled_task_id, success=is_success)
             except Exception as ne:
-                logger.error(f"更新定时任务状态失败: {ne}")
+                logger.error(
+                    "APP scheduled result update failed (error_type=%s)", type(ne).__name__
+                )
 
     except AppTestExecution.DoesNotExist:
-        logger.error(f"执行记录不存在: {execution_id}")
+        logger.error("APP execution record not found")
     except Exception as e:
-        logger.error(f"执行APP测试失败: {str(e)}", exc_info=True)
+        safe_error = _safe_app_error_message(e)
+        logger.error("APP test execution failed (error_type=%s)", type(e).__name__)
         unsafe_termination = isinstance(e, AppTestProcessTerminationError)
         if unsafe_termination:
             os.chdir(original_worker_cwd)
             if execution:
                 AppTestExecution.objects.filter(pk=execution.pk, status='running').update(
-                    stop_requested=True, error_message=str(e), updated_at=timezone.now()
+                    stop_requested=True, error_message=safe_error, updated_at=timezone.now()
                 )
 
         if execution and not unsafe_termination:
             settled_ids = settle_app_execution_failure(
-                [execution.pk], e, include_running=worker_claimed
+                [execution.pk], safe_error, include_running=worker_claimed
             )
             if settled_ids:
                 execution.refresh_from_db()
@@ -585,7 +706,7 @@ def execute_app_test_task(
                     execution_id,
                     status=execution.status,
                     progress=execution.progress or 0,
-                    message='任务已停止' if execution.status == 'stopped' else str(e),
+                    message='任务已停止' if execution.status == 'stopped' else safe_error,
                     report_path=execution.report_path,
                     finished_at=execution.finished_at,
                     result=None,
@@ -601,11 +722,14 @@ def execute_app_test_task(
                 _record_scheduled_result(
                     scheduled_task_id,
                     False,
-                    {'status': 'error', 'message': str(e)[:4000]},
+                    {'status': 'error', 'message': safe_error},
                     scheduler_lease_token=scheduler_lease_token,
                 )
             except Exception as schedule_error:
-                logger.error('更新 APP 调度失败状态失败: %s', schedule_error, exc_info=True)
+                logger.error(
+                    "APP schedule failure update failed (error_type=%s)",
+                    type(schedule_error).__name__,
+                )
     finally:
         if device_heartbeat is not None:
             device_heartbeat.stop()
@@ -621,7 +745,10 @@ def execute_app_test_task(
                 try:
                     release_device_if_idle(device.pk, execution.user, bound_generation)
                 except Exception as e:
-                    logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
+                    logger.error(
+                        "APP device lease release failed (error_type=%s)",
+                        type(e).__name__,
+                    )
 
 
 @shared_task
@@ -656,11 +783,17 @@ def execute_app_suite_task(
     )
     from .execution_admission import (
         claim_app_execution_batch,
+        clear_device_action_pending,
+        mark_device_action_pending,
         release_device_if_idle,
         settle_app_execution_failure,
         start_next_app_execution,
     )
-    from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
+    from .executors.test_executor import (
+        AppTestExecutor,
+        AppTestProcessTerminationError,
+        AppTestWorkerError,
+    )
 
     suite = None
     device = None
@@ -767,10 +900,9 @@ def execute_app_suite_task(
         cancel_check = combine_cancel_checks(*cancel_checks)
         cancel_check()
         if suite:
-            logger.info('套件执行开始: %s, 设备: %s, 共 %s 个用例',
-                        suite.name, device.device_id, len(executions))
+            logger.info('套件执行开始: 共 %s 个用例', len(executions))
         else:
-            logger.info('APP批量执行开始: 设备 %s, 共 %s 个用例', device.device_id, len(executions))
+            logger.info('APP批量执行开始: 共 %s 个用例', len(executions))
 
         batch_ids = [item.pk for item in executions]
         for idx, execution in enumerate(executions):
@@ -826,8 +958,15 @@ def execute_app_suite_task(
                     execution_id=execution.id,
                     username=execution.user.username if execution.user else 'unknown',
                     cancel_check=case_cancel_check,
+                    before_device_io=lambda: mark_device_action_pending(execution.pk),
                 )
                 case_cancel_check()
+                if worker_io_completed_normally(report_result):
+                    clear_device_action_pending(execution.pk)
+                else:
+                    execution.refresh_from_db(fields=['device_action_pending'])
+                    if execution.device_action_pending:
+                        raise AppTestWorkerError('APP worker did not complete cleanly')
 
                 execution.refresh_from_db()
 
@@ -884,19 +1023,26 @@ def execute_app_suite_task(
                     result=execution.result,
                 )
 
-                logger.info(f"用例 {test_case.name} 执行完成: status={execution.status}, result={execution.result}")
+                logger.info(
+                    'APP case execution completed: status=%s, result=%s',
+                    execution.status,
+                    execution.result,
+                )
 
             except Exception as e:
                 if isinstance(e, AppTestProcessTerminationError):
                     raise
                 case_cancel_check()
-                logger.error('用例 %s 执行失败: %s', test_case.name, e, exc_info=True)
+                safe_error = _safe_app_error_message(e)
+                logger.error(
+                    'APP case execution failed (error_type=%s)', type(e).__name__
+                )
                 now = timezone.now()
                 settled = AppTestExecution.objects.filter(
                     pk=execution.pk,
                     status='running',
                 ).update(
-                    status='error', result=None, error_message=str(e),
+                    status='error', result=None, error_message=safe_error,
                     finished_at=now, updated_at=now,
                 )
                 if not settled:
@@ -906,7 +1052,7 @@ def execute_app_suite_task(
                 send_execution_update(
                     execution.id, status='error',
                     progress=execution.progress or 0,
-                    message=str(e),
+                    message=safe_error,
                     finished_at=execution.finished_at,
                     result=None,
                 )
@@ -928,7 +1074,7 @@ def execute_app_suite_task(
             suite.save(update_fields=[
                 'execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'
             ])
-            logger.info('套件执行完成: %s, 通过: %s, 失败: %s', suite.name, passed, failed)
+            logger.info('套件执行完成: 通过: %s, 失败: %s', passed, failed)
         else:
             logger.info('APP批量执行完成: 通过 %s, 失败 %s', passed, failed)
 
@@ -949,25 +1095,29 @@ def execute_app_suite_task(
                 )
                 send_scheduled_task_notification(scheduled_task_id, success=is_success)
             except Exception as ne:
-                logger.error(f"更新定时任务状态失败: {ne}")
+                logger.error(
+                    "APP scheduled result update failed (error_type=%s)", type(ne).__name__
+                )
 
     except Exception as e:
-        logger.error('执行APP批次失败: %s', e, exc_info=True)
+        safe_error = _safe_app_error_message(e)
+        logger.error("APP execution batch failed (error_type=%s)", type(e).__name__)
         unsafe_termination = isinstance(e, AppTestProcessTerminationError)
         if unsafe_termination:
             os.chdir(original_worker_cwd)
             AppTestExecution.objects.filter(
                 pk__in=[item.pk for item in executions], status='running'
-            ).update(stop_requested=True, error_message=str(e), updated_at=timezone.now())
+            ).update(stop_requested=True, error_message=safe_error, updated_at=timezone.now())
         settled_ids = settle_app_execution_failure(
-            [item.pk for item in executions], e, include_running=worker_claimed and not unsafe_termination
+            [item.pk for item in executions], safe_error,
+            include_running=worker_claimed and not unsafe_termination,
         )
         for settled in AppTestExecution.objects.filter(pk__in=settled_ids):
             send_execution_update(
                 settled.pk,
                 status=settled.status,
                 progress=settled.progress or 0,
-                message='任务已停止' if settled.status == 'stopped' else str(e),
+                message='任务已停止' if settled.status == 'stopped' else safe_error,
                 finished_at=settled.finished_at,
                 result=None,
             )
@@ -986,11 +1136,14 @@ def execute_app_suite_task(
                 _record_scheduled_result(
                     scheduled_task_id,
                     False,
-                    {'status': 'error', 'message': str(e)[:4000]},
+                    {'status': 'error', 'message': safe_error},
                     scheduler_lease_token=scheduler_lease_token,
                 )
             except Exception as schedule_error:
-                logger.error('更新 APP 套件调度失败状态失败: %s', schedule_error, exc_info=True)
+                logger.error(
+                    'APP suite schedule failure update failed (error_type=%s)',
+                    type(schedule_error).__name__,
+                )
     finally:
         if device_heartbeat is not None:
             device_heartbeat.stop()
@@ -1006,7 +1159,10 @@ def execute_app_suite_task(
                 try:
                     release_device_if_idle(device.pk, user, bound_generation)
                 except Exception as e:
-                    logger.error(f"释放设备租约失败: {str(e)}", exc_info=True)
+                    logger.error(
+                        "APP device lease release failed (error_type=%s)",
+                        type(e).__name__,
+                    )
 
 
 @shared_task
@@ -1048,7 +1204,9 @@ def check_and_release_expired_devices():
         logger.info(f"检查设备锁定完成，释放 {released_count} 个设备")
         
     except Exception as e:
-        logger.error(f"检查设备锁定失败: {str(e)}", exc_info=True)
+        logger.error(
+            "APP expired-device lease cleanup failed (error_type=%s)", type(e).__name__
+        )
 
 @shared_task
 def reap_expired_device_leases_task():

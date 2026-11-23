@@ -44,6 +44,7 @@ class Command(BaseCommand):
             try:
                 now = timezone.localtime(timezone.now())
                 self.stdout.write(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开始检查任务...")
+                device_lease_recovery_count = self.reap_expired_app_device_leases()
                 retry_count = self.consume_retry_outbox()
                 generation_recovery_count = self.recover_stale_generation_tasks()
                 self.reconcile_execution_claims()
@@ -55,11 +56,12 @@ class Command(BaseCommand):
                     self.schedule_app_tasks(),
                     self.schedule_perf_tasks(),
                 )
-                total_count = sum(counts) + retry_count + generation_recovery_count
+                total_count = sum(counts) + retry_count + generation_recovery_count + device_lease_recovery_count
                 if total_count:
                     self.stdout.write(self.style.SUCCESS(
                         f'✓ 本次调度执行了 {total_count} 个任务 '
                         f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, '
+                        f'device leases recovered: {device_lease_recovery_count}, '
                         f'retry: {retry_count}, generation recovery: {generation_recovery_count})'))
                 else:
                     self.stdout.write('  没有需要执行的任务')
@@ -77,6 +79,19 @@ class Command(BaseCommand):
                 if run_once:
                     break
                 time.sleep(interval)
+
+    def reap_expired_app_device_leases(self):
+        """Reclaim expired device leases on the scheduler cadence, never on UI requests."""
+        try:
+            from apps.app_automation.device_pool import reap_expired_device_leases
+
+            reclaimed = reap_expired_device_leases()
+            if reclaimed:
+                logger.info('expired APP device leases reclaimed: %s', reclaimed)
+            return reclaimed
+        except Exception as exc:  # noqa: BLE001 - optional cleanup cannot stop dispatch
+            logger.error('expired APP device lease reaping failed (error_type=%s)', type(exc).__name__)
+            return 0
 
     def reconcile_execution_claims(self):
         try:

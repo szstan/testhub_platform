@@ -21,6 +21,89 @@ def assert_device_execution_idle(device_id):
         status__in=ACTIVE_EXECUTION_STATUSES,
     ).exists():
         raise DeviceExecutionBusy('设备已有待执行或正在执行的任务')
+    assert_device_action_clear(device_id)
+
+
+def assert_device_action_clear(device_id):
+    if (
+        AppDevice.objects.filter(pk=device_id, device_action_pending=True).exists()
+        or AppTestExecution.objects.filter(
+            device_id=device_id,
+            device_action_pending=True,
+        ).exists()
+    ):
+        raise DeviceExecutionBusy('设备存在待安全恢复的设备动作')
+
+
+def mark_device_action_pending(execution_id):
+    """Durably fence a worker before it starts any device I/O."""
+    from .device_pool import _assert_execution_lease, _has_pending_device_action
+
+    snapshot = AppTestExecution.objects.filter(pk=execution_id).values(
+        'device_id', 'user_id', 'device_lease_generation'
+    ).first()
+    if not snapshot or not snapshot['device_id'] or not snapshot['user_id']:
+        raise DeviceLeaseError('执行记录未绑定有效设备租约')
+
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().filter(pk=snapshot['device_id']).first()
+        execution = AppTestExecution.objects.select_for_update().filter(pk=execution_id).first()
+        if device is None or execution is None:
+            raise DeviceLeaseError('执行记录或设备租约已失效')
+        if (
+            execution.device_id != device.pk
+            or execution.user_id != snapshot['user_id']
+            or execution.device_lease_generation != snapshot['device_lease_generation']
+            or execution.status != 'running'
+            or execution.device_action_pending
+        ):
+            raise DeviceLeaseError('执行设备租约状态不允许启动设备动作')
+        _assert_execution_lease(
+            device,
+            execution.user,
+            execution.device_lease_generation,
+            execution_id=execution.pk,
+        )
+        if _has_pending_device_action(device.pk):
+            raise DeviceLeaseError('设备存在待安全恢复的其他动作')
+        execution.device_action_pending = True
+        execution.save(update_fields=['device_action_pending', 'updated_at'])
+    return True
+
+
+def clear_device_action_pending(execution_id):
+    """Clear a pending action only while the execution still owns its lease."""
+    from .device_pool import _assert_execution_lease
+
+    snapshot = AppTestExecution.objects.filter(pk=execution_id).values(
+        'device_id', 'user_id', 'device_lease_generation'
+    ).first()
+    if not snapshot or not snapshot['device_id'] or not snapshot['user_id']:
+        raise DeviceLeaseError('执行记录未绑定有效设备租约')
+
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().filter(pk=snapshot['device_id']).first()
+        execution = AppTestExecution.objects.select_for_update().filter(pk=execution_id).first()
+        if device is None or execution is None:
+            raise DeviceLeaseError('执行记录或设备租约已失效')
+        if (
+            execution.device_id != device.pk
+            or execution.user_id != snapshot['user_id']
+            or execution.device_lease_generation != snapshot['device_lease_generation']
+            or execution.status != 'running'
+        ):
+            raise DeviceLeaseError('执行设备租约所有者或世代已变更')
+        _assert_execution_lease(
+            device,
+            execution.user,
+            execution.device_lease_generation,
+            execution_id=execution.pk,
+        )
+        if not execution.device_action_pending:
+            return False
+        execution.device_action_pending = False
+        execution.save(update_fields=['device_action_pending', 'updated_at'])
+    return True
 
 
 def release_device_if_idle(device_id, user, generation):
@@ -30,7 +113,17 @@ def release_device_if_idle(device_id, user, generation):
     with transaction.atomic():
         if not AppDevice.objects.select_for_update().filter(pk=device_id).exists():
             return False
-        if AppTestExecution.objects.filter(device_id=device_id, status__in=ACTIVE_EXECUTION_STATUSES).exists():
+        if AppTestExecution.objects.filter(
+            device_id=device_id,
+            status__in=ACTIVE_EXECUTION_STATUSES,
+        ).exists():
+            return False
+        if AppDevice.objects.filter(pk=device_id, device_action_pending=True).exists():
+            return False
+        if AppTestExecution.objects.filter(
+            device_id=device_id,
+            device_action_pending=True,
+        ).exists():
             return False
         return release_device_execution_lease(device_id, user, generation)
 
@@ -53,6 +146,7 @@ def claim_app_execution_batch(execution_ids, *, suite_id=None):
         device = AppDevice.objects.select_for_update().filter(pk=first['device_id']).first()
         if device is None:
             return False
+        assert_device_action_clear(device.pk)
         rows = list(
             AppTestExecution.objects.select_for_update()
             .filter(pk__in=execution_ids)
@@ -124,6 +218,7 @@ def start_next_app_execution(execution_id, batch_ids):
         execution = AppTestExecution.objects.select_for_update().filter(pk=execution_id).first()
         if device is None or execution is None or execution.status != 'pending':
             return False
+        assert_device_action_clear(device.pk)
         assert_device_execution_lease(
             device.pk,
             execution.user,

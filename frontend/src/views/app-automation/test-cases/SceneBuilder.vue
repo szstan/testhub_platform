@@ -51,6 +51,9 @@
                     <el-col :span="24">
                         <el-form-item :label="$t('appAutomation.sceneBuilder.form.sceneVariables')">
                             <div class="scene-variables">
+                                <div class="variable-hint scene-variable-secret-help">
+                                    {{ $t('appAutomation.sceneData.secretHelp') }}
+                                </div>
                                 <div
                                     v-for="(item, index) in sceneVariables"
                                     :key="`var_${index}`"
@@ -73,7 +76,7 @@
                                         <el-option label="object" value="object" />
                                     </el-select>
                                     <el-input
-                                        v-model.trim="item.value"
+                                        v-model="item.value"
                                         :placeholder="$t('appAutomation.sceneBuilder.form.defaultValue')"
                                         size="small"
                                     />
@@ -82,6 +85,7 @@
                                         :placeholder="$t('appAutomation.sceneBuilder.form.descriptionPlaceholder')"
                                         size="small"
                                     />
+                                    <el-checkbox v-model="item.sensitive">{{ $t('appAutomation.sceneData.sensitiveVariable') }}</el-checkbox>
                                     <el-button link size="small" @click="removeSceneVariable(index)">
                                         {{ $t('appAutomation.common.delete') }}
                                     </el-button>
@@ -110,6 +114,8 @@
                             <el-input
                                 v-model.number="sceneRuntime.retry_times"
                                 type="number"
+                                :min="0"
+                                :max="10"
                                 placeholder="0"
                                 size="small"
                             />
@@ -120,6 +126,8 @@
                             <el-input
                                 v-model.number="sceneRuntime.retry_interval"
                                 type="number"
+                                :min="0"
+                                :max="10"
                                 placeholder="0.5"
                                 size="small"
                             />
@@ -128,6 +136,87 @@
                 </el-row>
             </el-form>
         </el-card>
+
+        <el-collapse v-model="expandedOptionalPanels" class="scene-optional-panels">
+            <el-collapse-item name="recorder" :title="$t('appAutomation.recorder.title')">
+                <el-card class="recorder-panel" shadow="never">
+                    <div class="recorder-heading">
+                        <div class="recorder-device-controls">
+                            <label for="scene-recorder-device">{{ $t('appAutomation.recorder.device') }}</label>
+                            <el-select
+                                id="scene-recorder-device"
+                                v-model="recorderDeviceId"
+                                :placeholder="$t('appAutomation.recorder.selectDevice')"
+                                :disabled="recorderStarting || recorderEnabled"
+                                filterable
+                                clearable
+                            >
+                                <el-option
+                                    v-for="device in recorderDevices"
+                                    :key="device.id"
+                                    :value="device.id"
+                                    :label="recorderDeviceLabel(device)"
+                                    :disabled="!canSelectRecorderDevice(device)"
+                                />
+                            </el-select>
+                            <el-button
+                                size="small"
+                                :icon="Refresh"
+                                :loading="recorderDevicesLoading"
+                                :disabled="recorderStarting || recorderEnabled"
+                                @click="loadRecorderDevices()"
+                            >
+                                {{ $t('appAutomation.recorder.refreshDevices') }}
+                            </el-button>
+                        </div>
+                        <p class="recorder-ownership" role="status">
+                            <strong>{{ $t('appAutomation.recorder.owner') }}:</strong>
+                            {{ recorderOwnershipLabel }}
+                        </p>
+                    </div>
+                    <el-alert
+                        v-if="recorderErrorKey"
+                        :title="$t(recorderErrorKey)"
+                        type="error"
+                        :closable="false"
+                        show-icon
+                    />
+                    <DeviceRecorder
+                        v-if="recorderDeviceId !== null && recorderDeviceId !== undefined"
+                        :device-id="recorderDeviceId"
+                        :recording-enabled="recorderEnabled"
+                        :can-start="canStartRecorder"
+                        :starting="recorderStarting"
+                        :can-view-screenshot="recorderHasOwnedLease"
+                        :get-screenshot="captureDeviceScreenshot"
+                        :send-interaction="sendRecorderInteraction"
+                        @recording-change="handleRecordingChange"
+                        @step-staged="appendRecorderStep"
+                        @error="handleRecorderError"
+                    />
+                    <p v-else class="recorder-no-selection">
+                        {{ $t('appAutomation.recorder.noSelection') }}
+                    </p>
+                    <StepDiagnostics
+                        :case-id="editingCaseId"
+                        :step-index="selectedIndex"
+                        :step-name="activeParentStep?.name"
+                        :nested="selectedSubIndex !== null"
+                        :dirty="isSceneDirty"
+                        :recording="recorderEnabled"
+                        :device-id="recorderDeviceId"
+                    />
+                </el-card>
+            </el-collapse-item>
+            <el-collapse-item name="scene-data" :title="$t('appAutomation.sceneData.title')">
+                <SceneDataPanel
+                    :project-id="sceneForm.project"
+                    :get-steps="getProjectComponentSteps"
+                    @components-loaded="setProjectComponents"
+                    @insert-component="insertProjectComponent"
+                />
+            </el-collapse-item>
+        </el-collapse>
 
         <el-row :gutter="16" class="scene-layout">
             <el-col :span="6">
@@ -145,69 +234,78 @@
                             </div>
                         </div>
                     </template>
+                    <el-input
+                        v-model.trim="paletteSearch"
+                        class="palette-search"
+                        :placeholder="$t('appAutomation.sceneBuilder.palette.searchPlaceholder')"
+                        clearable
+                    >
+                        <template #prefix><el-icon><Search /></el-icon></template>
+                    </el-input>
                     <el-tabs v-model="paletteTab" stretch>
                         <el-tab-pane :label="$t('appAutomation.sceneBuilder.palette.baseComponents')" name="base">
-                            <draggable
-                                class="palette-list"
-                                :list="componentPalette"
-                                :group="{ name: 'ui-components', pull: 'clone', put: false }"
-                                :clone="cloneComponent"
-                                :sort="false"
-                                item-key="type"
-                            >
-                                <template #item="{ element }">
-                                    <div
-                                        class="palette-item"
-                                    >
-                                        <span class="palette-name">{{ element.name }}</span>
-                                        <span class="palette-type">{{ element.type }}</span>
-                                    </div>
-                                </template>
-                                <template #footer>
-                                    <div v-if="componentPalette.length === 0" class="palette-empty">
-                                        {{ $t('appAutomation.sceneBuilder.palette.noBaseComponents') }}
-                                    </div>
-                                </template>
-                            </draggable>
+                            <div v-for="group in filteredComponentGroups" :key="group.key" class="palette-group">
+                                <div class="palette-group-title">{{ group.label }}</div>
+                                <draggable
+                                    class="palette-list"
+                                    :list="group.items"
+                                    :group="{ name: 'ui-components', pull: 'clone', put: false }"
+                                    :clone="cloneComponent"
+                                    :sort="false"
+                                    item-key="type"
+                                >
+                                    <template #item="{ element }">
+                                        <div class="palette-item" role="button" tabindex="0" @click="addPaletteComponent(element)" @keydown.enter.prevent="addPaletteComponent(element)" @keydown.space.prevent="addPaletteComponent(element)">
+                                            <div class="palette-item-content">
+                                                <div class="palette-item-heading">
+                                                    <span class="palette-name">{{ element.name }}</span>
+                                                    <span class="palette-type">{{ element.type }}</span>
+                                                </div>
+                                                <span v-if="element.description" class="palette-description">{{ element.description }}</span>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </draggable>
+                            </div>
+                            <div v-if="filteredComponentGroups.length === 0" class="palette-empty">
+                                {{ componentPalette.length === 0 ? $t('appAutomation.sceneBuilder.palette.noBaseComponents') : $t('appAutomation.sceneBuilder.palette.noSearchResults') }}
+                            </div>
                         </el-tab-pane>
                         <el-tab-pane :label="$t('appAutomation.sceneBuilder.palette.customComponents')" name="custom">
-                            <draggable
-                                class="palette-list"
-                                :list="customComponentPalette"
-                                :group="{ name: 'ui-components', pull: 'clone', put: false }"
-                                :clone="cloneComponent"
-                                :sort="false"
-                                item-key="id"
-                            >
-                                <template #item="{ element }">
-                                    <div
-                                        class="palette-item"
-                                    >
-                                        <div class="palette-left">
-                                            <span class="palette-name">{{ element.name }}</span>
-                                            <span class="palette-type">{{ element.type }}</span>
+                            <div v-for="group in filteredCustomComponentGroups" :key="group.key" class="palette-group">
+                                <div class="palette-group-title">{{ group.label }}</div>
+                                <draggable
+                                    class="palette-list"
+                                    :list="group.items"
+                                    :group="{ name: 'ui-components', pull: 'clone', put: false }"
+                                    :clone="cloneComponent"
+                                    :sort="false"
+                                    item-key="id"
+                                >
+                                    <template #item="{ element }">
+                                        <div class="palette-item" role="button" tabindex="0" @click="addPaletteComponent(element)" @keydown.enter.prevent="addPaletteComponent(element)" @keydown.space.prevent="addPaletteComponent(element)">
+                                            <div class="palette-item-content">
+                                                <div class="palette-item-heading">
+                                                    <span class="palette-name">{{ element.name }}</span>
+                                                    <span class="palette-type">{{ element.type }}</span>
+                                                </div>
+                                                <span v-if="element.description" class="palette-description">{{ element.description }}</span>
+                                            </div>
+                                            <div class="palette-actions">
+                                                <el-button link size="small" @click.stop="openEditCustomComponent(element)">
+                                                    {{ $t('appAutomation.common.edit') }}
+                                                </el-button>
+                                                <el-button link size="small" style="color: #f56c6c" @click.stop="deleteCustomComponent(element)">
+                                                    {{ $t('appAutomation.common.delete') }}
+                                                </el-button>
+                                            </div>
                                         </div>
-                                        <div class="palette-actions">
-                                            <el-button link size="small" @click.stop="openEditCustomComponent(element)">
-                                                {{ $t('appAutomation.common.edit') }}
-                                            </el-button>
-                                            <el-button
-                                                link
-                                                size="small"
-                                                style="color: #f56c6c"
-                                                @click.stop="deleteCustomComponent(element)"
-                                            >
-                                                {{ $t('appAutomation.common.delete') }}
-                                            </el-button>
-                                        </div>
-                                    </div>
-                                </template>
-                                <template #footer>
-                                    <div v-if="customComponentPalette.length === 0" class="palette-empty">
-                                        {{ $t('appAutomation.sceneBuilder.palette.noCustomComponents') }}
-                                    </div>
-                                </template>
-                            </draggable>
+                                    </template>
+                                </draggable>
+                            </div>
+                            <div v-if="filteredCustomComponentGroups.length === 0" class="palette-empty">
+                                {{ customComponentPalette.length === 0 ? $t('appAutomation.sceneBuilder.palette.noCustomComponents') : $t('appAutomation.sceneBuilder.palette.noSearchResults') }}
+                            </div>
                         </el-tab-pane>
                     </el-tabs>
                 </el-card>
@@ -238,6 +336,7 @@
                         :group="{ name: 'ui-components', pull: true, put: true }"
                         :animation="200"
                         item-key="id"
+                        @change="handleScenarioStepsChange"
                     >
                         <template #item="{ element, index }">
                             <div class="scene-item-wrapper">
@@ -331,7 +430,7 @@
                         {{ $t('appAutomation.sceneBuilder.config.selectStepHint') }}
                     </div>
                     <!-- 选中自定义组件父级时提示展开编辑 -->
-                    <div v-else-if="activeParentStep && activeParentStep.kind === 'custom' && selectedSubIndex === null" class="config-form">
+                    <div v-else-if="activeParentStep && activeParentStep.kind === 'custom' && activeParentStep.version === undefined && selectedSubIndex === null" class="config-form">
                         <el-form label-width="110px" size="small">
                             <el-form-item :label="$t('appAutomation.sceneBuilder.config.stepName')">
                                 <el-input v-model.trim="activeParentStep.name" />
@@ -429,9 +528,38 @@
                                         :key="field"
                                         :label="getFieldLabel(field)"
                                         :required="schemaRequired.includes(field)"
+                                        :error="getJsonFieldError(activeStep, field)"
                                     >
+                                        <div
+                                            v-if="isVersionedTypedParameter(activeStep, field, activeComponentDef)"
+                                            class="typed-parameter-mode"
+                                        >
+                                            <el-switch
+                                                :model-value="isTypedParameterExpressionMode(activeStep, field, activeComponentDef)"
+                                                :active-text="$t('appAutomation.sceneBuilder.config.expressionMode')"
+                                                :inactive-text="$t('appAutomation.sceneBuilder.config.literalMode')"
+                                                @update:model-value="setTypedParameterExpressionMode(activeStep, field, activeComponentDef, $event)"
+                                            />
+                                        </div>
                                         <el-input
-                                            v-if="field === 'expected_list'"
+                                            v-if="isTypedParameterExpressionMode(activeStep, field, activeComponentDef)"
+                                            :model-value="getTypedParameterInput(activeStep, field)"
+                                            :type="isSensitiveField(activeComponentDef, field) ? 'password' : 'text'"
+                                            :placeholder="$t('appAutomation.sceneBuilder.config.expressionPlaceholder')"
+                                            @update:model-value="updateTypedParameterInput(activeStep, field, activeComponentDef, $event)"
+                                        />
+                                        <NestedFlowEditor
+                                            v-else-if="isNestedStepsField(field, activeComponentDef)"
+                                            :model-value="activeStep.config[field] || []"
+                                            :label="getFieldLabel(field)"
+                                            :components="nestedComponents"
+                                            :component-definitions="allComponentDefinitions"
+                                            :field-label="getNestedFieldLabel"
+                                            :field-options="getNestedFieldOptions"
+                                            @update:model-value="activeStep.config[field] = $event"
+                                        />
+                                        <el-input
+                                            v-else-if="field === 'expected_list'"
                                             type="textarea"
                                             :rows="4"
                                             :model-value="getExpectedListValue(activeStep && activeStep.config)"
@@ -439,41 +567,43 @@
                                             @update:model-value="updateExpectedList(activeStep.config, $event)"
                                         />
                                         <el-input
-                                            v-else-if="isJsonField(field)"
+                                            v-else-if="isJsonField(field, activeComponentDef)"
                                             type="textarea"
                                             :rows="getJsonFieldRows(field)"
-                                            :value="getJsonFieldValue(activeStep && activeStep.config, field)"
+                                            :model-value="getJsonFieldValue(activeStep && activeStep.config, field)"
                                             :placeholder="getFieldPlaceholder(field)"
-                                            @input="updateJsonField(activeStep.config, field, $event)"
+                                            @update:model-value="updateJsonField(activeStep.config, field, $event, activeStep)"
                                         />
                                         <el-select
-                                            v-else-if="getFieldOptions(field).length"
+                                            v-else-if="getFieldOptions(field, activeComponentDef, activeStep).length"
                                             v-model="activeStep.config[field]"
                                             :placeholder="$t('appAutomation.sceneBuilder.config.pleaseSelect')"
                                             :filterable="isImageScopeField(field)"
                                         >
                                             <el-option
-                                                v-for="option in getFieldOptions(field)"
+                                                v-for="option in getFieldOptions(field, activeComponentDef, activeStep)"
                                                 :key="option.value"
                                                 :label="option.label"
                                                 :value="option.value"
                                             />
                                         </el-select>
                                         <el-switch
-                                            v-else-if="getFieldType(field) === 'boolean'"
+                                            v-else-if="getFieldTypeForDef(activeComponentDef, field) === 'boolean'"
                                             v-model="activeStep.config[field]"
                                         />
                                         <el-input-number
-                                            v-else-if="getFieldType(field) === 'number'"
+                                            v-else-if="['number', 'integer'].includes(getFieldTypeForDef(activeComponentDef, field))"
                                             v-model="activeStep.config[field]"
-                                            :min="getFieldNumberRule(field).min"
-                                            :max="getFieldNumberRule(field).max"
-                                            :step="getFieldNumberRule(field).step"
+                                            :min="getFieldNumberRuleForDef(activeComponentDef, field).min"
+                                            :max="getFieldNumberRuleForDef(activeComponentDef, field).max"
+                                            :step="getFieldNumberRuleForDef(activeComponentDef, field).step"
                                             controls-position="right"
                                         />
                                         <el-input
                                             v-else
-                                            v-model.trim="activeStep.config[field]"
+                                            v-model="activeStep.config[field]"
+                                            :type="isSensitiveField(activeComponentDef, field) ? 'password' : 'text'"
+                                            :show-password="isSensitiveField(activeComponentDef, field)"
                                             :placeholder="getFieldPlaceholder(field)"
                                         />
                                     </el-form-item>
@@ -696,33 +826,44 @@
                                             <el-form-item
                                                 v-for="field in group.fields"
                                                 :key="field"
-                                                :label="getFieldLabel(field)"
+                                                :label="getFieldLabel(field, editingActiveStep)"
                                                 :required="editingSchemaRequired.includes(field)"
+                                                :error="getJsonFieldError(editingActiveStep, field)"
                                             >
+                                                <NestedFlowEditor
+                                                    v-if="isNestedStepsField(field, editingActiveDef)"
+                                                    :model-value="editingActiveStep.config[field] || []"
+                                                    :label="getFieldLabel(field, editingActiveStep)"
+                                                    :components="nestedComponents"
+                                                    :component-definitions="allComponentDefinitions"
+                                                    :field-label="getNestedFieldLabel"
+                                                    :field-options="getNestedFieldOptions"
+                                                    @update:model-value="editingActiveStep.config[field] = $event"
+                                                />
                                                 <el-input
-                                                    v-if="field === 'expected_list'"
+                                                    v-else-if="field === 'expected_list'"
                                                     type="textarea"
                                                     :rows="4"
                                                     :model-value="getExpectedListValue(editingActiveStep && editingActiveStep.config)"
-                                                    :placeholder="getFieldPlaceholder(field)"
+                                                    :placeholder="getFieldPlaceholder(field, editingActiveStep)"
                                                     @update:model-value="updateExpectedList(editingActiveStep.config, $event)"
                                                 />
                                                 <el-input
-                                                    v-else-if="isJsonField(field)"
+                                                    v-else-if="isJsonField(field, editingActiveDef)"
                                                     type="textarea"
                                                     :rows="getJsonFieldRows(field)"
-                                                    :value="getJsonFieldValue(editingActiveStep && editingActiveStep.config, field)"
-                                                    :placeholder="getFieldPlaceholder(field)"
-                                                    @input="updateJsonField(editingActiveStep.config, field, $event)"
+                                                    :model-value="getJsonFieldValue(editingActiveStep && editingActiveStep.config, field)"
+                                                    :placeholder="getFieldPlaceholder(field, editingActiveStep)"
+                                                    @update:model-value="updateJsonField(editingActiveStep.config, field, $event, editingActiveStep, editingActiveDef)"
                                                 />
                                                 <el-select
-                                                    v-else-if="getFieldOptions(field).length"
+                                                    v-else-if="getFieldOptions(field, editingActiveDef, editingActiveStep).length"
                                                     v-model="editingActiveStep.config[field]"
                                                     :placeholder="$t('appAutomation.sceneBuilder.config.pleaseSelect')"
                                                     :filterable="isImageScopeField(field)"
                                                 >
                                                     <el-option
-                                                        v-for="option in getFieldOptions(field)"
+                                                        v-for="option in getFieldOptions(field, editingActiveDef, editingActiveStep)"
                                                         :key="option.value"
                                                         :label="option.label"
                                                         :value="option.value"
@@ -733,7 +874,7 @@
                                                     v-model="editingActiveStep.config[field]"
                                                 />
                                                 <el-input-number
-                                                    v-else-if="getFieldTypeForDef(editingActiveDef, field) === 'number'"
+                                                    v-else-if="['number', 'integer'].includes(getFieldTypeForDef(editingActiveDef, field))"
                                                     v-model="editingActiveStep.config[field]"
                                                     :min="getFieldNumberRuleForDef(editingActiveDef, field).min"
                                                     :max="getFieldNumberRuleForDef(editingActiveDef, field).max"
@@ -742,7 +883,9 @@
                                                 />
                                                 <el-input
                                                     v-else
-                                                    v-model.trim="editingActiveStep.config[field]"
+                                                    v-model="editingActiveStep.config[field]"
+                                                    :type="isSensitiveField(editingActiveDef, field) ? 'password' : 'text'"
+                                                    :show-password="isSensitiveField(editingActiveDef, field)"
                                                     :placeholder="getFieldPlaceholder(field)"
                                                 />
                                             </el-form-item>
@@ -899,13 +1042,18 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { useRoute, onBeforeRouteLeave } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { Upload, Download, FolderAdd, DocumentCopy, Check, Search, Link, Refresh, Camera } from '@element-plus/icons-vue'
 import draggable from "vuedraggable"
 import CaptureElementDialog from '../elements/components/CaptureElementDialog.vue'
+import DeviceRecorder from '../components/DeviceRecorder.vue'
+import StepDiagnostics from '../components/StepDiagnostics.vue'
+import SceneDataPanel from '../components/SceneDataPanel.vue'
+import NestedFlowEditor from './NestedFlowEditor.vue'
+import { useUserStore } from '@/stores/user'
 import {
   getComponents,
   getCustomComponents,
@@ -920,17 +1068,75 @@ import {
   getAppElementList,
   getAppImageCategories,
   getDeviceList,
+  getAppDevice,
+  acquireRecorderLease,
+  releaseRecorderLease as releaseRecorderLeaseApi,
+  heartbeatDevice,
+  captureDeviceScreenshot,
+  recordDeviceInteraction,
   getAppProjects
 } from '@/api/app-automation'
 
 // Route
 const route = useRoute()
-const router = useRouter()
 const { t } = useI18n()
+const userStore = useUserStore()
+const RECORDER_LEASE_SECONDS = 90
+const RECORDER_MIN_LEASE_SECONDS = 30
+const RECORDER_MIN_HEARTBEAT_INTERVAL_MS = 1000
+const RECORDER_MAX_HEARTBEAT_INTERVAL_MS = 30000
+const recorderHeartbeatIntervalMs = leaseSeconds => Math.max(
+    RECORDER_MIN_HEARTBEAT_INTERVAL_MS,
+    Math.min(RECORDER_MAX_HEARTBEAT_INTERVAL_MS, Math.floor(leaseSeconds * 1000 / 3)),
+)
+const sameId = (left, right) => left !== null && left !== undefined && right !== null && right !== undefined
+    && String(left) === String(right)
+const currentRecorderUserId = () => {
+    const id = userStore.user?.id ?? userStore.user?.pk
+    if (Number.isSafeInteger(id) && id > 0) return id
+    if (typeof id === 'string' && /^\d+$/.test(id)) return id
+    return null
+}
+
+const currentRecorderSessionGeneration = () => typeof userStore.getSessionGeneration === 'function'
+    ? userStore.getSessionGeneration()
+    : null
 
 // Reactive state
+const recorderDevices = ref([])
+const expandedOptionalPanels = ref([])
+const recorderDeviceId = ref(null)
+const recorderDevicesLoading = ref(false)
+const recorderStarting = ref(false)
+const recorderEnabled = ref(false)
+const recorderLease = ref(null)
+const recorderErrorKey = ref('')
+const recorderEpoch = ref(0)
+const recorderSessionGeneration = ref(null)
+const recorderHeartbeatTimer = ref(null)
+const recorderSelectedDevice = computed(() => recorderDevices.value.find(device => sameId(device.id, recorderDeviceId.value)) || null)
+const recorderHasOwnedLease = computed(() => Boolean(
+    userStore.accessToken && recorderEnabled.value && recorderLease.value
+    && sameId(recorderLease.value.deviceId, recorderDeviceId.value)
+    && sameId(recorderLease.value.expectedUserId, currentRecorderUserId())
+    && recorderLease.value.sessionGeneration === currentRecorderSessionGeneration()
+))
+const canStartRecorder = computed(() => Boolean(
+    !recorderEnabled.value && !recorderStarting.value && currentRecorderUserId() !== null
+    && recorderSelectedDevice.value && canSelectRecorderDevice(recorderSelectedDevice.value)
+))
+const recorderOwnershipLabel = computed(() => {
+    const device = recorderSelectedDevice.value
+    if (!device) return t('appAutomation.recorder.noSelection')
+    if (recorderHasOwnedLease.value) return t('appAutomation.recorder.ownerSession')
+    if (device.maintenance_mode) return t('appAutomation.recorder.ownerMaintenance')
+    if (device.locked_by_name) return t('appAutomation.recorder.ownerNamed', { name: device.locked_by_name })
+    if (device.locked_by) return t('appAutomation.recorder.ownerUnknown')
+    return t('appAutomation.recorder.ownerAvailable')
+})
 const saving = ref(false)
 const paletteTab = ref("base")
+const paletteSearch = ref("")
 const projectList = ref([])
 const sceneForm = ref({
     name: "",
@@ -949,11 +1155,54 @@ const defaultPalette = ref([])
 const customComponentPalette = ref([])
 const defaultCustomPalette = ref([])
 const scenarioSteps = ref([])
-const selectedIndex = ref(null)
-const selectedSubIndex = ref(null)    // 当前选中的子步骤索引（展开编辑用）
+const uiFlowEnvelope = ref(null)
+const selectedStepId = ref(null)
+const selectedSubStepId = ref(null)
+const selectedIndex = computed({
+    get: () => {
+        if (!selectedStepId.value) return null
+        const index = scenarioSteps.value.findIndex(step => step.id === selectedStepId.value)
+        return index < 0 ? null : index
+    },
+    set: index => {
+        selectedStepId.value = index === null || index === undefined ? null : scenarioSteps.value[index]?.id || null
+        if (selectedStepId.value === null) selectedSubStepId.value = null
+    }
+})
+const selectedSubIndex = computed({
+    get: () => {
+        const step = selectedIndex.value === null ? null : scenarioSteps.value[selectedIndex.value]
+        if (!step || !selectedSubStepId.value) return null
+        const index = (step.steps || []).findIndex(subStep => subStep.id === selectedSubStepId.value)
+        return index < 0 ? null : index
+    },
+    set: index => {
+        const step = selectedIndex.value === null ? null : scenarioSteps.value[selectedIndex.value]
+        selectedSubStepId.value = index === null || index === undefined ? null : step?.steps?.[index]?.id || null
+    }
+})
+const jsonFieldErrors = ref({})
+const typedExpressionModes = ref({})
+const sceneBaseline = ref("")
 const componentDefinitions = ref({})
 const customComponentDefinitions = ref({})
+const projectComponentDefinitions = ref({})
+const projectComponentPalette = ref([])
 const editingCaseId = ref(null)
+const allComponentDefinitions = computed(() => ({
+    ...componentDefinitions.value,
+    ...customComponentDefinitions.value,
+    ...Object.fromEntries(projectComponentPalette.value.map(item => [item.type, item])),
+    ...projectComponentDefinitions.value
+}))
+const nestedComponents = computed(() => [
+    ...componentPalette.value,
+    ...customComponentPalette.value,
+    ...projectComponentPalette.value
+])
+const filteredComponentGroups = computed(() => groupPalette(componentPalette.value))
+const filteredCustomComponentGroups = computed(() => groupPalette(customComponentPalette.value))
+const isSceneDirty = computed(() => Boolean(sceneBaseline.value) && getSceneSnapshot() !== sceneBaseline.value)
 const apiRequestTemplates = computed(() => [
     {
         name: t('appAutomation.sceneBuilder.config.vipInitTemplate'),
@@ -980,7 +1229,17 @@ const customSaving = ref(false)
 const customDialogMode = ref("create")
 const editingCustomId = ref(null)
 const editingCustomSteps = ref([])
-const editingSelectedIndex = ref(null)
+const editingSelectedStepId = ref(null)
+const editingSelectedIndex = computed({
+    get: () => {
+        if (!editingSelectedStepId.value) return null
+        const index = editingCustomSteps.value.findIndex(step => step.id === editingSelectedStepId.value)
+        return index < 0 ? null : index
+    },
+    set: index => {
+        editingSelectedStepId.value = index === null || index === undefined ? null : editingCustomSteps.value[index]?.id || null
+    }
+})
 const editStepType = ref("")
 const customForm = ref({
     name: "",
@@ -1047,19 +1306,7 @@ const activeParentStep = computed(() => {
     return scenarioSteps.value[selectedIndex.value] || null
 })
 
-const activeComponentDef = computed(() => {
-    if (!activeStep.value) {
-        return null
-    }
-    // 子步骤一定是基础组件
-    if (selectedSubIndex.value !== null) {
-        return componentDefinitions.value[activeStep.value.type] || null
-    }
-    if (activeStep.value.kind === "custom") {
-        return customComponentDefinitions.value[activeStep.value.type] || null
-    }
-    return componentDefinitions.value[activeStep.value.type] || null
-})
+const activeComponentDef = computed(() => getComponentDefinitionForStep(activeStep.value))
 
 const editingActiveStep = computed(() => {
     if (editingSelectedIndex.value === null) {
@@ -1133,28 +1380,493 @@ watch(() => activeStep.value?.config?.assert_type, (value) => {
 })
 
 // Lifecycle hooks
+const beforeUnloadHandler = event => {
+    if (!isSceneDirty.value) return
+    event.preventDefault()
+    event.returnValue = ''
+}
+
+onBeforeRouteLeave(async () => {
+    if (!isSceneDirty.value) return true
+    try {
+        await ElMessageBox.confirm(
+            t('appAutomation.sceneBuilder.messages.unsavedConfirm'),
+            t('appAutomation.sceneBuilder.messages.unsavedTitle'),
+            { type: 'warning', confirmButtonText: t('appAutomation.common.confirm'), cancelButtonText: t('appAutomation.common.cancel') }
+        )
+        return true
+    } catch {
+        return false
+    }
+})
+
 onMounted(async () => {
-    // console.log('UiTestSceneBuilder mounted, $api:', $api)
+    if (typeof window !== 'undefined') window.addEventListener('beforeunload', beforeUnloadHandler)
+    sceneBaseline.value = getSceneSnapshot()
     try {
         await Promise.all([
             loadComponentPalette(), 
             loadCustomComponentPalette(),
-            loadImageCategoryOptions(),  // 加载图片分类选项
+            loadImageCategoryOptions(),
+            loadRecorderDevices(),
             getAppProjects({ page_size: 100 }).then(res => { projectList.value = res.data.results || res.data || [] })
         ])
 
         const caseId = route.query.case_id
         if (caseId) {
             editingCaseId.value = caseId
-            loadCaseDetail(caseId)
+            await loadCaseDetail(caseId)
+        } else {
+            sceneBaseline.value = getSceneSnapshot()
         }
     } catch (error) {
         console.error('初始化组件数据失败:', error)
     }
 })
 
+onBeforeUnmount(() => {
+    if (typeof window !== 'undefined') window.removeEventListener('beforeunload', beforeUnloadHandler)
+    void stopRecorder({ silent: true, refresh: false })
+})
+
 
 // Methods
+const getRecorderResponseData = response => {
+    let data = response?.data ?? response
+    if (data && typeof data === 'object' && data.data && typeof data.data === 'object' && !Array.isArray(data.data)) {
+        data = data.data
+    }
+    return data
+}
+
+const isRecorderDeviceUsable = device => Boolean(device)
+    && ['available', 'online'].includes(device.status)
+    && !device.locked_by
+    && !device.maintenance_mode
+    && !device.lease_requires_token
+
+const canSelectRecorderDevice = device => isRecorderDeviceUsable(device)
+
+const recorderDeviceLabel = device => {
+    const states = ['available', 'online', 'locked', 'offline']
+    const state = states.includes(device.status)
+        ? t(`appAutomation.recorder.deviceStates.${device.status}`)
+        : String(device.status || '')
+    const owner = device.locked_by_name || (device.locked_by ? t('appAutomation.recorder.ownerUnknown') : '')
+    const maintenance = device.maintenance_mode ? t('appAutomation.recorder.ownerMaintenance') : ''
+    return [device.name || device.device_id, state, owner, maintenance].filter(Boolean).join(' · ')
+}
+
+const mapRecorderError = (operation, status) => {
+    if (status === 403) return 'appAutomation.recorder.errors.leaseLost'
+    if (status === 409) return ['lock', 'acquire'].includes(operation)
+        ? 'appAutomation.recorder.errors.deviceBusy'
+        : 'appAutomation.recorder.errors.conflict'
+    if (status === 502 || status === 504) return 'appAutomation.recorder.errors.maintenance'
+    if (status === 503) return 'appAutomation.recorder.errors.serviceUnavailable'
+    if (status === 404) return 'appAutomation.recorder.errors.deviceUnavailable'
+    return operation === 'screenshot'
+        ? 'appAutomation.recorder.errors.screenshotFailed'
+        : operation === 'interaction'
+            ? 'appAutomation.recorder.errors.interactionFailed'
+            : 'appAutomation.recorder.errors.lockFailed'
+}
+
+const loadRecorderDevices = async () => {
+    recorderDevicesLoading.value = true
+    try {
+        const payload = getRecorderResponseData(await getDeviceList({ page: 1, page_size: 1000 }))
+        const items = Array.isArray(payload) ? payload : payload?.results || payload?.devices || []
+        recorderDevices.value = Array.isArray(items) ? items : []
+        if (recorderLease.value) {
+            const ownedDevice = recorderDevices.value.find(device => sameId(device.id, recorderLease.value.deviceId))
+            if (!ownedDevice || ownedDevice.maintenance_mode || ownedDevice.status === 'offline'
+                || !sameId(ownedDevice.locked_by, recorderLease.value.expectedUserId)) {
+                recorderErrorKey.value = ownedDevice?.maintenance_mode
+                    ? 'appAutomation.recorder.errors.maintenance'
+                    : 'appAutomation.recorder.errors.leaseLost'
+                await stopRecorder({ release: false, silent: true, refresh: false })
+            }
+        }
+        return recorderDevices.value
+    } catch {
+        recorderErrorKey.value = 'appAutomation.recorder.errors.deviceListFailed'
+        return []
+    } finally {
+        recorderDevicesLoading.value = false
+    }
+}
+
+const releaseRecorderLease = async (lease, { silent = false } = {}) => {
+    if (!lease?.leaseToken || !sameId(currentRecorderUserId(), lease.expectedUserId)
+        || lease.sessionGeneration !== currentRecorderSessionGeneration()) return false
+    try {
+        const result = getRecorderResponseData(await releaseRecorderLeaseApi(lease.deviceId, {
+            expected_user_id: lease.expectedUserId,
+            lease_token: lease.leaseToken,
+        }))
+        if (result?.success === false) throw new Error('release rejected')
+        return true
+    } catch {
+        if (!silent) recorderErrorKey.value = 'appAutomation.recorder.errors.releaseFailed'
+        return false
+    }
+}
+
+const stopRecorder = async ({ release = true, silent = false, refresh = true } = {}) => {
+    recorderEpoch.value += 1
+    recorderEnabled.value = false
+    recorderStarting.value = false
+    if (recorderHeartbeatTimer.value !== null) clearInterval(recorderHeartbeatTimer.value)
+    recorderHeartbeatTimer.value = null
+    const lease = recorderLease.value
+    recorderLease.value = null
+    recorderSessionGeneration.value = null
+    if (lease && release) await releaseRecorderLease(lease, { silent })
+    if (lease && refresh) await loadRecorderDevices()
+}
+
+const handleHeartbeatFailure = async (error) => {
+    const status = Number.isInteger(error?.response?.status) ? error.response.status : undefined
+    recorderErrorKey.value = mapRecorderError('interaction', status)
+    await stopRecorder({ release: false, silent: true })
+}
+
+const heartbeatRecorderLease = async lease => {
+    if (!recorderEnabled.value || recorderLease.value !== lease) return
+    if (!sameId(currentRecorderUserId(), lease.expectedUserId)
+        || lease.sessionGeneration !== currentRecorderSessionGeneration()) {
+        recorderErrorKey.value = 'appAutomation.recorder.errors.accountChanged'
+        await stopRecorder({ release: false, silent: true })
+        return
+    }
+    try {
+        await heartbeatDevice(lease.deviceId, {
+            lease_token: lease.leaseToken,
+            lease_seconds: lease.leaseSeconds,
+        })
+    } catch (error) {
+        if (recorderLease.value === lease) await handleHeartbeatFailure(error)
+    }
+}
+
+const startRecorder = async () => {
+    if (recorderStarting.value || recorderEnabled.value) return false
+    const selectedId = recorderDeviceId.value
+    const expectedUserId = currentRecorderUserId()
+    if (expectedUserId === null) {
+        recorderErrorKey.value = 'appAutomation.recorder.errors.signIn'
+        return false
+    }
+    if (selectedId === null || selectedId === undefined) return false
+
+    const generation = recorderEpoch.value
+    const sessionGeneration = currentRecorderSessionGeneration()
+    recorderSessionGeneration.value = sessionGeneration
+    recorderStarting.value = true
+    recorderErrorKey.value = ''
+    try {
+        const freshDevice = getRecorderResponseData(await getAppDevice(selectedId))
+        if (generation !== recorderEpoch.value || !sameId(recorderDeviceId.value, selectedId)
+            || sessionGeneration !== currentRecorderSessionGeneration()) return false
+        if (!isRecorderDeviceUsable(freshDevice)) {
+            recorderErrorKey.value = freshDevice?.maintenance_mode
+                ? 'appAutomation.recorder.errors.maintenance'
+                : 'appAutomation.recorder.errors.deviceUnavailable'
+            await loadRecorderDevices()
+            return false
+        }
+
+        const leasePayload = getRecorderResponseData(await acquireRecorderLease(selectedId, {
+            expected_user_id: expectedUserId,
+        }))
+        const lockedDevice = leasePayload?.device
+        const lease = {
+            deviceId: selectedId,
+            expectedUserId,
+            sessionGeneration,
+            leaseToken: typeof leasePayload?.lease_token === 'string' ? leasePayload.lease_token : '',
+            leaseSeconds: leasePayload?.lease_seconds,
+        }
+        const verified = Boolean(lease.leaseToken)
+            && Number.isInteger(lease.leaseSeconds)
+            && lease.leaseSeconds >= RECORDER_MIN_LEASE_SECONDS
+            && lease.leaseSeconds <= RECORDER_LEASE_SECONDS
+            && sameId(lockedDevice?.locked_by, expectedUserId)
+            && lockedDevice?.status === 'locked'
+            && lockedDevice?.lease_requires_token === true
+        if (!verified) {
+            if (lease.leaseToken) await releaseRecorderLease(lease, { silent: true })
+            recorderErrorKey.value = leasePayload?.success === false
+                ? 'appAutomation.recorder.errors.deviceBusy'
+                : 'appAutomation.recorder.errors.lockUnverified'
+            await loadRecorderDevices()
+            return false
+        }
+
+        const stillCurrent = generation === recorderEpoch.value
+            && sessionGeneration === currentRecorderSessionGeneration()
+            && sameId(currentRecorderUserId(), expectedUserId)
+            && sameId(recorderDeviceId.value, selectedId)
+        if (!stillCurrent) {
+            if (sameId(currentRecorderUserId(), lease.expectedUserId)
+                && sessionGeneration === currentRecorderSessionGeneration()) {
+                await releaseRecorderLease(lease, { silent: true })
+            }
+            return false
+        }
+
+        recorderLease.value = lease
+        recorderDevices.value = recorderDevices.value.map(device => sameId(device.id, selectedId) ? lockedDevice : device)
+        recorderEnabled.value = true
+        recorderHeartbeatTimer.value = setInterval(
+            () => { void heartbeatRecorderLease(lease) },
+            recorderHeartbeatIntervalMs(lease.leaseSeconds),
+        )
+        return true
+    } catch (error) {
+        const status = Number.isInteger(error?.response?.status) ? error.response.status : undefined
+        const selected = recorderSelectedDevice.value
+        recorderErrorKey.value = selected?.maintenance_mode
+            ? 'appAutomation.recorder.errors.maintenance'
+            : mapRecorderError('acquire', status)
+        await loadRecorderDevices()
+        return false
+    } finally {
+        if (generation === recorderEpoch.value) {
+            recorderStarting.value = false
+            if (!recorderLease.value) recorderSessionGeneration.value = null
+        }
+    }
+}
+
+const handleRecordingChange = enabled => {
+    if (enabled) {
+        void startRecorder()
+        return
+    }
+    void stopRecorder()
+}
+
+const sendRecorderInteraction = (deviceId, command) => {
+    const lease = recorderLease.value
+    if (!recorderEnabled.value || !lease
+        || !sameId(deviceId, lease.deviceId)
+        || !sameId(currentRecorderUserId(), lease.expectedUserId)
+        || lease.sessionGeneration !== currentRecorderSessionGeneration()) {
+        const error = new Error('Recorder session is not active')
+        error.response = { status: 409 }
+        return Promise.reject(error)
+    }
+    if (!command || !['tap', 'swipe', 'key'].includes(command.action)) {
+        const error = new Error('Unsupported recorder action')
+        error.response = { status: 400 }
+        return Promise.reject(error)
+    }
+    return recordDeviceInteraction(deviceId, {
+        ...command,
+        lease_token: lease.leaseToken,
+        expected_user_id: lease.expectedUserId,
+    })
+}
+
+const appendRecorderStep = staged => {
+    const lease = recorderLease.value
+    const isRatio = value => Number.isFinite(value) && value >= 0 && value <= 1
+    if (!recorderEnabled.value || !lease
+        || lease.sessionGeneration !== currentRecorderSessionGeneration()
+        || !sameId(currentRecorderUserId(), lease.expectedUserId)) return null
+    let type
+    let config
+    let nameKey
+    if (staged?.action === 'tap' && isRatio(staged.x_ratio) && isRatio(staged.y_ratio)) {
+        type = 'click'
+        nameKey = 'click'
+        config = {
+            selector_type: 'relative',
+            selector: `${staged.x_ratio},${staged.y_ratio}`,
+        }
+    } else if (staged?.action === 'swipe'
+        && isRatio(staged.start?.x_ratio) && isRatio(staged.start?.y_ratio)
+        && isRatio(staged.end?.x_ratio) && isRatio(staged.end?.y_ratio)
+        && Number.isFinite(staged.duration_ms) && staged.duration_ms > 0 && staged.duration_ms <= 1500) {
+        const deltaX = staged.end.x_ratio - staged.start.x_ratio
+        const deltaY = staged.end.y_ratio - staged.start.y_ratio
+        if (deltaX === 0 && deltaY === 0) return null
+        const direction = Math.abs(deltaX) >= Math.abs(deltaY)
+            ? (deltaX >= 0 ? 'right' : 'left')
+            : (deltaY >= 0 ? 'down' : 'up')
+        type = 'swipe'
+        nameKey = 'swipe'
+        config = {
+            coordinate_space: 'image_ratio',
+            selector_type: 'relative',
+            start: `${staged.start.x_ratio},${staged.start.y_ratio}`,
+            end: `${staged.end.x_ratio},${staged.end.y_ratio}`,
+            direction,
+            duration: staged.duration_ms / 1000,
+        }
+    } else if (staged?.action === 'key' && ['back', 'home', 'enter'].includes(staged.key)) {
+        type = 'key_event'
+        nameKey = 'key'
+        config = { key: staged.key.toUpperCase() }
+    } else {
+        return null
+    }
+    const step = {
+        id: generateStepId(),
+        type,
+        name: t(`appAutomation.recorder.stepNames.${nameKey}`),
+        kind: 'atomic',
+        config,
+    }
+    scenarioSteps.value.push(step)
+    selectStep(scenarioSteps.value.length - 1)
+    return step
+}
+
+const handleRecorderError = error => {
+    const status = Number.isInteger(error?.status) ? error.status : undefined
+    recorderErrorKey.value = mapRecorderError(error?.operation || 'interaction', status)
+    if (['interaction', 'screenshot'].includes(error?.operation) && [403, 409, 502, 503, 504].includes(status)) {
+        void stopRecorder({ release: true, silent: true })
+    }
+}
+
+watch(
+    () => [
+        userStore.user?.id ?? userStore.user?.pk,
+        userStore.user,
+        userStore.accessToken,
+    ],
+    ([nextId], [previousId]) => {
+        const accountChanged = !sameId(nextId, previousId)
+        const sessionChanged = recorderSessionGeneration.value !== null
+            && recorderSessionGeneration.value !== currentRecorderSessionGeneration()
+        if (!accountChanged && !sessionChanged) return
+        recorderErrorKey.value = 'appAutomation.recorder.errors.accountChanged'
+        void stopRecorder({ release: false, silent: true })
+    },
+)
+
+watch(recorderDeviceId, (next, previous) => {
+    if (previous === null || previous === undefined || sameId(next, previous)) return
+    if (recorderEnabled.value || recorderStarting.value || recorderLease.value) void stopRecorder()
+})
+
+const defaultSceneRuntime = () => ({
+    base_url: "http://127.0.0.1:8000",
+    retry_times: 0,
+    retry_interval: 0.5
+})
+
+const normalizeUiFlow = rawFlow => {
+    if (Array.isArray(rawFlow)) return { steps: rawFlow, envelope: null, runtime: {}, runtimeConfig: {} }
+    if (!rawFlow || typeof rawFlow !== 'object') return { steps: [], envelope: null, runtime: {}, runtimeConfig: {} }
+    const envelope = Object.fromEntries(Object.entries(rawFlow)
+        .filter(([key]) => !['steps', 'runtime', 'runtime_config'].includes(key)))
+    return {
+        steps: Array.isArray(rawFlow.steps) ? rawFlow.steps : [],
+        envelope,
+        runtime: rawFlow.runtime,
+        runtimeConfig: rawFlow.runtime_config
+    }
+}
+
+const buildUiFlowPayload = steps => uiFlowEnvelope.value === null
+    ? steps
+    : { ...uiFlowEnvelope.value, steps }
+
+const getSceneSnapshot = () => {
+    const stripTransientState = value => {
+        if (Array.isArray(value)) return value.map(stripTransientState)
+        if (!value || typeof value !== 'object') return value
+        return Object.fromEntries(Object.entries(value)
+            .filter(([key]) => key !== '_expanded')
+            .map(([key, child]) => [key, stripTransientState(child)]))
+    }
+    return JSON.stringify(stripTransientState({
+        form: sceneForm.value,
+        variables: sceneVariables.value,
+        runtime: sceneRuntime.value,
+        uiFlowEnvelope: uiFlowEnvelope.value,
+        steps: scenarioSteps.value
+    }))
+}
+
+const normalizeSceneRuntime = runtime => {
+    const defaults = defaultSceneRuntime()
+    const source = runtime && typeof runtime === 'object' && !Array.isArray(runtime) ? runtime : {}
+    const numeric = (value, fallback) => {
+        const parsed = Number(value)
+        return Number.isFinite(parsed) ? parsed : fallback
+    }
+    return {
+        ...defaults,
+        ...source,
+        base_url: typeof source.base_url === 'string' ? source.base_url : defaults.base_url,
+        retry_times: Math.min(10, Math.max(0, Math.floor(numeric(source.retry_times, defaults.retry_times)))),
+        retry_interval: Math.min(10, Math.max(0, numeric(source.retry_interval, defaults.retry_interval)))
+    }
+}
+
+const getComponentDefinitionForStep = step => {
+    if (!step) return null
+    if (step.kind === 'custom' && step.version !== undefined) {
+        return projectComponentDefinitions.value[`${step.type}@${step.version}`] || null
+    }
+    if (step.kind === 'custom') return customComponentDefinitions.value[step.type] || componentDefinitions.value[step.type] || null
+    return componentDefinitions.value[step.type] || customComponentDefinitions.value[step.type] || null
+}
+
+const normalizeStepTree = (steps, usedIds = new Set()) => (Array.isArray(steps) ? steps : []).map(rawStep => {
+    const step = rawStep && typeof rawStep === 'object' && !Array.isArray(rawStep) ? { ...rawStep } : {}
+    let id = step.id
+    if (!id || usedIds.has(id)) id = generateStepId()
+    usedIds.add(id)
+    step.id = id
+    step.config = step.config && typeof step.config === 'object' && !Array.isArray(step.config) ? { ...step.config } : {}
+    const definition = getComponentDefinitionForStep(step)
+    for (const field of Object.keys(definition?.schema?.properties || {})) {
+        if (['id', 'type', 'name', 'kind', 'config'].includes(field) || (step.kind === 'custom' && field === 'steps')) continue
+        if (step.config[field] === undefined && step[field] !== undefined) step.config[field] = step[field]
+        delete step[field]
+    }
+    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
+        if (Array.isArray(step.config[field])) step.config[field] = normalizeStepTree(step.config[field], usedIds)
+    }
+    if (Array.isArray(step.steps)) step.steps = normalizeStepTree(step.steps, usedIds)
+    if (step.kind === 'custom') step._expanded = false
+    return step
+})
+
+const regenerateStepTreeIds = step => {
+    step.id = generateStepId()
+    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
+        if (Array.isArray(step.config?.[field])) step.config[field].forEach(regenerateStepTreeIds)
+    }
+    if (Array.isArray(step.steps)) step.steps.forEach(regenerateStepTreeIds)
+    return step
+}
+
+const groupPalette = (items) => {
+    const query = paletteSearch.value.trim().toLocaleLowerCase()
+    const groups = new Map()
+    items.filter(item => {
+        const category = item.category_name || item.category_display || item.category || ''
+        const categoryText = typeof category === 'object' ? (category.name || category.label || '') : category
+        return !query || [item.name, item.type, categoryText, item.description].some(value => String(value || '').toLocaleLowerCase().includes(query))
+    }).forEach(item => {
+        const rawCategory = item.category_name || item.category_display || item.category || ''
+        const category = typeof rawCategory === 'object' ? (rawCategory.name || rawCategory.label || '') : String(rawCategory || '')
+        const label = category || t('appAutomation.sceneBuilder.palette.uncategorized')
+        const key = category || '__uncategorized__'
+        if (!groups.has(key)) groups.set(key, { key, label, items: [] })
+        groups.get(key).items.push(item)
+    })
+    return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label))
+}
+
 const shouldShowField = (field, step) => {
     if (!step || !step.config) {
         return field !== "image_scope"
@@ -1261,13 +1973,10 @@ const getExpectedListValue = (config) => {
     return formatExpectedList(config.expected_list)
 }
 
-const getActiveConfigForField = () => {
-    if (activeStep.value && activeStep.value.config) {
-        return activeStep.value.config
-    }
-    if (editingActiveStep.value && editingActiveStep.value.config) {
-        return editingActiveStep.value.config
-    }
+const getActiveConfigForField = (step = null) => {
+    if (step?.config) return step.config
+    if (activeStep.value?.config) return activeStep.value.config
+    if (editingActiveStep.value?.config) return editingActiveStep.value.config
     return null
 }
 
@@ -1288,10 +1997,134 @@ const updateExpectedList = (config, rawValue) => {
     config.expected_list = parts
 }
 
-const isJsonField = (field) => {
-    const def = editingActiveDef.value || activeComponentDef.value
-    const type = def ? getFieldTypeForDef(def, field) : getFieldType(field)
+const isJsonField = (field, def = activeComponentDef.value) => {
+    const type = getFieldTypeForDef(def, field)
     return type === "array" || type === "object"
+}
+
+const isNestedStepsField = (field, def) => isJsonField(field, def)
+    && ["steps", "then_steps", "else_steps", "try_steps", "catch_steps", "finally_steps"].includes(field)
+
+const getJsonErrorKey = (step, field) => `${step?.id || 'scene'}:${field}`
+const getJsonFieldError = (step, field) => jsonFieldErrors.value[getJsonErrorKey(step, field)] || ''
+const setJsonFieldError = (step, field, message) => {
+    const errors = { ...jsonFieldErrors.value }
+    const key = getJsonErrorKey(step, field)
+    if (message) errors[key] = message
+    else delete errors[key]
+    jsonFieldErrors.value = errors
+}
+const isSensitiveField = (def, field) => {
+    const property = def?.schema?.properties?.[field] || {}
+    return property.sensitive === true || property.secret === true || property.writeOnly === true
+}
+const getNestedFieldLabel = (field, step) => getFieldLabel(field, step)
+const getNestedFieldOptions = (field, step, property) => {
+    if (Array.isArray(property?.enum) && property.enum.length) {
+        return property.enum.map(value => ({ label: String(value), value }))
+    }
+    return getFieldOptions(field, getComponentDefinitionForStep(step), step)
+}
+
+const _TYPED_PARAMETER_TYPES = new Set(['number', 'integer', 'boolean', 'array', 'object'])
+const _SCENE_VARIABLE_REFERENCE = /^(?:\{\{\s*(?:local|global)\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\}\}|\$\{\s*(?:local|global)\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\})$/
+const isExactSceneVariableReference = value => typeof value === 'string' && _SCENE_VARIABLE_REFERENCE.test(value)
+const isVersionedTypedParameter = (step, field, def) => step?.kind === 'custom'
+    && step.version !== undefined
+    && _TYPED_PARAMETER_TYPES.has(def?.schema?.properties?.[field]?.type)
+const getTypedParameterModeKey = (step, field) => `${step?.id || 'step'}:${field}`
+const isTypedParameterExpressionMode = (step, field, def) => isVersionedTypedParameter(step, field, def)
+    && (isExactSceneVariableReference(step?.config?.[field]) || typedExpressionModes.value[getTypedParameterModeKey(step, field)] === true)
+const getTypedParameterInput = (step, field) => {
+    const config = step?.config || {}
+    const value = config[field]
+    if (typeof config[`${field}_input`] === 'string') return config[`${field}_input`]
+    if (value === undefined || value === null) return ''
+    if (typeof value === 'object') {
+        try { return JSON.stringify(value) } catch { return '' }
+    }
+    return String(value)
+}
+const parseTypedParameterLiteral = (value, property = {}) => {
+    const type = property.type
+    const typedResult = literal => {
+        if (Array.isArray(property.enum) && property.enum.length) {
+            const matches = property.enum.some(option => {
+                if (option && typeof option === 'object' && literal && typeof literal === 'object') {
+                    try { return JSON.stringify(option) === JSON.stringify(literal) } catch { return false }
+                }
+                return Object.is(option, literal)
+            })
+            if (!matches) return { valid: false }
+        }
+        return { valid: true, value: literal }
+    }
+    if (type === 'number' || type === 'integer') {
+        let number = value
+        if (typeof value === 'string') {
+            try {
+                number = JSON.parse(value)
+                if (typeof number !== 'number') number = NaN
+            } catch {
+                number = NaN
+            }
+        }
+        const valid = Number.isFinite(number)
+            && (type !== 'integer' || Number.isInteger(number))
+            && (!Number.isFinite(property.minimum) || number >= property.minimum)
+            && (!Number.isFinite(property.maximum) || number <= property.maximum)
+            && (!Number.isFinite(property.multipleOf) || property.multipleOf <= 0
+                || Math.abs(number / property.multipleOf - Math.round(number / property.multipleOf)) < 1e-9)
+        return valid ? typedResult(number) : { valid: false }
+    }
+    if (type === 'boolean') {
+        if (value === true || value === false) return typedResult(value)
+        if (value === 'true') return typedResult(true)
+        if (value === 'false') return typedResult(false)
+        return { valid: false }
+    }
+    if (type === 'array' || type === 'object') {
+        let parsed = value
+        if (typeof value === 'string') {
+            try { parsed = JSON.parse(value) } catch { return { valid: false } }
+        }
+        const valid = type === 'array'
+            ? Array.isArray(parsed)
+            : parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        return valid ? typedResult(parsed) : { valid: false }
+    }
+    return { valid: false }
+}
+const setTypedParameterExpressionMode = (step, field, def, enabled) => {
+    const key = getTypedParameterModeKey(step, field)
+    if (enabled) {
+        typedExpressionModes.value[key] = true
+        return
+    }
+    const current = step?.config?.[field]
+    if (isExactSceneVariableReference(current)) {
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.literalValueRequired'))
+        return
+    }
+    const result = parseTypedParameterLiteral(current, def?.schema?.properties?.[field] || {})
+    if (!result.valid) {
+        setJsonFieldError(step, field, t('appAutomation.sceneBuilder.messages.invalidTypedParameter'))
+        ElMessage.warning(t('appAutomation.sceneBuilder.messages.invalidTypedParameter'))
+        return
+    }
+    step.config[field] = result.value
+    delete step.config[`${field}_input`]
+    delete typedExpressionModes.value[key]
+    setJsonFieldError(step, field, '')
+}
+const updateTypedParameterInput = (step, field, def, rawValue) => {
+    if (!step.config) step.config = {}
+    const raw = String(rawValue ?? '')
+    delete step.config[`${field}_input`]
+    step.config[field] = raw
+    const property = def?.schema?.properties?.[field] || {}
+    const valid = isExactSceneVariableReference(raw) || parseTypedParameterLiteral(raw, property).valid
+    setJsonFieldError(step, field, valid ? '' : t('appAutomation.sceneBuilder.messages.invalidTypedParameter'))
 }
 
 const getJsonFieldRows = (field) => {
@@ -1300,44 +2133,43 @@ const getJsonFieldRows = (field) => {
 }
 
 const getJsonFieldValue = (config, field) => {
-    if (!config) {
-        return ""
-    }
+    if (!config) return ""
     const inputKey = `${field}_input`
-    if (typeof config[inputKey] === "string") {
-        return config[inputKey]
-    }
+    if (typeof config[inputKey] === "string") return config[inputKey]
     const value = config[field]
-    if (value === undefined || value === null || value === "") {
-        return ""
-    }
+    if (value === undefined || value === null || value === "") return ""
     try {
         return JSON.stringify(value, null, 2)
-    } catch (error) {
+    } catch {
         return String(value)
     }
 }
 
-const updateJsonField = (config, field, rawValue) => {
-    if (!config) {
-        return
-    }
-    const inputValue = String(rawValue || "")
-    config[`${field}_input`] = inputValue
+const updateJsonField = (config, field, rawValue, step = null, def = null) => {
+    if (!config) return
+    const inputValue = String(rawValue ?? "")
+    const inputKey = `${field}_input`
+    const fieldType = getFieldTypeForDef(def || getComponentDefinitionForStep(step), field)
+    config[inputKey] = inputValue
     if (!inputValue.trim()) {
-        const def = editingActiveDef.value || activeComponentDef.value
-        const fieldType = def ? getFieldTypeForDef(def, field) : getFieldType(field)
-        if (fieldType === "array") {
-            config[field] = []
-        } else {
-            config[field] = {}
-        }
+        config[field] = fieldType === "array" ? [] : {}
+        delete config[inputKey]
+        setJsonFieldError(step, field, '')
         return
     }
     try {
-        config[field] = JSON.parse(inputValue)
-    } catch (error) {
-        // 保留原始输入
+        const parsed = JSON.parse(inputValue)
+        if ((fieldType === "array" && !Array.isArray(parsed))
+            || (fieldType === "object" && (parsed === null || Array.isArray(parsed) || typeof parsed !== "object"))) {
+            setJsonFieldError(step, field, t('appAutomation.sceneBuilder.messages.invalidJsonShape'))
+            delete config[field]
+            return
+        }
+        config[field] = parsed
+        setJsonFieldError(step, field, '')
+    } catch {
+        delete config[field]
+        setJsonFieldError(step, field, t('appAutomation.sceneBuilder.messages.invalidJson'))
     }
 }
 
@@ -1347,7 +2179,8 @@ const addSceneVariable = () => {
         value: "",
         type: "string",
         scope: "local",
-        description: ""
+        description: "",
+        sensitive: false,
     })
 }
 
@@ -1362,8 +2195,11 @@ const formatSceneVariables = () => {
             name: item.name,
             scope: item.scope || "local",
             type: item.type || "string",
-            value: parseSceneVariableValue(item.value, item.type),
-            description: item.description || ""
+            value: item.sensitive === true
+                ? (item.value ?? "")
+                : parseSceneVariableValue(item.value, item.type),
+            description: item.description || "",
+            sensitive: item.sensitive === true,
         }))
 }
 
@@ -1391,6 +2227,12 @@ const parseSceneVariableValue = (value, type) => {
     return value
 }
 
+const isSecretReference = value => {
+    if (typeof value !== 'string') return false
+    const match = /^secret:\/\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.exec(value)
+    return Boolean(match && match[0] === value)
+}
+
 const loadSceneVariables = (rawVariables) => {
     if (!Array.isArray(rawVariables)) {
         sceneVariables.value = []
@@ -1400,10 +2242,13 @@ const loadSceneVariables = (rawVariables) => {
         name: item.name || "",
         scope: item.scope || "local",
         type: item.type || "string",
-        value: (item.type === "array" || item.type === "object")
-            ? JSON.stringify(item.value || (item.type === "array" ? [] : {}))
-            : (item.value !== undefined && item.value !== null ? String(item.value) : ""),
-        description: item.description || ""
+        value: item.sensitive === true
+            ? (item.value !== undefined && item.value !== null ? String(item.value) : "")
+            : (item.type === "array" || item.type === "object")
+                ? JSON.stringify(item.value || (item.type === "array" ? [] : {}))
+                : (item.value !== undefined && item.value !== null ? String(item.value) : ""),
+        description: item.description || "",
+        sensitive: item.sensitive === true,
     }))
 }
 
@@ -1412,25 +2257,33 @@ const generateStepId = () => {
 }
 
 const cloneComponent = (item) => {
+    const metadata = { ...item }
+    const componentId = metadata.id
+    ;['id', 'schema', 'defaultConfig', 'default_config', 'enabled', 'sort_order', 'raw'].forEach(key => delete metadata[key])
     const cloned = {
+        ...metadata,
         id: generateStepId(),
         type: item.type,
         name: item.name,
         kind: item.kind || "atomic",
-        config: {
-            ...item.defaultConfig
-        }
+        config: JSON.parse(JSON.stringify(item.defaultConfig || item.default_config || {}))
     }
-    // 自定义组件：深拷贝子步骤到实例中（后续编辑不影响原始定义）
-    if (item.kind === "custom" && item.steps && item.steps.length > 0) {
-        cloned.steps = JSON.parse(JSON.stringify(item.steps)).map(s => ({
-            ...s,
-            id: s.id || generateStepId(),
-            config: s.config || {}
-        }))
-        cloned._expanded = false  // 展开/收起状态
+    if (item.kind === "custom") {
+        cloned.component_id = componentId
+        if (Array.isArray(item.steps)) {
+            cloned.steps = normalizeStepTree(item.steps)
+            cloned.steps.forEach(regenerateStepTreeIds)
+        }
+        cloned._expanded = false
     }
     return cloned
+}
+
+const addPaletteComponent = (item) => {
+    const step = cloneComponent(item)
+    scenarioSteps.value.push(step)
+    selectStep(scenarioSteps.value.length - 1)
+    return step
 }
 
 const selectStep = (index) => {
@@ -1451,6 +2304,13 @@ const selectStep = (index) => {
         target: null,
         expected: null
     }
+}
+
+const handleScenarioStepsChange = (event) => {
+    const addedId = event?.added?.element?.id
+    if (!addedId) return
+    const index = scenarioSteps.value.findIndex(step => step.id === addedId)
+    if (index >= 0) selectStep(index)
 }
 
 const selectSubStep = (parentIndex, subIndex) => {
@@ -1499,7 +2359,7 @@ const duplicateSubStep = (parentIndex, subIndex) => {
     const source = parentStep.steps[subIndex]
     if (!source) return
     const copy = JSON.parse(JSON.stringify(source))
-    copy.id = generateStepId()
+    regenerateStepTreeIds(copy)
     copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: source.name || source.type })
     parentStep.steps.splice(subIndex + 1, 0, copy)
 }
@@ -1507,21 +2367,19 @@ const duplicateSubStep = (parentIndex, subIndex) => {
 const removeSubStep = (parentIndex, subIndex) => {
     const parentStep = scenarioSteps.value[parentIndex]
     if (!parentStep || !parentStep.steps) return
+    const removed = parentStep.steps[subIndex]
     parentStep.steps.splice(subIndex, 1)
-    // 调整选中状态
-    if (selectedIndex.value === parentIndex && selectedSubIndex.value === subIndex) {
-        selectedSubIndex.value = null
-    } else if (selectedIndex.value === parentIndex && selectedSubIndex.value > subIndex) {
-        selectedSubIndex.value--
+    if (selectedIndex.value === parentIndex && selectedSubStepId.value === removed?.id) {
+        selectedSubStepId.value = null
     }
 }
 
 const removeStep = (index) => {
+    const removed = scenarioSteps.value[index]
     scenarioSteps.value.splice(index, 1)
-    if (selectedIndex.value === index) {
-        selectedIndex.value = null
-    } else if (selectedIndex.value > index) {
-        selectedIndex.value -= 1
+    if (selectedStepId.value === removed?.id) {
+        selectedStepId.value = null
+        selectedSubStepId.value = null
     }
 }
 
@@ -1531,27 +2389,35 @@ const duplicateStep = (index) => {
         return
     }
     const copy = JSON.parse(JSON.stringify(source))
-    copy.id = generateStepId()
+    regenerateStepTreeIds(copy)
     const baseName = source.name || source.type || t('appAutomation.sceneBuilder.steps.step')
     copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: baseName })
     scenarioSteps.value.splice(index + 1, 0, copy)
     selectStep(index + 1)
 }
 
-const resetScene = () => {
-    sceneForm.value = {
-        name: "",
-        description: "",
-        project: null
+const resetScene = async () => {
+    if (isSceneDirty.value) {
+        try {
+            await ElMessageBox.confirm(
+                t('appAutomation.sceneBuilder.messages.resetConfirm'),
+                t('appAutomation.sceneBuilder.messages.unsavedTitle'),
+                { type: 'warning', confirmButtonText: t('appAutomation.common.confirm'), cancelButtonText: t('appAutomation.common.cancel') }
+            )
+        } catch {
+            return
+        }
     }
+    sceneForm.value = { name: "", description: "", project: null }
     sceneVariables.value = []
-    sceneRuntime.value = {
-        base_url: "http://127.0.0.1:8000",
-        retry_times: 0,
-        retry_interval: 0.5
-    }
+    sceneRuntime.value = defaultSceneRuntime()
+    uiFlowEnvelope.value = null
     scenarioSteps.value = []
-    selectedIndex.value = null
+    selectedStepId.value = null
+    selectedSubStepId.value = null
+    jsonFieldErrors.value = {}
+    typedExpressionModes.value = {}
+    sceneBaseline.value = getSceneSnapshot()
 }
 
 const openCustomComponentDialog = () => {
@@ -1595,12 +2461,7 @@ const openEditCustomComponent = (item) => {
     const rawSteps = (item.steps && Array.isArray(item.steps))
         ? item.steps
         : (customComponentDefinitions.value[item.type] && customComponentDefinitions.value[item.type].steps) || []
-    editingCustomSteps.value = JSON.parse(JSON.stringify(rawSteps)).map(step => ({
-        id: step.id || generateStepId(),
-        type: step.type,
-        name: step.name,
-        config: step.config || {}
-    }))
+    editingCustomSteps.value = normalizeStepTree(rawSteps)
     editingCustomSteps.value.forEach(step => applyDefaultConfig(step))
     editingSelectedIndex.value = null
 }
@@ -1636,12 +2497,9 @@ const addEditStep = () => {
 }
 
 const removeEditStep = (index) => {
+    const removed = editingCustomSteps.value[index]
     editingCustomSteps.value.splice(index, 1)
-    if (editingSelectedIndex.value === index) {
-        editingSelectedIndex.value = null
-    } else if (editingSelectedIndex.value > index) {
-        editingSelectedIndex.value -= 1
-    }
+    if (editingSelectedStepId.value === removed?.id) editingSelectedStepId.value = null
 }
 
 const duplicateEditStep = (index) => {
@@ -1650,7 +2508,7 @@ const duplicateEditStep = (index) => {
         return
     }
     const copy = JSON.parse(JSON.stringify(source))
-    copy.id = generateStepId()
+    regenerateStepTreeIds(copy)
     const baseName = source.name || source.type || t('appAutomation.sceneBuilder.steps.step')
     copy.name = t('appAutomation.sceneBuilder.steps.duplicateName', { name: baseName })
     editingCustomSteps.value.splice(index + 1, 0, copy)
@@ -1694,16 +2552,21 @@ const saveCustomComponent = () => {
             ElMessage.warning(t('appAutomation.sceneBuilder.messages.addComponentStepsFirst'))
             return
         }
+        const sourceSteps = customDialogMode.value === "edit"
+            ? editingCustomSteps.value
+            : scenarioSteps.value
+        const preparedSteps = prepareStepsForSave(sourceSteps)
+        if (preparedSteps.error) {
+            ElMessage.error(preparedSteps.error)
+            return
+        }
         customSaving.value = true
         try {
-            const steps = (customDialogMode.value === "edit"
-                ? editingCustomSteps.value
-                : scenarioSteps.value
-            ).map(step => ({
-                type: step.type,
-                name: step.name,
-                config: step.config || {}
-            }))
+            const steps = preparedSteps.value.map(step => {
+                const savedStep = { ...step }
+                delete savedStep.id
+                return savedStep
+            })
             const payload = {
                 name: customForm.value.name,
                 type: customForm.value.type,
@@ -1744,34 +2607,28 @@ const saveCustomComponent = () => {
 const loadComponentPalette = async () => {
     try {
         const response = await getComponents({ enabled: 1 })
-        
-        const list = response.data?.data || response.data || []
-        
-        if (list.length > 0) {
-            const mergedList = list.map(item => ({
-                type: item.type,
-                name: item.name,
-                schema: item.schema || {},
-                defaultConfig: item.default_config || {},
-                raw: item
-            }))
-            componentPalette.value = mergedList.map(item => ({
+        const responseList = response.data?.data || response.data || []
+        const list = Array.isArray(responseList) ? responseList : []
+        componentPalette.value = list.map(item => {
+            const defaultConfig = item.default_config || item.defaultConfig || {}
+            return {
+                ...item,
                 type: item.type || '',
-                name: item.name || '',
+                name: item.name || item.type || '',
                 schema: item.schema || {},
-                defaultConfig: item.defaultConfig || {}
-            })).filter(item => item.type)
-            componentDefinitions.value = mergedList.reduce((acc, item) => {
-                acc[item.type] = {
-                    ...item.raw,
-                    schema: item.schema,
-                    default_config: item.defaultConfig
-                }
-                return acc
-            }, {})
-        } else {
-            componentPalette.value = []
-            componentDefinitions.value = {}
+                defaultConfig: JSON.parse(JSON.stringify(defaultConfig)),
+                description: item.description || '',
+                category: item.category ?? item.category_name ?? item.category_display ?? ''
+            }
+        }).filter(item => item.type)
+        componentDefinitions.value = componentPalette.value.reduce((acc, item) => {
+            acc[item.type] = {
+                ...item,
+                default_config: item.defaultConfig
+            }
+            return acc
+        }, {})
+        if (componentPalette.value.length === 0) {
             ElMessage.warning(t('appAutomation.sceneBuilder.messages.noComponentDef'))
         }
     } catch (error) {
@@ -1786,21 +2643,23 @@ const loadCustomComponentPalette = async () => {
     defaultCustomPalette.value = JSON.parse(JSON.stringify(customComponentPalette.value))
     try {
         const response = await getCustomComponents({ enabled: 1 })
-        
-        const list = response.data?.data || response.data || []
-        
+        const responseList = response.data?.data || response.data || []
+        const list = Array.isArray(responseList) ? responseList : []
         if (list.length > 0) {
             customComponentPalette.value = list.map(item => ({
+                ...item,
                 id: item.id || `custom_${item.type}_${Date.now()}_${Math.random()}`,
                 type: item.type || '',
-                name: item.name || '',
+                name: item.name || item.type || '',
                 kind: "custom",
                 schema: item.schema || {},
-                defaultConfig: item.default_config || {},
-                steps: item.steps || []
+                defaultConfig: JSON.parse(JSON.stringify(item.default_config || item.defaultConfig || {})),
+                category: item.category ?? item.category_name ?? item.category_display ?? '',
+                description: item.description || '',
+                steps: Array.isArray(item.steps) ? normalizeStepTree(item.steps) : []
             })).filter(item => item.id && item.type)
-            customComponentDefinitions.value = list.reduce((acc, item) => {
-                acc[item.type] = item
+            customComponentDefinitions.value = customComponentPalette.value.reduce((acc, item) => {
+                acc[item.type] = { ...item, default_config: item.defaultConfig }
                 return acc
             }, {})
         } else {
@@ -1809,9 +2668,7 @@ const loadCustomComponentPalette = async () => {
                 id: item.id || `custom_${item.type}_${Date.now()}_${Math.random()}`
             })).filter(item => item.id && item.type)
             customComponentDefinitions.value = customComponentPalette.value.reduce((acc, item) => {
-                if (item && item.type) {
-                    acc[item.type] = item
-                }
+                if (item && item.type) acc[item.type] = { ...item, default_config: item.defaultConfig || item.default_config || {} }
                 return acc
             }, {})
         }
@@ -1822,9 +2679,7 @@ const loadCustomComponentPalette = async () => {
             id: item.id || `custom_${item.type}_${Date.now()}_${Math.random()}`
         })).filter(item => item.id && item.type)
         customComponentDefinitions.value = customComponentPalette.value.reduce((acc, item) => {
-            if (item && item.type) {
-                acc[item.type] = item
-            }
+            if (item && item.type) acc[item.type] = { ...item, default_config: item.defaultConfig || item.default_config || {} }
             return acc
         }, {})
     }
@@ -1840,26 +2695,21 @@ const loadCaseDetail = async (caseId) => {
             sceneForm.value.description = data.description || ""
             sceneForm.value.project = data.project || null
             loadSceneVariables(data.variables || [])
-            sceneRuntime.value = {
-                base_url: data.runtime?.base_url || "http://127.0.0.1:8000",
-                retry_times: data.runtime?.retry_times || 0,
-                retry_interval: data.runtime?.retry_interval || 0.5
-            }
-            scenarioSteps.value = (Array.isArray(data.ui_flow) ? data.ui_flow : []).map(step => {
-                // 确保每个步骤有 id
-                if (!step.id) step.id = generateStepId()
-                // 自定义组件初始化展开状态
-                if (step.kind === 'custom' && step.steps) {
-                    step._expanded = false
-                    step.steps.forEach(sub => {
-                        if (!sub.id) sub.id = generateStepId()
-                    })
-                }
-                return step
+            const sceneFlow = normalizeUiFlow(data.ui_flow)
+            uiFlowEnvelope.value = sceneFlow.envelope
+            sceneRuntime.value = normalizeSceneRuntime({
+                ...(sceneFlow.runtime && typeof sceneFlow.runtime === 'object' ? sceneFlow.runtime : {}),
+                ...(sceneFlow.runtimeConfig && typeof sceneFlow.runtimeConfig === 'object' ? sceneFlow.runtimeConfig : {}),
+                ...(data.runtime && typeof data.runtime === 'object' ? data.runtime : {}),
+                ...(data.runtime_config && typeof data.runtime_config === 'object' ? data.runtime_config : {})
             })
+            scenarioSteps.value = normalizeStepTree(sceneFlow.steps)
             scenarioSteps.value.forEach(step => applyDefaultConfig(step))
-            selectedIndex.value = null
-            selectedSubIndex.value = null
+            selectedStepId.value = null
+            selectedSubStepId.value = null
+            jsonFieldErrors.value = {}
+            typedExpressionModes.value = {}
+            sceneBaseline.value = getSceneSnapshot()
         }
     } catch (error) {
         console.error("加载用例失败:", error)
@@ -1868,21 +2718,17 @@ const loadCaseDetail = async (caseId) => {
 }
 
 const applyDefaultConfig = (step) => {
-    if (!step || !step.config) {
-        return
-    }
-    const def = step.kind === "custom"
-        ? customComponentDefinitions.value[step.type]
-        : componentDefinitions.value[step.type]
-    if (!def || !def.default_config) {
-        return
-    }
-    const defaults = def.default_config
+    if (!step || typeof step !== 'object') return
+    if (!step.config || typeof step.config !== 'object' || Array.isArray(step.config)) step.config = {}
+    const def = getComponentDefinitionForStep(step)
+    const defaults = def?.default_config || def?.defaultConfig || {}
     Object.keys(defaults).forEach(key => {
-        if (step.config[key] === undefined) {
-            step.config[key] = defaults[key]
-        }
+        if (step.config[key] === undefined) step.config[key] = JSON.parse(JSON.stringify(defaults[key]))
     })
+    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
+        if (Array.isArray(step.config[field])) step.config[field].forEach(applyDefaultConfig)
+    }
+    if (Array.isArray(step.steps)) step.steps.forEach(applyDefaultConfig)
 }
 
 // 字段分组辅助函数（通用：支持场景步骤和自定义组件编辑）
@@ -1982,7 +2828,7 @@ const getEditingFieldGroups = () => {
     return getFieldGroups(editingSchemaFields.value)
 }
 
-const getFieldLabel = (field) => {
+const getFieldLabel = (field, stepOverride = null) => {
     const labels = {
         selector_type: t('appAutomation.sceneBuilder.fieldLabel.selectorType'),
         selector: t('appAutomation.sceneBuilder.fieldLabel.selector'),
@@ -2055,8 +2901,8 @@ const getFieldLabel = (field) => {
         retry_times: t('appAutomation.sceneBuilder.fieldLabel.retryTimes'),
         retry_interval: t('appAutomation.sceneBuilder.fieldLabel.retryInterval')
     }
-    const config = getActiveConfigForField()
-    const currentStep = activeStep.value || editingActiveStep.value
+    const config = getActiveConfigForField(stepOverride)
+    const currentStep = stepOverride || activeStep.value || editingActiveStep.value
     if (field === "value" && currentStep && currentStep.type === "set_variable") {
         return t('appAutomation.sceneBuilder.fieldLabel.variableValue')
     }
@@ -2071,8 +2917,8 @@ const getFieldLabel = (field) => {
     return labels[field] || field
 }
 
-const getFieldPlaceholder = (field) => {
-            const config = getActiveConfigForField()
+const getFieldPlaceholder = (field, stepOverride = null) => {
+            const config = getActiveConfigForField(stepOverride)
 
             // 动态占位符：根据定位方式返回不同提示
             const getDynamicPlaceholder = (selectorField, typeField) => {
@@ -2153,7 +2999,7 @@ const getFieldPlaceholder = (field) => {
                 catch_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps'),
                 finally_steps: t('appAutomation.sceneBuilder.fieldPlaceholder.jsonArraySteps')
     }
-    const currentStep = activeStep.value || editingActiveStep.value
+    const currentStep = stepOverride || activeStep.value || editingActiveStep.value
     if (field === "value" && currentStep && currentStep.type === "set_variable") {
         return t('appAutomation.sceneBuilder.fieldPlaceholder.valueExpression')
     }
@@ -2188,14 +3034,6 @@ const isImageScopeField = (field) => {
     return ['image_scope', 'expected_image_scope', 'fallback_image_scope'].includes(field)
 }
 
-const getFieldType = (field) => {
-    if (!activeComponentDef.value || !activeComponentDef.value.schema) {
-        return "string"
-    }
-    const properties = activeComponentDef.value.schema.properties || {}
-    return properties[field] && properties[field].type ? properties[field].type : "string"
-}
-
 const getFieldTypeForDef = (def, field) => {
     if (!def || !def.schema) {
         return "string"
@@ -2204,7 +3042,7 @@ const getFieldTypeForDef = (def, field) => {
     return properties[field] && properties[field].type ? properties[field].type : "string"
 }
 
-const getFieldOptions = (field) => {
+const getFieldOptions = (field, def = activeComponentDef.value, step = activeStep.value) => {
             const optionsMap = {
                 image_scope: imageCategoryOptions.value,  // 动态加载的图片分类选项
                 expected_image_scope: imageCategoryOptions.value,  // 动态加载的图片分类选项
@@ -2310,21 +3148,32 @@ const getFieldOptions = (field) => {
                     { label: "first", value: "first" }
                 ]
     }
-    if (field === "assert_type") {
-        const currentStep = activeStep.value || editingActiveStep.value
-        if (currentStep && currentStep.type === "foreach_assert") {
-            return [
-                { label: "number", value: "number" },
-                { label: "text", value: "text" },
-                { label: "image", value: "image" }
-            ]
-        }
+    const schemaEnum = def?.schema?.properties?.[field]?.enum
+    if (Array.isArray(schemaEnum) && schemaEnum.length) {
+        return schemaEnum.map(value => ({ label: String(value), value }))
     }
-    const currentStep = activeStep.value || editingActiveStep.value
-    if (field === "match_mode" && currentStep && currentStep.config) {
-        if (currentStep.config.assert_type === "number") {
-            return [{ label: "exact", value: "exact" }]
-        }
+    const selectorTypeFields = ["selector_type", "fallback_selector_type", "start_selector_type", "end_selector_type", "target_selector_type", "click_selector_type", "ocr_selector_type"]
+    const relativeSelectorFields = ["selector_type", "fallback_selector_type", "start_selector_type", "end_selector_type", "click_selector_type"]
+    if (selectorTypeFields.includes(field)) {
+        const nativeSelectorOptions = [
+            { label: t('appAutomation.sceneBuilder.selectorTypes.resourceId'), value: 'resource_id' },
+            { label: t('appAutomation.sceneBuilder.selectorTypes.text'), value: 'text' },
+            { label: t('appAutomation.sceneBuilder.selectorTypes.contentDesc'), value: 'content_desc' },
+            { label: t('appAutomation.sceneBuilder.selectorTypes.className'), value: 'class' }
+        ]
+        const options = [...(optionsMap[field] || []), ...nativeSelectorOptions]
+        if (relativeSelectorFields.includes(field)) options.push({ label: 'relative', value: 'relative' })
+        return [...new Map(options.map(option => [option.value, option])).values()]
+    }
+    if (field === "assert_type" && step?.type === "foreach_assert") {
+        return [
+            { label: "number", value: "number" },
+            { label: "text", value: "text" },
+            { label: "image", value: "image" }
+        ]
+    }
+    if (field === "match_mode" && step?.config?.assert_type === "number") {
+        return [{ label: "exact", value: "exact" }]
     }
     return optionsMap[field] || []
 }
@@ -2460,10 +3309,13 @@ const getFieldNumberRule = (field) => {
 }
 
 const getFieldNumberRuleForDef = (def, field) => {
-    if (!def || !def.schema) {
-        return getFieldNumberRule(field)
+    const property = def?.schema?.properties?.[field] || {}
+    const fallback = getFieldNumberRule(field)
+    return {
+        min: Number.isFinite(property.minimum) ? property.minimum : fallback.min,
+        max: Number.isFinite(property.maximum) ? property.maximum : fallback.max,
+        step: Number.isFinite(property.multipleOf) ? property.multipleOf : fallback.step
     }
-    return getFieldNumberRule(field)
 }
 
 const openPackageDialog = async () => {
@@ -2578,8 +3430,193 @@ const downloadBlob = (blob, filename) => {
     window.URL.revokeObjectURL(url)
 }
 
+const normalizeJsonDrafts = (value, path = 'ui_flow', schema = null, allowTypedParameterExpressions = false) => {
+    if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index++) {
+            const result = normalizeJsonDrafts(value[index], `${path}[${index + 1}]`)
+            if (result.error) return result
+            value[index] = result.value
+        }
+        return { value }
+    }
+    if (!value || typeof value !== 'object') return { value }
+
+    const definition = value.type ? getComponentDefinitionForStep(value) : null
+    const versionedComponentReference = value.kind === 'custom' && value.version !== undefined
+    const resultValue = {}
+    for (const [key, child] of Object.entries(value)) {
+        const field = key.endsWith('_input') ? key.slice(0, -6) : null
+        if (field && schema?.properties?.[field]) continue
+        if (key === '_expanded') continue
+        const childSchema = key === 'config' ? definition?.schema : null
+        const allowTypedExpressions = key === 'config' && versionedComponentReference
+        const result = normalizeJsonDrafts(child, `${path}.${key}`, childSchema, allowTypedExpressions)
+        if (result.error) return result
+        resultValue[key] = result.value
+    }
+
+    if (schema?.properties) {
+        for (const [key, raw] of Object.entries(value)) {
+            if (!key.endsWith('_input')) continue
+            const field = key.slice(0, -6)
+            const property = schema.properties[field]
+            if (!property) continue
+            let parsed
+            try {
+                parsed = String(raw).trim() ? JSON.parse(raw) : property.type === 'array' ? [] : {}
+            } catch {
+                return { error: t('appAutomation.sceneBuilder.messages.invalidJsonAt', { path: `${path}.${field}` }) }
+            }
+            if ((property.type === 'array' && !Array.isArray(parsed))
+                || (property.type === 'object' && (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object'))) {
+                return { error: t('appAutomation.sceneBuilder.messages.invalidJsonShapeAt', { path: `${path}.${field}` }) }
+            }
+            resultValue[field] = parsed
+        }
+        if (allowTypedParameterExpressions) {
+            for (const [field, property] of Object.entries(schema.properties)) {
+                if (!_TYPED_PARAMETER_TYPES.has(property?.type)
+                    || !Object.prototype.hasOwnProperty.call(value, field)
+                    || typeof value[field] !== 'string') continue
+                const raw = value[field]
+                if (isExactSceneVariableReference(raw)) continue
+                const parsed = parseTypedParameterLiteral(raw, property)
+                if (!parsed.valid) {
+                    return { error: t('appAutomation.sceneBuilder.messages.invalidTypedParameterAt', { path: `${path}.${field}` }) }
+                }
+                resultValue[field] = parsed.value
+            }
+        }
+    }
+    return { value: resultValue }
+}
+
+const isMissingRequiredValue = (value, property = {}) => value === undefined || value === null
+    || (typeof value === 'string' && value.trim() === '')
+    || (Array.isArray(value) && Number.isFinite(property.minItems) && value.length < property.minItems)
+    || (value && typeof value === 'object' && !Array.isArray(value)
+        && Number.isFinite(property.minProperties) && Object.keys(value).length < property.minProperties)
+    || (typeof value === 'number' && !Number.isFinite(value))
+
+const linkedElementFieldFor = field => ({
+    selector: 'element_id',
+    fallback_selector: 'fallback_element_id',
+    click_selector: 'click_element_id',
+    ocr_selector: 'ocr_element_id',
+    start_selector: 'start_element_id',
+    end_selector: 'end_element_id',
+    target_selector: 'target_element_id'
+})[field]
+
+const validateRequiredSteps = (steps, path = 'ui_flow') => {
+    for (let index = 0; index < steps.length; index++) {
+        const step = steps[index]
+        const stepPath = `${path}[${index + 1}]`
+        const config = { ...step, ...(step.config || {}) }
+        const definition = getComponentDefinitionForStep(step)
+        for (const field of definition?.schema?.required || []) {
+            const value = config[field]
+            const property = definition?.schema?.properties?.[field] || {}
+            const linkedField = linkedElementFieldFor(field)
+            if (isMissingRequiredValue(value, property) && !(linkedField && config[linkedField])) {
+                return t('appAutomation.sceneBuilder.messages.requiredFieldAt', {
+                    path: `${stepPath}.${getFieldLabel(field, step)}`
+                })
+            }
+        }
+        for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
+            if (Array.isArray(config[field])) {
+                const issue = validateRequiredSteps(config[field], `${stepPath}.${getFieldLabel(field, step)}`)
+                if (issue) return issue
+            }
+        }
+        if (Array.isArray(step.steps)) {
+            const issue = validateRequiredSteps(step.steps, `${stepPath}.steps`)
+            if (issue) return issue
+        }
+    }
+    return ''
+}
+
+const validateSceneVariables = () => {
+    for (let index = 0; index < sceneVariables.value.length; index++) {
+        const item = sceneVariables.value[index]
+        if (!item?.name?.trim()) {
+            return t('appAutomation.sceneBuilder.messages.variableNameRequiredAt', { index: index + 1 })
+        }
+        if (item.sensitive === true) {
+            const value = item.value
+            if (value === undefined || value === null || value === '') continue
+            if (!isSecretReference(value)) return t('appAutomation.sceneData.secretHelp')
+            continue
+        }
+        if (!['array', 'object'].includes(item.type)) continue
+        if (!String(item.value ?? '').trim()) continue
+        let parsed
+        try {
+            parsed = JSON.parse(item.value)
+        } catch {
+            return t('appAutomation.sceneBuilder.messages.invalidVariableJson', { name: item.name })
+        }
+        if ((item.type === 'array' && !Array.isArray(parsed))
+            || (item.type === 'object' && (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object'))) {
+            return t('appAutomation.sceneBuilder.messages.invalidVariableJsonShape', { name: item.name })
+        }
+    }
+    return ''
+}
+
+const removeTransientFields = value => {
+    if (Array.isArray(value)) return value.map(removeTransientFields)
+    if (!value || typeof value !== 'object') return value
+    return Object.fromEntries(Object.entries(value)
+        .filter(([key]) => key !== '_expanded')
+        .map(([key, child]) => [key, removeTransientFields(child)]))
+}
+
+const prepareStepsForSave = steps => {
+    const source = JSON.parse(JSON.stringify(steps))
+    const parsed = normalizeJsonDrafts(source)
+    if (parsed.error) return parsed
+    const issue = validateRequiredSteps(parsed.value)
+    if (issue) return { error: issue }
+    return { value: removeTransientFields(parsed.value) }
+}
+
+const getProjectComponentSteps = () => {
+    const prepared = prepareStepsForSave(scenarioSteps.value)
+    if (prepared.error) throw new Error('invalid scene')
+    return prepared.value
+}
+
+const setProjectComponents = items => {
+    const entries = Array.isArray(items) ? items : []
+    projectComponentPalette.value = entries.map(item => ({
+        ...item, kind: 'custom', optionKey: `${item.type}@${item.version}`,
+        name: `${item.name} · v${item.version}`,
+        defaultConfig: item.default_config || {},
+        // Keep versioned references pinned to the server definition.
+        steps: undefined,
+    }))
+    projectComponentDefinitions.value = Object.fromEntries(
+        projectComponentPalette.value.map(item => [item.optionKey, item])
+    )
+}
+
+const insertProjectComponent = item => {
+    if (!item || !item.type || !item.version) return
+    const step = {
+        id: generateStepId(), kind: 'custom', type: item.type, version: String(item.version),
+        name: `${item.name} · v${item.version}`,
+        config: JSON.parse(JSON.stringify(item.default_config || {})),
+    }
+    scenarioSteps.value.push(step)
+    selectedStepId.value = step.id
+    selectedSubStepId.value = null
+}
+
 const saveScene = async () => {
-    if (!sceneForm.value.name) {
+    if (!sceneForm.value.name?.trim()) {
         ElMessage.warning(t('appAutomation.sceneBuilder.messages.inputSceneName'))
         return
     }
@@ -2587,21 +3624,26 @@ const saveScene = async () => {
         ElMessage.warning(t('appAutomation.sceneBuilder.messages.addAtLeastOneStep'))
         return
     }
+    const variableIssue = validateSceneVariables()
+    if (variableIssue) {
+        ElMessage.error(variableIssue)
+        return
+    }
+    const preparedSteps = prepareStepsForSave(scenarioSteps.value)
+    if (preparedSteps.error) {
+        ElMessage.error(preparedSteps.error)
+        return
+    }
 
     saving.value = true
     try {
-        // 直接发送平铺的字段结构，匹配后端模型
-        // 深拷贝并清理前端内部状态字段（_expanded 等）
-        const cleanedSteps = JSON.parse(JSON.stringify(scenarioSteps.value)).map(step => {
-            delete step._expanded
-            return step
-        })
         const caseData = {
             name: sceneForm.value.name,
             description: sceneForm.value.description,
             project: sceneForm.value.project || null,
-            ui_flow: cleanedSteps,
-            variables: formatSceneVariables()
+            ui_flow: buildUiFlowPayload(preparedSteps.value),
+            variables: formatSceneVariables(),
+            runtime_config: normalizeSceneRuntime(sceneRuntime.value)
         }
 
         let caseResponse = null
@@ -2614,14 +3656,13 @@ const saveScene = async () => {
         const responseData = caseResponse.data || caseResponse
         if (responseData && (responseData.id || responseData.success)) {
             ElMessage.success(editingCaseId.value ? t('appAutomation.sceneBuilder.messages.sceneUpdateSuccess') : t('appAutomation.sceneBuilder.messages.sceneSaveSuccess'))
-            if (responseData.id && !editingCaseId.value) {
-                editingCaseId.value = responseData.id
-            }
+            if (responseData.id && !editingCaseId.value) editingCaseId.value = responseData.id
         } else {
             ElMessage.success(t('appAutomation.sceneBuilder.messages.sceneSubmitted'))
         }
+        sceneBaseline.value = getSceneSnapshot()
     } catch (error) {
-        console.error("保存场景失败:", error)
+        console.error("保存场景失败")
         const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
         ElMessage.error(t('appAutomation.sceneBuilder.messages.saveSceneFailed', { error: errorMsg }))
     } finally {
@@ -2916,8 +3957,45 @@ defineExpose({
     gap: 8px;
 }
 
+.scene-optional-panels {
+    margin-top: 12px;
+}
+
 .scene-config {
     margin-top: 12px;
+}
+
+.recorder-panel {
+    display: grid;
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.recorder-heading {
+    display: grid;
+    gap: 10px;
+}
+
+.recorder-heading h3 {
+    margin: 0;
+    font-size: 16px;
+}
+
+.recorder-device-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.recorder-device-controls .el-select {
+    width: min(100%, 420px);
+}
+
+.recorder-ownership,
+.recorder-no-selection {
+    margin: 0;
+    color: #52616a;
 }
 
 .scene-layout {
@@ -2939,7 +4017,7 @@ defineExpose({
 
 .scene-variable-item {
     display: grid;
-    grid-template-columns: 140px 120px 120px 1fr 1fr auto;
+    grid-template-columns: 140px 120px 120px 1fr 1fr auto auto;
     gap: 8px;
     align-items: center;
 }
@@ -2954,20 +4032,64 @@ defineExpose({
     color: #f56c6c;
 }
 
+.palette-search {
+    margin-bottom: 8px;
+}
+
+.palette-group {
+    margin-bottom: 12px;
+}
+
+.palette-group-title {
+    padding: 4px 2px;
+    color: #606266;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: capitalize;
+}
+
 .palette-list {
-    min-height: 360px;
+    min-height: 0;
 }
 
 .palette-item {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding: 8px 10px;
     border: 1px dashed #dcdfe6;
     border-radius: 4px;
     margin-bottom: 8px;
     cursor: grab;
     background: #fafafa;
+}
+
+.palette-item:hover,
+.palette-item:focus-visible {
+    border-color: #409eff;
+    background: #f5faff;
+    outline: none;
+}
+
+.palette-item-content {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+}
+
+.palette-item-heading {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+}
+
+.palette-description {
+    color: #606266;
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
 }
 
 .palette-left {
@@ -2984,7 +4106,8 @@ defineExpose({
     transition: opacity 0.15s ease;
 }
 
-.palette-item:hover .palette-actions {
+.palette-item:hover .palette-actions,
+.palette-item:focus-within .palette-actions {
     opacity: 1;
 }
 
@@ -3003,6 +4126,16 @@ defineExpose({
     color: #909399;
     font-size: 12px;
     line-height: 20px;
+}
+
+.typed-parameter-mode {
+    margin-bottom: 6px;
+}
+
+.json-field-error {
+    color: #f56c6c;
+    font-size: 12px;
+    line-height: 1.4;
 }
 
 .custom-steps-section {

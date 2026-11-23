@@ -145,6 +145,9 @@
           <el-button link type="success" size="small" :disabled="executionSubmitting" @click="runCase(row)">
             {{ $t('appAutomation.common.run') }}
           </el-button>
+          <el-button link type="primary" size="small" :disabled="executionSubmitting" @click="openDatasetDialog(row)">
+            {{ $t('appAutomation.sceneData.runWithData') }}
+          </el-button>
           <el-button link type="primary" size="small" @click="editCase(row)">
             {{ $t('appAutomation.common.edit') }}
           </el-button>
@@ -255,6 +258,33 @@
         </el-table-column>
       </el-table>
     </el-card>
+    <el-dialog v-model="datasetDialogOpen" :title="$t('appAutomation.sceneData.runWithData')" width="520px"
+               :close-on-click-modal="!executionSubmitting">
+      <el-form label-position="top">
+        <el-form-item :label="$t('appAutomation.sceneData.datasets')" required>
+          <el-select v-model="selectedDatasetId" :loading="datasetLoading" style="width: 100%">
+            <el-option v-for="dataset in availableDatasets" :key="dataset.id" :value="dataset.id"
+                       :label="`${dataset.name} · v${dataset.version} · ${dataset.row_count}`" />
+          </el-select>
+        </el-form-item>
+        <el-form-item :label="$t('appAutomation.sceneData.runMode')">
+          <el-radio-group v-model="datasetRunMode">
+            <el-radio value="single">{{ $t('appAutomation.sceneData.singleRow') }}</el-radio>
+            <el-radio value="all">{{ $t('appAutomation.sceneData.allRows') }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="datasetRunMode === 'single'" :label="$t('appAutomation.sceneData.rowNumber')">
+          <el-input-number v-model="datasetRowNumber" :min="1" :max="Math.max(1, selectedDataset?.row_count || 1)" :precision="0" />
+        </el-form-item>
+        <el-alert :title="$t('appAutomation.sceneData.sequentialHint')" type="info" :closable="false" />
+      </el-form>
+      <template #footer>
+        <el-button :disabled="executionSubmitting" @click="datasetDialogOpen = false">{{ $t('appAutomation.common.cancel') }}</el-button>
+        <el-button type="primary" :loading="executionSubmitting" :disabled="!selectedDatasetId" @click="runDatasetCase">
+          {{ $t('appAutomation.common.run') }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -288,6 +318,7 @@ import {
   normalizeAppDeviceList,
   prepareAppDeviceForExecution,
 } from '@/utils/app-automation-device-execution.mjs'
+import { getAllSceneDatasets, executeSceneDataset } from '@/api/app-scene-data'
 import { useUserStore } from '@/stores/user'
 
 const router = useRouter()
@@ -303,6 +334,15 @@ const stoppingExecutionIds = ref(new Set())
 const availableDevices = ref([])
 const appPackages = ref([])
 const searchQuery = ref('')
+const datasetDialogOpen = ref(false)
+const datasetLoading = ref(false)
+const datasetLoadGeneration = ref(0)
+const availableDatasets = ref([])
+const selectedDatasetId = ref(null)
+const datasetRunMode = ref('single')
+const datasetRowNumber = ref(1)
+const datasetRunContext = ref(null)
+const selectedDataset = computed(() => availableDatasets.value.find(item => String(item.id) === String(selectedDatasetId.value)))
 
 const projectList = ref([])
 const form = ref({
@@ -519,6 +559,86 @@ const stopTest = async (execution) => {
     }
   } finally {
     stoppingExecutionIds.value.delete(execution.id)
+  }
+}
+
+// Dataset execution uses the same device lease and account-switch fences as ordinary execution.
+const openDatasetDialog = async (testCase) => {
+  if (executionSubmitting.value) return
+  const identity = captureExecutionIdentity()
+  const deviceId = form.value.deviceId
+  const projectId = typeof testCase.project === 'object' ? testCase.project?.id : testCase.project
+  if (!deviceId || !projectId) {
+    ElMessage.warning(t(!deviceId ? 'appAutomation.testCase.pleaseSelectDevice' : 'appAutomation.sceneData.selectProject'))
+    return
+  }
+  datasetRunContext.value = { caseId: testCase.id, projectId, deviceId, identity,
+    packageName: appPackages.value.find(pkg => pkg.id === form.value.packageId)?.package_name }
+  datasetDialogOpen.value = true
+  const generation = ++datasetLoadGeneration.value
+  datasetLoading.value = true
+  availableDatasets.value = []
+  selectedDatasetId.value = null
+  datasetRunMode.value = 'single'
+  datasetRowNumber.value = 1
+  try {
+    const datasets = await getAllSceneDatasets(projectId)
+    const context = datasetRunContext.value
+    if (generation !== datasetLoadGeneration.value || !isExecutionIdentityCurrent(identity) ||
+        context?.caseId !== testCase.id || String(context?.projectId) !== String(projectId)) return
+    if (!Array.isArray(datasets)) throw new Error('Invalid scene dataset list')
+    availableDatasets.value = datasets
+  } catch {
+    const context = datasetRunContext.value
+    if (generation === datasetLoadGeneration.value && isExecutionIdentityCurrent(identity) &&
+        context?.caseId === testCase.id && String(context?.projectId) === String(projectId)) {
+      availableDatasets.value = []
+      ElMessage.error(t('appAutomation.sceneData.loadFailed'))
+    }
+  } finally {
+    if (generation === datasetLoadGeneration.value) datasetLoading.value = false
+  }
+}
+
+const runDatasetCase = async () => {
+  const context = datasetRunContext.value
+  if (executionSubmitting.value || !context || !selectedDatasetId.value) return
+  if (!isExecutionIdentityCurrent(context.identity) || String(form.value.deviceId) !== String(context.deviceId)) {
+    ElMessage.error(t('appAutomation.device.messages.executionUserChanged'))
+    datasetDialogOpen.value = false
+    return
+  }
+  executionSubmitting.value = true
+  try {
+    const device = await prepareAppDeviceForExecution({
+      selectedId: context.deviceId, userId: context.identity.userId,
+      sessionGeneration: context.identity.sessionGeneration,
+      getCurrentUserId: () => userStore.user?.id,
+      getCurrentSessionGeneration: () => userStore.getSessionGeneration?.(),
+      getDevice: refreshExecutionDevice, onDeviceRefreshed: updateExecutionDevice, t,
+    })
+    verifyExecutionUser(context.identity)
+    const payload = {
+      dataset_id: selectedDatasetId.value, device_id: device.device_id, auto_lock: true,
+      expected_user_id: context.identity.userId, mode: datasetRunMode.value,
+      row_index: datasetRowNumber.value - 1,
+    }
+    if (context.packageName) payload.package_name = context.packageName
+    const response = await executeSceneDataset(context.caseId, payload)
+    verifyExecutionUser(context.identity)
+    if (response?.data?.success === false) throw new Error('dataset execution rejected')
+    const ids = response?.data?.data?.execution_ids || []
+    if (ids.length) trackExecution(ids[0])
+    datasetDialogOpen.value = false
+    ElMessage.success(t('appAutomation.testCase.submitted'))
+    await loadExecutions()
+  } catch (error) {
+    const message = isExecutionIdentityCurrent(context.identity)
+      ? getAppExecutionErrorMessage(error, t('appAutomation.testCase.unknownError'))
+      : t('appAutomation.device.messages.executionUserChanged')
+    ElMessage.error(t('appAutomation.testCase.executionFailed', { message }))
+  } finally {
+    executionSubmitting.value = false
   }
 }
 
@@ -947,6 +1067,7 @@ onMounted(async () => {
 // 组件卸载
 onBeforeUnmount(() => {
   unmounted = true
+  datasetLoadGeneration.value += 1
   if (refreshTimer) {
     clearInterval(refreshTimer)
   }

@@ -4,7 +4,9 @@ from pathlib import Path
 from decouple import config
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
+import json
 import os
+import re
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TESTING = os.environ.get('DJANGO_SETTINGS_MODULE') == 'backend.test_settings'
@@ -69,6 +71,58 @@ REGISTRATION_STATS_VISIBLE_USERNAMES = config(
 )
 APP_USE_HTTPS = config('APP_USE_HTTPS', default=not DEBUG, cast=bool)
 APP_DEVICE_ALLOWED_CIDRS = parse_csv(config('APP_DEVICE_ALLOWED_CIDRS', default=''))
+_ocr_model_dir = config('APP_OCR_MODEL_DIR', default='').strip()
+if _ocr_model_dir:
+    _ocr_model_path = Path(_ocr_model_dir).expanduser()
+    if not _ocr_model_path.is_absolute():
+        _ocr_model_path = BASE_DIR / _ocr_model_path
+    APP_OCR_MODEL_DIR = str(_ocr_model_path.resolve())
+else:
+    APP_OCR_MODEL_DIR = ''
+
+# This server-owned map contains resolved values; clients may reference only its
+# explicitly configured aliases and never choose environment variable names.
+_SCENE_SECRET_ALIAS_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
+_SCENE_PROJECT_ID_RE = re.compile(r'[1-9][0-9]{0,19}\Z')
+try:
+    _scene_secret_config = json.loads(config('APP_SCENE_SECRET_ALIASES_JSON', default='{}'))
+except (TypeError, ValueError):
+    raise ImproperlyConfigured('APP_SCENE_SECRET_ALIASES_JSON must use the project-scoped secret format') from None
+
+
+def _valid_scene_secret_map(value):
+    return (
+        isinstance(value, dict)
+        and len(value) <= 256
+        and all(
+            isinstance(alias, str)
+            and _SCENE_SECRET_ALIAS_RE.fullmatch(alias)
+            and isinstance(secret, str)
+            and secret.strip()
+            and len(secret) <= 16_384
+            for alias, secret in value.items()
+        )
+    )
+
+
+if (not isinstance(_scene_secret_config, dict)
+        or set(_scene_secret_config) - {'projects', 'global'}):
+    raise ImproperlyConfigured('APP_SCENE_SECRET_ALIASES_JSON must use the project-scoped secret format')
+_scene_secret_projects = _scene_secret_config.get('projects', {})
+_scene_secret_global = _scene_secret_config.get('global', {})
+if (not isinstance(_scene_secret_projects, dict)
+        or len(_scene_secret_projects) > 256
+        or any(not isinstance(project_id, str)
+               or not _SCENE_PROJECT_ID_RE.fullmatch(project_id)
+               or not _valid_scene_secret_map(aliases)
+               for project_id, aliases in _scene_secret_projects.items())
+        or not _valid_scene_secret_map(_scene_secret_global)
+        or sum(len(aliases) for aliases in _scene_secret_projects.values()) + len(_scene_secret_global) > 4096):
+    raise ImproperlyConfigured('APP_SCENE_SECRET_ALIASES_JSON must use the project-scoped secret format')
+APP_SCENE_SECRET_ALIASES = {
+    'projects': _scene_secret_projects,
+    'global': _scene_secret_global,
+}
 TRUST_PROXY_SSL_HEADER = config('TRUST_PROXY_SSL_HEADER', default=APP_USE_HTTPS, cast=bool)
 
 QUALITY_INTELLIGENCE_ENABLED = config(

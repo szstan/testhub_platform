@@ -66,6 +66,47 @@ export default {
     daysAgo: '{n} days ago'
   },
 
+  sceneData: {
+    title: 'Project data and reusable components',
+    selectProject: 'Select a project first',
+    datasets: 'Datasets',
+    components: 'Reusable components',
+    datasetHelp: 'Upload CSV or XLSX to create an immutable dataset version.',
+    datasetName: 'Dataset name',
+    chooseFile: 'Choose file',
+    sensitiveColumns: 'Sensitive columns, separated by commas',
+    upload: 'Upload dataset',
+    secretHelp: 'Use server-configured secret:// aliases in sensitive columns; do not upload plaintext secrets.',
+    sensitiveVariable: 'Sensitive variable',
+    emptyDatasets: 'No datasets in this project',
+    name: 'Name',
+    version: 'Version',
+    rows: 'Rows',
+    componentHelp: 'Save the current scene steps as a new project component version.',
+    componentName: 'Component name',
+    componentType: 'Component type, for example login_flow',
+    type: 'Type',
+    parameterSchema: 'Parameter properties as a JSON object',
+    requiredParameters: 'Required parameter names, separated by commas',
+    parameterHelp: 'Steps can reference component parameters. Use scene variables for sensitive values.',
+    saveVersion: 'Save new version',
+    emptyComponents: 'No reusable components in this project',
+    insert: 'Insert into scene',
+    datasetRequired: 'Enter a name and select a file up to 5 MiB',
+    componentRequired: 'Enter the component name, type, and version',
+    invalidComponent: 'Invalid parameter definition or scene steps',
+    datasetSaved: 'Dataset version created',
+    componentSaved: 'Component version created',
+    loadFailed: 'Could not load project data',
+    saveFailed: 'Could not save; check the configuration',
+    runWithData: 'Run with data',
+    runMode: 'Rows to run',
+    singleRow: 'One row',
+    allRows: 'All rows',
+    rowNumber: 'Row number (starting at 1)',
+    sequentialHint: 'Rows run sequentially on one device, with a separate execution record for each row.'
+  },
+
   // Status
   status: {
     notStarted: 'Not Started',
@@ -195,6 +236,8 @@ export default {
     lock: 'Lock',
     unlock: 'Unlock',
     reconnect: 'Reconnect',
+    recoverPendingAction: 'Recover pending action',
+    clearMaintenance: 'Clear maintenance mode',
     port: 'Port',
     portPlaceholder: 'Default 5555',
     ipAddressPlaceholder: 'Please enter the remote device IP address',
@@ -239,6 +282,12 @@ export default {
       executionTokenLeaseBadge: 'API lease; unavailable on web',
       executionLockFailed: 'Could not lock the device. Check its status.',
       executionLockUnverified: 'Could not verify the device lock. Refresh and try again.',
+      recoverPendingActionConfirm: 'Recover the pending action for {name}? First manually verify the device state and confirm that no worker is active on the device. This only clears the pending-action marker; maintenance mode will remain enabled.',
+      pendingActionRecovered: 'Pending-action marker cleared; the device remains in maintenance mode.',
+      recoverPendingActionFailed: 'Failed to recover the pending action',
+      clearMaintenanceConfirm: 'Clear maintenance mode for {name}? Manually verify the device state and confirm there is no pending action; the device may become available for allocation again.',
+      maintenanceCleared: 'Device maintenance mode cleared',
+      clearMaintenanceFailed: 'Failed to clear device maintenance mode',
       disconnectConfirm: 'Are you sure you want to disconnect device {name}?',
       lockConfirm: 'Are you sure you want to lock device {name}?',
       unlockConfirm: 'Are you sure you want to unlock device {name}?',
@@ -522,6 +571,77 @@ export default {
     submittedCount: 'Submitted {count} case(s) for execution'
   },
 
+  recorder: {
+    title: 'Device recorder',
+    device: 'Device',
+    selectDevice: 'Select an idle device',
+    refreshDevices: 'Refresh devices',
+    noDevices: 'No devices are available to show',
+    noSelection: 'Select a device to open the recorder',
+    owner: 'Lock ownership',
+    ownerAvailable: 'Available; no active owner',
+    ownerSession: 'Locked by this recorder session',
+    ownerNamed: 'Locked by {name}',
+    ownerUnknown: 'Locked by another owner',
+    ownerMaintenance: 'Unavailable: maintenance mode',
+    deviceStates: {
+      available: 'Available',
+      online: 'Online',
+      locked: 'Locked',
+      offline: 'Offline'
+    },
+    start: 'Start recording',
+    stop: 'Stop recording',
+    refresh: 'Refresh screenshot',
+    mode: 'Interaction mode',
+    modes: { tap: 'Tap', swipe: 'Swipe', key: 'Key' },
+    empty: 'Start recording to interact with the screenshot',
+    screen: 'Device screenshot',
+    keys: 'Android keys',
+    keyNames: { back: 'Back', home: 'Home', enter: 'Enter' },
+    stagedSteps: 'Recorded steps',
+    clear: 'Clear staged list',
+    actions: { tap: 'Tap', swipe: 'Swipe', key: 'Key' },
+    status: {
+      idle: 'Recording is off. Device input is disabled.',
+      loading: 'Loading screenshot...',
+      recording: 'Recording is enabled. Device input is sent only after an interaction.',
+      error: 'Recorder operation failed.'
+    },
+    stepNames: { click: 'Recorded click', swipe: 'Recorded swipe', key: 'Recorded key event' },
+    errors: {
+      signIn: 'Sign in before recording.',
+      deviceListFailed: 'Could not load devices.',
+      deviceUnavailable: 'The selected device is offline or unavailable.',
+      deviceBusy: 'The selected device is already locked or busy. Refresh the list.',
+      lockFailed: 'Could not acquire the device lock.',
+      lockUnverified: 'The device lock could not be verified; recording remains disabled.',
+      leaseLost: 'The device lease is no longer valid. Recording has been disabled.',
+      accountChanged: 'The signed-in account changed. Recording has been disabled.',
+      maintenance: 'The device entered maintenance mode after an uncertain interaction. Recording has been disabled.',
+      serviceUnavailable: 'The device service is unavailable.',
+      conflict: 'The device is busy or the account fence was rejected. Recording has been disabled.',
+      screenshotFailed: 'Could not load the device screenshot.',
+      interactionFailed: 'The device interaction failed and was not staged.',
+      releaseFailed: 'The recorder stopped, but its device lock could not be released.'
+    }
+  },
+
+  // Single-step diagnostics
+  stepDiagnostics: {
+    title: 'Single-step diagnostics',
+    run: 'Run selected step',
+    saveFirst: 'Save the test case before running a diagnostic.',
+    stopRecording: 'Stop device recording before running a diagnostic.',
+    selectRootStep: 'Select a top-level step.',
+    selectDevice: 'Select a device first.',
+    ready: 'The selected step will run by itself after you confirm: {step}',
+    viewResult: 'View execution result',
+    accountChanged: 'The signed-in account or session changed. The diagnostic was cancelled.',
+    submitted: 'Single-step diagnostic submitted.',
+    failed: 'Single-step diagnostic failed.'
+  },
+
   // sceneBuilder
   sceneBuilder: {
     custom: 'Custom',
@@ -556,7 +676,10 @@ export default {
       baseComponents: 'Base Components',
       noBaseComponents: 'No base components',
       customComponents: 'Custom Components',
-      noCustomComponents: 'No custom components'
+      noCustomComponents: 'No custom components',
+      searchPlaceholder: 'Search name, type, category or description',
+      noSearchResults: 'No matching components',
+      uncategorized: 'Uncategorized'
     },
     steps: {
       title: 'Scene Steps',
@@ -568,6 +691,12 @@ export default {
       addSubStep: 'Add Sub-step',
       step: 'Step',
       duplicateName: '{name} - Copy'
+    },
+    nested: {
+      selectComponent: 'Select a step component',
+      addStep: 'Add Step',
+      empty: 'No steps',
+      maxDepthReached: 'The maximum nested flow depth has been reached'
     },
     config: {
       title: 'Component Configuration',
@@ -593,6 +722,9 @@ export default {
       clear: 'Clear',
       pleaseSelect: 'Please select',
       noSchema: 'This component has no schema configured',
+      expressionMode: 'Expression',
+      literalMode: 'Literal',
+      expressionPlaceholder: 'Enter an exact scene-variable reference',
       vipInitTemplate: 'VIP Init'
     },
     dialog: {
@@ -634,6 +766,12 @@ export default {
       tags: 'Tags',
       preview: 'Preview',
       apply: 'Apply'
+    },
+    selectorTypes: {
+      resourceId: 'Resource ID',
+      text: 'Text',
+      contentDesc: 'Accessibility Description',
+      className: 'Widget Class'
     },
     fieldGroup: {
       selector: 'Locator',
@@ -787,7 +925,21 @@ export default {
       imageMissingPath: 'This image element is missing its file path',
       elementTypeNotApplicable: 'Element type {type} is not applicable to {target}',
       noValidFieldGroup: 'No valid field group specified',
-      clearedLink: 'Cleared {target} link'
+      clearedLink: 'Cleared {target} link',
+      invalidJson: 'Invalid JSON format',
+      invalidJsonShape: 'JSON type does not match the field',
+      invalidJsonAt: 'Invalid JSON at {path}',
+      invalidJsonShapeAt: 'JSON type does not match the field at {path}',
+      invalidTypedParameter: 'Enter a type-matching literal or an exact scene-variable reference',
+      invalidTypedParameterAt: 'Enter a type-matching literal or an exact scene-variable reference at {path}',
+      literalValueRequired: 'Enter a type-matching literal before switching modes',
+      requiredFieldAt: 'Required field is missing: {path}',
+      variableNameRequiredAt: 'Enter a name for scene variable {index}',
+      invalidVariableJson: 'Variable "{name}" contains invalid JSON',
+      invalidVariableJsonShape: 'Variable "{name}" JSON type does not match its variable type',
+      unsavedConfirm: 'This scene has unsaved changes. Leave anyway?',
+      unsavedTitle: 'Unsaved Changes',
+      resetConfirm: 'Resetting clears the current scene edits. Continue?'
     }
   },
 

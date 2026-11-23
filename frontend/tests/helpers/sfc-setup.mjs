@@ -33,6 +33,16 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
       ElMessage: Object.fromEntries(['error', 'warning', 'success'].map(type => [type, text => messages.push({ type, text })])),
       ElMessageBox: { confirm: globals.confirm || (async () => true) },
     },
+    '@/api/app-scene-data': {
+      getSceneDatasets: async () => ({ data: [] }),
+      getAllSceneDatasets: async () => [],
+      uploadSceneDataset: async () => ({ data: {} }),
+      getProjectComponents: async () => ({ data: [] }),
+      getAllProjectComponents: async () => [],
+      createProjectComponent: async () => ({ data: {} }),
+      executeSceneDataset: async () => ({ data: { success: true, data: { execution_ids: [] } } }),
+    },
+    '../components/SceneDataPanel.vue': { default: {} },
     ...imports,
   }
   const bundle = await build({

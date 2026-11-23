@@ -9,8 +9,6 @@ import glob
 import importlib
 import json
 import shutil
-from collections import deque
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 from django.conf import settings
@@ -25,6 +23,43 @@ class AppTestWorkerError(RuntimeError):
 
 class AppTestProcessTerminationError(AppTestWorkerError):
     """The child process could not be confirmed stopped; keep its device busy."""
+
+
+def _check_cancel(cancel_check):
+    if cancel_check is None:
+        return
+    try:
+        cancel_check()
+    except AppTestProcessTerminationError:
+        raise AppTestProcessTerminationError(
+            '无法确认测试进程已退出，请检查设备和执行进程'
+        ) from None
+    except Exception as exc:
+        if (
+            type(exc) is RuntimeError
+            and len(exc.args) == 1
+            and isinstance(exc.args[0], str)
+            and exc.args[0] in {
+                'device lease lost',
+                'APP执行已停止或不再处于运行状态',
+                'APP执行批次已停止或已结算',
+            }
+        ):
+            raise RuntimeError(exc.args[0]) from None
+        raise AppTestWorkerError(
+            'APP execution cancelled or device lease validation failed'
+        ) from None
+
+
+def _safe_worker_error_message(error):
+    if type(error) is AppTestWorkerError and error.args == ('worker preflight failed',):
+        return 'worker preflight failed'
+    if error.args == ('Allure report generation failed after pytest completed',):
+        return 'Allure report generation failed after pytest completed'
+    return (
+        'APP worker failed; check Python dependencies, ADB and Allure configuration, '
+        'then retry'
+    )
 
 
 class AppTestExecutor:
@@ -49,11 +84,11 @@ class AppTestExecutor:
             self.base_path = base_path
         
         if not os.path.exists(self.base_path):
-            raise ValueError(f"测试项目路径不存在: {self.base_path}")
+            raise ValueError("测试项目路径不存在")
         
         self._current_process: Optional[subprocess.Popen] = None
         
-        logger.info(f"初始化 AppTestExecutor，基础路径: {self.base_path}")
+        logger.info("初始化 AppTestExecutor")
     
     def run_tests(
         self,
@@ -63,6 +98,9 @@ class AppTestExecutor:
         execution_id: Optional[int] = None,
         username: Optional[str] = None,
         cancel_check=None,
+        step_index: Optional[int] = None,
+        expected_case_updated_at: Optional[str] = None,
+        before_device_io=None,
     ) -> Dict[str, Any]:
         """
         运行APP测试用例并生成报告
@@ -77,14 +115,41 @@ class AppTestExecutor:
         Returns:
             执行结果字典
         """
-        logger.info(f"开始执行APP测试: test_case_id={test_case_id}, device={device_id}")
-        if cancel_check is not None:
-            cancel_check()
+        logger.info("开始执行APP测试")
+        diagnostic_requested = step_index is not None or expected_case_updated_at is not None
+        if diagnostic_requested and (
+            type(step_index) is not int
+            or step_index < 0
+            or not isinstance(expected_case_updated_at, str)
+            or not expected_case_updated_at
+            or len(expected_case_updated_at) > 64
+        ):
+            raise AppTestWorkerError('Invalid saved-step diagnostic selection')
+        _check_cancel(cancel_check)
 
         # Fail before starting pytest so a broken worker is reported as an execution
         # error instead of a misleading completed/skipped test run.
-        worker_runtime = self._preflight_worker()
+        try:
+            worker_runtime = self._preflight_worker()
+        except AppTestWorkerError as exc:
+            logger.error(
+                "APP worker preflight failed (error_type=%s)", type(exc).__name__
+            )
+            raise AppTestWorkerError(_safe_worker_error_message(exc)) from None
+        except Exception as exc:
+            logger.error(
+                "APP worker preflight failed (error_type=%s)", type(exc).__name__
+            )
+            raise AppTestWorkerError(
+                'APP worker preflight failed; check Python dependencies, ADB and Allure configuration'
+            ) from None
         original_cwd = os.getcwd()
+        device_io_admitted = False
+        pytest_process_started = False
+        pytest_process_completed = False
+        exit_code = None
+        test_results = None
+        report_path = None
         
         try:
             # 切换到项目根目录
@@ -92,6 +157,11 @@ class AppTestExecutor:
             
             # 准备环境变量
             env = os.environ.copy()
+            env.pop('APP_DEBUG_STEP_INDEX', None)
+            env.pop('APP_DEBUG_CASE_UPDATED_AT', None)
+            if diagnostic_requested:
+                env['APP_DEBUG_STEP_INDEX'] = str(step_index)
+                env['APP_DEBUG_CASE_UPDATED_AT'] = expected_case_updated_at
             env['PYTHONPATH'] = self._build_pythonpath()
             env['DJANGO_SETTINGS_MODULE'] = 'backend.settings'
             # 强制子进程使用 UTF-8，避免 Windows 下 gbk 解码错误
@@ -117,87 +187,91 @@ class AppTestExecutor:
             # 构建 pytest 参数
             pytest_args = self._build_pytest_args(allure_results_dir)
             
-            logger.info(f"执行命令: {' '.join(pytest_args)}")
-            logger.info(f"工作目录: {os.getcwd()}")
-            logger.info(f"PYTHONPATH: {env['PYTHONPATH']}")
-            
-            # Stream pytest output to disk; only a bounded tail is retained in memory.
-            log_file_path = self._get_log_file_path(username or 'unknown')
-            important_patterns = ['PASSED', 'FAILED', 'ERROR', 'SKIPPED', 'collected', 'passed', 'failed']
-            with open(log_file_path, 'a+', encoding='utf-8', errors='replace') as log_file:
-                log_file.seek(0, os.SEEK_END)
-                output_start = log_file.tell()
-                log_file.write(f"\n{'='*80}\n")
-                log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                               f"执行记录 ID: {execution_id}, 用例 ID: {test_case_id}, "
-                               f"设备: {device_id}\n")
-                log_file.write(f"{'='*80}\n")
-                log_file.flush()
+            logger.info("启动 pytest worker")
+            _check_cancel(cancel_check)
+            if before_device_io is not None:
+                if not callable(before_device_io):
+                    raise AppTestWorkerError('Invalid device action fence callback')
+                before_device_io()
+                device_io_admitted = True
+            process = subprocess.Popen(
+                pytest_args,
+                cwd=self.base_path,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                env=env,
+            )
+            pytest_process_started = True
+            self._current_process = process
+            while True:
+                _check_cancel(cancel_check)
+                try:
+                    exit_code = process.wait(timeout=0.25)
+                    pytest_process_completed = True
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
-                if cancel_check is not None:
-                    cancel_check()
-                process = subprocess.Popen(
-                    pytest_args,
-                    cwd=self.base_path,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    env=env,
-                )
-                self._current_process = process
-                while True:
-                    if cancel_check is not None:
-                        cancel_check()
-                    try:
-                        exit_code = process.wait(timeout=0.25)
-                        break
-                    except subprocess.TimeoutExpired:
-                        continue
+            self._current_process = None
+            logger.info('pytest worker finished, exit_code=%s', exit_code)
 
-                self._current_process = None
-                log_file.write("\n[执行完毕]\n")
-                log_file.flush()
-                log_file.seek(output_start)
-                output_lines = self._read_log_tail(log_file, important_patterns)
-
-            logger.info(f"执行日志已保存: {log_file_path}")
-            logger.info(f"pytest 执行完成，退出码: {exit_code}")
-
-            if cancel_check is not None:
-                cancel_check()
+            _check_cancel(cancel_check)
             test_results = self._parse_allure_results(allure_results_dir)
-            if cancel_check is not None:
-                cancel_check()
+            _check_cancel(cancel_check)
             report_path = self._generate_allure_report(execution_id)
             if not report_path:
-                raise AppTestWorkerError(
-                    "Allure report generation failed after pytest completed"
-                )
+                return {
+                    'success': False,
+                    'exit_code': exit_code,
+                    'report_path': None,
+                    'test_results': test_results,
+                    'error': 'Allure report generation failed after pytest completed',
+                    'device_io_admitted': device_io_admitted,
+                    'pytest_process_started': pytest_process_started,
+                    'pytest_process_completed': pytest_process_completed,
+                }
 
             return {
                 'success': exit_code == 0,
                 'exit_code': exit_code,
                 'report_path': report_path,
                 'test_results': test_results,
-                'output': '\n'.join(output_lines),
+                'device_io_admitted': device_io_admitted,
+                'pytest_process_started': pytest_process_started,
+                'pytest_process_completed': pytest_process_completed,
             }
             
-        except AppTestWorkerError:
-            logger.error("APP worker execution failed", exc_info=True)
-            raise
-        except Exception as e:
+        except AppTestProcessTerminationError:
+            logger.error("APP worker could not confirm process termination")
+            raise AppTestProcessTerminationError(
+                '无法确认测试进程已退出，请检查设备和执行进程'
+            ) from None
+        except AppTestWorkerError as exc:
+            logger.error("APP worker execution failed (error_type=%s)", type(exc).__name__)
+            raise AppTestWorkerError(_safe_worker_error_message(exc)) from None
+        except Exception as exc:
             if cancel_check is not None:
                 try:
-                    cancel_check()
+                    _check_cancel(cancel_check)
                 except Exception:
                     raise
-            logger.error(f"执行测试失败: {str(e)}", exc_info=True)
-            return {
+            logger.error("APP test execution failed (error_type=%s)", type(exc).__name__)
+            result = {
                 'success': False,
-                'error': str(e),
+                'exit_code': exit_code if pytest_process_completed else None,
+                'error': 'APP test execution failed; check worker configuration and retry',
+                'device_io_admitted': device_io_admitted,
+                'pytest_process_started': pytest_process_started,
+                'pytest_process_completed': pytest_process_completed,
             }
+            if test_results is not None:
+                result['test_results'] = test_results
+            if report_path:
+                result['report_path'] = report_path
+            return result
         finally:
             try:
                 if self._current_process is not None:
@@ -205,31 +279,6 @@ class AppTestExecutor:
             finally:
                 os.chdir(original_cwd)
     
-    @staticmethod
-    def _read_log_tail(log_file, important_patterns, *, max_lines=50, max_line_chars=16384):
-        tail = deque(maxlen=max_lines)
-        carry = ''
-
-        def record(line):
-            line = line[-max_line_chars:].rstrip()
-            if line:
-                tail.append(line)
-                if any(pattern in line for pattern in important_patterns):
-                    logger.info(f"[pytest] {line}")
-
-        while True:
-            chunk = log_file.read(8192)
-            if not chunk:
-                break
-            parts = (carry + chunk).split('\n')
-            carry = parts.pop()
-            for line in parts:
-                record(line)
-            if len(carry) > max_line_chars:
-                carry = carry[-max_line_chars:]
-        record(carry)
-        return list(tail)
-
     def _build_pytest_args(self, allure_results_dir: str) -> list:
         """构建只执行 APP UI Flow 的 pytest 参数。"""
         return [
@@ -262,8 +311,7 @@ class AppTestExecutor:
         adb_path = shutil.which(configured_adb)
         if not adb_path:
             failures.append(
-                f"ADB executable '{configured_adb}' was not found; "
-                "install android-tools or set APP_ADB_PATH"
+                "ADB executable was not found; install android-tools or set APP_ADB_PATH"
             )
         else:
             try:
@@ -275,13 +323,11 @@ class AppTestExecutor:
                 )
                 if adb_result.returncode != 0:
                     failures.append(
-                        f"ADB executable '{configured_adb}' failed `adb version` "
-                        f"(exit {adb_result.returncode})"
+                        f"ADB executable failed `adb version` (exit {adb_result.returncode})"
                     )
             except (OSError, subprocess.SubprocessError) as exc:
                 failures.append(
-                    f"ADB executable '{configured_adb}' could not run "
-                    f"({type(exc).__name__})"
+                    f"ADB executable could not run ({type(exc).__name__})"
                 )
 
         allure_path = self._find_allure_command()
@@ -291,7 +337,7 @@ class AppTestExecutor:
                 "allure/bin/allure executable"
             )
         elif os.name != 'nt' and not os.access(allure_path, os.X_OK):
-            failures.append(f"Allure command is not executable: {allure_path}")
+            failures.append("Allure command is not executable; check the bundled installation")
         else:
             try:
                 allure_result = subprocess.run(
@@ -315,22 +361,9 @@ class AppTestExecutor:
                 "APP automation worker preflight failed: " + '; '.join(failures)
             )
 
-        logger.info(
-            "APP automation worker preflight passed: adb=%s, allure=%s",
-            adb_path,
-            allure_path,
-        )
+        logger.info("APP automation worker preflight passed")
         return {'adb_path': adb_path, 'allure_path': allure_path}
 
-    def _get_log_file_path(self, username: str) -> str:
-        """生成日志文件路径: logs/app_automation/{username}/{日期}.log"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        log_dir = os.path.join(
-            str(self.base_path), 'logs', 'app_automation', username
-        )
-        os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, f'{today}.log')
-    
     def _build_pythonpath(self) -> str:
         """构建 PYTHONPATH 环境变量"""
         python_path_parts = [
@@ -392,27 +425,29 @@ class AppTestExecutor:
             # 生成报告
             cmd = [allure_path, 'generate', allure_results_dir, '-o', report_dir, '--clean']
             
-            logger.info(f"生成 Allure 报告: {' '.join(cmd)}")
-            
+            logger.info("Generating Allure report")
             result = subprocess.run(
                 cmd,
-                capture_output=True,
-                text=True,
-                timeout=60
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
             )
-            
+
             if result.returncode == 0:
-                logger.info(f"Allure 报告生成成功: {report_dir}")
+                logger.info("Allure report generation succeeded")
                 return report_dir
-            else:
-                logger.error(f"Allure 报告生成失败: {result.stderr}")
-                return None
+            logger.error(
+                "Allure report generation failed (exit_code=%s)", result.returncode
+            )
+            return None
                 
         except subprocess.TimeoutExpired:
             logger.error("Allure 报告生成超时")
             return None
-        except Exception as e:
-            logger.error(f"生成 Allure 报告失败: {str(e)}", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Allure report generation failed (error_type=%s)", type(exc).__name__
+            )
             return None
     
     def _find_allure_command(self) -> Optional[str]:
@@ -426,7 +461,7 @@ class AppTestExecutor:
             builtin_allure = base_dir / 'allure' / 'bin' / 'allure'
         
         if builtin_allure.exists():
-            logger.info(f"使用项目内置 Allure: {builtin_allure}")
+            logger.info("Using bundled Allure executable")
             return str(builtin_allure)
         
         logger.warning("未找到项目内置 Allure，请确认 allure 目录存在")
@@ -453,7 +488,7 @@ class AppTestExecutor:
             broken = 0
             unverified = 0
 
-            logger.debug(f"解析Allure目录 {results_dir} ，找到文件: {result_files}")
+            logger.debug("Parsing Allure results")
             for result_file in result_files:
                 try:
                     with open(result_file, 'r', encoding='utf-8') as f:
@@ -483,13 +518,16 @@ class AppTestExecutor:
                         else:
                             # 其他未知状态同样视为失败，保证不会被误判为通过
                             failed += 1
-                            logger.debug(f"未知测试状态 '{status}' 视为失败: {result_file}")
+                            logger.debug("Unknown Allure status treated as failed")
 
-                except Exception as e:
+                except Exception as exc:
                     total += 1
                     failed += 1
                     broken += 1
-                    logger.warning(f"解析结果文件失败: {result_file}, 错误: {e}")
+                    logger.warning(
+                        "Failed to parse an Allure result (error_type=%s)",
+                        type(exc).__name__,
+                    )
             
             logger.info(f"测试结果统计: 总数={total}, 通过={passed}, 失败={failed}, 跳过={skipped}, broken={broken}")
             
@@ -502,8 +540,10 @@ class AppTestExecutor:
                 'unverified': unverified,
             }
             
-        except Exception as e:
-            logger.error(f"解析 Allure 结果失败: {str(e)}", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Allure results parsing failed (error_type=%s)", type(exc).__name__
+            )
             return {
                 'total': 0,
                 'passed': 0,
@@ -541,8 +581,8 @@ class AppTestExecutor:
             
             return progress
             
-        except Exception as e:
-            logger.error(f"计算进度失败: {str(e)}")
+        except Exception as exc:
+            logger.error("Progress calculation failed (error_type=%s)", type(exc).__name__)
             return 0
     
     def stop(self):
@@ -565,6 +605,8 @@ class AppTestExecutor:
             except Exception:
                 exited = False
             if not exited:
-                logger.error("无法确认测试进程已退出，保留设备占用", exc_info=True)
-                raise AppTestProcessTerminationError('无法确认测试进程已退出，请检查设备和执行进程') from exc
+                logger.error("无法确认测试进程已退出，保留设备占用")
+                raise AppTestProcessTerminationError(
+                    '无法确认测试进程已退出，请检查设备和执行进程'
+                ) from None
         self._current_process = None

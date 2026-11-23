@@ -6,6 +6,7 @@ import ipaddress
 import os
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
@@ -17,7 +18,7 @@ from apps.quality_intelligence.services.redaction import redact_text
 import logging
 
 from .test_case_views import AppPagination
-from ..models import AppDevice
+from ..models import AppDevice, AppTestExecution
 from ..access import is_app_admin
 from ..serializers import AppDeviceSerializer
 from ..managers.device_manager import DeviceManager
@@ -31,6 +32,38 @@ from ..device_pool import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _PendingDeviceActionConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = '设备存在待恢复的设备动作，请先通过显式恢复操作处理'
+    default_code = 'pending_device_action'
+
+
+def _device_has_pending_action(device):
+    return device.device_action_pending or AppTestExecution.objects.filter(
+        device_id=device.pk,
+        device_action_pending=True,
+    ).exists()
+
+
+def _expected_user_id_mismatch(request):
+    return (
+        'expected_user_id' in request.data
+        and str(request.data.get('expected_user_id')) != str(request.user.pk)
+    )
+
+
+def _pending_action_blocks_update(device, changes):
+    connection_identity_fields = ('device_id', 'connection_type', 'ip_address', 'port')
+    return (
+        any(
+            field in changes and changes[field] != getattr(device, field)
+            for field in connection_identity_fields
+        )
+        or ('status' in changes and changes['status'] != device.status)
+        or changes.get('maintenance_mode') is False
+    )
 
 
 def _upsert_discovered_device(device_id, defaults):
@@ -125,15 +158,37 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         if not is_app_admin(self.request.user):
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied('仅管理员可以修改设备')
-        serializer.save()
+
+        try:
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(pk=serializer.instance.pk)
+                changes = serializer.validated_data
+                if (
+                    changes.get('maintenance_mode') is False
+                    and _expected_user_id_mismatch(self.request)
+                ):
+                    raise PermissionDenied('当前账号已变化，请刷新后重试')
+                if _device_has_pending_action(device) and _pending_action_blocks_update(device, changes):
+                    raise _PendingDeviceActionConflict()
+                serializer.instance = device
+                serializer.save()
+        except AppDevice.DoesNotExist:
+            raise NotFound('设备不存在')
 
     def perform_destroy(self, instance):
         if not is_app_admin(self.request.user):
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied('仅管理员可以删除设备')
-        instance.delete()
+
+        try:
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(pk=instance.pk)
+                if _device_has_pending_action(device):
+                    raise _PendingDeviceActionConflict()
+                device.delete()
+        except AppDevice.DoesNotExist:
+            raise NotFound('设备不存在')
 
     @action(detail=False, methods=['get'])
     def discover(self, request):
@@ -408,6 +463,81 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
         if denial:
             return denial
         return Response({'reclaimed': reap_expired_device_leases()})
+
+    @action(detail=True, methods=['post'], url_path='recover-pending-action')
+    def recover_pending_action(self, request, pk=None):
+        denial = self._require_admin(request)
+        if denial:
+            return denial
+        if _expected_user_id_mismatch(request):
+            return Response(
+                {'detail': '当前账号已变化，请刷新后重试'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if request.data.get('confirm_no_active_worker') is not True:
+            return Response(
+                {'detail': '恢复前必须确认设备上没有活动工作进程'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(pk=pk)
+                executions = list(
+                    AppTestExecution.objects.select_for_update()
+                    .filter(device_id=device.pk)
+                    .order_by('pk')
+                )
+                pending = [
+                    execution for execution in executions
+                    if execution.device_action_pending
+                ]
+                device_action_pending = device.device_action_pending
+                if not pending and not device_action_pending:
+                    return Response(
+                        {'detail': '设备没有待恢复的动作标记'},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                active = [
+                    execution for execution in executions
+                    if execution.status in ('pending', 'running')
+                ]
+                if any(
+                    execution.status == 'running' and not execution.stop_requested
+                    for execution in active
+                ):
+                    return Response(
+                        {'detail': '仍有未请求停止的运行中执行，不能恢复'},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                device.maintenance_mode = True
+                device.health_status = 'unknown'
+                device.device_action_pending = False
+                device.save(update_fields=[
+                    'maintenance_mode', 'health_status', 'device_action_pending', 'updated_at'
+                ])
+                now = timezone.now()
+                for execution in active:
+                    execution.status = 'stopped' if execution.stop_requested else 'error'
+                    execution.result = None
+                    execution.error_message = '管理员确认工作进程已停止；设备仍处于维护隔离状态'
+                    execution.finished_at = now
+                    execution.save(update_fields=[
+                        'status', 'result', 'error_message', 'finished_at', 'updated_at'
+                    ])
+                AppTestExecution.objects.filter(
+                    pk__in=[execution.pk for execution in pending]
+                ).update(device_action_pending=False, updated_at=now)
+        except AppDevice.DoesNotExist:
+            return Response({'detail': '设备不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'recovered_executions': len(pending),
+            'recovered_device_action': device_action_pending,
+            'maintenance_mode': True,
+            'device_lease_preserved': True,
+        })
 
     @action(detail=True, methods=['post'])
     def screenshot(self, request, pk=None):

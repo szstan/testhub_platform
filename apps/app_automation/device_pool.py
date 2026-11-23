@@ -25,6 +25,10 @@ class DeviceLeaseError(RuntimeError):
     """Raised when a device lease cannot be acquired or mutated."""
 
 
+class DeviceActionBusy(DeviceLeaseError):
+    """The lease is valid, but another device action or execution is pending."""
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
@@ -42,6 +46,16 @@ def _matches_capabilities(device: AppDevice, selector: Mapping[str, object] | No
         elif actual != expected:
             return False
     return True
+
+
+def _has_pending_device_action(device_id):
+    return (
+        AppDevice.objects.filter(pk=device_id, device_action_pending=True).exists()
+        or AppTestExecution.objects.filter(
+            device_id=device_id,
+            device_action_pending=True,
+        ).exists()
+    )
 
 
 def _lease_is_active(device: AppDevice, now) -> bool:
@@ -68,6 +82,7 @@ def _clear_lease(device: AppDevice, *, health_sensitive=True):
     device.lease_acquired_at = None
     device.lease_expires_at = None
     device.last_heartbeat_at = None
+    device.lease_max_seconds = None
     device.status = (
         DeviceStatus.AVAILABLE
         if not health_sensitive or device.health_status != 'unhealthy'
@@ -78,12 +93,14 @@ def _clear_lease(device: AppDevice, *, health_sensitive=True):
 def _lease_fields():
     return [
         'locked_by', 'locked_at', 'lease_token_hash', 'lease_acquired_at',
-        'lease_expires_at', 'last_heartbeat_at', 'status', 'updated_at',
+        'lease_expires_at', 'last_heartbeat_at', 'lease_max_seconds', 'status', 'updated_at',
     ]
 
 
 def _reclaim_expired(device: AppDevice, now=None):
     now = now or timezone.now()
+    if _has_pending_device_action(device.pk):
+        return False
     lease_expired = bool(device.lease_expires_at and device.lease_expires_at <= now)
     legacy_expired = bool(
         not device.lease_token_hash
@@ -101,7 +118,7 @@ def _reclaim_expired(device: AppDevice, now=None):
     return False
 
 
-def _acquire_locked_device(device, user, *, now, lease_seconds):
+def _acquire_locked_device(device, user, *, now, lease_seconds, cap_lease_to_grant=False):
     from .execution_admission import assert_device_execution_idle
 
     if _reclaim_expired(device, now):
@@ -114,18 +131,20 @@ def _acquire_locked_device(device, user, *, now, lease_seconds):
     raw_token = secrets.token_urlsafe(32)
     seconds = max(int(lease_seconds or 3600), 30)
     max_seconds = max(int(device.max_allocation_time or 0), 30)
-    expires = now + timedelta(seconds=min(seconds, max_seconds))
+    granted_seconds = min(seconds, max_seconds)
+    expires = now + timedelta(seconds=granted_seconds)
     device.lease_generation += 1
     device.locked_by = user
     device.locked_at = now
     device.lease_acquired_at = now
     device.lease_expires_at = expires
     device.last_heartbeat_at = now
+    device.lease_max_seconds = granted_seconds if cap_lease_to_grant else None
     device.lease_token_hash = _hash_token(raw_token)
     device.status = DeviceStatus.LOCKED
     device.save(update_fields=[
         'locked_by', 'locked_at', 'lease_generation', 'lease_acquired_at',
-        'lease_expires_at', 'last_heartbeat_at', 'lease_token_hash', 'status', 'updated_at',
+        'lease_expires_at', 'last_heartbeat_at', 'lease_max_seconds', 'lease_token_hash', 'status', 'updated_at',
     ])
     return device, raw_token
 
@@ -151,14 +170,17 @@ def acquire_device(user, *, capabilities=None, lease_seconds=None):
     raise DeviceLeaseError('没有满足能力条件的可用设备')
 
 
-def acquire_specific_device(device_id, user, *, lease_seconds=None):
-    """Acquire one scheduled device without exposing its bearer token to Celery."""
+def acquire_specific_device(device_id, user, *, lease_seconds=None, cap_lease_to_grant=False):
+    """Acquire one device, optionally capping renewals to this grant's duration."""
     now = timezone.now()
     with transaction.atomic():
         device = AppDevice.objects.select_for_update().get(pk=device_id)
         if device.maintenance_mode or device.status == DeviceStatus.OFFLINE:
             raise DeviceLeaseError('设备不可用')
-        return _acquire_locked_device(device, user, now=now, lease_seconds=lease_seconds)
+        return _acquire_locked_device(
+            device, user, now=now, lease_seconds=lease_seconds,
+            cap_lease_to_grant=cap_lease_to_grant,
+        )
 
 
 def _check_owner(device, user, token):
@@ -172,9 +194,64 @@ def validate_device_lease(device_id, user, token):
     """Validate a user-presented token before enqueueing a device execution."""
     device = AppDevice.objects.select_for_update().get(pk=device_id)
     _check_owner(device, user, token)
+    if device.maintenance_mode or device.status == DeviceStatus.OFFLINE:
+        raise DeviceLeaseError('设备不可用，请检查维护状态或连接')
     if not _lease_is_active(device, timezone.now()):
         raise DeviceLeaseError('设备租约已过期或无效')
     return device
+
+
+def begin_device_action(device_id, user, token, *, lease_validator=None):
+    """Commit a lease-fenced device marker before a non-worker device action."""
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().get(pk=device_id)
+        validate = lease_validator or validate_device_lease
+        validated = validate(device.pk, user, token)
+        if (
+            validated.pk != device.pk
+            or validated.locked_by_id != device.locked_by_id
+            or validated.lease_generation != device.lease_generation
+        ):
+            raise DeviceLeaseError('设备租约验证结果与当前世代不匹配')
+        if AppTestExecution.objects.filter(
+            device_id=device.pk,
+            status__in=('pending', 'running'),
+        ).exists() or _has_pending_device_action(device.pk):
+            raise DeviceActionBusy('设备存在待执行或待安全恢复的动作')
+        device.device_action_pending = True
+        device.save(update_fields=['device_action_pending', 'updated_at'])
+        fence = (device.device_id, device.lease_generation)
+    return fence
+
+
+def finish_device_action(device_id, user, generation, *, quarantine=False):
+    """Clear a committed action marker under its original lease fence."""
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().filter(
+            pk=device_id,
+            locked_by_id=getattr(user, 'id', None),
+            lease_generation=generation,
+            device_action_pending=True,
+        ).first()
+        if device is None:
+            raise DeviceLeaseError('设备动作的租约所有者、世代或待处理标记已变更')
+        fields = ['device_action_pending', 'updated_at']
+        if quarantine:
+            device.maintenance_mode = True
+            device.health_status = 'unknown'
+            fields.extend(['maintenance_mode', 'health_status'])
+        device.device_action_pending = False
+        device.save(update_fields=fields)
+    return device
+
+
+def _renewal_seconds(device, lease_seconds, *, default_seconds, minimum):
+    seconds = max(int(lease_seconds or default_seconds), minimum)
+    allocation_limit = max(int(device.max_allocation_time or 0), minimum)
+    seconds = min(seconds, allocation_limit)
+    if device.lease_max_seconds is not None:
+        seconds = min(seconds, max(int(device.lease_max_seconds), minimum))
+    return seconds
 
 
 def heartbeat_device(device_id, user, token, *, lease_seconds=None):
@@ -184,11 +261,11 @@ def heartbeat_device(device_id, user, token, *, lease_seconds=None):
         now = timezone.now()
         if not _lease_is_active(device, now):
             raise DeviceLeaseError('设备租约已过期，不能续租')
-        seconds = max(int(lease_seconds or device.max_allocation_time), 30)
+        seconds = _renewal_seconds(
+            device, lease_seconds, default_seconds=device.max_allocation_time, minimum=30,
+        )
         if device.lease_token_hash:
-            device.lease_expires_at = now + timedelta(
-                seconds=min(seconds, max(int(device.max_allocation_time or 0), 30))
-            )
+            device.lease_expires_at = now + timedelta(seconds=seconds)
         # Keep the original locked_at as the legacy execution binding proof.
         device.last_heartbeat_at = now
         device.last_seen_at = now
@@ -233,6 +310,8 @@ def _assert_execution_lease(device, user, generation, *, execution_id=None, now=
             raise DeviceLeaseError('旧版设备锁无法唯一绑定到此执行')
     elif device.lease_generation != generation:
         raise DeviceLeaseError('设备租约世代已被替换')
+    if device.maintenance_mode or device.status == DeviceStatus.OFFLINE:
+        raise DeviceLeaseError('设备不可用，请检查维护状态或连接')
     if not _lease_is_active(device, now):
         raise DeviceLeaseError('设备租约已过期或无效')
     return device
@@ -252,11 +331,9 @@ def heartbeat_device_execution(device_id, user, generation, *, execution_id=None
         _assert_execution_lease(
             device, user, generation, execution_id=execution_id, now=now
         )
-        seconds = max(int(lease_seconds or 300), 1)
+        seconds = _renewal_seconds(device, lease_seconds, default_seconds=300, minimum=1)
         if device.lease_token_hash:
-            device.lease_expires_at = now + timedelta(
-                seconds=min(seconds, max(int(device.max_allocation_time or 0), 1))
-            )
+            device.lease_expires_at = now + timedelta(seconds=seconds)
         # Keep the original locked_at as the legacy execution binding proof.
         device.last_heartbeat_at = now
         device.last_seen_at = now
@@ -282,6 +359,8 @@ def release_device_execution_lease(device_id, user, generation):
                 return False
         elif device.lease_generation != generation:
             return False
+        if _has_pending_device_action(device.pk):
+            return False
         _clear_lease(device)
         device.save(update_fields=_lease_fields())
         return True
@@ -292,6 +371,8 @@ def release_device(device_id, user, token, *, force=False):
         device = AppDevice.objects.select_for_update().get(pk=device_id)
         if not force:
             _check_owner(device, user, token)
+        if _has_pending_device_action(device.pk):
+            raise DeviceLeaseError('设备存在待安全恢复的设备动作')
         _clear_lease(device)
         device.save(update_fields=_lease_fields())
         return device
@@ -399,13 +480,16 @@ class DeviceLeaseHeartbeat:
 
 
 __all__ = [
+    'DeviceActionBusy',
     'DeviceLeaseError',
     'DeviceLeaseHeartbeat',
     'acquire_device',
     'acquire_specific_device',
     'assert_device_execution_lease',
+    'begin_device_action',
     'heartbeat_device',
     'heartbeat_device_execution',
+    'finish_device_action',
     'is_device_lease_active',
     'reap_expired_device_leases',
     'release_device',

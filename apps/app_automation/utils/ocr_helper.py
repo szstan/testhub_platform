@@ -7,8 +7,8 @@ import time
 import logging
 import hashlib
 import re
+import threading
 from typing import Any, Dict, Optional, Tuple
-from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -24,6 +24,15 @@ from airtest.core.api import G, sleep as airtest_sleep
 
 logger = logging.getLogger(__name__)
 
+_NUMBER_TOKEN_PATTERN = re.compile(
+    r'(?<![\w,+-])(?P<sign>[+-]?)(?P<digits>[0-9OoIl?]+(?:,[0-9OoIl?]+)*)(?![\w,+-])'
+)
+_NUMBER_TOKEN_NO_COMMAS_PATTERN = re.compile(
+    r'(?<![\w,+-])(?P<sign>[+-]?)(?P<digits>[0-9OoIl?]+)(?![\w,+-])'
+)
+_OCR_DIGIT_TRANSLATION = str.maketrans({'o': '0', 'O': '0', 'l': '1', 'I': '1', '?': '1'})
+_NUMBER_RECOGNITION_ERROR = 'No digits recognized by OCR or number is ambiguous'
+
 
 class OCRHelper:
     """OCR 辅助类 - 提供图像文字识别功能"""
@@ -33,8 +42,9 @@ class OCRHelper:
     _cache_ttl = 2.0  # 缓存有效期2秒
     _cache_max_size = 50  # 最大缓存条目数
     
-    # EasyOCR reader实例（延迟初始化）
-    _easyocr_reader = None
+    # EasyOCR readers are worker-side OCR models, not device compatibility claims.
+    _easyocr_readers = {}
+    _reader_lock = threading.Lock()
     
     def __init__(self, languages=None, use_gpu=False):
         """
@@ -48,9 +58,35 @@ class OCRHelper:
         if not EASYOCR_AVAILABLE:
             logger.warning("EasyOCR 未安装，OCR 功能将不可用。请运行: pip install easyocr")
         
-        self.languages = languages or ['en']
-        self.use_gpu = use_gpu
-    
+        self.languages = self._normalize_languages(languages)
+        self.use_gpu = bool(use_gpu)
+
+    @staticmethod
+    def _normalize_languages(languages):
+        if languages is None:
+            return ('en',)
+        if isinstance(languages, str):
+            languages = [part.strip() for part in languages.replace(',', '/').split('/') if part.strip()]
+        if not isinstance(languages, (list, tuple)) or not languages:
+            raise ValueError('OCR languages must be a non-empty sequence')
+        normalized = tuple(str(language).strip() for language in languages if str(language).strip())
+        if not normalized:
+            raise ValueError('OCR languages must be a non-empty sequence')
+        return normalized
+
+    @staticmethod
+    def _model_storage_directory():
+        try:
+            from django.conf import settings as django_settings
+            if django_settings.configured:
+                configured = getattr(django_settings, 'APP_OCR_MODEL_DIR', '')
+                if configured:
+                    return str(configured).strip() or None
+                return os.path.join(str(django_settings.MEDIA_ROOT), 'app-automation', 'ocr-models')
+        except Exception:
+            pass
+        return os.environ.get('APP_OCR_MODEL_DIR', '').strip() or None
+
     @classmethod
     def get_easyocr_reader(cls, languages=None, use_gpu=False):
         """
@@ -66,17 +102,28 @@ class OCRHelper:
         if not EASYOCR_AVAILABLE:
             raise ImportError("EasyOCR 未安装，请运行: pip install easyocr")
         
-        if cls._easyocr_reader is None:
-            try:
-                languages = languages or ['en']
-                logger.info(f"初始化 EasyOCR reader (语言: {languages}, GPU: {use_gpu})...")
-                logger.info("首次使用会下载模型，可能需要一些时间")
-                cls._easyocr_reader = easyocr.Reader(languages, gpu=use_gpu)
-                logger.info("EasyOCR reader 初始化完成")
-            except Exception as e:
-                logger.error(f"EasyOCR 初始化失败: {e}")
-                raise
-        return cls._easyocr_reader
+        language_key = cls._normalize_languages(languages)
+        gpu_key = bool(use_gpu)
+        model_directory = cls._model_storage_directory()
+        cache_key = (language_key, gpu_key, model_directory)
+        with cls._reader_lock:
+            reader = cls._easyocr_readers.get(cache_key)
+            if reader is None:
+                try:
+                    logger.info('Initializing EasyOCR reader (languages=%s, GPU=%s)', language_key, gpu_key)
+                    reader_options = {'gpu': gpu_key, 'download_enabled': False}
+                    if model_directory:
+                        reader_options['model_storage_directory'] = model_directory
+                        reader_options['user_network_directory'] = os.path.join(model_directory, 'user_network')
+                    reader = easyocr.Reader(list(language_key), **reader_options)
+                    cls._easyocr_readers[cache_key] = reader
+                    logger.info('EasyOCR reader initialized')
+                except Exception:
+                    logger.error('EasyOCR initialization failed')
+                    raise RuntimeError(
+                        'EasyOCR initialization failed; install the required model files locally'
+                    ) from None
+        return reader
     
     @staticmethod
     def _get_image_hash(img) -> str:
@@ -134,24 +181,32 @@ class OCRHelper:
             识别出的文本字符串
         """
         if not EASYOCR_AVAILABLE:
-            logger.error("EasyOCR 未安装，无法进行文字识别")
-            return ""
+            logger.error('OCR is unavailable; EasyOCR and local model files are required')
+            raise RuntimeError('OCR is unavailable; EasyOCR and local model files are required')
         
         # 检查缓存
         img_hash = None
         cache_key = None
         if use_cache:
             img_hash = self._get_image_hash(img)
-            cache_key = (img_hash,)  # 简化的缓存键
+            cache_key = (
+                self.languages, self.use_gpu, self._model_storage_directory(), img_hash,
+            )
             if cache_key in self._ocr_cache:
                 result, timestamp = self._ocr_cache[cache_key]
                 if time.time() - timestamp < self._cache_ttl:
-                    logger.debug(f"使用缓存 OCR 结果: {result}")
+                    logger.debug('Using cached OCR result')
                     return result
         
         try:
             reader = self.get_easyocr_reader(self.languages, self.use_gpu)
-            
+        except Exception:
+            logger.error('EasyOCR reader initialization failed')
+            raise RuntimeError(
+                'EasyOCR initialization failed; install the required model files locally'
+            ) from None
+
+        try:
             # 图像预处理
             if isinstance(img, Image.Image):
                 # 转换为 RGB
@@ -184,7 +239,7 @@ class OCRHelper:
                 if float(confidence) >= min_confidence:
                     x_coord = bbox[0][0]  # 左上角的 x 坐标
                     text_items.append((x_coord, text, float(confidence)))
-                    logger.debug(f"OCR: '{text}', 置信度: {confidence:.2f}, x: {x_coord:.1f}")
+                    logger.debug('OCR text item recognized (confidence=%.2f)', float(confidence))
             
             # 按 x 坐标排序
             text_items.sort(key=lambda x: x[0])
@@ -196,12 +251,12 @@ class OCRHelper:
                 self._ocr_cache[cache_key] = (combined_text, time.time())
                 self._clean_cache()
             
-            logger.info(f"OCR 识别结果: '{combined_text}'")
+            logger.info('OCR recognition completed (%d characters)', len(combined_text.strip()))
             return combined_text.strip()
             
-        except Exception as e:
-            logger.error(f"OCR 识别失败: {e}")
-            return ""
+        except Exception:
+            logger.error('OCR recognition failed')
+            raise RuntimeError('OCR recognition failed') from None
     
     def recognize_number(self, img, allow_comma=True, use_cache=True) -> int:
         """
@@ -216,26 +271,25 @@ class OCRHelper:
             识别出的数字（整数）
         """
         text = self.recognize_text(img, use_cache=use_cache)
-        
-        # 常见字符替换
-        text = text.replace('o', '0').replace('O', '0')  # o/O -> 0
-        text = text.replace('l', '1').replace('I', '1')  # l/I -> 1
-        text = text.replace('?', '1')  # ? -> 1
-        
-        # 提取数字和逗号
-        if allow_comma:
-            digits = ''.join(filter(lambda x: x.isdigit() or x == ',', text))
-            digits = digits.replace(',', '')
-        else:
-            digits = ''.join(filter(str.isdigit, text))
-        
-        try:
-            number = int(digits) if digits else 0
-            logger.info(f"提取数字: {number}")
-            return number
-        except ValueError:
-            logger.error(f"无法将文本转换为数字: {text}")
-            return 0
+        pattern = _NUMBER_TOKEN_PATTERN if allow_comma else _NUMBER_TOKEN_NO_COMMAS_PATTERN
+        numbers = []
+
+        for match in pattern.finditer(text):
+            digits = match.group('digits')
+            if not any('0' <= character <= '9' for character in digits):
+                continue
+
+            normalized_digits = digits.translate(_OCR_DIGIT_TRANSLATION).replace(',', '')
+            try:
+                numbers.append(int(match.group('sign') + normalized_digits))
+            except ValueError:
+                raise ValueError(_NUMBER_RECOGNITION_ERROR) from None
+
+        if len(numbers) != 1:
+            raise ValueError(_NUMBER_RECOGNITION_ERROR)
+
+        logger.info('Number extraction completed')
+        return numbers[0]
     
     @staticmethod
     def crop_region(region: Tuple[int, int, int, int], screenshot_path: Optional[str] = None) -> Image.Image:
@@ -300,22 +354,15 @@ class OCRHelper:
         return self.recognize_number(img)
 
 
-# 全局单例实例
-_ocr_helper_instance = None
+_ocr_helper_instances = {}
 
 
 def get_ocr_helper(languages=None, use_gpu=False) -> OCRHelper:
-    """
-    获取全局 OCR Helper 单例实例
-    
-    Args:
-        languages: OCR 识别语言列表
-        use_gpu: 是否使用 GPU
-        
-    Returns:
-        OCRHelper 实例
-    """
-    global _ocr_helper_instance
-    if _ocr_helper_instance is None:
-        _ocr_helper_instance = OCRHelper(languages=languages, use_gpu=use_gpu)
-    return _ocr_helper_instance
+    """Return an OCR helper cached by language set and worker-side GPU option."""
+    language_key = OCRHelper._normalize_languages(languages)
+    cache_key = (language_key, bool(use_gpu))
+    helper = _ocr_helper_instances.get(cache_key)
+    if helper is None:
+        helper = OCRHelper(languages=language_key, use_gpu=bool(use_gpu))
+        _ocr_helper_instances[cache_key] = helper
+    return helper
