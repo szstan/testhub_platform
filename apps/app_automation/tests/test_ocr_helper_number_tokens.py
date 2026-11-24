@@ -9,7 +9,7 @@ from apps.app_automation.utils.ocr_helper import OCRHelper
 
 @pytest.fixture
 def number_helper(monkeypatch):
-    def fake_recognize_text(self, text, use_cache=True):
+    def fake_recognize_text(self, text, use_cache=True, *, deadline=None):
         return text
 
     monkeypatch.setattr(OCRHelper, 'recognize_text', fake_recognize_text)

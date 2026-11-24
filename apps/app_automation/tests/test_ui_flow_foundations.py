@@ -77,7 +77,7 @@ def test_unresolved_variable_references_fail_with_the_reference_name(tmp_path):
         runner._render_value('{{local.missing}}')
 
 
-def test_api_response_is_available_as_last_and_step_output_without_sensitive_logs(tmp_path, caplog):
+def test_api_response_is_redacted_in_outputs_without_sensitive_logs(tmp_path, caplog):
     runner = make_runner(tmp_path)
     body = {'account': {'token': 'body-private-token', 'active': False}}
     response = SimpleNamespace(
@@ -105,8 +105,11 @@ def test_api_response_is_available_as_last_and_step_output_without_sensitive_log
         result = runner.run([step], runtime={'retry_times': 0})
 
     request.assert_called_once()
-    assert result['outputs']['last']['body'] == body
-    assert runner.context['steps']['login-step'] == result['outputs']['last']
+    assert result['outputs']['last']['body'] == {
+        'account': {'token': '[REDACTED]', 'active': False},
+    }
+    assert result['outputs']['last']['headers']['Set-Cookie'] == '[REDACTED]'
+    assert runner.context['steps']['login-step']['body'] == body
     assert runner.context['local']['token'] == 'body-private-token'
     assert runner._render_value('{{outputs.last.body.account.active}}') is False
     assert runner._render_value('{{steps.login-step.body.account.token}}') == 'body-private-token'
@@ -203,7 +206,7 @@ def test_swipe_to_checks_for_target_after_the_last_legacy_swipe(tmp_path):
     with (
         patch.object(flow_module, 'G', fake_global),
         patch.object(runner, '_resolve_selector', return_value='target'),
-        patch.object(flow_module, 'exists', side_effect=[False, True]),
+        patch.object(runner, '_resolve_action_target', side_effect=[None, 'target']),
         patch.object(flow_module, 'swipe') as swipe,
         patch.object(flow_module.time, 'sleep'),
     ):
@@ -218,7 +221,6 @@ def test_image_exists_click_chain_passes_both_thresholds_and_rejects_missing_tar
     main_target, fallback_target = object(), object()
     with (
         patch.object(runner, '_resolve_selector', side_effect=[main_target, fallback_target]) as resolve,
-        patch.object(flow_module, 'exists', return_value=True),
         patch.object(flow_module, 'touch') as touch,
         patch.object(flow_module.time, 'sleep'),
     ):
@@ -255,7 +257,7 @@ def test_foreach_assert_image_mode_uses_templates_without_ocr_and_fails_on_no_ma
         patch.object(runner, '_resolve_selector', return_value=(0, 0)),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template') as template,
-        patch.object(flow_module, 'exists', return_value=True),
+        patch.object(runner, '_image_lookup_once', return_value=(4, 5)),
         patch.object(flow_module, 'touch') as touch,
         patch.object(runner, '_get_ocr_helper') as get_ocr,
     ):
@@ -279,7 +281,7 @@ def test_foreach_assert_image_mode_uses_templates_without_ocr_and_fails_on_no_ma
         patch.object(runner, '_resolve_selector', return_value=(1, 1)),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template'),
-        patch.object(flow_module, 'exists', return_value=False),
+        patch.object(runner, '_image_lookup_once', return_value=None),
         patch.object(flow_module, 'touch'),
         pytest.raises(AssertionError, match='got 0'),
     ):
@@ -305,17 +307,17 @@ def test_foreach_assert_caps_waits_at_the_configured_timeout(tmp_path, monkeypat
         patch.object(runner, '_resolve_selector', return_value=(1, 1)),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template'),
-        patch.object(flow_module, 'exists', return_value=True),
+        patch.object(runner, '_image_lookup_once', return_value=(4, 5)),
         patch.object(flow_module, 'touch') as touch,
         patch.object(flow_module.time, 'sleep', side_effect=fake_sleep),
     ):
         runner._action_foreach_assert({
             'assert_type': 'image', 'expected_list': ['expected.png'],
             'click_selector_type': 'pos', 'click_selector': '1,1',
-            'max_loops': 5, 'interval': 5, 'timeout': 0.25,
+            'max_loops': 5, 'interval': 0.2, 'timeout': 0.25,
         })
 
-    assert waits == [0.25]
+    assert waits == [0.2]
     touch.assert_called_once()
 
 
@@ -326,7 +328,7 @@ def test_foreach_assert_preserves_zero_timeout_and_zero_min_match_legacy_values(
         patch.object(runner, '_resolve_selector', return_value=(1, 1)),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template'),
-        patch.object(flow_module, 'exists', return_value=True),
+        patch.object(runner, '_image_lookup_once', return_value=(4, 5)),
         patch.object(flow_module, 'touch') as touch,
     ):
         runner._action_foreach_assert({

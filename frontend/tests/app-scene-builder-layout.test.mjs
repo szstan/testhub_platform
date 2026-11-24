@@ -38,6 +38,7 @@ test('optional recorder and project data sections start collapsed without changi
     './NestedFlowEditor.vue': { default: {} },
     '@/stores/user': { useUserStore: () => ({ user: { id: 7 } }) },
     '@/api/app-automation': api,
+    '@/api/app-device-options': { getAllAppDevices: async () => [] },
   })
   instances.push(instance)
 

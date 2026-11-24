@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 from apps.app_automation.device_actions import (
-    DeviceActionError, DeviceActionUncertainError, clear_focused_input,
+    DeviceActionError, DeviceActionUncertainError, capture_screenshot, clear_focused_input,
     handle_permission, hide_keyboard, restart_application, send_key,
     start_application, stop_application,
 )
@@ -17,7 +17,7 @@ class FakeADB:
         self.response = response
         self.failures = failures or {}
 
-    def cmd(self, argv, timeout=None):
+    def cmd(self, argv, timeout=None, ensure_unicode=True):
         self.calls.append((argv, timeout))
         if len(self.calls) in self.failures:
             raise self.failures[len(self.calls)]
@@ -28,6 +28,37 @@ class FakeADB:
 
 def fake_device(response='', failures=None):
     return SimpleNamespace(adb=FakeADB(response, failures), touch=Mock())
+
+
+def test_capture_screenshot_uses_binary_screencap_with_deadline():
+    image = b'PNG bytes'
+    device = fake_device(image)
+    device.display_id = 2
+
+    assert capture_screenshot(device, timeout=0.75) == image
+    assert device.adb.calls == [(['shell', 'screencap', '-d', '2', '-p'], 0.75)]
+
+
+def test_capture_screenshot_failure_is_read_only_and_sanitized():
+    failure = subprocess.TimeoutExpired(
+        cmd=['adb', '-s', 'DEVICE-ID-SECRET', 'shell', 'screencap'], timeout=0.5,
+    )
+    device = fake_device(failure)
+
+    with pytest.raises(DeviceActionError) as error:
+        capture_screenshot(device, timeout=0.5)
+
+    assert type(error.value) is DeviceActionError
+    assert not isinstance(error.value, DeviceActionUncertainError)
+    assert 'DEVICE-ID-SECRET' not in str(error.value)
+
+
+def test_zero_timeout_permission_probe_is_one_bounded_hierarchy_read():
+    device = fake_device('<hierarchy />')
+
+    assert handle_permission(device, 'allow', timeout=0, optional=True) is False
+    assert device.adb.calls == [(['shell', 'uiautomator', 'dump', '/dev/tty'], 2.0)]
+    device.touch.assert_not_called()
 
 
 @pytest.mark.parametrize(('key', 'code'), [

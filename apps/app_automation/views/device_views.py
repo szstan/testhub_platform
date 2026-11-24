@@ -7,6 +7,7 @@ import os
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied
+from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
@@ -24,9 +25,13 @@ from ..serializers import AppDeviceSerializer
 from ..managers.device_manager import DeviceManager
 from ..device_pool import (
     DeviceLeaseError,
+    DeviceActionBusy,
     acquire_device,
+    begin_device_management_action,
+    finish_device_management_action,
     heartbeat_device,
     release_device,
+    release_device_snapshot,
     reap_expired_device_leases,
     is_device_lease_active,
 )
@@ -66,14 +71,26 @@ def _pending_action_blocks_update(device, changes):
     )
 
 
-def _upsert_discovered_device(device_id, defaults):
-    """Refresh discovery fields without overwriting a live worker lease."""
+def _snapshot_device_authority_revisions():
+    """Read device revisions before external discovery I/O without locking rows."""
+    return dict(AppDevice.objects.values_list('device_id', 'updated_at'))
+
+
+def _upsert_discovered_device(device_id, defaults, *, expected_revision):
+    """Apply discovery fields only if the row is unchanged since the scan began."""
     with transaction.atomic():
-        device, created = AppDevice.objects.select_for_update().get_or_create(
-            device_id=device_id,
-            defaults=defaults,
-        )
-        if created:
+        device = AppDevice.objects.select_for_update().filter(device_id=device_id).first()
+        if device is None:
+            if expected_revision is not None:
+                return None
+            device, created = AppDevice.objects.get_or_create(
+                device_id=device_id,
+                defaults=defaults,
+            )
+            if not created:
+                return device
+            return device
+        if expected_revision is None or device.updated_at != expected_revision:
             return device
         for field, value in defaults.items():
             setattr(device, field, value)
@@ -131,9 +148,16 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     serializer_class = AppDeviceSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = AppPagination
-    filter_backends = [DjangoFilterBackend]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ['status', 'connection_type']
     search_fields = ['device_id', 'name']
+    ordering_fields = ['id']
+
+    def list(self, request, *args, **kwargs):
+        if request.query_params.get('consistent') == '1':
+            from ..device_listing import list_consistent_devices
+            return list_consistent_devices(self, request)
+        return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -201,6 +225,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             logger.info(f"使用 ADB 路径: {adb_path}")
             
             manager = DeviceManager(adb_path=adb_path)
+            authority_revisions = _snapshot_device_authority_revisions()
             devices_info = manager.list_devices()
             
             # 更新或创建设备记录
@@ -238,8 +263,10 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                             'connection_type': connection_type,
                         },
                     },
+                    expected_revision=authority_revisions.get(device_info['device_id']),
                 )
-                db_devices.append(device)
+                if device is not None:
+                    db_devices.append(device)
             
             # 返回序列化后的数据库对象
             return Response({
@@ -282,19 +309,30 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def unlock(self, request, pk=None):
-        """释放设备"""
+        """Release the current generation, requiring a token for token-backed leases."""
         device = self.get_object()
-        
-        if device.locked_by and device.locked_by != request.user:
+
+        if device.locked_by and device.locked_by_id != request.user.id:
             return Response({
                 'success': False,
                 'message': '无权释放他人锁定的设备'
             }, status=status.HTTP_403_FORBIDDEN)
-        
-        if not device.unlock():
+
+        try:
+            released = release_device_snapshot(
+                device.pk,
+                request.user,
+                device.lease_generation,
+                request.data.get('lease_token', ''),
+            )
+        except DeviceLeaseError as exc:
+            return Response({'success': False, 'message': str(exc)},
+                            status=status.HTTP_403_FORBIDDEN)
+        if not released:
             return Response({'success': False, 'message': '设备租约已变更，请刷新后重试'},
                             status=status.HTTP_409_CONFLICT)
 
+        device.refresh_from_db()
         return Response({
             'success': True,
             'message': '设备释放成功',
@@ -303,45 +341,92 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def disconnect(self, request, pk=None):
-        """断开远程设备连接"""
+        """Disconnect a remote device under a short committed admission fence."""
         device = self.get_object()
-        if not is_app_admin(request.user) and device.locked_by_id != request.user.id:
+        admin = is_app_admin(request.user)
+        if not admin and device.locked_by_id != request.user.id:
             return Response({'success': False, 'message': '无权断开该设备'},
                             status=status.HTTP_403_FORBIDDEN)
-
-        # 只有远程设备可以断开
         if device.connection_type not in ['remote', 'remote_emulator']:
             return Response({
                 'success': False,
                 'message': '只能断开远程设备的连接'
             }, status=status.HTTP_400_BAD_REQUEST)
-        
+
         try:
-            adb_path = get_adb_path()
-            manager = DeviceManager(adb_path=adb_path)
+            device, temporary_lease, action_epoch = begin_device_management_action(
+                device.pk,
+                request.user,
+                request.data.get('lease_token', ''),
+                admin=admin,
+                allowed_connection_types=('remote', 'remote_emulator'),
+            )
+        except AppDevice.DoesNotExist:
+            return Response({'detail': '设备不存在'}, status=status.HTTP_404_NOT_FOUND)
+        except DeviceActionBusy as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+        except DeviceLeaseError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+
+        generation = device.lease_generation
+        owner_id = device.locked_by_id
+        try:
+            manager = DeviceManager(adb_path=get_adb_path())
             success = manager.disconnect_device(f'{device.ip_address}:{device.port}')
-            
-            if not success:
-                return Response({
-                    'success': False,
-                    'message': '断开设备失败'
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
-            # 更新设备状态为离线
-            device.status = 'offline'
-            device.save()
-            
-            return Response({
-                'success': True,
-                'message': f'设备 {device.name or device.device_id} 已断开连接',
-                'device': AppDeviceSerializer(device).data
-            })
-            
-        except Exception as e:
+        except Exception as exc:
+            logger.warning('APP device disconnect outcome unknown (error_type=%s)', type(exc).__name__)
+            try:
+                finish_device_management_action(
+                    device.pk, owner_id, generation, action_epoch, quarantine=True,
+                )
+            except Exception:
+                logger.error('APP device disconnect quarantine could not be committed')
             return Response({
                 'success': False,
-                'message': f'断开设备失败: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                'recovery_required': True,
+                'message': '断开结果无法确认，设备已隔离并保留占用，请管理员恢复设备',
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        if success is not True:
+            try:
+                finish_device_management_action(
+                    device.pk, owner_id, generation, action_epoch, quarantine=True,
+                )
+            except Exception:
+                logger.error('APP device disconnect quarantine could not be committed')
+            return Response({
+                'success': False,
+                'recovery_required': True,
+                'message': '断开结果无法确认，设备已隔离并保留占用，请管理员恢复设备',
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        try:
+            device = finish_device_management_action(
+                device.pk,
+                owner_id,
+                generation,
+                action_epoch,
+                status='offline',
+                release_reservation=temporary_lease,
+            )
+        except Exception:
+            try:
+                finish_device_management_action(
+                    device.pk, owner_id, generation, action_epoch, quarantine=True,
+                )
+            except Exception:
+                logger.error('APP device disconnect quarantine could not be committed')
+            return Response({
+                'success': False,
+                'recovery_required': True,
+                'message': '断开已返回成功但状态未能确认，设备占用已保留，请管理员恢复设备',
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({
+            'success': True,
+            'message': f'设备 {device.name or device.device_id} 已断开连接',
+            'device': AppDeviceSerializer(device).data
+        })
     
     @action(detail=False, methods=['post'])
     def connect(self, request):
@@ -367,6 +452,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
 
             adb_path = get_adb_path()
             manager = DeviceManager(adb_path=adb_path)
+            authority_revisions = _snapshot_device_authority_revisions()
             device_info = manager.connect_device(ip_address, port)
 
             # 创建或更新设备记录
@@ -380,7 +466,13 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                     'port': port,
                     'connection_type': 'remote_emulator',
                 },
+                expected_revision=authority_revisions.get(device_info['device_id']),
             )
+            if device is None:
+                return Response(
+                    {'success': False, 'message': '设备状态已变化，请刷新后重试'},
+                    status=status.HTTP_409_CONFLICT,
+                )
             
             return Response({
                 'success': True,
@@ -421,6 +513,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 request.user,
                 request.data.get('lease_token', ''),
                 force=is_app_admin(request.user),
+                expected_generation=device.lease_generation,
             )
         except DeviceLeaseError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
@@ -514,8 +607,10 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                 device.maintenance_mode = True
                 device.health_status = 'unknown'
                 device.device_action_pending = False
+                device.device_action_epoch += 1
                 device.save(update_fields=[
-                    'maintenance_mode', 'health_status', 'device_action_pending', 'updated_at'
+                    'maintenance_mode', 'health_status', 'device_action_pending',
+                    'device_action_epoch', 'updated_at'
                 ])
                 now = timezone.now()
                 for execution in active:

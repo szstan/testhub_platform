@@ -385,12 +385,15 @@ def expand_steps(
     source_size = _check_payload(steps, "steps", max_payload_bytes)
     budget = {"steps": 0, "source_bytes": source_size}
 
-    def append_checked(target: list[dict[str, Any]], step: dict[str, Any], path: str) -> None:
-        target.append(step)
-        size = _encoded_size(target, path)
-        if size > max_payload_bytes:
-            target.pop()
+    def append_checked(target: list[dict[str, Any]], step: dict[str, Any], path: str,
+                       current_size: int) -> int:
+        # Count each appended value once; re-encoding every growing prefix is
+        # quadratic for an otherwise bounded, valid component.
+        next_size = current_size + _encoded_size(step, path) + (1 if target else 0)
+        if next_size > max_payload_bytes:
             raise ExpansionLimitError(f"expanded payload exceeds the {max_payload_bytes}-byte limit")
+        target.append(step)
+        return next_size
 
     def expand_sequence(
         source: list[dict[str, Any]],
@@ -402,6 +405,7 @@ def expand_steps(
         if depth > max_depth:
             raise ExpansionLimitError(f"component expansion exceeds the depth limit of {max_depth}")
         expanded: list[dict[str, Any]] = []
+        expanded_size = 2  # Opening and closing list brackets.
         for index, original in enumerate(source):
             step_path = f"{path}[{index}]"
             if original.get("kind") == "custom":
@@ -424,7 +428,7 @@ def expand_steps(
                         inline_steps, inline_params, active, depth + 1, f"{step_path}.steps"
                     )
                     for child in children:
-                        append_checked(expanded, child, path)
+                        expanded_size = append_checked(expanded, child, path, expanded_size)
                     continue
 
                 reference = {
@@ -499,7 +503,7 @@ def expand_steps(
                     f"template {component_type}@{version}.steps",
                 )
                 for child in children:
-                    append_checked(expanded, child, path)
+                    expanded_size = append_checked(expanded, child, path, expanded_size)
                 continue
 
             concrete = {}
@@ -529,7 +533,7 @@ def expand_steps(
             budget["steps"] += 1
             if budget["steps"] > max_steps:
                 raise ExpansionLimitError(f"expanded step count exceeds the limit of {max_steps}")
-            append_checked(expanded, concrete, path)
+            expanded_size = append_checked(expanded, concrete, path, expanded_size)
         return expanded
 
     try:

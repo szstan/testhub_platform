@@ -63,11 +63,11 @@ def test_wait_rejects_region_instead_of_passing_it_to_image_matching():
     runner = UiFlowRunner.__new__(UiFlowRunner)
     with (
         patch.object(runner, '_resolve_selector', return_value=(10, 20, 30, 40)),
-        patch('apps.app_automation.runners.ui_flow_runner.wait') as wait,
+        patch.object(runner, '_image_lookup_once') as lookup,
         pytest.raises(ValueError, match='等待元素出现需要图片元素'),
     ):
         runner._action_wait({'timeout': 2})
-    wait.assert_not_called()
+    lookup.assert_not_called()
 
 
 def test_ocr_region_remains_a_four_coordinate_rectangle():

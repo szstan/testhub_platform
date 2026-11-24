@@ -107,6 +107,14 @@ def classify_app_test_result(report_result):
     if failed:
         return 'completed', 'failed', ''
     exit_code = report_result.get('exit_code')
+    if (
+        report_result.get('success') is False
+        and type(exit_code) is int and exit_code == 0
+        and report_result.get('error') == 'Allure report generation failed after pytest completed'
+    ):
+        # This is a fixed, server-owned stage message. Never echo arbitrary
+        # worker exception text, which may include paths or sensitive inputs.
+        return 'error', None, '测试进程已结束，但 Allure 报告生成失败，请检查报告配置'
     if report_result.get('success') is False or (exit_code is not None and exit_code != 0):
         return 'error', None, '测试进程异常退出，无法确认执行结果'
     if not total:
@@ -475,7 +483,7 @@ def execute_app_test_task(
 ):
     """
     异步执行APP测试任务
-    
+
     Args:
         execution_id: AppTestExecution 的 ID
         package_name: 可选的应用包名
@@ -495,7 +503,7 @@ def execute_app_test_task(
         settle_app_execution_failure,
     )
     from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
-    
+
     execution = None
     device = None
     bound_generation = lease_generation
@@ -504,21 +512,23 @@ def execute_app_test_task(
     device_heartbeat = None
     worker_claimed = False
     unsafe_termination = False
+    diagnostic_requested = step_index is not None or expected_case_updated_at is not None
+    pre_dispatch_diagnostic_failure = False
+    device_io_admitted = False
     original_worker_cwd = os.getcwd()
-    
+
     try:
         execution = AppTestExecution.objects.select_related('device', 'user', 'test_case').get(id=execution_id)
         test_case = execution.test_case
-        diagnostic_requested = step_index is not None or expected_case_updated_at is not None
-        if diagnostic_requested:
-            from .scene_execution import validate_diagnostic_selection
-            validate_diagnostic_selection(test_case, step_index, expected_case_updated_at)
         if lease_generation is not None and execution.device_lease_generation != lease_generation:
             raise DeviceLeaseError('入队设备租约世代与执行记录不匹配')
         if bound_generation is None:
             bound_generation = execution.device_lease_generation
 
         device = execution.device
+        if diagnostic_requested:
+            from .scene_execution import validate_diagnostic_selection
+            validate_diagnostic_selection(test_case, step_index, expected_case_updated_at)
         if not claim_app_execution_batch([execution.pk]):
             return
         worker_claimed = True
@@ -572,7 +582,7 @@ def execute_app_test_task(
         execution.progress = 10
         execution.save(update_fields=['progress'])
         send_execution_update(execution_id, status='running', progress=10, message='正在准备测试环境')
-        
+
         if package_name:
             final_package_name = package_name
         else:
@@ -585,6 +595,11 @@ def execute_app_test_task(
                 'step_index': step_index,
                 'expected_case_updated_at': expected_case_updated_at,
             }
+        def admit_device_io():
+            nonlocal device_io_admitted
+            mark_device_action_pending(execution.pk)
+            device_io_admitted = True
+
         report_result = executor.run_tests(
             test_case_id=test_case.id,
             device_id=device.device_id,
@@ -592,20 +607,30 @@ def execute_app_test_task(
             execution_id=execution_id,
             username=execution.user.username if execution.user else 'unknown',
             cancel_check=cancel_check,
-            before_device_io=lambda: mark_device_action_pending(execution.pk),
+            before_device_io=admit_device_io,
             **diagnostic_kwargs,
+        )
+        pre_dispatch_diagnostic_failure = (
+            diagnostic_requested
+            and not device_io_admitted
+            and isinstance(report_result, dict)
+            and report_result.get('success') is False
+            and report_result.get('exit_code') is None
+            and report_result.get('device_io_admitted') is False
+            and report_result.get('pytest_process_started') is False
+            and report_result.get('pytest_process_completed') is False
         )
         cancel_check()
         if worker_io_completed_normally(report_result):
             clear_device_action_pending(execution.pk)
-        
+
         # 从数据库重新读取最新进度（子进程中的回调可能已经更新过）
         execution.refresh_from_db()
-        
+
         if report_result.get('report_path'):
             execution.report_path = report_result['report_path']
             logger.info("APP test report generated")
-        
+
         test_results = report_result.get('test_results', {})
         execution.total_steps = test_results.get('total', 0)
         execution.passed_steps = test_results.get('passed', 0)
@@ -613,7 +638,7 @@ def execute_app_test_task(
         execution.failed_steps = test_results.get('failed', 0)
         if test_results.get('broken', 0):
             logger.info(f"检测到 broken 用例 {test_results.get('broken')} 个（已计入失败统计）。")
-        
+
         execution.progress = 95
         execution.save(update_fields=['progress', 'report_path', 'total_steps', 'passed_steps', 'failed_steps'])
         send_execution_update(
@@ -623,7 +648,7 @@ def execute_app_test_task(
             message='正在生成测试报告',
             report_path=execution.report_path
         )
-        
+
         # 3. 完成测试 — 结合进程退出状态、断言与 Allure 结果。
         execution.status, execution.result, execution.error_message = classify_app_test_result(report_result)
         execution.finished_at = timezone.now()
@@ -659,7 +684,7 @@ def execute_app_test_task(
             finished_at=execution.finished_at,
             result=execution.result,
         )
-        
+
         logger.info('APP测试执行完成: 状态: %s, 结果: %s', execution.status, execution.result)
 
         # 定时任务通知和 durable schedule completion
@@ -686,6 +711,7 @@ def execute_app_test_task(
     except AppTestExecution.DoesNotExist:
         logger.error("APP execution record not found")
     except Exception as e:
+        pre_dispatch_diagnostic_failure = diagnostic_requested and not device_io_admitted
         safe_error = _safe_app_error_message(e)
         logger.error("APP test execution failed (error_type=%s)", type(e).__name__)
         unsafe_termination = isinstance(e, AppTestProcessTerminationError)
@@ -737,6 +763,8 @@ def execute_app_test_task(
             heartbeat.stop()
         if release_device_lease and not unsafe_termination and device and execution and execution.user:
             should_release = bool(scheduled_task_id) or (
+                pre_dispatch_diagnostic_failure and execution.release_device_lease_on_stop
+            ) or (
                 worker_claimed and AppTestExecution.objects.filter(
                     pk=execution.pk, stop_requested=True
                 ).exists()
@@ -1198,11 +1226,11 @@ def check_and_release_expired_devices():
     检查并释放过期锁定的设备
     """
     from .device_pool import reap_expired_device_leases
-    
+
     try:
         released_count = reap_expired_device_leases()
         logger.info(f"检查设备锁定完成，释放 {released_count} 个设备")
-        
+
     except Exception as e:
         logger.error(
             "APP expired-device lease cleanup failed (error_type=%s)", type(e).__name__

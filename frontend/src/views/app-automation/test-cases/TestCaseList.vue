@@ -307,7 +307,7 @@ import {
   getAppDevice,
   batchExecuteTestCases,
 } from '@/api/app-automation'
-import { getDeviceList } from '@/api/app-automation'
+import { getAllAppDevices } from '@/api/app-device-options'
 import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
 import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
 import { buildWebSocketUrl, issueWebSocketTicket } from '@/utils/websocket'
@@ -389,8 +389,7 @@ const loadProjectList = async () => {
 const loadDevices = async () => {
   devicesLoading.value = true
   try {
-    const res = await getDeviceList({ page_size: 100 })
-    availableDevices.value = normalizeAppDeviceList(res.data)
+    availableDevices.value = normalizeAppDeviceList(await getAllAppDevices())
   } catch {
     availableDevices.value = []
   } finally {

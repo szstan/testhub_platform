@@ -78,7 +78,7 @@
                                     @update:model-value="updateTypedParameterInput(element, field, $event)"
                                 />
                                 <NestedFlowEditor
-                                    v-else-if="isStepArrayField(field, getProperty(element, field))"
+                                    v-else-if="isStepArrayField(element, field, getProperty(element, field))"
                                     :model-value="element.config[field] || []"
                                     :label="getFieldLabel(field, element)"
                                     :components="components"
@@ -105,11 +105,13 @@
                                 </el-select>
                                 <el-switch
                                     v-else-if="getProperty(element, field)?.type === 'boolean'"
-                                    v-model="element.config[field]"
+                                    :model-value="getTypedScalarControlValue(element, field)"
+                                    @update:model-value="element.config[field] = $event"
                                 />
                                 <el-input-number
                                     v-else-if="getProperty(element, field)?.type === 'number' || getProperty(element, field)?.type === 'integer'"
-                                    v-model="element.config[field]"
+                                    :model-value="getTypedScalarControlValue(element, field)"
+                                    @update:model-value="element.config[field] = $event"
                                     :min="getNumberRule(element, field).min"
                                     :max="getNumberRule(element, field).max"
                                     :step="getNumberRule(element, field).step"
@@ -210,12 +212,32 @@ const hasInlineComponentSteps = step => step?.kind === 'custom'
     && step.version === undefined
     && Array.isArray(step.steps)
 
+const FLOW_CHILD_FIELDS = ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']
+const isCustomComponentStep = step => step?.kind === 'custom' || step?.version !== undefined
+const normalizeFlowChildren = step => {
+    step.id ||= makeId()
+    if (!step.config || typeof step.config !== 'object' || Array.isArray(step.config)) step.config = {}
+    if (isCustomComponentStep(step)) {
+        if (hasInlineComponentSteps(step)) step.steps = step.steps.map(normalizeFlowChildren)
+        return step
+    }
+    for (const field of FLOW_CHILD_FIELDS) {
+        if (Array.isArray(step.config[field])) step.config[field] = step.config[field].map(normalizeFlowChildren)
+        if (Array.isArray(step[field])) step[field] = step[field].map(normalizeFlowChildren)
+    }
+    return step
+}
+
 const regenerateStepTreeIds = step => {
     step.id = makeId()
-    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-        if (Array.isArray(step.config?.[field])) step.config[field].forEach(regenerateStepTreeIds)
+    if (isCustomComponentStep(step)) {
+        if (hasInlineComponentSteps(step)) step.steps.forEach(regenerateStepTreeIds)
+    } else {
+        for (const field of FLOW_CHILD_FIELDS) {
+            if (Array.isArray(step.config?.[field])) step.config[field].forEach(regenerateStepTreeIds)
+            if (Array.isArray(step[field])) step[field].forEach(regenerateStepTreeIds)
+        }
     }
-    if (Array.isArray(step.steps)) step.steps.forEach(regenerateStepTreeIds)
     return step
 }
 
@@ -243,6 +265,7 @@ const getTypedParameterInput = (step, field) => {
 }
 const parseTypedParameterLiteral = (value, property = {}) => {
     const type = property.type
+    if (value === undefined || value === null || value === '') return { valid: true, value }
     const typedResult = literal => {
         if (Array.isArray(property.enum) && property.enum.length) {
             const matches = property.enum.some(option => {
@@ -291,6 +314,14 @@ const parseTypedParameterLiteral = (value, property = {}) => {
     }
     return { valid: false }
 }
+const getTypedScalarControlValue = (step, field) => {
+    const value = step?.config?.[field]
+    if (!isVersionedTypedParameter(step, field)) return value
+    const property = getProperty(step, field)
+    const parsed = parseTypedParameterLiteral(value, property)
+    if (property.type === 'boolean') return parsed.valid && parsed.value === true
+    return parsed.valid && typeof parsed.value === 'number' ? parsed.value : null
+}
 const setTypedParameterExpressionMode = (step, field, enabled) => {
     const key = getErrorKey(step, field)
     if (enabled) {
@@ -329,9 +360,10 @@ const getOptions = (field, step) => {
     }
     return props.fieldOptions(field, step, property) || []
 }
-const isStepArrayField = (field, property) => props.depth < props.maxDepth
+const isStepArrayField = (step, field, property) => props.depth < props.maxDepth
+    && !isCustomComponentStep(step)
     && property?.type === 'array'
-    && ['then_steps', 'else_steps', 'steps', 'try_steps', 'catch_steps', 'finally_steps'].includes(field)
+    && FLOW_CHILD_FIELDS.includes(field)
 const isStructuredField = (step, field) => ['array', 'object'].includes(getProperty(step, field)?.type)
 const isSensitive = (step, field) => {
     const property = getProperty(step, field)
@@ -406,6 +438,8 @@ const addStep = () => {
     if (source.kind === 'custom' && source.version === undefined && Array.isArray(source.steps)) {
         step.steps = clone(source.steps)
         step.steps.forEach(regenerateStepTreeIds)
+    } else {
+        normalizeFlowChildren(step)
     }
     steps.value = [...steps.value, step]
     expandedStepId.value = step.id

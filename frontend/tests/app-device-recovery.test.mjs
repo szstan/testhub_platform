@@ -156,9 +156,9 @@ test('admin recovery confirms manual worker/device verification and refreshes th
   await state.recoverPendingAction(device)
 
   assert.deepEqual(plain(calls), [
-    ['list', { page: 1, page_size: 1000 }],
+    ['list', { ordering: 'id', page: 1, page_size: 100 }],
     ['recover', 31, 7],
-    ['list', { page: 1, page_size: 1000 }],
+    ['list', { ordering: 'id', page: 1, page_size: 100 }],
   ])
   assert.equal(confirmations[0].args[0], 'appAutomation.device.messages.recoverPendingActionConfirm')
   assert.equal(confirmations[0].args[2].type, 'warning')
@@ -178,7 +178,7 @@ test('cancelling either confirmation leaves pending markers and maintenance unch
   await state.recoverPendingAction(pendingDevice)
   await state.clearMaintenanceMode(noPendingDevice)
 
-  assert.deepEqual(plain(calls), [['list', { page: 1, page_size: 1000 }]])
+  assert.deepEqual(plain(calls), [['list', { ordering: 'id', page: 1, page_size: 100 }]])
   assert.equal(messages.length, 0)
   assert.equal(pendingDevice.maintenance_mode, true)
 })
@@ -199,9 +199,9 @@ test('maintenance clearing is admin-only, requires an explicit false pending mar
   await state.clearMaintenanceMode({ ...pendingDevice, has_pending_action: false })
 
   assert.deepEqual(plain(calls), [
-    ['list', { page: 1, page_size: 1000 }],
+    ['list', { ordering: 'id', page: 1, page_size: 100 }],
     ['clear-maintenance', 31, 7],
-    ['list', { page: 1, page_size: 1000 }],
+    ['list', { ordering: 'id', page: 1, page_size: 100 }],
   ])
   assert.equal(confirmations[0].args[0], 'appAutomation.device.messages.clearMaintenanceConfirm')
 })

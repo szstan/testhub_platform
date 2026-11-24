@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 
 class DeviceActionError(RuntimeError):
@@ -37,6 +38,9 @@ _PERMISSION_SUFFIXES = {
     'while_in_use': ('permission_allow_foreground_only_button',),
 }
 _PERMISSION_PACKAGES = ('com.android.permissioncontroller', 'com.google.android.permissioncontroller', 'com.android.packageinstaller')
+_MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
+_MAX_SCREENSHOT_TIMEOUT = 30.0
+_ZERO_TIMEOUT_PERMISSION_PROBE_TIMEOUT = 2.0
 
 
 def _adb(device):
@@ -63,6 +67,38 @@ def _command(device, arguments, *, timeout=10, mutation=False):
     if isinstance(result, bytes):
         return result.decode('utf-8', errors='replace')
     return str(result or '')
+
+
+def capture_screenshot(device, *, timeout=2.0):
+    """Capture PNG bytes through a timed, read-only ADB screencap command."""
+    if (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout) or not 0 < timeout <= _MAX_SCREENSHOT_TIMEOUT
+    ):
+        raise DeviceActionError('Android screenshot timeout must be greater than 0 and at most 30 seconds')
+
+    adb = _adb(device)
+    arguments = ['shell', 'screencap']
+    display_id = getattr(device, 'display_id', None)
+    if display_id is not None:
+        display_id = str(display_id)
+        if not display_id.isascii() or not display_id.isdecimal():
+            raise DeviceActionError('Android display identifier is invalid')
+        arguments.extend(['-d', display_id])
+    arguments.append('-p')
+    deadline = time.monotonic() + float(timeout)
+    try:
+        image = adb.cmd(arguments, timeout=float(timeout), ensure_unicode=False)
+    except Exception:
+        raise DeviceActionError('Android screenshot failed or timed out; check the device connection') from None
+    if time.monotonic() >= deadline:
+        raise DeviceActionError('Android screenshot timed out; check the device connection')
+    if not isinstance(image, (bytes, bytearray, memoryview)):
+        raise DeviceActionError('Android screenshot returned invalid image data')
+    image = bytes(image)
+    if not image or len(image) > _MAX_SCREENSHOT_BYTES:
+        raise DeviceActionError('Android screenshot returned invalid image data')
+    return image
 
 
 def validate_package_name(package_name):
@@ -124,13 +160,14 @@ def handle_permission(device, choice, *, timeout=5, optional=True, finder=None):
         raise DeviceActionError('权限弹窗等待时间必须在 0 到 60 秒之间')
     adb = _adb(device)
     if finder is None:
-        from .native_locator import find_native_element_any
-        finder = find_native_element_any
+        from .native_locator import find_native_element_any, probe_native_element_any
+        finder = probe_native_element_any if timeout == 0 else find_native_element_any
     if not callable(getattr(device, 'touch', None)):
         raise DeviceActionError('当前设备不支持点击操作')
     identifiers = [f'{package}:id/{suffix}' for package in _PERMISSION_PACKAGES for suffix in _PERMISSION_SUFFIXES[choice]]
+    probe_timeout = _ZERO_TIMEOUT_PERMISSION_PROBE_TIMEOUT if timeout == 0 else timeout
     try:
-        match = finder(adb, 'resource_id', identifiers, timeout=timeout, interval=0.5,
+        match = finder(adb, 'resource_id', identifiers, timeout=probe_timeout, interval=0.5,
                        match='exact', active_only=True)
     except Exception:
         raise DeviceActionError('无法读取系统权限弹窗，请检查设备连接') from None

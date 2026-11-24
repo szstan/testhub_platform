@@ -18,6 +18,8 @@ const validProps = {
   nested: false,
   dirty: false,
   recording: false,
+  recorderBusy: false,
+  caseUpdatedAt: '2026-11-24T11:00:00Z',
   deviceId: 31,
 }
 
@@ -138,11 +140,13 @@ test('SceneBuilder supplies the selected saved root step, recorder state, and de
     ':nested="selectedSubIndex !== null"',
     ':dirty="isSceneDirty"',
     ':recording="recorderEnabled"',
+    ':recorder-busy="recorderDiagnosticBusy"',
+    ':case-updated-at="loadedCaseUpdatedAt"',
     ':device-id="recorderDeviceId"',
   ]) assert.ok(mount.includes(binding), `missing ${binding}`)
 
   const keys = [
-    'title', 'run', 'saveFirst', 'stopRecording', 'selectRootStep', 'selectDevice',
+    'title', 'run', 'saveFirst', 'caseRevisionUnavailable', 'stopRecording', 'selectRootStep', 'selectDevice',
     'ready', 'viewResult', 'accountChanged', 'submitted', 'failed',
   ]
   for (const locale of ['zh-cn', 'en']) {
@@ -174,6 +178,7 @@ test('diagnostics setup does not touch a device or submit until explicitly invok
     auto_lock: true,
     expected_user_id: 7,
     step_index: 2,
+    expected_case_updated_at: '2026-11-24T11:00:00Z',
   }]])
 })
 
@@ -184,6 +189,8 @@ test('unsaved, dirty, nested, recording, unselected, and device-less contexts ar
     [{ nested: true }, 'selectRootStep'],
     [{ stepIndex: null }, 'selectRootStep'],
     [{ recording: true }, 'stopRecording'],
+    [{ recorderBusy: true }, 'stopRecording'],
+    [{ caseUpdatedAt: '' }, 'caseRevisionUnavailable'],
     [{ deviceId: null }, 'selectDevice'],
   ]
   for (const [props, reason] of cases) {

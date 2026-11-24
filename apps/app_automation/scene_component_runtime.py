@@ -7,7 +7,7 @@ import re
 
 from .access import project_accessible
 from .component_templates import ComponentTemplateError, expand_steps
-from .models import AppProjectComponent
+from .models import AppCustomComponent, AppProjectComponent
 
 
 class SceneComponentError(ValueError):
@@ -18,12 +18,25 @@ _STEP_FIELDS = ('steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps',
 _MAX_STEPS = 1000
 _MAX_DEPTH = 16
 _MAX_BYTES = 1_048_576
+_LEGACY_BUILTIN_ACTIONS = frozenset({
+    'click', 'touch', 'input', 'text', 'swipe', 'double_click', 'long_press', 'drag',
+    'swipe_to', 'image_exists_click', 'image_exists_click_chain', 'set_variable',
+    'unset_variable', 'extract_output', 'extract_text', 'screenshot', 'api_request',
+    'clear_input', 'key_event', 'hide_keyboard', 'app_start', 'app_stop', 'app_restart',
+    'handle_permission', 'wait_element', 'assert_element', 'assert_text', 'assert_value',
+    'assert_response', 'wait', 'sleep', 'if', 'loop', 'sequence', 'try', 'assert',
+    'foreach_assert',
+})
 _SCENE_VARIABLE_REFERENCE = re.compile(
     r'(?:\{\{\s*([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\}\}'
     r'|\$\{\s*([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\})\Z'
 )
 _PARAM_REFERENCE = re.compile(r'^\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$')
 _PARAM_TOKEN = re.compile(r'\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}')
+_LEGACY_LOCAL_REFERENCE = re.compile(
+    r'(?:\{\{\s*(?:local\.)?([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\}\}'
+    r'|\$\{\s*(?:local\.)?([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\})\Z'
+)
 _SENSITIVE_NAME = re.compile(r'password|passwd|secret|token|credential|api[_-]?key|密码|密钥|令牌', re.IGNORECASE)
 
 
@@ -422,6 +435,134 @@ def validate_component_definition_sensitive_data(schema, configured_defaults, st
     )
 
 
+def sensitive_component_parameter_names(schema, configured_defaults, steps):
+    if type(schema) is not dict or type(configured_defaults) is not dict:
+        _validation_failure()
+    properties = schema.get('properties', {})
+    if type(properties) is not dict:
+        _validation_failure()
+    sensitive = {
+        name for name, spec in properties.items()
+        if type(name) is str and (
+            _SENSITIVE_NAME.search(name) or _schema_contains_sensitive(spec)
+        )
+    }
+    sensitive.update(
+        name for name in configured_defaults
+        if type(name) is str and _SENSITIVE_NAME.search(name)
+    )
+    sensitive.update(_sensitive_template_parameters(steps, legacy=True))
+    return sensitive
+
+
+def validate_legacy_component_configuration(
+    schema, configured_defaults, steps, supplied_values, *, stored_definition=None,
+):
+    """Validate sensitive parameters without weakening a server-owned contract."""
+    stored_sensitive = set()
+    if stored_definition is not None:
+        stored_sensitive = validate_legacy_component_configuration(
+            stored_definition.get('schema') or {},
+            stored_definition.get('default_config') or {},
+            stored_definition.get('steps') or [],
+            supplied_values,
+        )
+    sensitive_names = sensitive_component_parameter_names(schema, configured_defaults, steps)
+    sensitive_names.update(stored_sensitive)
+    validate_sensitive_component_data(
+        schema, configured_defaults, sensitive_names=sensitive_names,
+        supplied_values=[supplied_values], allow_parameter_references=True,
+    )
+    _validate_expanded_sensitive_inputs(steps)
+    return sensitive_names
+
+
+def validate_legacy_component_references(flow):
+    """Validate referenced global/inline legacy component secret contracts."""
+    if isinstance(flow, dict):
+        flow = flow.get('steps', [])
+    if not isinstance(flow, list):
+        return
+
+    references = {}
+    budget = {'steps': 0}
+
+    def visit(sequence, depth=0):
+        if depth > _MAX_DEPTH or not isinstance(sequence, list):
+            _validation_failure()
+        for step in sequence:
+            budget['steps'] += 1
+            if budget['steps'] > _MAX_STEPS or not isinstance(step, dict):
+                _validation_failure()
+            if step.get('kind') == 'custom':
+                component_type = step.get('type')
+                if ((step.get('version') is None or isinstance(step.get('steps'), list))
+                        and isinstance(component_type, str) and component_type):
+                    references.setdefault(component_type, []).append(step)
+                inline_steps = step.get('steps')
+                if isinstance(inline_steps, list):
+                    visit(inline_steps, depth + 1)
+                continue
+            component_type = step.get('type')
+            if (
+                isinstance(component_type, str) and component_type
+                and component_type not in _LEGACY_BUILTIN_ACTIONS
+            ):
+                references.setdefault(component_type, []).append(step)
+            containers = [step]
+            config = step.get('config')
+            if isinstance(config, dict):
+                containers.append(config)
+            for container in containers:
+                for field in _STEP_FIELDS:
+                    nested = container.get(field)
+                    if nested is not None:
+                        if not isinstance(nested, list):
+                            _validation_failure()
+                        visit(nested, depth + 1)
+
+    visit(flow)
+    if not references:
+        return
+
+    definitions = {
+        definition['type']: definition
+        for definition in AppCustomComponent.objects.filter(
+            enabled=True, type__in=references,
+        ).values('type', 'schema', 'default_config', 'steps')
+    }
+    for component_type, invocations in references.items():
+        definition = definitions.get(component_type)
+        for invocation in invocations:
+            has_inline_contract = any(
+                field in invocation for field in ('schema', 'default_config', 'steps')
+            )
+            if definition is None and not has_inline_contract:
+                continue
+            schema = invocation.get('schema')
+            defaults = invocation.get('default_config')
+            steps = invocation.get('steps')
+            if definition is not None:
+                schema = definition.get('schema') if schema is None else schema
+                defaults = definition.get('default_config') if defaults is None else defaults
+                steps = definition.get('steps') if steps is None else steps
+            schema = {} if schema is None else schema
+            defaults = {} if defaults is None else defaults
+            steps = [] if steps is None else steps
+            config = invocation.get('config', {})
+            if config is None:
+                config = {}
+            if not isinstance(config, dict):
+                _validation_failure()
+            parameter_values = {
+                key: value for key, value in config.items()
+                if key not in {'type', 'name', 'kind', 'steps', 'schema', 'default_config', 'version'}
+            }
+            validate_legacy_component_configuration(
+                schema, defaults, steps, parameter_values, stored_definition=definition,
+            )
+
+
 def _effective_input_expression(step):
     config = step.get('config') if isinstance(step.get('config'), dict) else {}
     action = str(step.get('type', '')).lower()
@@ -444,7 +585,7 @@ def _sensitive_input_values(step):
     ]
 
 
-def _sensitive_template_parameters(steps):
+def _sensitive_template_parameters(steps, *, legacy=False):
 
     sensitive = set()
 
@@ -463,6 +604,12 @@ def _sensitive_template_parameters(steps):
                     and any(container.get('sensitive') is True for container in containers)):
                 for value in _sensitive_input_values(step):
                     parameter_names = _template_parameter_names(value)
+                    if legacy and isinstance(value, str):
+                        reference = _LEGACY_LOCAL_REFERENCE.fullmatch(value)
+                        if reference:
+                            name = reference.group(1) or reference.group(2)
+                            if name not in {'global', 'outputs', 'steps', 'runtime', 'params'}:
+                                parameter_names.add(name)
                     if isinstance(value, str) and parameter_names:
                         sensitive.update(parameter_names)
                     elif not _empty_sensitive_value(value) and not _safe_sensitive_value(value):

@@ -146,7 +146,27 @@ def probe_native_elements(
     return (result,)
 
 
-def _probe_native_element(adb, strategy, value, timeout, match, *, all_matches=False):
+def probe_native_element_any(
+    adb, strategy: str, values, timeout: float = 2.0, interval: float = 0.5,
+    match: str = "exact", *, active_only: bool = False,
+) -> Optional[NativeElementMatch]:
+    """Read one hierarchy and find the first active match among identifiers."""
+    if not isinstance(values, (list, tuple)) or not 1 <= len(values) <= 32:
+        raise NativeLocatorInputError("values must contain between 1 and 32 identifiers")
+    if not isinstance(active_only, bool):
+        raise NativeLocatorInputError("active_only must be a boolean")
+    for value in values:
+        _validate_lookup(strategy, value, timeout, interval, match)
+    if timeout <= 0:
+        raise NativeLocatorInputError("timeout must be greater than zero for a hierarchy probe")
+    return _probe_native_element(
+        adb, strategy, tuple(values), timeout, match, active_only=active_only,
+    )
+
+
+def _probe_native_element(
+    adb, strategy, value, timeout, match, *, all_matches=False, active_only=False,
+):
     try:
         command = getattr(adb, "cmd", None)
     except Exception:
@@ -168,7 +188,8 @@ def _probe_native_element(adb, strategy, value, timeout, match, *, all_matches=F
         ) from None
 
     hierarchy = _parse_hierarchy(
-        output, strategy, value, match, require_match_bounds=True, collect_all=all_matches,
+        output, strategy, value, match, active_only=active_only,
+        require_match_bounds=True, collect_all=all_matches,
     )
     if time.monotonic() >= deadline:
         raise NativeLocatorTimeout("Reading the Android UI hierarchy timed out")

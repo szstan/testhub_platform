@@ -8,6 +8,7 @@ from apps.app_automation.native_locator import (
     NativeLocatorInputError,
     NativeLocatorUnsupportedDevice,
     find_native_element,
+    probe_native_element_any,
 )
 
 
@@ -52,7 +53,24 @@ def test_fixed_airtest_command_and_all_supported_strategies():
         assert adb.timeouts[0] == 1
 
 
-def test_known_uiautomator_status_line_after_hierarchy_is_stripped():
+def test_one_shot_any_probe_skips_inactive_nodes_and_uses_one_bounded_dump():
+    hierarchy = '''<hierarchy>
+      <node resource-id="app:id/permission" bounds="[0,0][10,10]" visible="false" />
+      <node resource-id="app:id/permission" bounds="[10,20][30,40]" visible="true" enabled="true" />
+    </hierarchy>'''
+    adb = FakeADB(hierarchy)
+
+    result = probe_native_element_any(
+        adb, 'resource_id', ['app:id/permission', 'other:id/permission'],
+        timeout=1.5, interval=0.1, active_only=True,
+    )
+
+    assert result is not None
+    assert result.center == (20, 30)
+    assert adb.commands == [["shell", "uiautomator", "dump", "/dev/tty"]]
+    assert adb.timeouts == [1.5]
+
+
     for suffix in (
         "\nUI hierchary dumped to: /dev/tty",
         "\r\nUI hierchary dumped to: /dev/tty\r\n",

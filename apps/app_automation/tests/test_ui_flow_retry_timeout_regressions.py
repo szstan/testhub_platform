@@ -101,14 +101,14 @@ def test_zero_timeout_count_mode_has_a_bounded_deadline(tmp_path, monkeypatch):
         patch.object(runner, '_resolve_selector', return_value=(1, 1)),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template'),
-        patch.object(flow_module, 'exists', return_value=True),
+        patch.object(runner, '_image_lookup_once', return_value=(2, 3)),
         patch.object(flow_module, 'touch') as touch,
         patch.object(flow_module.time, 'sleep', side_effect=fake_sleep),
     ):
         runner._action_foreach_assert({
             'assert_type': 'image', 'expected_list': ['expected.png'],
             'click_selector_type': 'pos', 'click_selector': '1,1',
-            'max_loops': 5, 'interval': 300, 'timeout': 0,
+            'max_loops': 5, 'min_match': 0, 'interval': 300, 'timeout': 0,
         })
 
     assert touch.call_count == 1

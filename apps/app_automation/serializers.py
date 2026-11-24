@@ -31,7 +31,12 @@ from .models import (
     AppScheduledTask,
     AppNotificationLog,
 )
-from .scene_component_runtime import SceneComponentError, validate_project_component_references
+from .scene_component_runtime import (
+    SceneComponentError,
+    validate_legacy_component_configuration,
+    validate_legacy_component_references,
+    validate_project_component_references,
+)
 
 
 _SECRET_ALIAS_RE = re.compile(r'secret://[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
@@ -345,6 +350,10 @@ class AppTestCaseSerializer(serializers.ModelSerializer):
 
     def validate_ui_flow(self, value):
         _validate_sensitive_flow(value)
+        try:
+            validate_legacy_component_references(value)
+        except SceneComponentError:
+            raise serializers.ValidationError('旧版组件配置无效或包含不安全的敏感值') from None
         return value
 
     def validate(self, attrs):
@@ -488,6 +497,18 @@ class AppCustomComponentSerializer(serializers.ModelSerializer):
         model = AppCustomComponent
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
+    def validate(self, attrs):
+        schema = attrs.get('schema', getattr(self.instance, 'schema', {}))
+        defaults = attrs.get('default_config', getattr(self.instance, 'default_config', {}))
+        steps = attrs.get('steps', getattr(self.instance, 'steps', []))
+        try:
+            validate_legacy_component_configuration(
+                schema, defaults, steps, {},
+            )
+        except SceneComponentError:
+            raise serializers.ValidationError('全局组件定义包含无效或不安全的敏感配置') from None
+        return attrs
 
 
 class AppComponentPackageSerializer(serializers.ModelSerializer):

@@ -261,10 +261,10 @@ import {
   runAppScheduledTask,
   getTestSuiteList,
   getTestCaseList,
-  getDeviceList,
   getPackageList,
   getAppProjects,
 } from '@/api/app-automation.js'
+import { getAllAppDevices } from '@/api/app-device-options'
 
 const { t } = useI18n()
 
@@ -317,12 +317,12 @@ const loadOptions = async () => {
     const [s, tc, d, p] = await Promise.all([
       getTestSuiteList({ page_size: 200 }),
       getTestCaseList({ page_size: 500 }),
-      getDeviceList({ page_size: 100 }),
+      getAllAppDevices(),
       getPackageList({ page_size: 100 }),
     ])
     suites.value = s.data.results || s.data || []
     testCases.value = tc.data.results || tc.data || []
-    devices.value = d.data.results || d.data || []
+    devices.value = d
     packages.value = p.data.results || p.data || []
   } catch (e) { console.error('加载选项失败', e) }
 }

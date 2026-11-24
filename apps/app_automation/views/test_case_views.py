@@ -8,6 +8,7 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db import transaction
+from django.http import Http404
 from apps.quality_intelligence.services.redaction import redact_text
 import logging
 import re
@@ -23,9 +24,25 @@ from ..execution_dispatch import (
     prepare_execution_device,
 )
 from ..serializers import AppPackageSerializer, AppTestCaseSerializer, AppTestExecutionSerializer, AppDeviceSerializer
-from ..scene_execution import ScenePreparationError, validate_saved_root_step
+from ..scene_execution import (
+    SCENE_CASE_CHANGED_MESSAGE,
+    ScenePreparationError,
+    validate_diagnostic_selection,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _diagnostic_selection_error_response(exc):
+    if str(exc) == SCENE_CASE_CHANGED_MESSAGE:
+        return Response(
+            {'success': False, 'message': SCENE_CASE_CHANGED_MESSAGE},
+            status=status.HTTP_409_CONFLICT,
+        )
+    return Response(
+        {'success': False, 'message': '步骤编号无效或超出用例范围'},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 class AppPagination(PageNumberPagination):
@@ -63,6 +80,15 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    def _get_locked_diagnostic_case(self, request, case_id):
+        test_case = AppTestCase.objects.select_for_update().filter(pk=case_id).first()
+        if test_case is None:
+            raise Http404
+        self.check_object_permissions(request, test_case)
+        if not self.filter_queryset(self.get_queryset()).filter(pk=test_case.pk).exists():
+            raise Http404
+        return test_case
+
     @action(detail=True, methods=['post'], url_path='run-step')
     def run_step(self, request, pk=None):
         """Queue one saved root step for an authenticated diagnostic run."""
@@ -78,11 +104,17 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_403_FORBIDDEN)
 
         step_index = request.data.get('step_index')
+        expected_case_updated_at = request.data.get('expected_case_updated_at')
+        case_id = test_case.pk
         try:
-            validate_saved_root_step(test_case, step_index)
-        except ScenePreparationError:
-            return Response({'success': False, 'message': '步骤编号无效或超出用例范围'},
-                            status=status.HTTP_400_BAD_REQUEST)
+            # Reject already-stale editor revisions before entering device admission.
+            validate_diagnostic_selection(
+                test_case,
+                step_index,
+                expected_case_updated_at,
+            )
+        except ScenePreparationError as exc:
+            return _diagnostic_selection_error_response(exc)
 
         device_id = request.data.get('device_id')
         auto_lock = request.data.get('auto_lock', False)
@@ -101,7 +133,15 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
         acquired_lease = False
         try:
             with transaction.atomic():
+                # Execution endpoints take the device lock before their case FK lock.
                 device = AppDevice.objects.select_for_update().get(device_id=device_id)
+                test_case = self._get_locked_diagnostic_case(request, case_id)
+                validate_diagnostic_selection(
+                    test_case,
+                    step_index,
+                    expected_case_updated_at,
+                )
+                package_name = test_case.app_package.package_name if test_case.app_package_id else ''
                 device, lease_generation, acquired_lease = prepare_execution_device(
                     device,
                     request.user,
@@ -118,6 +158,8 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
                     device_lease_generation=lease_generation,
                     release_device_lease_on_stop=acquired_lease,
                 )
+        except ScenePreparationError as exc:
+            return _diagnostic_selection_error_response(exc)
         except AppDevice.DoesNotExist:
             return Response({'success': False, 'message': '设备不存在'},
                             status=status.HTTP_404_NOT_FOUND)
@@ -138,11 +180,11 @@ class AppTestCaseViewSet(viewsets.ModelViewSet):
                 dispatch_id=dispatch_id,
                 args=(execution.pk,),
                 kwargs={
-                    'package_name': test_case.app_package.package_name if test_case.app_package else '',
+                    'package_name': package_name,
                     'lease_generation': lease_generation,
                     'release_device_lease': acquired_lease,
                     'step_index': step_index,
-                    'expected_case_updated_at': test_case.updated_at.isoformat(),
+                    'expected_case_updated_at': expected_case_updated_at,
                 },
             )
         except Exception as exc:

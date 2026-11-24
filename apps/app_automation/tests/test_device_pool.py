@@ -48,15 +48,20 @@ def test_same_owner_replacement_fences_stale_worker(device_pool_user):
 
 @pytest.mark.django_db
 def test_discovery_refresh_preserves_active_lease(device_pool_user):
-    from apps.app_automation.views.device_views import _upsert_discovered_device
+    from apps.app_automation.views.device_views import (
+        _snapshot_device_authority_revisions,
+        _upsert_discovered_device,
+    )
 
     user, device = device_pool_user
     leased, _token = acquire_device(user)
     generation = leased.lease_generation
 
+    revision = _snapshot_device_authority_revisions()[device.device_id]
     refreshed = _upsert_discovered_device(
         device.device_id,
         {'name': 'rediscovered', 'status': 'online'},
+        expected_revision=revision,
     )
 
     assert refreshed.status == 'locked'

@@ -85,6 +85,7 @@ def test_sensitive_text_steps_reject_direct_secret_references(location):
     assert 'secret://login.password' not in str(serializer.errors)
 
 
+@pytest.mark.django_db
 def test_sensitive_steps_accept_exact_variable_references_and_empty_values():
     flow = [
         {'type': 'input', 'sensitive': True, 'value': '{{local.password}}'},

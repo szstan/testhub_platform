@@ -111,6 +111,9 @@ class AppDevice(models.Model):
     health_status = models.CharField(max_length=20, default='unknown', verbose_name='健康状态')
     maintenance_mode = models.BooleanField(default=False, verbose_name='维护模式')
     device_action_pending = models.BooleanField(default=False, verbose_name='设备动作待安全恢复')
+    device_action_epoch = models.PositiveBigIntegerField(
+        default=0, editable=False, verbose_name='设备动作世代',
+    )
     last_seen_at = models.DateTimeField(null=True, blank=True, verbose_name='最后在线时间')
     description = models.TextField(blank=True, default='', verbose_name='设备描述')
     location = models.CharField(max_length=200, blank=True, default='', verbose_name='设备位置')
@@ -151,15 +154,19 @@ class AppDevice(models.Model):
             current.save(update_fields=_lease_fields())
             self.__dict__.update(current.__dict__)
 
-    def unlock(self, *, expected_generation=None, expected_owner_id=None):
-        """Compare-and-release this snapshot, including calls from legacy paths."""
-        from .device_pool import release_device_execution_lease
+    def unlock(self, *, expected_generation=None, expected_owner_id=None, lease_token=''):
+        """Compare-and-release the current lease, requiring its token when present."""
+        from .device_pool import release_device_snapshot
 
         generation = self.lease_generation if expected_generation is None else expected_generation
         owner_id = self.locked_by_id if expected_owner_id is None else expected_owner_id
-        # The release helper needs only an identity, never a user credential.
         from types import SimpleNamespace
-        released = release_device_execution_lease(self.pk, SimpleNamespace(id=owner_id), generation)
+        released = release_device_snapshot(
+            self.pk,
+            SimpleNamespace(id=owner_id),
+            generation,
+            lease_token,
+        )
         if released:
             self.refresh_from_db()
         return released

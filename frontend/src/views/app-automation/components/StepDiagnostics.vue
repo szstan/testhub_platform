@@ -31,6 +31,8 @@ const props = defineProps({
   nested: { type: Boolean, default: false },
   dirty: { type: Boolean, default: false },
   recording: { type: Boolean, default: false },
+  recorderBusy: { type: Boolean, default: false },
+  caseUpdatedAt: { type: String, default: '' },
   deviceId: { type: [Number, String], default: null },
 })
 const { t } = useI18n()
@@ -52,6 +54,8 @@ const editorContextMatches = snapshot => sameIdentifier(props.caseId, snapshot.c
   && props.stepIndex === snapshot.stepIndex
   && props.dirty === snapshot.dirty
   && props.recording === snapshot.recording
+  && props.recorderBusy === snapshot.recorderBusy
+  && props.caseUpdatedAt === snapshot.caseUpdatedAt
   && props.nested === snapshot.nested
 const lastExecutionId = computed(() => {
   const execution = lastExecution.value
@@ -59,9 +63,10 @@ const lastExecutionId = computed(() => {
 })
 const reasonKey = computed(() => {
   if (!props.caseId || props.dirty) return 'appAutomation.stepDiagnostics.saveFirst'
-  if (props.recording) return 'appAutomation.stepDiagnostics.stopRecording'
   if (props.nested || props.stepIndex === null) return 'appAutomation.stepDiagnostics.selectRootStep'
   if (!props.deviceId) return 'appAutomation.stepDiagnostics.selectDevice'
+  if (!props.caseUpdatedAt) return 'appAutomation.stepDiagnostics.caseRevisionUnavailable'
+  if (props.recording || props.recorderBusy) return 'appAutomation.stepDiagnostics.stopRecording'
   return ''
 })
 const canRun = computed(() => !reasonKey.value && !submitting.value)
@@ -74,6 +79,8 @@ const runStep = async () => {
     deviceId: props.deviceId,
     dirty: props.dirty,
     recording: props.recording,
+    recorderBusy: props.recorderBusy,
+    caseUpdatedAt: props.caseUpdatedAt,
     nested: props.nested,
     userId: currentUserId(),
     sessionGeneration: currentSessionGeneration(),
@@ -95,6 +102,7 @@ const runStep = async () => {
     const response = await runSavedSceneStep(snapshot.caseId, {
       device_id: device.device_id, auto_lock: true, expected_user_id: snapshot.userId,
       step_index: snapshot.stepIndex,
+      expected_case_updated_at: snapshot.caseUpdatedAt,
     })
     const data = response?.data ?? response
     if (data?.success === false) throw new Error('diagnostic rejected')

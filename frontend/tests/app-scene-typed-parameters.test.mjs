@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
-import { effectScope } from 'vue'
+import { createSSRApp, effectScope, h } from 'vue'
+import { renderToString } from '@vue/server-renderer'
+import { ElInputNumber, ElSwitch } from 'element-plus'
 import { loadSfcSetup, plain } from './helpers/sfc-setup.mjs'
 
 const instances = []
@@ -13,6 +15,20 @@ const apiNames = [
 ]
 
 afterEach(() => instances.splice(0).forEach(instance => instance.dispose()))
+
+async function assertScalarControlPreserves(step, field, property, modelValue) {
+  if (!['number', 'integer', 'boolean'].includes(property.type)) return
+  const original = step.config[field]
+  const updates = []
+  await renderToString(createSSRApp({
+    render: () => h(property.type === 'boolean' ? ElSwitch : ElInputNumber, {
+      modelValue,
+      'onUpdate:modelValue': value => { updates.push(value); step.config[field] = value },
+    }),
+  }))
+  assert.equal(updates.length, 0, 'Element Plus must not normalize the saved blank on initialization')
+  assert.equal(step.config[field], original)
+}
 
 async function loadBuilder(detail = null) {
   const writes = []
@@ -41,8 +57,10 @@ async function loadBuilder(detail = null) {
     './NestedFlowEditor.vue': { default: {} },
     '@/stores/user': { useUserStore: () => ({ user: { id: 7, username: 'typed-parameter-user' } }) },
     '@/api/app-automation': api,
+    '@/api/app-device-options': { getAllAppDevices: async () => [] },
   })
   instances.push(instance)
+  await instance.mount()
   return { ...instance, writes }
 }
 
@@ -183,6 +201,106 @@ test('nested editor uses expression input for versioned typed parameters without
   scope.stop()
 })
 
+const optionalTypedComponent = {
+  ...projectComponent,
+  type: 'optional_typed_fixture',
+  schema: { properties: {
+    count: { type: 'number', minimum: 0 },
+    attempts: { type: 'integer', minimum: 0 },
+    enabled: { type: 'boolean' },
+    tags: { type: 'array' },
+    options: { type: 'object' },
+  } },
+  default_config: {},
+}
+
+test('optional typed parameters preserve absent, null and empty values through mode changes and save', async () => {
+  const { state, writes } = await loadBuilder()
+  state.setProjectComponents([optionalTypedComponent])
+  state.insertProjectComponent(optionalTypedComponent)
+  state.sceneForm.value.name = 'Optional typed values'
+  const step = state.scenarioSteps.value[0]
+  const definition = state.activeComponentDef.value
+  const fields = Object.keys(optionalTypedComponent.schema.properties)
+  for (const value of [null, '', undefined]) {
+    for (const field of fields) {
+      step.config[field] = value
+      state.setTypedParameterExpressionMode(step, field, definition, true)
+      state.setTypedParameterExpressionMode(step, field, definition, false)
+      assert.equal(state.isTypedParameterExpressionMode(step, field, definition), false, `${field}: ${String(value)}`)
+      assert.equal(step.config[field], value)
+      assert.equal(state.getJsonFieldError(step, field), '')
+      await assertScalarControlPreserves(step, field, optionalTypedComponent.schema.properties[field],
+        state.getTypedScalarControlValue(step, field, definition))
+    }
+    await state.saveScene()
+    assert.equal(writes.length, [null, '', undefined].indexOf(value) + 1)
+    const config = writes.at(-1).ui_flow[0].config
+    for (const field of fields) {
+      if (value === undefined) assert.equal(Object.hasOwn(config, field), false)
+      else assert.equal(config[field], value)
+    }
+  }
+  for (const field of fields) {
+    state.setTypedParameterExpressionMode(step, field, definition, true)
+    state.updateTypedParameterInput(step, field, definition, '')
+    assert.equal(state.getJsonFieldError(step, field), '')
+    state.setTypedParameterExpressionMode(step, field, definition, false)
+    assert.equal(state.isTypedParameterExpressionMode(step, field, definition), false)
+  }
+})
+
+test('nested optional typed parameters accept blank values without admitting invalid literals', async () => {
+  const loaded = await loadSfcSetup('src/views/app-automation/test-cases/NestedFlowEditor.vue', {
+    vuedraggable: { default: {} },
+  })
+  instances.push(loaded)
+  const step = { id: 'optional-nested', kind: 'custom', type: optionalTypedComponent.type,
+    version: optionalTypedComponent.version, config: {} }
+  const scope = effectScope()
+  try {
+    const state = scope.run(() => loaded.component.setup({
+      modelValue: [step], label: 'Then steps', components: [],
+      componentDefinitions: { [`${step.type}@${step.version}`]: optionalTypedComponent },
+      fieldLabel: field => field, fieldOptions: () => [], depth: 0, maxDepth: 12,
+    }, { expose() {}, emit() {} }))
+    for (const field of Object.keys(optionalTypedComponent.schema.properties)) {
+      for (const value of [null, '', undefined]) {
+        step.config[field] = value
+        state.setTypedParameterExpressionMode(step, field, true)
+        state.setTypedParameterExpressionMode(step, field, false)
+        assert.equal(state.isTypedParameterExpressionMode(step, field), false)
+        assert.equal(step.config[field], value)
+        await assertScalarControlPreserves(step, field, optionalTypedComponent.schema.properties[field],
+          state.getTypedScalarControlValue(step, field))
+      }
+      state.setTypedParameterExpressionMode(step, field, true)
+      state.updateTypedParameterInput(step, field, '')
+      assert.equal(state.jsonErrors[state.getErrorKey(step, field)], undefined)
+      state.updateTypedParameterInput(step, field, 'invalid-typed-literal')
+      state.setTypedParameterExpressionMode(step, field, false)
+      assert.equal(state.isTypedParameterExpressionMode(step, field), true)
+      assert.ok(state.jsonErrors[state.getErrorKey(step, field)])
+    }
+  } finally { scope.stop() }
+})
+
+test('blank typed parameter mode changes retain required-field validation', async () => {
+  const { state, writes, messages } = await loadBuilder()
+  const component = { ...optionalTypedComponent,
+    schema: { ...optionalTypedComponent.schema, required: ['count'] } }
+  state.setProjectComponents([component])
+  state.insertProjectComponent(component)
+  state.sceneForm.value.name = 'Required typed value'
+  const step = state.scenarioSteps.value[0]
+  step.config.count = null
+  state.setTypedParameterExpressionMode(step, 'count', state.activeComponentDef.value, true)
+  state.setTypedParameterExpressionMode(step, 'count', state.activeComponentDef.value, false)
+  await state.saveScene()
+  assert.equal(writes.length, 0)
+  assert.ok(messages.some(message => message.text.includes('requiredFieldAt')))
+})
+
 test('expression controls are available in both component parameter forms and mask sensitive fields', async () => {
   const sceneBuilder = await import('node:fs/promises').then(({ readFile }) => readFile(
     new URL('../src/views/app-automation/test-cases/SceneBuilder.vue', import.meta.url), 'utf8',
@@ -192,7 +310,9 @@ test('expression controls are available in both component parameter forms and ma
   ))
 
   assert.match(sceneBuilder, /isVersionedTypedParameter\(activeStep, field, activeComponentDef\)/)
+  assert.match(sceneBuilder, /:model-value="getTypedScalarControlValue\(activeStep, field, activeComponentDef\)"/)
   assert.match(sceneBuilder, /:type="isSensitiveField\(activeComponentDef, field\) \? 'password' : 'text'"/)
   assert.match(nestedEditor, /isVersionedTypedParameter\(element, field\)/)
+  assert.match(nestedEditor, /:model-value="getTypedScalarControlValue\(element, field\)"/)
   assert.match(nestedEditor, /:type="isSensitive\(element, field\) \? 'password' : 'text'"/)
 })

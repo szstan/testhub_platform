@@ -7,6 +7,12 @@ import { loadSfcSetup, plain } from './helpers/sfc-setup.mjs'
 const instances = []
 afterEach(() => instances.splice(0).forEach(instance => instance.dispose()))
 
+function deferred() {
+  let resolve
+  const promise = new Promise(done => { resolve = done })
+  return { promise, resolve }
+}
+
 const stepDefinition = {
   schema: {
     properties: {
@@ -22,9 +28,9 @@ const stepDefinition = {
   default_config: { selector_type: 'text', retries: 0 },
 }
 
-async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSeconds = 90 } = {}) {
+async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSeconds = 90, releaseRecorderLease: releaseLease } = {}) {
   const writes = []
-  const calls = { acquisitions: [], releases: [], heartbeats: [], heartbeatIntervals: [], interactions: [], confirmations: [], routeGuard: null }
+  const calls = { acquisitions: [], releases: [], heartbeats: [], heartbeatIntervals: [], interactions: [], confirmations: [], routeGuard: null, deviceOptions: [] }
   const session = { generation: 1 }
   const userStore = reactive({
     user: { id: userId, username: 'recorder-owner' },
@@ -66,11 +72,13 @@ async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSecon
     releaseRecorderLease: async (id, payload) => {
       calls.releases.push([id, payload])
       if (payload.lease_token !== `fixture-token-${id}`) return { data: { success: false } }
+      const response = releaseLease ? await releaseLease(id, payload) : null
+      if (response?.data?.success === false) return response
       const current = findDevice(id)
       const unlocked = { ...current, status: 'online', locked_by: null, locked_by_name: null, locked_at: null, lease_requires_token: false }
       const index = liveDevices.findIndex(device => String(device.id) === String(id))
       liveDevices[index] = unlocked
-      return { data: { device: unlocked } }
+      return response || { data: { device: unlocked } }
     },
     heartbeatDevice: async (id, payload) => { calls.heartbeats.push([id, payload]); return { data: {} } },
     captureDeviceScreenshot: async () => ({ data: { success: true, data: { content: 'data:image/png;base64,mocked' } } }),
@@ -91,11 +99,16 @@ async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSecon
     './NestedFlowEditor.vue': { default: {} },
     '@/stores/user': { useUserStore: () => userStore },
     '@/api/app-automation': api,
+    '@/api/app-device-options': { getAllAppDevices: async params => {
+      calls.deviceOptions.push(params)
+      return liveDevices
+    } },
   }, { confirm: async (...args) => { calls.confirmations.push(args); return true }, setInterval: (callback, delay) => {
     calls.heartbeatIntervals.push({ callback, delay })
     return calls.heartbeatIntervals.length
   }, clearInterval() {} })
   instances.push(instance)
+  await instance.mount()
   instance.state.componentDefinitions.value = { tap: stepDefinition, flow: { ...stepDefinition, default_config: {} } }
   return {
     ...instance, writes, calls, userStore, liveDevices,
@@ -300,10 +313,9 @@ test('mounting the scene builder does not acquire a lease or send device actions
     id: 38, device_id: 'mount-fixture-serial', status: 'online', locked_by: null,
     maintenance_mode: false, lease_requires_token: false,
   }
-  const { mount, calls } = await loadBuilder(null, { devices: [idleDevice] })
+  const { calls } = await loadBuilder(null, { devices: [idleDevice] })
 
-  await mount()
-
+  assert.deepEqual(calls.deviceOptions, [undefined])
   assert.deepEqual(calls.acquisitions, [])
   assert.deepEqual(calls.releases, [])
   assert.deepEqual(calls.heartbeats, [])
@@ -429,6 +441,7 @@ test('recorder lease release waits until its active interaction settles', async 
 
   assert.equal(state.recorderEnabled.value, false)
   assert.equal(state.canStartRecorder.value, false)
+  assert.equal(state.recorderDiagnosticBusy.value, true)
   assert.deepEqual(calls.releases, [])
 
   state.handleRecorderInteractionState({
@@ -446,6 +459,30 @@ test('recorder lease release waits until its active interaction settles', async 
     expected_user_id: 7, lease_token: 'fixture-token-43',
   }]])
   assert.equal(state.deferredRecorderRelease.value, null)
+  assert.equal(state.recorderDiagnosticBusy.value, false)
+})
+
+test('diagnostics stay blocked until the stop request and asynchronous lease release settle', async () => {
+  const releaseRequest = deferred()
+  const device = {
+    id: 46, device_id: 'diagnostic-release-serial', status: 'online', locked_by: null,
+    maintenance_mode: false, lease_requires_token: false,
+  }
+  const { state, calls } = await loadBuilder(null, {
+    devices: [device], releaseRecorderLease: () => releaseRequest.promise,
+  })
+  state.recorderDevices.value = [device]
+  state.recorderDeviceId.value = device.id
+  assert.equal(await state.startRecorder(), true)
+
+  const stopping = state.stopRecorder()
+  assert.equal(state.recorderEnabled.value, false)
+  assert.equal(state.recorderDiagnosticBusy.value, true)
+  assert.equal(calls.releases.length, 1)
+  releaseRequest.resolve({ data: { success: true } })
+  await stopping
+
+  assert.equal(state.recorderDiagnosticBusy.value, false)
 })
 
 test('recorded gestures append runnable relative-coordinate ui_flow steps', async () => {
@@ -540,6 +577,45 @@ test('nested editor can visually add a schema-defined component and creates fres
   assert.equal(added.type, 'flow')
   assert.notEqual(added.steps[0].id, 'source-child')
   assert.equal(added.steps[0].config.selector, 'x')
+  scope.stop()
+})
+
+test('nested custom parameter arrays named like flow fields remain structured data', async () => {
+  const parameterDefaults = {
+    steps: [{ id: 'payload-row', type: 'business-value', config: { _expanded: 'keep' } }],
+    then_steps: ['then-data'],
+    try_steps: ['try-data'],
+  }
+  const component = {
+    type: 'versioned_data', name: 'Versioned data', kind: 'custom', version: '2', optionKey: 'versioned_data@2',
+    schema: { properties: {
+      steps: { type: 'array' }, then_steps: { type: 'array' }, try_steps: { type: 'array' },
+    } },
+    default_config: parameterDefaults,
+  }
+  const loaded = await loadSfcSetup('src/views/app-automation/test-cases/NestedFlowEditor.vue', {
+    vuedraggable: { default: {} },
+    'element-plus': { ElMessage: { warning() {} } },
+  })
+  instances.push(loaded)
+  const emitted = []
+  const scope = effectScope()
+  const state = scope.run(() => loaded.component.setup({
+    modelValue: [], label: 'Parameters', components: [component],
+    componentDefinitions: { 'versioned_data@2': component },
+    fieldLabel: field => field, fieldOptions: () => [], depth: 0, maxDepth: 12,
+  }, { expose() {}, emit: (event, value) => emitted.push([event, value]) }))
+  const existing = { id: 'existing', ...component, config: structuredClone(parameterDefaults) }
+  assert.equal(state.isStepArrayField(existing, 'steps', component.schema.properties.steps), false)
+  assert.equal(state.isStructuredField(existing, 'steps'), true)
+
+  state.newStepType.value = 'versioned_data@2'
+  state.addStep()
+  const added = emitted.at(-1)[1][0]
+  assert.deepEqual(plain(added.config), parameterDefaults)
+  assert.deepEqual(plain(added.config.steps[0]), parameterDefaults.steps[0])
+  state.updateStructuredField(added, 'steps', '["edited-data"]')
+  assert.deepEqual(plain(added.config.steps), ['edited-data'])
   scope.stop()
 })
 
@@ -667,12 +743,14 @@ test('in-flight recorder action blocks navigation and reset, and fences a change
 test('unresolved recorder actions trigger an explicit leave warning', async () => {
   const { state, calls } = await loadBuilder()
   state.handleRecorderUnresolvedChange(1)
+  assert.equal(state.recorderDiagnosticBusy.value, true)
   let prevented = false
   state.beforeUnloadHandler({ preventDefault: () => { prevented = true }, returnValue: undefined })
   assert.equal(prevented, true)
   assert.equal(await calls.routeGuard(), true)
   assert.equal(calls.confirmations.at(-1)[0], 'appAutomation.recorder.unresolvedLeave')
   state.handleRecorderUnresolvedChange(0)
+  assert.equal(state.recorderDiagnosticBusy.value, false)
 })
 
 test('an uncertain recorder result disables recording without releasing its lease', async () => {

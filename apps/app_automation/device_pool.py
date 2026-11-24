@@ -84,9 +84,10 @@ def _clear_lease(device: AppDevice, *, health_sensitive=True):
     device.last_heartbeat_at = None
     device.lease_max_seconds = None
     device.status = (
-        DeviceStatus.AVAILABLE
-        if not health_sensitive or device.health_status != 'unhealthy'
-        else DeviceStatus.OFFLINE
+        DeviceStatus.OFFLINE
+        if device.status == DeviceStatus.OFFLINE
+        or (health_sensitive and device.health_status == 'unhealthy')
+        else DeviceStatus.AVAILABLE
     )
 
 
@@ -183,11 +184,152 @@ def acquire_specific_device(device_id, user, *, lease_seconds=None, cap_lease_to
         )
 
 
+def _check_token(device, token):
+    if not isinstance(token, str):
+        raise DeviceLeaseError('设备租约令牌无效')
+    if device.lease_token_hash and not hmac.compare_digest(
+        device.lease_token_hash, _hash_token(token)
+    ):
+        raise DeviceLeaseError('设备租约令牌无效')
+
+
 def _check_owner(device, user, token):
     if device.locked_by_id != getattr(user, 'id', None):
         raise DeviceLeaseError('无权操作该设备租约')
-    if device.lease_token_hash and not hmac.compare_digest(device.lease_token_hash, _hash_token(token or '')):
+    _check_token(device, token)
+
+
+def begin_device_management_action(
+    device_id, user, token='', *, admin=False, allowed_connection_types=None,
+):
+    """Reserve a device for bounded management I/O without holding its row lock."""
+    if not isinstance(token, str):
         raise DeviceLeaseError('设备租约令牌无效')
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().get(pk=device_id)
+        if allowed_connection_types and device.connection_type not in allowed_connection_types:
+            raise DeviceActionBusy('只能断开远程设备的连接')
+        if (
+            device.device_action_pending
+            or AppTestExecution.objects.filter(
+                device_id=device.pk,
+                status__in=('pending', 'running'),
+            ).exists()
+            or AppTestExecution.objects.filter(
+                device_id=device.pk,
+                device_action_pending=True,
+            ).exists()
+        ):
+            raise DeviceActionBusy('设备存在待执行或待安全恢复的动作')
+
+        now = timezone.now()
+        temporary_lease = False
+        if device.locked_by_id is None:
+            if not admin:
+                raise DeviceLeaseError('设备没有当前用户的有效租约')
+            if (
+                device.status == DeviceStatus.LOCKED
+                or device.lease_token_hash
+                or device.locked_at is not None
+                or device.lease_acquired_at is not None
+                or device.lease_expires_at is not None
+                or device.lease_max_seconds is not None
+            ):
+                raise DeviceActionBusy('设备租约状态不明确，拒绝管理操作')
+            device.lease_generation += 1
+            device.locked_by = user
+            device.locked_at = now
+            device.last_heartbeat_at = now
+            device.lease_acquired_at = None
+            device.lease_expires_at = None
+            device.lease_max_seconds = None
+            device.lease_token_hash = ''
+            device.status = DeviceStatus.LOCKED
+            temporary_lease = True
+            fields = [
+                'locked_by', 'locked_at', 'last_heartbeat_at', 'lease_acquired_at',
+                'lease_expires_at', 'lease_max_seconds', 'lease_token_hash',
+                'lease_generation', 'status',
+            ]
+        else:
+            if device.locked_by_id != getattr(user, 'id', None) and not admin:
+                raise DeviceLeaseError('无权操作该设备租约')
+            if not _lease_is_active(device, now):
+                raise DeviceActionBusy('设备租约已过期或状态不明确，拒绝管理操作')
+            if device.lease_token_hash:
+                if device.locked_by_id == getattr(user, 'id', None):
+                    _check_owner(device, user, token)
+                else:
+                    _check_token(device, token)
+            fields = []
+
+        device.device_action_pending = True
+        device.device_action_epoch += 1
+        device.save(update_fields=[
+            *fields, 'device_action_pending', 'device_action_epoch', 'updated_at'
+        ])
+    return device, temporary_lease, device.device_action_epoch
+
+
+def finish_device_management_action(
+    device_id, owner_id, generation, action_epoch, *, status=None, release_reservation=False,
+    quarantine=False,
+):
+    """Finish a management action only under its original action and lease fences."""
+    with transaction.atomic(durable=True):
+        device = AppDevice.objects.select_for_update().filter(
+            pk=device_id,
+            locked_by_id=owner_id,
+            lease_generation=generation,
+            device_action_pending=True,
+            device_action_epoch=action_epoch,
+        ).first()
+        if device is None:
+            raise DeviceLeaseError('设备管理动作的所有者、世代或待处理标记已变更')
+
+        if quarantine:
+            device.maintenance_mode = True
+            device.health_status = 'unknown'
+            device.save(update_fields=['maintenance_mode', 'health_status', 'updated_at'])
+            return device
+
+        fields = ['device_action_pending', 'updated_at']
+        if release_reservation:
+            _clear_lease(device)
+            fields.extend(_lease_fields())
+        if status is not None:
+            device.status = status
+            fields.append('status')
+        device.device_action_pending = False
+        device.save(update_fields=list(dict.fromkeys(fields)))
+    return device
+
+
+def release_device_snapshot(device_id, user, generation, token=''):
+    """Release a legacy API snapshot only if owner and generation still match."""
+    with transaction.atomic():
+        device = AppDevice.objects.select_for_update().filter(
+            pk=device_id,
+            locked_by_id=getattr(user, 'id', None),
+            lease_generation=generation,
+        ).first()
+        if device is None:
+            return False
+        _check_owner(device, user, token)
+        if _has_pending_device_action(device.pk):
+            raise DeviceLeaseError('设备存在待安全恢复的设备动作')
+        _clear_lease(device)
+        device.save(update_fields=_lease_fields())
+        return True
+
+
+def _renewal_seconds(device, lease_seconds, *, default_seconds, minimum):
+    seconds = max(int(lease_seconds or default_seconds), minimum)
+    allocation_limit = max(int(device.max_allocation_time or 0), minimum)
+    seconds = min(seconds, allocation_limit)
+    if device.lease_max_seconds is not None:
+        seconds = min(seconds, max(int(device.lease_max_seconds), minimum))
+    return seconds
 
 
 def validate_device_lease(device_id, user, token):
@@ -219,19 +361,23 @@ def begin_device_action(device_id, user, token, *, lease_validator=None):
         ).exists() or _has_pending_device_action(device.pk):
             raise DeviceActionBusy('设备存在待执行或待安全恢复的动作')
         device.device_action_pending = True
-        device.save(update_fields=['device_action_pending', 'updated_at'])
-        fence = (device.device_id, device.lease_generation)
+        device.device_action_epoch += 1
+        device.save(update_fields=[
+            'device_action_pending', 'device_action_epoch', 'updated_at'
+        ])
+        fence = (device.device_id, device.lease_generation, device.device_action_epoch)
     return fence
 
 
-def finish_device_action(device_id, user, generation, *, quarantine=False):
-    """Clear a committed action marker under its original lease fence."""
+def finish_device_action(device_id, user, generation, action_epoch, *, quarantine=False):
+    """Clear a committed action marker under its original lease and action fences."""
     with transaction.atomic(durable=True):
         device = AppDevice.objects.select_for_update().filter(
             pk=device_id,
             locked_by_id=getattr(user, 'id', None),
             lease_generation=generation,
             device_action_pending=True,
+            device_action_epoch=action_epoch,
         ).first()
         if device is None:
             raise DeviceLeaseError('设备动作的租约所有者、世代或待处理标记已变更')
@@ -243,15 +389,6 @@ def finish_device_action(device_id, user, generation, *, quarantine=False):
         device.device_action_pending = False
         device.save(update_fields=fields)
     return device
-
-
-def _renewal_seconds(device, lease_seconds, *, default_seconds, minimum):
-    seconds = max(int(lease_seconds or default_seconds), minimum)
-    allocation_limit = max(int(device.max_allocation_time or 0), minimum)
-    seconds = min(seconds, allocation_limit)
-    if device.lease_max_seconds is not None:
-        seconds = min(seconds, max(int(device.lease_max_seconds), minimum))
-    return seconds
 
 
 def heartbeat_device(device_id, user, token, *, lease_seconds=None):
@@ -366,10 +503,14 @@ def release_device_execution_lease(device_id, user, generation):
         return True
 
 
-def release_device(device_id, user, token, *, force=False):
+def release_device(device_id, user, token, *, force=False, expected_generation=None):
     with transaction.atomic():
         device = AppDevice.objects.select_for_update().get(pk=device_id)
-        if not force:
+        if expected_generation is not None and device.lease_generation != expected_generation:
+            raise DeviceLeaseError('设备租约已变更，请刷新后重试')
+        if force:
+            _check_token(device, token)
+        else:
             _check_owner(device, user, token)
         if _has_pending_device_action(device.pk):
             raise DeviceLeaseError('设备存在待安全恢复的设备动作')
@@ -487,12 +628,15 @@ __all__ = [
     'acquire_specific_device',
     'assert_device_execution_lease',
     'begin_device_action',
+    'begin_device_management_action',
+    'finish_device_action',
+    'finish_device_management_action',
     'heartbeat_device',
     'heartbeat_device_execution',
-    'finish_device_action',
     'is_device_lease_active',
     'reap_expired_device_leases',
     'release_device',
     'release_device_execution_lease',
+    'release_device_snapshot',
     'validate_device_lease',
 ]

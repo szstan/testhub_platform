@@ -20,18 +20,18 @@ def make_runner():
     return runner
 
 
-def test_missing_image_and_existence_assertions_fail_when_airtest_returns_false():
+def test_missing_image_and_existence_assertions_fail_when_lookup_returns_absence():
     runner = make_runner()
     with (patch.object(runner, '_resolve_selector', return_value=object()),
-          patch('apps.app_automation.runners.ui_flow_runner.exists', return_value=False),
+          patch.object(runner, '_image_lookup_once', return_value=None),
           pytest.raises(AssertionError, match='实际不存在')):
         runner._assert_exists({'expected_exists': True})
     with (patch.object(runner, '_resolve_selector', return_value=object()),
-          patch('apps.app_automation.runners.ui_flow_runner.exists', return_value=False)):
+          patch.object(runner, '_image_lookup_once', return_value=None)):
         runner._assert_exists({'expected_exists': False})
     with (patch('apps.app_automation.runners.ui_flow_runner.os.path.isfile', return_value=True),
           patch('apps.app_automation.runners.ui_flow_runner.Template', return_value=object()),
-          patch('apps.app_automation.runners.ui_flow_runner.exists', return_value=False),
+          patch.object(runner, '_image_lookup_once', return_value=None),
           pytest.raises(AssertionError, match='未在屏幕上找到')):
         runner._assert_image({'expected': 'fixture.png'})
 

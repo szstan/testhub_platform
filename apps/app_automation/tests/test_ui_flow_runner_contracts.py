@@ -192,7 +192,7 @@ def test_zero_min_match_keeps_legacy_loop_but_does_not_count_as_business_asserti
         patch.object(runner, '_safe_image_path', return_value=str(tmp_path / 'expected.png')),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
         patch.object(flow_module, 'Template', return_value='expected-template'),
-        patch.object(flow_module, 'exists', return_value=True),
+        patch.object(runner, '_image_lookup_once', return_value=(4, 5)),
         patch.object(flow_module, 'touch') as touch,
     ):
         result = runner.run([{

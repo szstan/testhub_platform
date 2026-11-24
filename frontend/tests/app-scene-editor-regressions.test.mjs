@@ -15,7 +15,9 @@ const apiNames = [
   'captureDeviceScreenshot', 'recordDeviceInteraction', 'getAppProjects',
 ]
 
-async function loadBuilder({ detail = null, userId = 7, createTestCase, updateTestCase, getTestCaseDetail: loadDetail } = {}) {
+async function loadBuilder({ detail = null, userId = 7, createTestCase, updateTestCase, getTestCaseDetail: loadDetail,
+  getComponents: loadBaseComponents, getCustomComponents: loadCustomComponents, getAllAppDevices: loadDevices,
+  routeCaseId, autoMount = true } = {}) {
   const writes = []
   const session = { generation: 1 }
   const userStore = reactive({
@@ -25,6 +27,10 @@ async function loadBuilder({ detail = null, userId = 7, createTestCase, updateTe
   })
   const api = Object.fromEntries(apiNames.map(name => [name, async () => ({ data: [] })]))
   api.getTestCaseDetail = async id => loadDetail ? loadDetail(id) : { data: detail }
+  api.getComponents = loadBaseComponents || (async () => ({ data: [{
+    type: 'tap', name: 'Tap', schema: tapDefinition.schema, default_config: tapDefinition.default_config,
+  }] }))
+  if (loadCustomComponents) api.getCustomComponents = loadCustomComponents
   api.createTestCase = async payload => {
     writes.push({ action: 'create', payload })
     return createTestCase ? createTestCase(payload) : { data: { id: 51 } }
@@ -34,7 +40,7 @@ async function loadBuilder({ detail = null, userId = 7, createTestCase, updateTe
     return updateTestCase ? updateTestCase(id, payload) : { data: { id } }
   }
   const loaded = await loadSfcSetup('src/views/app-automation/test-cases/SceneBuilder.vue', {
-    'vue-router': { useRoute: () => ({ query: {} }), onBeforeRouteLeave() {} },
+    'vue-router': { useRoute: () => ({ query: routeCaseId ? { case_id: routeCaseId } : {} }), onBeforeRouteLeave() {} },
     '@element-plus/icons-vue': Object.fromEntries(
       ['Upload', 'Download', 'FolderAdd', 'DocumentCopy', 'Check', 'Search', 'Link', 'Refresh', 'Camera']
         .map(name => [name, {}]),
@@ -47,7 +53,9 @@ async function loadBuilder({ detail = null, userId = 7, createTestCase, updateTe
     './NestedFlowEditor.vue': { default: {} },
     '@/stores/user': { useUserStore: () => userStore },
     '@/api/app-automation': api,
+    '@/api/app-device-options': { getAllAppDevices: loadDevices || (async () => []) },
   })
+  if (autoMount) await loaded.mount()
   let disposed = false
   const instance = {
     ...loaded,
@@ -83,6 +91,90 @@ async function loadNestedEditor({ modelValue = [], components = [], componentDef
   instances.push({ dispose: () => { scope.stop(); loaded.dispose() } })
   return { loaded, state, emitted }
 }
+
+test('mounted editor waits for definitions and detail, and never applies a response over an intervening draft', async () => {
+  const detailRequest = deferred()
+  const detailStarted = deferred()
+  const builder = await loadBuilder({
+    routeCaseId: 99,
+    autoMount: false,
+    getTestCaseDetail: id => {
+      detailStarted.resolve(id)
+      return detailRequest.promise
+    },
+  })
+  const mounting = builder.mount()
+
+  assert.equal(builder.state.sceneEditorReady.value, false)
+  assert.equal(await detailStarted.promise, 99)
+  assert.equal(builder.state.sceneEditorReady.value, false)
+  await builder.state.saveScene()
+  assert.equal(builder.writes.length, 0)
+
+  builder.state.sceneForm.value.name = 'Intervening draft'
+  builder.state.scenarioSteps.value = [{ id: 'draft-step', type: 'tap', config: { selector: 'draft' } }]
+  detailRequest.resolve({ data: {
+    id: 99,
+    updated_at: '2026-11-24T11:00:00Z',
+    name: 'Server case',
+    project: null,
+    variables: [],
+    ui_flow: [{ id: 'server-step', type: 'tap', config: { selector: 'server' } }],
+  } })
+  await mounting
+
+  assert.equal(builder.state.sceneEditorReady.value, false)
+  assert.equal(builder.state.editorInitializationStatus.value, 'failed')
+  assert.equal(builder.state.caseDetailStatus.value, 'failed')
+  assert.equal(builder.state.sceneForm.value.name, 'Intervening draft')
+  assert.equal(builder.state.scenarioSteps.value[0].config.selector, 'draft')
+  await builder.state.saveScene()
+  assert.equal(builder.writes.length, 0)
+})
+
+test('case loading enables editing and saves the exact revision while optional device paging is pending', async () => {
+  const devicePaging = deferred()
+  const detailRequest = deferred()
+  const detailStarted = deferred()
+  const builder = await loadBuilder({
+    routeCaseId: 99,
+    autoMount: false,
+    getAllAppDevices: () => devicePaging.promise,
+    getTestCaseDetail: id => {
+      detailStarted.resolve(id)
+      return detailRequest.promise
+    },
+    updateTestCase: async id => ({ data: { id, updated_at: 'revision-2' } }),
+  })
+  const mounting = builder.mount()
+  assert.equal(await detailStarted.promise, 99)
+  assert.equal(builder.state.sceneEditorReady.value, false)
+
+  detailRequest.resolve({ data: {
+    id: 99,
+    updated_at: 'revision-1',
+    name: 'Loaded case',
+    project: null,
+    variables: [],
+    ui_flow: [{ id: 'loaded-step', type: 'tap', config: { selector: 'Continue' } }],
+  } })
+  await mounting
+
+  assert.equal(builder.state.sceneEditorReady.value, true)
+  assert.equal(builder.state.recorderDevicesLoading.value, true)
+  assert.equal(builder.state.loadedCaseUpdatedAt.value, 'revision-1')
+  builder.state.sceneForm.value.name = 'Updated case'
+  await builder.state.saveScene()
+
+  assert.equal(builder.writes.length, 1)
+  assert.equal(builder.writes[0].id, 99)
+  assert.equal(builder.state.loadedCaseUpdatedAt.value, 'revision-2')
+  assert.equal(builder.state.caseDetailStatus.value, 'loaded')
+
+  devicePaging.resolve([])
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(builder.state.recorderDevicesLoading.value, false)
+})
 
 test('save completion uses its submitted snapshot and leaves later edits dirty', async () => {
   const request = deferred()
@@ -206,6 +298,116 @@ test('case loads cannot cross account or session replacement', async () => {
   }
 })
 
+test('custom params use one edited authority and preserve business arrays through clone, save and reload', async () => {
+  const component = {
+    id: 4,
+    name: 'Data component',
+    type: 'data_component',
+    schema: { properties: {
+      amount: { type: 'integer' },
+      steps: { type: 'array' },
+      then_steps: { type: 'array' },
+      try_steps: { type: 'array' },
+      finally_steps: { type: 'array' },
+    }, required: ['amount'] },
+    default_config: { amount: 2 },
+    steps: [],
+  }
+  const loadComponents = async () => ({ data: [component] })
+  const payloadArray = {
+    steps: [{
+      id: 'business-row', type: 'not-a-flow-component', _expanded: 'data-value',
+      config: { _expanded: 'nested-data-value', retries: 'not-a-number', steps: ['ordinary-data'] },
+    }],
+    then_steps: [{ type: 'row', then_steps: ['business-branch'] }],
+    try_steps: ['try-data'],
+    finally_steps: ['finally-data'],
+  }
+
+  for (const parameterSource of ['params', 'config', 'both']) {
+    const id = parameterSource === 'params' ? 71 : parameterSource === 'config' ? 72 : 73
+    const source = { amount: 1, ...structuredClone(payloadArray) }
+    const uiStep = { id: `custom-${id}`, kind: 'custom', type: component.type }
+    if (parameterSource !== 'config') uiStep.params = source
+    if (parameterSource !== 'params') uiStep.config = parameterSource === 'both'
+      ? { amount: 99, steps: ['stale-config'] }
+      : source
+    const detail = {
+      id, updated_at: `revision-${id}`, name: 'Data round trip', project: null,
+      variables: [], ui_flow: [uiStep],
+    }
+    const builder = await loadBuilder({ detail, getCustomComponents: loadComponents })
+    await builder.state.loadCaseDetail(id)
+    assert.equal(builder.state.loadedCaseUpdatedAt.value, `revision-${id}`)
+    assert.deepEqual(plain(builder.state.scenarioSteps.value[0].config), source)
+
+    builder.state.duplicateStep(0)
+    const duplicate = builder.state.scenarioSteps.value[1]
+    duplicate.config.amount = 5
+    builder.state.scenarioSteps.value[0].config.amount = 7
+    assert.deepEqual(plain(duplicate.config.steps), payloadArray.steps)
+    assert.deepEqual(plain(builder.state.scenarioSteps.value[0].config.steps), payloadArray.steps)
+
+    await builder.state.saveScene()
+    assert.equal(builder.writes.length, 1)
+    const savedSteps = builder.writes[0].payload.ui_flow
+    assert.equal(savedSteps[0].params?.amount ?? savedSteps[0].config.amount, 7)
+    assert.equal(savedSteps[1].params?.amount ?? savedSteps[1].config.amount, 5)
+    for (const saved of savedSteps) {
+      const canonical = saved.params || saved.config
+      assert.deepEqual(plain(canonical.steps), payloadArray.steps)
+      assert.deepEqual(plain(canonical.then_steps), payloadArray.then_steps)
+      assert.deepEqual(plain(canonical.try_steps), payloadArray.try_steps)
+      assert.deepEqual(plain(canonical.finally_steps), payloadArray.finally_steps)
+      if (parameterSource === 'both' || parameterSource === 'params') assert.equal(saved.config, undefined)
+      if (parameterSource === 'config') assert.equal(saved.params, undefined)
+    }
+
+    const reloaded = await loadBuilder({
+      detail: { ...detail, ui_flow: savedSteps }, getCustomComponents: loadComponents,
+    })
+    await reloaded.state.loadCaseDetail(id)
+    assert.equal(reloaded.state.scenarioSteps.value[0].config.amount, 7)
+    assert.deepEqual(plain(reloaded.state.scenarioSteps.value[0].config), plain(savedSteps[0].params || savedSteps[0].config))
+  }
+})
+
+test('numeric and boolean variables reject invalid literals and retain null and empty values', async () => {
+  const { state, writes, messages } = await loadBuilder()
+  state.sceneForm.value.name = 'Typed variables'
+  state.scenarioSteps.value = [{ id: 'tap-step', type: 'tap', config: { selector: 'Continue' } }]
+  state.sceneVariables.value = [
+    { name: 'number_value', type: 'number', value: 'not-a-number' },
+    { name: 'boolean_value', type: 'boolean', value: 'not-a-boolean' },
+  ]
+
+  await state.saveScene()
+  assert.equal(writes.length, 0)
+  assert.ok(messages.some(message => message.text.includes('invalidVariableNumber')))
+
+  state.sceneVariables.value[0].value = '3.5'
+  await state.saveScene()
+  assert.equal(writes.length, 0)
+  assert.ok(messages.some(message => message.text.includes('invalidVariableBoolean')))
+
+  state.sceneVariables.value = [
+    { name: 'null_number', type: 'number', value: null },
+    { name: 'empty_number', type: 'number', value: '' },
+    { name: 'zero', type: 'number', value: '0' },
+    { name: 'false_value', type: 'boolean', value: false },
+    { name: 'empty_boolean', type: 'boolean', value: '' },
+  ]
+  await state.saveScene()
+  assert.equal(writes.length, 1)
+  assert.deepEqual(plain(writes[0].payload.variables.map(({ name, value }) => ({ name, value }))), [
+    { name: 'null_number', value: null },
+    { name: 'empty_number', value: '' },
+    { name: 'zero', value: 0 },
+    { name: 'false_value', value: false },
+    { name: 'empty_boolean', value: '' },
+  ])
+})
+
 test('save accepts legacy inline custom steps when their global definition was removed', async () => {
   const { state, writes, messages } = await loadBuilder()
   state.componentDefinitions.value = { wait: { schema: { properties: {}, required: [] }, default_config: {} } }
@@ -292,19 +494,21 @@ test('missing and unavailable project component definitions block versioned-refe
   assert.equal(writes.length, 0, 'definitions from the prior account must not authorize saving')
 })
 
-test('missing base definitions block save while loading and after load failure', async () => {
+test('unknown base steps fail clearly after the palette has loaded', async () => {
   const { state, writes, messages } = await loadBuilder()
+  state.componentDefinitions.value = {}
+  state.componentDefinitionsStatus.value = 'loaded'
   state.sceneForm.value.name = 'Unknown component case'
   state.scenarioSteps.value = [{ id: 'unknown-step', type: 'missing_component', config: {} }]
 
   await state.saveScene()
   assert.equal(writes.length, 0)
-  assert.ok(messages.some(message => message.text.includes('componentDefinitionsLoading')))
+  assert.ok(messages.some(message => message.text.includes('componentDefinitionsUnavailable')))
 
   state.componentDefinitionsStatus.value = 'failed'
   await state.saveScene()
   assert.equal(writes.length, 0)
-  assert.ok(messages.some(message => message.text.includes('componentDefinitionsUnavailable')))
+  assert.ok(messages.some(message => message.text.includes('editorLoadFailed')))
 })
 
 test('confirmed recorder steps survive lease loss only in their captured account, project and scene', async () => {

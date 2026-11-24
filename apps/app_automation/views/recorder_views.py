@@ -111,10 +111,12 @@ def _parse_interaction(payload):
     return lease_token, command, expected_user_id
 
 
-def _quarantine_uncertain_device(device_id, user, generation):
-    """Commit maintenance quarantine before clearing the device-level fence."""
+def _quarantine_uncertain_device(device_id, user, generation, action_epoch):
+    """Commit maintenance quarantine only while this action still owns the fence."""
     try:
-        finish_device_action(device_id, user, generation, quarantine=True)
+        finish_device_action(
+            device_id, user, generation, action_epoch, quarantine=True
+        )
         return True
     except Exception:
         return False
@@ -152,7 +154,7 @@ class RecordInteractionView(APIView):
             )
 
         try:
-            device_serial, generation = begin_device_action(
+            device_serial, generation, action_epoch = begin_device_action(
                 device_id,
                 request.user,
                 lease_token,
@@ -193,7 +195,9 @@ class RecordInteractionView(APIView):
                 shell=False,
             )
         except subprocess.TimeoutExpired:
-            quarantined = _quarantine_uncertain_device(device_id, request.user, generation)
+            quarantined = _quarantine_uncertain_device(
+                device_id, request.user, generation, action_epoch
+            )
             detail = (
                 '设备交互超时，设备已进入维护模式，请管理员确认设备状态'
                 if quarantined else '设备交互超时，设备占用已保留，请管理员恢复设备'
@@ -205,7 +209,7 @@ class RecordInteractionView(APIView):
         except (FileNotFoundError, PermissionError):
             recovery_required = False
             try:
-                finish_device_action(device_id, request.user, generation)
+                finish_device_action(device_id, request.user, generation, action_epoch)
             except Exception:
                 recovery_required = True
                 detail = 'ADB 服务不可用，设备占用已保留，请管理员恢复设备'
@@ -216,7 +220,9 @@ class RecordInteractionView(APIView):
                 detail=detail, status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         except Exception:
-            quarantined = _quarantine_uncertain_device(device_id, request.user, generation)
+            quarantined = _quarantine_uncertain_device(
+                device_id, request.user, generation, action_epoch
+            )
             detail = (
                 '设备交互状态未确认，设备已进入维护模式，请管理员检查'
                 if quarantined else '设备交互状态未确认，设备占用已保留，请管理员恢复设备'
@@ -227,7 +233,7 @@ class RecordInteractionView(APIView):
             )
 
         try:
-            finish_device_action(device_id, request.user, generation)
+            finish_device_action(device_id, request.user, generation, action_epoch)
         except Exception:
             return _interaction_response(
                 outcome='completed', recovery_required=True,

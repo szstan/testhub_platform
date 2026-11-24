@@ -25,7 +25,7 @@ async function setupDiagnostic({ props, getDevice, run, store } = {}) {
   const scope = effectScope()
   const effectiveProps = {
     caseId: 9, stepIndex: 1, stepName: 'Step', nested: false, dirty: false,
-    recording: false, deviceId: 11, ...props,
+    recording: false, recorderBusy: false, caseUpdatedAt: '2026-11-24T11:00:00Z', deviceId: 11, ...props,
   }
   const state = scope.run(() => loaded.component.setup(effectiveProps, { expose() {} }))
   instances.push({ dispose: () => { scope.stop(); loaded.dispose() } })
@@ -38,6 +38,7 @@ test('single-step diagnostics require an explicit click and submit only saved in
   assert.equal(await state.runStep(), true)
   assert.deepEqual(plain(calls[0]), ['run', 9, {
     device_id: 'synthetic-device', auto_lock: true, expected_user_id: 7, step_index: 1,
+    expected_case_updated_at: '2026-11-24T11:00:00Z',
   }])
   assert.equal(state.lastExecutionId.value, 52)
 })

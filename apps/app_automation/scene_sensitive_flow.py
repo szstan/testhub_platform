@@ -107,9 +107,32 @@ def protect_sensitive_inputs(flow, variables):
     for _ in range(min(len(all_steps) + 1, 32)):
         previous = len(names)
         for step in all_steps:
-            if str(step.get('type', '')).lower() != 'set_variable':
-                continue
+            action = str(step.get('type', '')).lower()
             config = step.get('config') if isinstance(step.get('config'), dict) else {}
+            if action == 'api_request':
+                extracts = step.get('extracts', config.get('extracts', []))
+                if isinstance(extracts, list):
+                    for extract in extracts:
+                        if not isinstance(extract, dict):
+                            continue
+                        name = extract.get('name')
+                        path = extract.get('path', '')
+                        if isinstance(name, str) and (
+                            _SECRET_NAME.search(str(name)) or _SECRET_NAME.search(str(path))
+                        ):
+                            names.add(name)
+            elif action == 'extract_output':
+                name = step.get('name', config.get('name'))
+                source = step.get('source', config.get('source'))
+                path = step.get('path', config.get('path', ''))
+                if isinstance(name, str) and (
+                    is_sensitive(source)
+                    or _SECRET_NAME.search(str(path))
+                    or _SECRET_NAME.search(name)
+                ):
+                    names.add(name)
+            if action != 'set_variable':
+                continue
             name = config.get('name', step.get('name'))
             value = step.get('value', config.get('value'))
             if isinstance(name, str) and is_sensitive(value):

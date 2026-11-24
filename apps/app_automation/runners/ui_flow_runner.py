@@ -18,20 +18,19 @@ from django.conf import settings
 from django.db import transaction
 from ..runtime_config import validate_base_url
 from .. import device_actions, native_locator, secret_input
+from ..bounded_inference import BoundedInference, InferenceBusy, InferenceTimeout
 from apps.core.http_transport import guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
+from airtest.aircv import utils as aircv_utils
 from airtest.core.api import (
     Template,
-    wait,
     touch,
     sleep,
     swipe,
     snapshot,
-    exists,
     double_click,
     G,
-    ST,
     text as airtest_text,
 )
 
@@ -56,11 +55,17 @@ _MAX_LOOP_COUNT = 10_000
 _MAX_LOOP_INTERVAL = 300.0
 _MAX_FOREACH_ASSERT_WAIT = 300.0
 _MAX_NATIVE_STATE_PROBE_TIMEOUT = 2.0
+_MAX_IMAGE_LOOKUP_TIMEOUT = 2.0
+_IMAGE_INFERENCE = BoundedInference('app-image-inference')
 _ALLOWED_RUNTIME_OPTIONS = {
     'base_url', 'retry_times', 'retry_interval', 'ocr_languages', 'ocr_use_gpu', 'stop_on_error',
     'package_name',
 }
 _SUPPORTED_OCR_LANGUAGES = {'en', 'ch_sim'}
+_SENSITIVE_OUTPUT_KEY = re.compile(
+    r'password|passwd|secret|token|credential|authorization|cookie|session|api[_-]?key|private[_-]?key',
+    re.IGNORECASE,
+)
 # foreach_assert is excluded because it may click before evaluating its assertion.
 _READ_ONLY_BUSINESS_ASSERTION_ACTIONS = frozenset({
     'assert', 'assert_element', 'assert_text', 'assert_value', 'assert_response',
@@ -248,6 +253,7 @@ class UiFlowRunner:
             'steps': {},
         }
         self._sensitive_variable_names = set()
+        self._sensitive_variable_paths = {}
         self._sensitive_variable_values = set()
         self.runtime = {
             'retry_times': 0,
@@ -314,11 +320,7 @@ class UiFlowRunner:
             if scope not in self.context:
                 scope = 'local'
             value = item.get('value')
-            if item.get('sensitive') is True:
-                self._sensitive_variable_names.add((scope, str(name)))
-                self._remember_sensitive_values(value)
-            
-            self._set_variable(name, value, scope)
+            self._set_variable(name, value, scope, sensitive=item.get('sensitive') is True)
     
     def _remember_sensitive_values(self, value):
         if isinstance(value, dict):
@@ -332,6 +334,58 @@ class UiFlowRunner:
             if rendered:
                 self._sensitive_variable_values.add(rendered)
 
+    def _sensitive_paths_for_reference(self, reference):
+        if not isinstance(reference, str):
+            return set()
+        reference = reference.strip()
+        if reference.startswith('{{') and reference.endswith('}}'):
+            reference = reference[2:-2].strip()
+        elif reference.startswith('${') and reference.endswith('}'):
+            reference = reference[2:-1].strip()
+        parts = self._parse_path(reference)
+        if not parts:
+            return set()
+
+        scope = None
+        if parts[0] in {'local', 'global', 'outputs', 'steps'}:
+            if len(parts) < 2:
+                return set()
+            scope, name, selected_path = parts[0], parts[1], tuple(parts[2:])
+        else:
+            scope = next((candidate for candidate in ('local', 'global', 'outputs', 'steps')
+                          if reference in self.context.get(candidate, {})), None)
+            if scope is not None:
+                name, selected_path = reference, ()
+            else:
+                scope = next((candidate for candidate in ('local', 'global', 'outputs', 'steps')
+                              if parts[0] in self.context.get(candidate, {})), None)
+                if scope is None:
+                    return set()
+                name, selected_path = parts[0], tuple(parts[1:])
+
+        key = (scope, str(name))
+        if key in getattr(self, '_sensitive_variable_names', set()):
+            return {()}
+        tainted_paths = getattr(self, '_sensitive_variable_paths', {}).get(key, set())
+        result = set()
+        for tainted_path in tainted_paths:
+            if tainted_path[:len(selected_path)] == selected_path:
+                result.add(tainted_path[len(selected_path):])
+            elif selected_path[:len(tainted_path)] == tainted_path:
+                result.add(())
+        return result
+
+    @staticmethod
+    def _project_sensitive_paths(tainted_paths, selected_path):
+        selected_path = tuple(selected_path)
+        result = set()
+        for tainted_path in tainted_paths:
+            if tainted_path[:len(selected_path)] == selected_path:
+                result.add(tainted_path[len(selected_path):])
+            elif selected_path[:len(tainted_path)] == tainted_path:
+                result.add(())
+        return result
+
     def _references_sensitive_variable(self, value):
         if isinstance(value, dict):
             return any(
@@ -344,18 +398,14 @@ class UiFlowRunner:
         if not isinstance(value, str):
             return False
         references = re.finditer(r'\{\{\s*([^}]+)\s*\}\}|\$\{\s*([^}]+)\s*\}', value)
-        sensitive_names = getattr(self, '_sensitive_variable_names', set())
         for match in references:
             reference = (match.group(1) or match.group(2)).strip()
             if match.group(1) is None and self._is_dynamic_function(reference):
                 continue
             parts = self._parse_path(reference)
-            if not parts:
-                continue
-            if parts[0] in {'local', 'global', 'outputs', 'steps'}:
-                if len(parts) > 1 and (parts[0], parts[1]) in sensitive_names:
-                    return True
-            elif any((scope, parts[0]) in sensitive_names for scope in ('local', 'global', 'outputs')):
+            if self._sensitive_paths_for_reference(reference):
+                return True
+            if any(_SENSITIVE_OUTPUT_KEY.search(part) for part in parts):
                 return True
         return False
 
@@ -488,11 +538,66 @@ class UiFlowRunner:
                 pass
         self._ui_flow_unsafe_failure_seen = True
 
-    def _set_variable(self, name: str, value: Any, scope: str = 'local'):
-        """设置变量"""
+    def _set_variable(
+        self, name: str, value: Any, scope: str = 'local', *, sensitive=None, sensitive_paths=None,
+    ):
+        """Set a variable and replace or preserve its sensitivity contract."""
         if scope not in self.context:
             scope = 'local'
         self.context[scope][name] = value
+        key = (scope, str(name))
+        names = getattr(self, '_sensitive_variable_names', set())
+        paths_by_variable = getattr(self, '_sensitive_variable_paths', {})
+        if sensitive is True:
+            names.add(key)
+            paths_by_variable.pop(key, None)
+            self._remember_sensitive_values(value)
+        elif sensitive is False:
+            names.discard(key)
+            paths_by_variable.pop(key, None)
+        if sensitive_paths is not None:
+            normalized = {tuple(path) for path in sensitive_paths}
+            if () in normalized:
+                names.add(key)
+                paths_by_variable.pop(key, None)
+                self._remember_sensitive_values(value)
+            else:
+                names.discard(key)
+                if normalized:
+                    paths_by_variable[key] = normalized
+                    for path in normalized:
+                        current = value
+                        for part in path:
+                            current = self._lookup_path_value(current, str(part))
+                            if current is _MISSING:
+                                break
+                        if current is not _MISSING:
+                            self._remember_sensitive_values(current)
+                else:
+                    paths_by_variable.pop(key, None)
+
+    def _sensitive_output_paths(self, value):
+        paths = set()
+        budget = {'nodes': 0}
+
+        def visit(item, path=(), depth=0):
+            budget['nodes'] += 1
+            if budget['nodes'] > 10_000 or depth > 32:
+                paths.add(())
+                return
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    child_path = path + (str(key),)
+                    if _SENSITIVE_OUTPUT_KEY.search(str(key)):
+                        paths.add(child_path)
+                    else:
+                        visit(child, child_path, depth + 1)
+            elif isinstance(item, (list, tuple)):
+                for index, child in enumerate(item):
+                    visit(child, path + (str(index),), depth + 1)
+
+        visit(value)
+        return paths
     
     def _get_variable(self, name: str, scope: Optional[str] = None) -> Any:
         """获取变量"""
@@ -588,11 +693,16 @@ class UiFlowRunner:
         return value
 
     def _record_step_output(self, step: Dict[str, Any], output: Any) -> None:
+        sensitive_paths = self._sensitive_output_paths(output)
         step_id = step.get('id', step.get('step_id'))
         if step_id is not None:
-            self.context.setdefault('steps', {})[str(step_id)] = output
+            self._set_variable(
+                str(step_id), output, 'steps', sensitive_paths=sensitive_paths,
+            )
         if output is not None:
-            self.context.setdefault('outputs', {})['last'] = output
+            self._set_variable(
+                'last', output, 'outputs', sensitive_paths=sensitive_paths,
+            )
     
     @staticmethod
     def _is_uncertain_device_error(error):
@@ -646,6 +756,13 @@ class UiFlowRunner:
         action = action_type.lower() if action_type else ''
         
         raw_config = step.get('config') if isinstance(step.get('config'), dict) else {}
+        from ..scene_component_runtime import _LEGACY_BUILTIN_ACTIONS
+
+        raw_component_config = (
+            copy.deepcopy(raw_config)
+            if step.get('kind') == 'custom' or action not in _LEGACY_BUILTIN_ACTIONS
+            else None
+        )
         if action == 'assert_value':
             raw_left = step.get('left', raw_config.get('left', _MISSING))
             self._validate_assert_value_left(raw_left)
@@ -659,6 +776,22 @@ class UiFlowRunner:
             )
         else:
             input_expression = step.get('value', raw_config.get('value'))
+        raw_sensitive_assignment = False
+        raw_sensitive_extract_paths = None
+        if action == 'set_variable':
+            raw_assignment = step.get('value', raw_config.get('value'))
+            raw_sensitive_assignment = (
+                bool(self._sensitive_paths_for_reference(raw_assignment))
+                or self._references_sensitive_variable(raw_assignment)
+                or self._contains_sensitive_value(raw_assignment)
+            )
+        elif action == 'extract_output':
+            raw_source = step.get('source', raw_config.get('source', ''))
+            raw_path = step.get('path', raw_config.get('path', ''))
+            source_paths = self._sensitive_paths_for_reference(raw_source)
+            raw_sensitive_extract_paths = self._project_sensitive_paths(
+                source_paths, self._parse_path(raw_path) if isinstance(raw_path, str) else (),
+            )
         secret_derived_input = (
             action in {'input', 'text'}
             and (
@@ -669,7 +802,8 @@ class UiFlowRunner:
         if secret_derived_input:
             step['sensitive'] = True
         preserve_loop_operands = {}
-        if action == 'loop' and step.get('mode', raw_config.get('mode')) == 'condition':
+        raw_loop_mode = step.get('mode', raw_config.get('mode', 'count'))
+        if action == 'loop' and str(self._render_value(raw_loop_mode)).strip().lower() == 'condition':
             for key in ('left', 'right'):
                 if key in step:
                     preserve_loop_operands[key] = step[key]
@@ -713,8 +847,14 @@ class UiFlowRunner:
                     step[key] = value
         step.update(preserve_loop_operands)
         step.update(preserve_child_steps)
+        if raw_component_config is not None:
+            step['_ui_flow_raw_component_config'] = raw_component_config
         if action == 'assert_value':
             step['_ui_flow_raw_assert_value_left_validated'] = True
+        if action == 'set_variable':
+            step['_ui_flow_sensitive_assignment'] = raw_sensitive_assignment
+        elif action == 'extract_output' and raw_sensitive_extract_paths is not None:
+            step['_ui_flow_sensitive_extract_paths'] = tuple(raw_sensitive_extract_paths)
         resolved_input = step.get('text', step.get('value')) if action == 'text' else step.get('value')
         if action in {'input', 'text'} and (
             secret_derived_input or self._contains_sensitive_value(resolved_input)
@@ -889,17 +1029,18 @@ class UiFlowRunner:
         """
         comp_type = step.get('type', '')
         comp_name = step.get('name', comp_type)
+        definitions = self._load_custom_component_defs()
+        comp_def = definitions.get(comp_type)
         
         # 优先从步骤自带的 steps 字段获取（前端可能直接带了）
         sub_steps = step.get('steps')
         
         if not sub_steps:
-            # 从数据库加载
-            defs = self._load_custom_component_defs()
-            comp_def = defs.get(comp_type)
-            if not comp_def:
-                raise ValueError(f"自定义组件 '{comp_type}' 未找到，请检查是否已创建并启用")
-            sub_steps = comp_def.get('steps', [])
+            comp_def = comp_def or {}
+            sub_steps = comp_def.get('steps')
+            if not sub_steps:
+                raise ValueError(f"自定义组件 '{comp_name}' 未找到或没有可执行步骤")
+        comp_def = comp_def or {}
         
         if not sub_steps or not isinstance(sub_steps, list):
             raise ValueError(f"自定义组件 '{comp_name}' 没有可执行步骤")
@@ -907,13 +1048,36 @@ class UiFlowRunner:
         # 深拷贝，避免修改原始定义
         sub_steps = copy.deepcopy(sub_steps)
         
-        # 将自定义组件的 config 参数注入到子步骤中（作为变量可渲染）
         comp_config = step.get('config', {})
-        if isinstance(comp_config, dict):
-            for key, value in comp_config.items():
-                if key not in ('type', 'name', 'kind', 'steps'):
-                    self._set_variable(key, value, 'local')
-        
+        if not isinstance(comp_config, dict):
+            raise ValueError('自定义组件参数配置无效')
+        schema = step.get('schema', comp_def.get('schema', {}))
+        defaults = step.get('default_config', comp_def.get('default_config', {}))
+        validation_config = step.get('_ui_flow_raw_component_config', comp_config)
+        if not isinstance(validation_config, dict):
+            validation_config = comp_config
+        parameter_values = {
+            key: value for key, value in validation_config.items()
+            if key not in {'type', 'name', 'kind', 'steps', 'schema', 'default_config', 'version'}
+        }
+        try:
+            from ..scene_component_runtime import (
+                SceneComponentError,
+                validate_legacy_component_configuration,
+            )
+
+            sensitive_parameters = validate_legacy_component_configuration(
+                schema or {}, defaults or {}, sub_steps, parameter_values,
+                stored_definition=comp_def if comp_def else None,
+            )
+        except SceneComponentError:
+            raise ValueError('自定义组件参数配置无效') from None
+        for key, value in comp_config.items():
+            if key not in ('type', 'name', 'kind', 'steps'):
+                self._set_variable(
+                    key, value, 'local', sensitive=key in sensitive_parameters,
+                )
+
         logger.info('Expanding custom component (%s steps)', len(sub_steps))
         
         last_output = None
@@ -1233,6 +1397,58 @@ class UiFlowRunner:
             logger.error('Unable to resolve element (error=%s)', type(exc).__name__)
             return None
     
+    def _image_lookup_once(self, target, *, timeout):
+        if not callable(getattr(target, 'match_in', None)):
+            raise ValueError('Image lookup requires an image template')
+        if (
+            isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or not 0 < timeout <= _MAX_IMAGE_LOOKUP_TIMEOUT
+        ):
+            raise ValueError('Image lookup timeout must be greater than 0 and at most 2 seconds')
+        deadline = time.monotonic() + float(timeout)
+        screenshot = device_actions.capture_screenshot(
+            self._require_device(), timeout=float(timeout),
+        )
+
+        def infer():
+            screen = aircv_utils.string_2_img(screenshot)
+            if screen is None:
+                raise ValueError('Invalid screenshot image')
+            return target.match_in(screen)
+
+        try:
+            result = _IMAGE_INFERENCE.run(infer, deadline)
+        except InferenceTimeout:
+            raise device_actions.DeviceActionError('Image lookup exceeded its deadline') from None
+        except InferenceBusy:
+            raise device_actions.DeviceActionError(
+                'Image recognition is unavailable while a previous request is still running'
+            ) from None
+        except Exception:
+            raise device_actions.DeviceActionError('Image recognition failed') from None
+        if time.monotonic() >= deadline:
+            raise device_actions.DeviceActionError('Image lookup exceeded its deadline')
+        return result
+
+    def _resolve_action_target(self, target, *, timeout=_MAX_IMAGE_LOOKUP_TIMEOUT, required=True):
+        target = self._interaction_target(target)
+        if target is None or not callable(getattr(target, 'match_in', None)):
+            return target
+        position = self._image_lookup_once(target, timeout=timeout)
+        if position is None:
+            if required:
+                raise device_actions.DeviceActionError('Image target was not found before mutation dispatch')
+            return None
+        if not isinstance(position, (tuple, list)) or len(position) < 2:
+            raise device_actions.DeviceActionError('Image recognition returned invalid coordinates')
+        try:
+            x, y = float(position[0]), float(position[1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise device_actions.DeviceActionError('Image recognition returned invalid coordinates') from exc
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise device_actions.DeviceActionError('Image recognition returned invalid coordinates')
+        return (int(x), int(y))
+
     @staticmethod
     def _interaction_target(target):
         """Use the center of a rectangular region for point-based gestures."""
@@ -1248,7 +1464,7 @@ class UiFlowRunner:
 
     def _action_touch(self, step: Dict[str, Any]):
         """点击动作"""
-        target = self._interaction_target(self._resolve_selector(step))
+        target = self._resolve_action_target(self._resolve_selector(step))
         if target is None:
             raise ValueError('Unable to resolve selector for click step')
         logger.info('Executing click action')
@@ -1256,7 +1472,7 @@ class UiFlowRunner:
     
     def _action_double_click(self, step: Dict[str, Any]):
         """双击动作"""
-        target = self._interaction_target(self._resolve_selector(step))
+        target = self._resolve_action_target(self._resolve_selector(step))
         if target is None:
             raise ValueError('双击步骤无法解析目标元素')
         logger.info('Executing double-click action')
@@ -1367,18 +1583,31 @@ class UiFlowRunner:
         return duration
     
     def _action_wait(self, step: Dict[str, Any]):
-        """等待：有 selector 时等待元素出现，没有时纯等待 timeout 秒"""
+        """Wait for a bounded image match or for the configured duration."""
         target = self._resolve_selector(step)
-        timeout = step.get('timeout', step.get('duration', 3))
         if target is None and (step.get('element_id') or step.get('selector')):
             raise ValueError('等待步骤无法解析已配置的目标元素')
-        
-        if target:
+
+        if target is not None:
             if isinstance(target, (tuple, list)):
                 raise ValueError('等待元素出现需要图片元素；坐标或区域可用于点击，纯等待请清空定位')
-            logger.info('Waiting for target element')
-            wait(target, timeout=timeout)
+            timeout, interval = self._validated_element_poll(step, timeout_default=3)
+            deadline = time.monotonic() + (timeout if timeout > 0 else _MAX_IMAGE_LOOKUP_TIMEOUT)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError('Target image did not appear before the deadline')
+                found = self._image_lookup_once(
+                    target, timeout=min(_MAX_IMAGE_LOOKUP_TIMEOUT, remaining),
+                ) is not None
+                remaining = deadline - time.monotonic()
+                if found and remaining > 0:
+                    return
+                if timeout == 0 or remaining <= 0:
+                    raise AssertionError('Target image did not appear before the deadline')
+                time.sleep(min(interval, remaining))
         else:
+            timeout = step.get('timeout', step.get('duration', 3))
             logger.info('Waiting without a selector')
             sleep(timeout)
     
@@ -1423,7 +1652,7 @@ class UiFlowRunner:
         if target is None:
             raise RuntimeError('Image element is unavailable for the requested state check')
         try:
-            present = bool(exists(target))
+            present = self._image_lookup_once(target, timeout=lookup_timeout) is not None
         except Exception:
             raise RuntimeError('Image recognition is unavailable for this device') from None
         return present if state == 'visible' else not present
@@ -1433,26 +1662,23 @@ class UiFlowRunner:
         allowed = {'visible', 'hidden', 'enabled', 'disabled', 'checked', 'unchecked', 'selected', 'unselected'}
         if state not in allowed:
             raise ValueError('Unsupported element state')
-        deadline = time.monotonic() + timeout
-        native_selector = step.get('selector_type', 'image') in {
-            'resource_id', 'text', 'content_desc', 'class',
-        }
+        probe_limit = (
+            _MAX_NATIVE_STATE_PROBE_TIMEOUT
+            if step.get('selector_type', 'image') in {'resource_id', 'text', 'content_desc', 'class'}
+            else _MAX_IMAGE_LOOKUP_TIMEOUT
+        )
+        deadline = time.monotonic() + (timeout if timeout > 0 else probe_limit)
         while True:
             remaining = deadline - time.monotonic()
-            if timeout > 0 and remaining <= 0:
+            if remaining <= 0:
                 raise AssertionError('Element did not reach the requested state')
-            if native_selector:
-                lookup_timeout = (
-                    _MAX_NATIVE_STATE_PROBE_TIMEOUT
-                    if timeout == 0 else min(_MAX_NATIVE_STATE_PROBE_TIMEOUT, remaining)
-                )
-            else:
-                lookup_timeout = max(min(interval, max(remaining, 0)), 0.001)
-            if self._element_state_matches(step, state, lookup_timeout):
+            matches = self._element_state_matches(step, state, min(probe_limit, remaining))
+            remaining = deadline - time.monotonic()
+            if matches and remaining > 0:
                 return True
-            if timeout == 0 or time.monotonic() >= deadline:
+            if timeout == 0 or remaining <= 0:
                 raise AssertionError('Element did not reach the requested state')
-            time.sleep(min(interval, deadline - time.monotonic()))
+            time.sleep(min(interval, remaining))
 
     def _action_wait_element(self, step):
         state = step.get('state', 'visible')
@@ -1467,7 +1693,7 @@ class UiFlowRunner:
         device = self._require_device()
         has_target = bool(step.get('element_id') or step.get('selector'))
         if has_target:
-            target = self._interaction_target(self._resolve_selector(step))
+            target = self._resolve_action_target(self._resolve_selector(step))
             if target is None:
                 raise ValueError('Unable to resolve selector for clear_input')
             touch(target)
@@ -1658,7 +1884,7 @@ class UiFlowRunner:
         if name:
             if 'value_type' in step:
                 value = self._convert_variable_value(value, step['value_type'])
-            self._set_variable(name, value, scope)
+            self._set_variable(name, value, scope, sensitive=step.get('_ui_flow_sensitive_assignment') is True)
             logger.info('Variable set')
     
     def _action_assert(self, step: Dict[str, Any]):
@@ -1675,9 +1901,16 @@ class UiFlowRunner:
         - image:  在屏幕上查找期望图片是否存在（图片对比断言）
         """
         assert_type = step.get('assert_type', 'text')
-        timeout = float(step.get('timeout', 0))
-        retry_interval = float(step.get('retry_interval', 1))
-        
+        try:
+            timeout = float(step.get('timeout', 0))
+            retry_interval = float(step.get('retry_interval', 1))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('Assertion timeout and retry interval must be numeric') from exc
+        if not math.isfinite(timeout) or not 0 <= timeout <= _MAX_LOOP_INTERVAL:
+            raise ValueError('Assertion timeout must be from 0 to 300 seconds')
+        if not math.isfinite(retry_interval) or not 0 <= retry_interval <= _MAX_RETRY_INTERVAL:
+            raise ValueError('Assertion retry interval must be from 0 to 10 seconds')
+
         assert_map = {
             'text': self._assert_text,
             'number': self._assert_number,
@@ -1686,43 +1919,43 @@ class UiFlowRunner:
             'exists': self._assert_exists,
             'image': self._assert_image,
         }
-        
         handler = assert_map.get(assert_type)
         if not handler:
             raise ValueError(f"未知的断言类型: {assert_type}，支持: {', '.join(assert_map.keys())}")
-        
-        # 无超时：直接执行一次
-        if timeout <= 0:
+
+        deadline = time.monotonic() + (
+            timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT
+        )
+        step['_ui_flow_deadline'] = deadline
+        if timeout == 0:
             handler(step)
+            if time.monotonic() >= deadline:
+                raise AssertionError('Assertion read exceeded its deadline')
             return
-        
-        # 有超时：在 timeout 秒内持续重试
-        deadline = time.time() + timeout
+
         last_error = None
         attempt = 0
-        while True:
+        while time.monotonic() < deadline:
             attempt += 1
             try:
                 handler(step)
+                if time.monotonic() >= deadline:
+                    raise AssertionError('Assertion read exceeded its deadline')
                 if attempt > 1:
-                    logger.info(f"断言在第 {attempt} 次尝试后通过")
-                return  # 断言通过
-            except (AssertionError, Exception) as e:
-                if self._is_uncertain_device_error(e):
-                    self._quarantine_uncertain_device_error(e)
+                    logger.info('Assertion passed after retrying')
+                return
+            except Exception as error:
+                if self._is_uncertain_device_error(error):
+                    self._quarantine_uncertain_device_error(error)
                     raise
-                last_error = e
-                if time.time() >= deadline:
+                last_error = error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                remaining = deadline - time.time()
-                wait_time = min(retry_interval, remaining)
-                if wait_time > 0:
-                    logger.debug(
-                        'Assertion attempt %s failed (%s); retrying in %.1fs',
-                        attempt, type(e).__name__, wait_time,
-                    )
-                    sleep(wait_time)
-        
+                time.sleep(min(retry_interval, remaining))
+
+        if last_error is None:
+            raise AssertionError('Assertion timed out')
         raise last_error
     
     # ---------- 断言内部实现 ----------
@@ -1757,15 +1990,15 @@ class UiFlowRunner:
         else:
             raise ValueError('Invalid OCR region')
     
-    def _ocr_recognize_text(self, region: tuple) -> str:
-        """OCR 识别指定区域的文本"""
+    def _ocr_recognize_text(self, region: tuple, *, deadline=None) -> str:
+        """Recognize a region from a bounded screenshot before the deadline."""
         ocr = self._get_ocr_helper()
-        return ocr.recognize_region_text(region)
-    
-    def _ocr_recognize_number(self, region: tuple) -> int:
-        """OCR 识别指定区域的数字（自动去除逗号等格式符号）"""
+        return ocr.recognize_region_text(region, deadline=deadline)
+
+    def _ocr_recognize_number(self, region: tuple, *, deadline=None) -> int:
+        """Recognize a number from a bounded screenshot before the deadline."""
         ocr = self._get_ocr_helper()
-        return ocr.recognize_region_number(region)
+        return ocr.recognize_region_number(region, deadline=deadline)
     
     def _assert_text(self, step: Dict[str, Any]):
         """文本断言：OCR 识别文本，支持 exact/contains/regex 匹配"""
@@ -1778,7 +2011,9 @@ class UiFlowRunner:
         if match_mode in {'contains', 'regex'} and (not isinstance(expected, str) or expected == ''):
             raise ValueError('Text contains/regex assertions require a non-empty expected value')
 
-        actual_text = self._ocr_recognize_text(region)
+        actual_text = self._ocr_recognize_text(
+            region, deadline=step.get('_ui_flow_deadline'),
+        )
         
         if match_mode == 'exact':
             passed = actual_text == expected
@@ -1808,7 +2043,9 @@ class UiFlowRunner:
         except (ValueError, TypeError):
             raise ValueError('Number assertion expected value must be an integer')
         
-        actual_num = self._ocr_recognize_number(region)
+        actual_num = self._ocr_recognize_number(
+            region, deadline=step.get('_ui_flow_deadline'),
+        )
         
         if actual_num != expected_num:
             raise AssertionError('Number assertion failed')
@@ -1826,7 +2063,9 @@ class UiFlowRunner:
         if not pattern:
             raise ValueError("regex 断言需要在 expected 字段填写正则表达式")
         
-        actual_text = self._ocr_recognize_text(region)
+        actual_text = self._ocr_recognize_text(
+            region, deadline=step.get('_ui_flow_deadline'),
+        )
         
         match = _safe_regex_search(pattern, actual_text)
         if not match:
@@ -1857,7 +2096,9 @@ class UiFlowRunner:
         except (ValueError, TypeError):
             raise ValueError('Range assertion maximum must be an integer')
         
-        actual_num = self._ocr_recognize_number(region)
+        actual_num = self._ocr_recognize_number(
+            region, deadline=step.get('_ui_flow_deadline'),
+        )
         
         if min_num is not None and actual_num < min_num:
             raise AssertionError('Range assertion failed: below minimum')
@@ -1874,7 +2115,14 @@ class UiFlowRunner:
         if target is None:
             raise ValueError('存在性断言无法解析目标元素')
 
-        result = bool(exists(target))
+        lookup_timeout = _MAX_IMAGE_LOOKUP_TIMEOUT
+        if step.get('_ui_flow_deadline') is not None:
+            lookup_timeout = min(
+                lookup_timeout, step['_ui_flow_deadline'] - time.monotonic(),
+            )
+        if lookup_timeout <= 0:
+            raise TimeoutError('Existence assertion exceeded its deadline')
+        result = self._image_lookup_once(target, timeout=lookup_timeout) is not None
         
         if expected_exists and not result:
             raise AssertionError(f"期望元素存在，但实际不存在")
@@ -1898,7 +2146,14 @@ class UiFlowRunner:
             raise ValueError('Expected image does not exist')
         
         target = Template(image_path, threshold=threshold)
-        result = exists(target)
+        lookup_timeout = _MAX_IMAGE_LOOKUP_TIMEOUT
+        if step.get('_ui_flow_deadline') is not None:
+            lookup_timeout = min(
+                lookup_timeout, step['_ui_flow_deadline'] - time.monotonic(),
+            )
+        if lookup_timeout <= 0:
+            raise TimeoutError('Image assertion exceeded its deadline')
+        result = self._image_lookup_once(target, timeout=lookup_timeout) is not None
         
         if not result:
             raise AssertionError('未在屏幕上找到期望图片')
@@ -1906,17 +2161,18 @@ class UiFlowRunner:
         logger.info('Image assertion passed')
     
     def _run_assertion_until(self, check, timeout, interval):
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + (
+            timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT
+        )
         while True:
             remaining = deadline - time.monotonic()
-            if timeout > 0 and remaining <= 0:
+            if remaining <= 0:
                 raise AssertionError('Text assertion timed out')
-            lookup_timeout = (
-                _MAX_NATIVE_STATE_PROBE_TIMEOUT
-                if timeout == 0 else min(interval, remaining)
-            )
+            lookup_timeout = min(_MAX_IMAGE_LOOKUP_TIMEOUT, remaining)
             try:
-                check(lookup_timeout)
+                check(lookup_timeout, deadline)
+                if time.monotonic() >= deadline:
+                    raise AssertionError('Text assertion timed out')
                 return
             except AssertionError:
                 remaining = deadline - time.monotonic()
@@ -1924,17 +2180,26 @@ class UiFlowRunner:
                     raise
                 time.sleep(min(interval, remaining))
 
-    def _read_text_selector(self, step, timeout):
+    def _read_text_selector(self, step, timeout, *, deadline=None):
         self._require_device()
+        if deadline is None:
+            deadline = step.get('_ui_flow_deadline')
         selector_type = step.get('selector_type', 'resource_id')
         if selector_type == 'region':
             if not OCR_AVAILABLE:
                 raise RuntimeError('OCR is unavailable; region text requires EasyOCR and its local model files')
             region = self._parse_ocr_region(step)
-            return self._ocr_recognize_text(region)
+            return self._ocr_recognize_text(region, deadline=deadline)
         if selector_type not in {'resource_id', 'text', 'content_desc', 'class'}:
             raise ValueError('Text checks support native selectors or an OCR region')
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError('Native text lookup exceeded its deadline')
+            timeout = min(timeout, remaining)
         match = self._find_native_match(step, timeout=timeout)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AssertionError('Native text lookup exceeded its deadline')
         if match is None:
             raise AssertionError('Native text element was not found')
         if match.text:
@@ -1952,8 +2217,8 @@ class UiFlowRunner:
         if match_mode not in {'exact', 'contains', 'regex'}:
             raise ValueError('Unsupported assert_text match mode')
 
-        def check(lookup_timeout):
-            actual = str(self._read_text_selector(step, lookup_timeout))
+        def check(lookup_timeout, deadline):
+            actual = str(self._read_text_selector(step, lookup_timeout, deadline=deadline))
             if match_mode == 'exact':
                 passed = actual == expected
             elif match_mode == 'contains':
@@ -2002,7 +2267,11 @@ class UiFlowRunner:
             raise ValueError('extract_text scope must be local or global')
         timeout, _interval = self._validated_element_poll(step)
         value = self._read_text_selector(
-            step, timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT,
+            step,
+            timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT,
+            deadline=time.monotonic() + (
+                timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT
+            ),
         )
         self._set_variable(name, value, scope)
         logger.info('Extracted UI text into a variable')
@@ -2015,21 +2284,15 @@ class UiFlowRunner:
     
     def _action_input(self, step: Dict[str, Any]):
         """输入文本"""
-        target = self._interaction_target(self._resolve_selector(step))
+        target = self._resolve_action_target(self._resolve_selector(step))
         if target is None and (step.get('element_id') or step.get('selector')):
             raise ValueError('输入步骤无法解析已配置的目标元素')
         value = step.get('value', '')
-        
-        # 解析变量表达式（如随机数函数）
-        from apps.core.variable_resolver import resolve_variables
-        value = resolve_variables(value)
-        
         send_enter = step.get('send_enter', False)
-        
+
         if target is not None:
             touch(target)
             time.sleep(0.3)
-
         if step.get('clear_first') is True:
             device_actions.clear_focused_input(self._require_device())
 
@@ -2037,6 +2300,8 @@ class UiFlowRunner:
         if self._is_sensitive_input(step):
             self._enter_sensitive_text(value)
         else:
+            from apps.core.variable_resolver import resolve_variables
+            value = resolve_variables(value)
             airtest_text(value)
 
         if send_enter:
@@ -2045,7 +2310,7 @@ class UiFlowRunner:
     
     def _action_long_press(self, step: Dict[str, Any]):
         """长按"""
-        target = self._interaction_target(self._resolve_selector(step))
+        target = self._resolve_action_target(self._resolve_selector(step))
         duration = step.get('duration', 2)
         
         if target is None:
@@ -2061,7 +2326,7 @@ class UiFlowRunner:
             'selector_type': step.get('start_selector_type', 'image'),
             'image_scope': step.get('image_scope', 'common')
         }
-        start = self._interaction_target(self._resolve_selector(start_config))
+        start = self._resolve_action_target(self._resolve_selector(start_config))
         
         # 解析终点
         end_config = {
@@ -2069,7 +2334,7 @@ class UiFlowRunner:
             'selector_type': step.get('end_selector_type', 'image'),
             'image_scope': step.get('image_scope', 'common')
         }
-        end = self._interaction_target(self._resolve_selector(end_config))
+        end = self._resolve_action_target(self._resolve_selector(end_config))
         
         duration = step.get('duration', 0.8)
         
@@ -2095,7 +2360,7 @@ class UiFlowRunner:
         duration = self._validated_swipe_duration(step.get('duration', 0.5))
 
         for i in range(max_swipes + 1):
-            if exists(target):
+            if self._resolve_action_target(target, required=False) is not None:
                 logger.info('Target found; stopping swipe search')
                 return
             if i == max_swipes:
@@ -2127,12 +2392,13 @@ class UiFlowRunner:
         }
         fallback_target = self._resolve_selector(fallback_config)
         
-        if main_target and exists(main_target):
-            logger.info(f"主定位存在，点击主定位")
-            touch(main_target)
-        elif fallback_target:
-            logger.info(f"主定位不存在，点击备用定位")
-            touch(fallback_target)
+        main_point = self._resolve_action_target(main_target, required=False)
+        if main_point is not None:
+            logger.info('Main target found; clicking main target')
+            touch(main_point)
+        elif fallback_target is not None:
+            logger.info('Main target missing; clicking fallback target')
+            touch(self._resolve_action_target(fallback_target))
         else:
             raise ValueError('主定位不存在且备用定位不可用')
     
@@ -2157,11 +2423,12 @@ class UiFlowRunner:
         if main_target is None or fallback_target is None:
             raise ValueError('image_exists_click_chain requires both main and fallback targets')
 
-        if exists(main_target):
+        main_point = self._resolve_action_target(main_target, required=False)
+        if main_point is not None:
             logger.info('Main target found; clicking main and fallback targets')
-            touch(main_target)
+            touch(main_point)
             time.sleep(0.5)
-        touch(fallback_target)
+        touch(self._resolve_action_target(fallback_target))
     
     def _action_unset_variable(self, step: Dict[str, Any]):
         """删除变量"""
@@ -2196,6 +2463,7 @@ class UiFlowRunner:
         if source_value is _MISSING:
             raise ValueError('extract_output source variable was not found')
 
+        source_paths = self._sensitive_paths_for_reference(source)
         if path:
             current = source_value
             for key in self._parse_path(path):
@@ -2203,10 +2471,15 @@ class UiFlowRunner:
                 if current is _MISSING:
                     raise ValueError('extract_output path value was not found')
             extracted = current
+            selected_path = self._parse_path(path)
         else:
             extracted = source_value
+            selected_path = ()
 
-        self._set_variable(name, extracted, scope)
+        sensitive_paths = step.get('_ui_flow_sensitive_extract_paths')
+        if sensitive_paths is None:
+            sensitive_paths = self._project_sensitive_paths(source_paths, selected_path)
+        self._set_variable(name, extracted, scope, sensitive_paths=sensitive_paths)
         logger.info('Output extracted into a variable')
     
     @staticmethod
@@ -2319,9 +2592,11 @@ class UiFlowRunner:
                     f"实际 {response.status_code}"
                 )
         
-        # 保存完整结果
+        result_sensitive_paths = self._sensitive_output_paths(result)
         if save_as:
-            self._set_variable(save_as, result, scope)
+            self._set_variable(
+                save_as, result, scope, sensitive_paths=result_sensitive_paths,
+            )
         
         # 字段提取
         if extracts and isinstance(extracts, list):
@@ -2343,7 +2618,13 @@ class UiFlowRunner:
                         raise ValueError(
                             f"api_request extracts path '{e_path}' could not be resolved at '{key}'"
                         )
-                self._set_variable(e_name, current, e_scope)
+                selected_paths = self._project_sensitive_paths(
+                    result_sensitive_paths,
+                    self._parse_path(e_path) if isinstance(e_path, str) else (),
+                )
+                self._set_variable(
+                    e_name, current, e_scope, sensitive_paths=selected_paths,
+                )
                 logger.info('API response field extracted')
         return result
     
@@ -2480,7 +2761,7 @@ class UiFlowRunner:
 
     def _action_loop(self, step: Dict[str, Any]):
         """循环：支持计数/条件/遍历三种模式"""
-        mode = str(step.get('mode', 'count')).lower()
+        mode = str(self._render_value(step.get('mode', 'count'))).strip().lower()
         steps = step.get('steps', [])
         if not isinstance(steps, list):
             raise ValueError('Loop steps must be a list')
@@ -2663,7 +2944,18 @@ class UiFlowRunner:
                     raise ValueError('Expected image does not exist')
                 expected_images.append(Template(image_path, threshold=threshold))
 
-            matcher = lambda: any(bool(exists(target)) for target in expected_images)
+            def match_image(deadline):
+                for target in expected_images:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    if self._image_lookup_once(
+                        target, timeout=min(_MAX_IMAGE_LOOKUP_TIMEOUT, remaining),
+                    ) is not None:
+                        return True
+                return False
+
+            matcher = match_image
         else:
             if not OCR_AVAILABLE:
                 raise RuntimeError('Text/number foreach_assert requires OCR support')
@@ -2684,11 +2976,11 @@ class UiFlowRunner:
                 raise ValueError(f'Unsupported text match mode: {match_mode}')
             ocr = self._get_ocr_helper()
 
-            def match_ocr_value():
+            def match_ocr_value(deadline):
                 actual = (
-                    ocr.recognize_region_number(ocr_region)
+                    ocr.recognize_region_number(ocr_region, deadline=deadline)
                     if assert_type == 'number'
-                    else ocr.recognize_region_text(ocr_region)
+                    else ocr.recognize_region_text(ocr_region, deadline=deadline)
                 )
                 for expected in expected_list:
                     if assert_type == 'number':
@@ -2708,25 +3000,30 @@ class UiFlowRunner:
             matcher = match_ocr_value
 
         matched_count = 0
-        attempts = 0
         # A zero timeout keeps count-driven behavior under the same hard deadline.
         deadline = time.monotonic() + (
             timeout if timeout > 0 else _MAX_FOREACH_ASSERT_WAIT
         )
         for index in range(max_loops):
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            # Avoid another click when its settling interval cannot fit.
+            if remaining <= 0 or (index > 0 and remaining < interval):
                 break
             logger.info('foreach_assert iteration')
-            touch(click_target)
-            attempts += 1
+            click_position = self._resolve_action_target(
+                click_target, timeout=min(_MAX_IMAGE_LOOKUP_TIMEOUT, remaining),
+            )
+            if time.monotonic() >= deadline:
+                break
+            touch(click_position)
 
             remaining = deadline - time.monotonic()
             if interval > 0 and remaining > 0:
                 time.sleep(min(interval, remaining))
-            if time.monotonic() > deadline:
+            if time.monotonic() >= deadline:
                 break
 
-            if matcher():
+            if matcher(deadline) and time.monotonic() < deadline:
                 matched_count += 1
 
         logger.info('foreach_assert completed')

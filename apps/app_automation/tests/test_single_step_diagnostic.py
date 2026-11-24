@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from django.db import connection
+from django.db.models import QuerySet
 from rest_framework.test import APIClient
 
 from apps.app_automation.executors.test_executor import AppTestExecutor
@@ -17,9 +19,11 @@ from apps.app_automation.scene_execution import (
     SCENE_CASE_CHANGED_MESSAGE,
     ScenePreparationError,
     prepare_scene_execution,
+    validate_diagnostic_selection,
 )
 from apps.app_automation.tasks import classify_app_test_result, execute_app_test_task
 from apps.app_automation.tests import test_app_flow
+from apps.app_automation.views.test_case_views import AppTestCaseViewSet
 from apps.users.models import User
 
 
@@ -42,6 +46,10 @@ def diagnostic_resources(db):
     return owner, other, project, case, device
 
 
+def serialized_case_revision(case):
+    return case.updated_at.isoformat().replace('+00:00', 'Z')
+
+
 def post_run_step(user, case, payload):
     client = APIClient()
     client.force_authenticate(user=user)
@@ -55,11 +63,13 @@ def post_run_step(user, case, payload):
 @pytest.mark.django_db
 def test_run_step_queues_only_saved_selection_and_case_version(diagnostic_resources):
     owner, _, _, case, device = diagnostic_resources
+    client_revision = serialized_case_revision(case)
     payload = {
         'device_id': device.device_id,
         'auto_lock': False,
         'expected_user_id': owner.pk,
         'step_index': 0,
+        'expected_case_updated_at': client_revision,
         'step': {'type': 'input', 'config': {'value': 'client-private-value'}},
         'input_values': {'password': 'client-private-secret'},
     }
@@ -77,7 +87,7 @@ def test_run_step_queues_only_saved_selection_and_case_version(diagnostic_resour
     queued = dispatch.call_args.kwargs
     assert queued['args'] == (execution.pk,)
     assert queued['kwargs']['step_index'] == 0
-    assert queued['kwargs']['expected_case_updated_at'] == case.updated_at.isoformat()
+    assert queued['kwargs']['expected_case_updated_at'] == client_revision
     assert 'step' not in queued['kwargs']
     assert 'input_values' not in queued['kwargs']
     assert 'client-private-value' not in str(queued)
@@ -95,6 +105,7 @@ def test_run_step_can_acquire_the_existing_auto_lock_lease(diagnostic_resources)
             'auto_lock': True,
             'expected_user_id': owner.pk,
             'step_index': 0,
+            'expected_case_updated_at': serialized_case_revision(case),
         })
 
     assert response.status_code == 200, response.data
@@ -114,6 +125,7 @@ def test_run_step_rejects_identity_and_device_lease_mismatches(diagnostic_resour
         'auto_lock': False,
         'expected_user_id': other.pk,
         'step_index': 0,
+        'expected_case_updated_at': serialized_case_revision(case),
     }
 
     with patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch:
@@ -127,7 +139,33 @@ def test_run_step_rejects_identity_and_device_lease_mismatches(diagnostic_resour
 
 
 @pytest.mark.django_db
+def test_run_step_rejects_case_outside_user_scope(diagnostic_resources):
+    _, other, _, case, device = diagnostic_resources
+    payload = {
+        'device_id': device.device_id,
+        'auto_lock': False,
+        'expected_user_id': other.pk,
+        'step_index': 0,
+        'expected_case_updated_at': serialized_case_revision(case),
+    }
+
+    with (
+        patch('apps.app_automation.views.test_case_views.prepare_execution_device') as admit,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch,
+    ):
+        response = post_run_step(other, case, payload)
+
+    assert response.status_code == 404
+    admit.assert_not_called()
+    dispatch.assert_not_called()
+    assert not AppTestExecution.objects.exists()
+    device.refresh_from_db()
+    assert device.locked_by_id is not None
+
+
+@pytest.mark.django_db
 def test_run_step_checks_bounds_before_auto_lock_or_execution_creation(diagnostic_resources):
+
     owner, _, _, case, device = diagnostic_resources
     device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
     device.refresh_from_db()
@@ -138,6 +176,7 @@ def test_run_step_checks_bounds_before_auto_lock_or_execution_creation(diagnosti
             'auto_lock': True,
             'expected_user_id': owner.pk,
             'step_index': 2,
+            'expected_case_updated_at': serialized_case_revision(case),
         })
 
     assert response.status_code == 400
@@ -164,11 +203,186 @@ def test_run_step_rejects_busy_device_without_queueing(diagnostic_resources):
             'auto_lock': False,
             'expected_user_id': owner.pk,
             'step_index': 0,
+            'expected_case_updated_at': serialized_case_revision(case),
         })
 
     assert response.status_code == 409
     assert AppTestExecution.objects.count() == 1
     dispatch.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_run_step_rejects_missing_case_revision_without_device_admission(diagnostic_resources):
+    owner, _, _, case, device = diagnostic_resources
+    device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    starting_generation = device.lease_generation
+    payload = {
+        'device_id': device.device_id,
+        'auto_lock': True,
+        'expected_user_id': owner.pk,
+        'step_index': 0,
+    }
+
+    with (
+        patch('apps.app_automation.views.test_case_views.prepare_execution_device') as admit,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch,
+    ):
+        response = post_run_step(owner, case, payload)
+
+    assert response.status_code == 409
+    assert response.data['message'] == SCENE_CASE_CHANGED_MESSAGE
+    admit.assert_not_called()
+    dispatch.assert_not_called()
+    assert not AppTestExecution.objects.exists()
+    device.refresh_from_db()
+    assert device.locked_by_id is None
+    assert device.lease_generation == starting_generation
+
+
+@pytest.mark.parametrize('revision', ['', 'not-a-timestamp', 123, [], {}])
+@pytest.mark.django_db
+def test_run_step_rejects_invalid_case_revision_without_device_admission(
+    diagnostic_resources, revision,
+):
+    owner, _, _, case, device = diagnostic_resources
+    device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    starting_generation = device.lease_generation
+    payload = {
+        'device_id': device.device_id,
+        'auto_lock': True,
+        'expected_user_id': owner.pk,
+        'step_index': 0,
+        'expected_case_updated_at': revision,
+    }
+
+    with (
+        patch('apps.app_automation.views.test_case_views.prepare_execution_device') as admit,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch,
+    ):
+        response = post_run_step(owner, case, payload)
+
+    assert response.status_code == 409
+    assert response.data['message'] == SCENE_CASE_CHANGED_MESSAGE
+    admit.assert_not_called()
+    dispatch.assert_not_called()
+    assert not AppTestExecution.objects.exists()
+    device.refresh_from_db()
+    assert device.locked_by_id is None
+    assert device.lease_generation == starting_generation
+
+
+@pytest.mark.django_db
+def test_run_step_rejects_stale_case_revision_without_device_admission(diagnostic_resources):
+    owner, _, _, case, device = diagnostic_resources
+    device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    starting_generation = device.lease_generation
+    stale_revision = serialized_case_revision(case)
+    AppTestCase.objects.filter(pk=case.pk).update(
+        ui_flow=[{'type': 'click', 'config': {'selector_type': 'pos', 'selector': '1,1'}}],
+        updated_at=case.updated_at + timedelta(seconds=1),
+    )
+
+    with (
+        patch('apps.app_automation.views.test_case_views.prepare_execution_device') as admit,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch,
+    ):
+        response = post_run_step(owner, case, {
+            'device_id': device.device_id,
+            'auto_lock': True,
+            'expected_user_id': owner.pk,
+            'step_index': 0,
+            'expected_case_updated_at': stale_revision,
+        })
+
+    assert response.status_code == 409
+    assert response.data['message'] == SCENE_CASE_CHANGED_MESSAGE
+    admit.assert_not_called()
+    dispatch.assert_not_called()
+    assert not AppTestExecution.objects.exists()
+    device.refresh_from_db()
+    assert device.locked_by_id is None
+    assert device.lease_generation == starting_generation
+
+
+@pytest.mark.parametrize(('mutation', 'expected_status'), [('update', 409), ('delete', 404)])
+@pytest.mark.django_db
+def test_run_step_rechecks_case_after_device_lock_before_lease(
+    diagnostic_resources, monkeypatch, mutation, expected_status,
+):
+    owner, _, _, case, device = diagnostic_resources
+    device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    starting_generation = device.lease_generation
+    revision = serialized_case_revision(case)
+    original_get_locked_case = AppTestCaseViewSet._get_locked_diagnostic_case
+    calls = 0
+
+    def interleave_case_change(viewset, request, case_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if mutation == 'update':
+                AppTestCase.objects.filter(pk=case_id).update(
+                    ui_flow=[{'type': 'click', 'config': {'selector_type': 'pos', 'selector': '1,1'}}],
+                    updated_at=case.updated_at + timedelta(seconds=1),
+                )
+            else:
+                AppTestCase.objects.filter(pk=case_id).delete()
+        return original_get_locked_case(viewset, request, case_id)
+
+    monkeypatch.setattr(
+        AppTestCaseViewSet,
+        '_get_locked_diagnostic_case',
+        interleave_case_change,
+    )
+    with (
+        patch('apps.app_automation.views.test_case_views.prepare_execution_device') as admit,
+        patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch,
+    ):
+        response = post_run_step(owner, case, {
+            'device_id': device.device_id,
+            'auto_lock': True,
+            'expected_user_id': owner.pk,
+            'step_index': 0,
+            'expected_case_updated_at': revision,
+        })
+
+    assert calls == 1
+    assert response.status_code == expected_status
+    if mutation == 'update':
+        assert response.data['message'] == SCENE_CASE_CHANGED_MESSAGE
+    admit.assert_not_called()
+    dispatch.assert_not_called()
+    assert not AppTestExecution.objects.exists()
+    device.refresh_from_db()
+    assert device.locked_by_id is None
+    assert device.lease_generation == starting_generation
+
+
+@pytest.mark.django_db
+def test_run_step_locks_case_and_device_in_execution_safe_order(diagnostic_resources, monkeypatch):
+    owner, _, _, case, device = diagnostic_resources
+    original_select_for_update = QuerySet.select_for_update
+    lock_events = []
+
+    def track_select_for_update(queryset, *args, **kwargs):
+        if queryset.model in (AppTestCase, AppDevice):
+            lock_events.append((queryset.model, connection.in_atomic_block))
+        return original_select_for_update(queryset, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, 'select_for_update', track_select_for_update)
+    with patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch:
+        response = post_run_step(owner, case, {
+            'device_id': device.device_id,
+            'auto_lock': False,
+            'expected_user_id': owner.pk,
+            'step_index': 0,
+            'expected_case_updated_at': serialized_case_revision(case),
+        })
+
+    assert response.status_code == 200, response.data
+    assert [model for model, _ in lock_events[:2]] == [AppDevice, AppTestCase]
+    assert all(in_atomic for _, in_atomic in lock_events[:2])
+    dispatch.assert_called_once()
 
 
 def test_debug_worker_environment_does_not_require_case_package(monkeypatch):
@@ -217,6 +431,109 @@ def test_worker_fails_stale_case_before_claim_or_executor(diagnostic_resources):
     execution.refresh_from_db()
     assert execution.status == 'error'
     assert execution.error_message == SCENE_CASE_CHANGED_MESSAGE
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('phase', ['before_claim', 'after_claim', 'executor_preflight'])
+def test_stale_queued_diagnostic_releases_its_auto_acquired_lease(diagnostic_resources, phase):
+    _assert_stale_diagnostic_cleanup(diagnostic_resources, auto_lock=True, lease_state='idle', phase=phase)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('auto_lock,lease_state', [
+    (False, 'idle'), (True, 'changed'), (True, 'pending'), (True, 'active'),
+])
+def test_stale_diagnostic_preserves_manual_changed_and_busy_leases(diagnostic_resources, auto_lock, lease_state):
+    _assert_stale_diagnostic_cleanup(diagnostic_resources, auto_lock=auto_lock,
+                                   lease_state=lease_state, phase='before_claim')
+
+
+@pytest.mark.django_db
+def test_stale_diagnostic_after_device_admission_preserves_durable_fence(diagnostic_resources):
+    _assert_stale_diagnostic_cleanup(diagnostic_resources, auto_lock=True,
+                                   lease_state='idle', phase='admitted_io')
+
+
+def _assert_stale_diagnostic_cleanup(resources, *, auto_lock, lease_state, phase):
+    from apps.app_automation.execution_admission import (
+        claim_app_execution_batch,
+        release_device_if_idle,
+    )
+
+    owner, other, _, case, device = resources
+    if auto_lock:
+        device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    with patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch:
+        response = post_run_step(owner, case, {
+            'device_id': device.device_id, 'auto_lock': auto_lock,
+            'expected_user_id': owner.pk, 'step_index': 0,
+            'expected_case_updated_at': serialized_case_revision(case),
+        })
+    assert response.status_code == 200, response.data
+    queued = dispatch.call_args.kwargs
+    assert queued['kwargs']['release_device_lease'] is auto_lock
+    execution = AppTestExecution.objects.get(pk=response.data['execution']['id'])
+    device.refresh_from_db()
+    original_generation = device.lease_generation
+    expected_owner = owner.pk
+    if lease_state == 'changed':
+        AppDevice.objects.filter(pk=device.pk).update(
+            lease_generation=original_generation + 1, locked_by=other,
+        )
+        expected_owner = other.pk
+    elif lease_state == 'pending':
+        AppDevice.objects.filter(pk=device.pk).update(device_action_pending=True)
+    elif lease_state == 'active':
+        AppTestExecution.objects.create(test_case=case, user=owner, device=device,
+                                       status='pending', device_lease_generation=original_generation)
+
+    def change_case():
+        case.name = 'Changed after successful diagnostic admission'
+        case.save(update_fields=['name', 'updated_at'])
+
+    def claim_and_change(*args, **kwargs):
+        claimed = claim_app_execution_batch(*args, **kwargs)
+        if phase == 'after_claim':
+            change_case()
+        return claimed
+
+    def stale_executor_preflight(**kwargs):
+        if phase == 'admitted_io':
+            kwargs['before_device_io']()
+        change_case()
+        validate_diagnostic_selection(case, kwargs['step_index'], kwargs['expected_case_updated_at'])
+        pytest.fail('stale executor preflight must fail before device I/O')
+
+    if phase == 'before_claim':
+        change_case()
+    with (
+        patch('apps.app_automation.execution_admission.claim_app_execution_batch', side_effect=claim_and_change) as claim,
+        patch('apps.app_automation.execution_admission.release_device_if_idle', wraps=release_device_if_idle) as release,
+        patch('apps.app_automation.tasks.send_execution_update'),
+        patch('apps.app_automation.device_pool.DeviceLeaseHeartbeat'),
+        patch('apps.app_automation.executors.test_executor.AppTestExecutor') as executor,
+    ):
+        executor.return_value.run_tests.side_effect = stale_executor_preflight
+        execute_app_test_task.run(*queued['args'], **queued['kwargs'])
+    if phase == 'before_claim':
+        claim.assert_not_called()
+    else:
+        claim.assert_called_once()
+    assert executor.return_value.run_tests.call_count == (1 if phase in {'executor_preflight', 'admitted_io'} else 0)
+    assert release.call_count == (1 if auto_lock and phase != 'admitted_io' else 0)
+    execution.refresh_from_db()
+    device.refresh_from_db()
+    assert execution.status == 'error'
+    assert execution.error_message == SCENE_CASE_CHANGED_MESSAGE
+    if auto_lock and lease_state == 'idle' and phase != 'admitted_io':
+        assert device.locked_by_id is None
+        assert device.status != 'locked'
+    else:
+        assert device.locked_by_id == expected_owner
+        assert device.status == 'locked'
+    assert device.lease_generation == original_generation + (1 if lease_state == 'changed' else 0)
+    assert device.device_action_pending is (lease_state == 'pending')
+    assert execution.device_action_pending is (phase == 'admitted_io')
 
 
 @pytest.mark.django_db
@@ -422,3 +739,89 @@ def test_worker_persists_report_and_unverified_result_for_diagnostic(diagnostic_
     assert execution.status == 'completed'
     assert execution.result == 'unverified'
     assert execution.report_path == report['report_path']
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('auto_lock,lease_state,evidence', [
+    (True, 'idle', 'real_executor'),
+    (False, 'idle', 'explicit'),
+    (True, 'changed', 'explicit'),
+    (True, 'pending', 'explicit'),
+    (True, 'active', 'explicit'),
+    (True, 'idle', 'missing'),
+    (True, 'idle', 'started'),
+    (True, 'idle', 'admitted'),
+])
+def test_returned_predispatch_diagnostic_failure_respects_lease_fences(
+    diagnostic_resources, monkeypatch, auto_lock, lease_state, evidence,
+):
+    from apps.app_automation.execution_admission import release_device_if_idle
+
+    owner, other, _, case, device = diagnostic_resources
+    if auto_lock:
+        device.unlock(expected_generation=device.lease_generation, expected_owner_id=owner.pk)
+    with patch('apps.app_automation.tasks.execute_app_test_task.apply_async') as dispatch:
+        response = post_run_step(owner, case, {
+            'device_id': device.device_id, 'auto_lock': auto_lock,
+            'expected_user_id': owner.pk, 'step_index': 0,
+            'expected_case_updated_at': serialized_case_revision(case),
+        })
+    assert response.status_code == 200, response.data
+    queued = dispatch.call_args.kwargs
+    execution = AppTestExecution.objects.get(pk=response.data['execution']['id'])
+    device.refresh_from_db()
+    generation = device.lease_generation
+    real_executor = AppTestExecutor()
+    reports = []
+    monkeypatch.setattr(real_executor, '_preflight_worker', lambda: {'adb_path': 'synthetic-adb'})
+    monkeypatch.setattr(real_executor, '_get_allure_results_dir', lambda _id: 'synthetic-denied-results')
+
+    def return_failure(**kwargs):
+        if lease_state == 'changed':
+            AppDevice.objects.filter(pk=device.pk).update(lease_generation=generation + 1, locked_by=other)
+        elif lease_state == 'pending':
+            AppDevice.objects.filter(pk=device.pk).update(device_action_pending=True)
+        elif lease_state == 'active':
+            AppTestExecution.objects.create(test_case=case, user=owner, device=device,
+                status='pending', device_lease_generation=generation)
+        if evidence == 'real_executor':
+            report = real_executor.run_tests(**kwargs)
+        else:
+            if evidence == 'admitted':
+                kwargs['before_device_io']()
+            report = {'success': False, 'exit_code': None}
+            if evidence != 'missing':
+                # The local admission callback outweighs contradictory returned flags.
+                report.update(device_io_admitted=False,
+                    pytest_process_started=evidence == 'started', pytest_process_completed=False)
+        reports.append(report)
+        return report
+
+    with (
+        patch('apps.app_automation.device_pool.DeviceLeaseHeartbeat'),
+        patch('apps.app_automation.tasks.send_execution_update'),
+        patch('apps.app_automation.execution_admission.release_device_if_idle', wraps=release_device_if_idle),
+        patch('apps.app_automation.executors.test_executor.os.makedirs', side_effect=PermissionError('synthetic path')),
+        patch('apps.app_automation.executors.test_executor.subprocess.Popen') as process,
+        patch('apps.app_automation.executors.test_executor.AppTestExecutor') as executor,
+    ):
+        executor.return_value.run_tests.side_effect = return_failure
+        execute_app_test_task.run(*queued['args'], **queued['kwargs'])
+    assert len(reports) == 1
+    if evidence == 'real_executor':
+        assert reports[0]['device_io_admitted'] is False
+        assert reports[0]['pytest_process_started'] is False
+        assert reports[0]['pytest_process_completed'] is False
+    process.assert_not_called()
+    execution.refresh_from_db()
+    device.refresh_from_db()
+    assert execution.status == 'error'
+    assert execution.device_action_pending is (evidence == 'admitted')
+    if auto_lock and lease_state == 'idle' and evidence == 'real_executor':
+        assert device.locked_by_id is None
+        assert device.status != 'locked'
+    else:
+        assert device.locked_by_id == (other.pk if lease_state == 'changed' else owner.pk)
+        assert device.status == 'locked'
+    assert device.lease_generation == generation + (1 if lease_state == 'changed' else 0)
+    assert device.device_action_pending is (lease_state == 'pending')

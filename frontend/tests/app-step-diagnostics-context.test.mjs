@@ -83,6 +83,8 @@ async function loadDiagnostics({ run } = {}) {
     nested: false,
     dirty: false,
     recording: false,
+    recorderBusy: false,
+    caseUpdatedAt: '2026-11-24T11:00:00Z',
     deviceId: 31,
   })
   const scope = vue.effectScope()
@@ -142,6 +144,17 @@ test('diagnostic execution ID is not exposed after account or session replacemen
   assert.ok(diagnostics.calls.messages.some(([type, text]) =>
     type === 'error' && text === 'appAutomation.stepDiagnostics.accountChanged'))
   assert.equal(JSON.stringify(diagnostics.calls.messages).includes('842'), false)
+})
+
+test('diagnostic context changes during preparation fence the exact case revision', async () => {
+  const preparation = deferred()
+  const diagnostics = await loadDiagnostics({ prepare: () => preparation.promise })
+  const running = diagnostics.state.runStep()
+  diagnostics.props.caseUpdatedAt = '2026-11-24T11:01:00Z'
+  preparation.resolve({ device_id: 'mock-device' })
+
+  assert.equal(await running, false)
+  assert.deepEqual(diagnostics.calls.runs, [])
 })
 
 test('previously accepted execution ID is hidden immediately when the session changes', async () => {

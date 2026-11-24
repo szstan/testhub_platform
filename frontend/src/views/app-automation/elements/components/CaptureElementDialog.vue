@@ -239,7 +239,6 @@ interface ProjectItem {
 }
 import { FolderOpened, Plus, Delete } from '@element-plus/icons-vue'
 import {
-  getDeviceList,
   captureDeviceScreenshot,
   uploadAppElementImage,
   createAppElement,
@@ -247,6 +246,7 @@ import {
   createAppImageCategory,
   deleteAppImageCategory
 } from '@/api/app-automation'
+import { getAllAppDevices } from '@/api/app-device-options'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -375,8 +375,7 @@ const canSave = computed(() => {
 const loadDevices = async () => {
   devicesLoading.value = true
   try {
-    const { data } = await getDeviceList()
-    devices.value = data.results || []
+    devices.value = await getAllAppDevices()
   } catch (error) {
     console.error('加载设备列表失败:', error)
     ElMessage.error(t('appAutomation.element.capture.messages.loadDevicesFailed'))

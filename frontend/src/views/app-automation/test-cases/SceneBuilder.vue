@@ -1,5 +1,18 @@
 <template>
-    <div class="ui-test-scene-builder">
+    <div
+        class="ui-test-scene-builder"
+        :aria-busy="!sceneEditorReady"
+        :inert="!sceneEditorReady"
+        v-loading="editorIsLoading"
+        :element-loading-text="$t('appAutomation.sceneBuilder.messages.editorInitializing')"
+    >
+        <el-alert
+            v-if="editorInitializationStatus === 'failed' || caseDetailStatus === 'failed'"
+            :title="$t('appAutomation.sceneBuilder.messages.editorLoadFailed')"
+            type="error"
+            :closable="false"
+            show-icon
+        />
         <div class="page-header">
             <h3>{{ $t('appAutomation.sceneBuilder.header.title') }}</h3>
             <div class="header-actions">
@@ -8,6 +21,7 @@
                     size="small"
                     :icon="Check"
                     :loading="saving"
+                    :disabled="!sceneEditorReady"
                     @click="saveScene"
                 >
                     {{ $t('appAutomation.sceneBuilder.header.saveCase') }}
@@ -206,6 +220,8 @@
                         :nested="selectedSubIndex !== null"
                         :dirty="isSceneDirty"
                         :recording="recorderEnabled"
+                        :recorder-busy="recorderDiagnosticBusy"
+                        :case-updated-at="loadedCaseUpdatedAt"
                         :device-id="recorderDeviceId"
                     />
                 </el-card>
@@ -552,7 +568,7 @@
                                             @update:model-value="updateTypedParameterInput(activeStep, field, activeComponentDef, $event)"
                                         />
                                         <NestedFlowEditor
-                                            v-else-if="isNestedStepsField(field, activeComponentDef)"
+                                            v-else-if="isNestedStepsField(field, activeComponentDef, activeStep)"
                                             :model-value="activeStep.config[field] || []"
                                             :label="getFieldLabel(field)"
                                             :components="nestedComponents"
@@ -592,11 +608,13 @@
                                         </el-select>
                                         <el-switch
                                             v-else-if="getFieldTypeForDef(activeComponentDef, field) === 'boolean'"
-                                            v-model="activeStep.config[field]"
+                                            :model-value="getTypedScalarControlValue(activeStep, field, activeComponentDef)"
+                                            @update:model-value="activeStep.config[field] = $event"
                                         />
                                         <el-input-number
                                             v-else-if="['number', 'integer'].includes(getFieldTypeForDef(activeComponentDef, field))"
-                                            v-model="activeStep.config[field]"
+                                            :model-value="getTypedScalarControlValue(activeStep, field, activeComponentDef)"
+                                            @update:model-value="activeStep.config[field] = $event"
                                             :min="getFieldNumberRuleForDef(activeComponentDef, field).min"
                                             :max="getFieldNumberRuleForDef(activeComponentDef, field).max"
                                             :step="getFieldNumberRuleForDef(activeComponentDef, field).step"
@@ -834,7 +852,7 @@
                                                 :error="getJsonFieldError(editingActiveStep, field)"
                                             >
                                                 <NestedFlowEditor
-                                                    v-if="isNestedStepsField(field, editingActiveDef)"
+                                                    v-if="isNestedStepsField(field, editingActiveDef, editingActiveStep)"
                                                     :model-value="editingActiveStep.config[field] || []"
                                                     :label="getFieldLabel(field, editingActiveStep)"
                                                     :components="nestedComponents"
@@ -1057,6 +1075,7 @@ import StepDiagnostics from '../components/StepDiagnostics.vue'
 import SceneDataPanel from '../components/SceneDataPanel.vue'
 import NestedFlowEditor from './NestedFlowEditor.vue'
 import { useUserStore } from '@/stores/user'
+import { getAllAppDevices } from '@/api/app-device-options'
 import {
   getComponents,
   getCustomComponents,
@@ -1070,7 +1089,6 @@ import {
   updateTestCase,
   getAppElementList,
   getAppImageCategories,
-  getDeviceList,
   getAppDevice,
   acquireRecorderLease,
   releaseRecorderLease as releaseRecorderLeaseApi,
@@ -1122,6 +1140,14 @@ const recorderDeviceId = ref(null)
 const recorderDevicesLoading = ref(false)
 const recorderStarting = ref(false)
 const recorderEnabled = ref(false)
+const recorderStopOperations = ref(0)
+const recorderReleaseOperations = ref(0)
+const recorderStopping = computed(() => recorderStopOperations.value > 0)
+const recorderReleasePending = computed(() => recorderReleaseOperations.value > 0)
+const recorderDiagnosticBusy = computed(() => Boolean(
+    recorderStarting.value || recorderStopping.value || recorderReleasePending.value
+    || recorderInteractionPending.value || recorderUnresolvedCount.value > 0
+))
 const recorderLease = ref(null)
 const recorderLeaseContext = ref(null)
 const recorderInteractionContext = ref(null)
@@ -1204,6 +1230,10 @@ const jsonFieldErrors = ref({})
 const typedExpressionModes = ref({})
 const sceneBaseline = ref("")
 const sceneContextGeneration = ref(0)
+const editorInitializationStatus = ref('not-started')
+const caseDetailStatus = ref('not-required')
+const caseDetailCaseId = ref(null)
+const loadedCaseUpdatedAt = ref(null)
 let sceneBuilderUnmounted = false
 const componentDefinitionsStatus = ref('loading')
 const customComponentDefinitionsStatus = ref('loading')
@@ -1217,6 +1247,16 @@ const customComponentDefinitions = ref({})
 const projectComponentDefinitions = ref({})
 const projectComponentPalette = ref([])
 const editingCaseId = ref(null)
+const editorIsLoading = computed(() => editorInitializationStatus.value === 'loading' || caseDetailStatus.value === 'loading')
+const sceneEditorReady = computed(() => {
+    if (editorInitializationStatus.value !== 'ready'
+        || componentDefinitionsStatus.value !== 'loaded'
+        || customComponentDefinitionsStatus.value !== 'loaded'
+        || caseDetailStatus.value === 'loading'
+        || caseDetailStatus.value === 'failed') return false
+    const targetCaseId = editingCaseId.value ?? route.query.case_id
+    return !targetCaseId || (caseDetailStatus.value === 'loaded' && sameOptionalId(caseDetailCaseId.value, targetCaseId))
+})
 const allComponentDefinitions = computed(() => ({
     ...componentDefinitions.value,
     ...customComponentDefinitions.value,
@@ -1436,27 +1476,46 @@ onBeforeRouteLeave(async () => {
 
 onMounted(async () => {
     if (typeof window !== 'undefined') window.addEventListener('beforeunload', beforeUnloadHandler)
-    sceneBaseline.value = getSceneSnapshot()
-    try {
-        await Promise.all([
-            loadComponentPalette(), 
-            loadCustomComponentPalette(),
-            loadImageCategoryOptions(),
-            loadRecorderDevices(),
-            getAppProjects({ page_size: 100 }).then(res => { projectList.value = res.data.results || res.data || [] })
-        ])
+    const initialDraftSnapshot = getSceneSnapshot()
+    sceneBaseline.value = initialDraftSnapshot
+    const caseId = route.query.case_id
+    editorInitializationStatus.value = 'loading'
+    caseDetailStatus.value = caseId ? 'loading' : 'not-required'
+    if (caseId) {
+        editingCaseId.value = caseId
+        caseDetailCaseId.value = caseId
+    }
+    const optionalLoads = [
+        loadImageCategoryOptions(),
+        loadRecorderDevices(),
+        getAppProjects({ page_size: 100 })
+            .then(res => { projectList.value = res.data.results || res.data || [] })
+            .catch(error => { console.error('加载项目列表失败:', error) }),
+    ]
+    void optionalLoads
 
-        if (sceneBuilderUnmounted) return
-        const caseId = route.query.case_id
-        if (caseId) {
-            editingCaseId.value = caseId
-            await loadCaseDetail(caseId)
+    const paletteLoads = await Promise.allSettled([
+        loadComponentPalette(),
+        loadCustomComponentPalette(),
+    ])
+    if (sceneBuilderUnmounted) return
+
+    if (caseId) {
+        if (getSceneSnapshot() !== initialDraftSnapshot) {
+            caseDetailStatus.value = 'failed'
+            ElMessage.error(t('appAutomation.sceneBuilder.messages.caseChangedDuringLoad'))
         } else {
-            sceneBaseline.value = getSceneSnapshot()
+            await loadCaseDetail(caseId)
         }
-    } catch (error) {
-        if (sceneBuilderUnmounted) return
-        console.error('初始化组件数据失败:', error)
+    }
+    if (sceneBuilderUnmounted) return
+
+    const palettesReady = componentDefinitionsStatus.value === 'loaded'
+        && customComponentDefinitionsStatus.value === 'loaded'
+    const detailReady = !caseId || (caseDetailStatus.value === 'loaded' && sameOptionalId(caseDetailCaseId.value, caseId))
+    editorInitializationStatus.value = palettesReady && detailReady ? 'ready' : 'failed'
+    if (!palettesReady && paletteLoads.some(result => result.status === 'rejected')) {
+        ElMessage.error(t('appAutomation.sceneBuilder.messages.editorLoadFailed'))
     }
 })
 
@@ -1513,9 +1572,8 @@ const mapRecorderError = (operation, status) => {
 const loadRecorderDevices = async () => {
     recorderDevicesLoading.value = true
     try {
-        const payload = getRecorderResponseData(await getDeviceList({ page: 1, page_size: 1000 }))
-        const items = Array.isArray(payload) ? payload : payload?.results || payload?.devices || []
-        recorderDevices.value = Array.isArray(items) ? items : []
+        const devices = await getAllAppDevices()
+        recorderDevices.value = Array.isArray(devices) ? devices : []
         if (recorderLease.value) {
             const ownedDevice = recorderDevices.value.find(device => sameId(device.id, recorderLease.value.deviceId))
             if (!ownedDevice || ownedDevice.maintenance_mode || ownedDevice.status === 'offline'
@@ -1538,6 +1596,7 @@ const loadRecorderDevices = async () => {
 const releaseRecorderLease = async (lease, { silent = false } = {}) => {
     if (!lease?.leaseToken || !sameId(currentRecorderUserId(), lease.expectedUserId)
         || lease.sessionGeneration !== currentRecorderSessionGeneration()) return false
+    recorderReleaseOperations.value += 1
     try {
         const result = getRecorderResponseData(await releaseRecorderLeaseApi(lease.deviceId, {
             expected_user_id: lease.expectedUserId,
@@ -1548,32 +1607,39 @@ const releaseRecorderLease = async (lease, { silent = false } = {}) => {
     } catch {
         if (!silent) recorderErrorKey.value = 'appAutomation.recorder.errors.releaseFailed'
         return false
+    } finally {
+        recorderReleaseOperations.value -= 1
     }
 }
 
 const stopRecorder = async ({ release = true, silent = false, refresh = true } = {}) => {
-    recorderEpoch.value += 1
-    recorderEnabled.value = false
-    recorderStarting.value = false
-    if (recorderHeartbeatTimer.value !== null) clearInterval(recorderHeartbeatTimer.value)
-    recorderHeartbeatTimer.value = null
-    const lease = recorderLease.value
-    const deferRelease = release && recorderInteractionUsesLease(recorderInteractionContext.value, lease)
-    if (deferRelease) {
-        deferredRecorderRelease.value = {
-            lease,
-            context: recorderInteractionContext.value,
-            silent,
-            refresh,
+    recorderStopOperations.value += 1
+    try {
+        recorderEpoch.value += 1
+        recorderEnabled.value = false
+        recorderStarting.value = false
+        if (recorderHeartbeatTimer.value !== null) clearInterval(recorderHeartbeatTimer.value)
+        recorderHeartbeatTimer.value = null
+        const lease = recorderLease.value
+        const deferRelease = release && recorderInteractionUsesLease(recorderInteractionContext.value, lease)
+        if (deferRelease) {
+            deferredRecorderRelease.value = {
+                lease,
+                context: recorderInteractionContext.value,
+                silent,
+                refresh,
+            }
+        } else if (deferredRecorderRelease.value) {
+            deferredRecorderRelease.value.silent = deferredRecorderRelease.value.silent && silent
+            deferredRecorderRelease.value.refresh = deferredRecorderRelease.value.refresh && refresh
         }
-    } else if (deferredRecorderRelease.value) {
-        deferredRecorderRelease.value.silent = deferredRecorderRelease.value.silent && silent
-        deferredRecorderRelease.value.refresh = deferredRecorderRelease.value.refresh && refresh
+        recorderLease.value = null
+        recorderSessionGeneration.value = null
+        if (lease && release && !deferRelease) await releaseRecorderLease(lease, { silent })
+        if (lease && refresh && !deferRelease) await loadRecorderDevices()
+    } finally {
+        recorderStopOperations.value -= 1
     }
-    recorderLease.value = null
-    recorderSessionGeneration.value = null
-    if (lease && release && !deferRelease) await releaseRecorderLease(lease, { silent })
-    if (lease && refresh && !deferRelease) await loadRecorderDevices()
 }
 
 const handleHeartbeatFailure = async (error) => {
@@ -1904,22 +1970,13 @@ const buildUiFlowPayload = steps => uiFlowEnvelope.value === null
     ? steps
     : { ...uiFlowEnvelope.value, steps }
 
-const getSceneSnapshot = () => {
-    const stripTransientState = value => {
-        if (Array.isArray(value)) return value.map(stripTransientState)
-        if (!value || typeof value !== 'object') return value
-        return Object.fromEntries(Object.entries(value)
-            .filter(([key]) => key !== '_expanded')
-            .map(([key, child]) => [key, stripTransientState(child)]))
-    }
-    return JSON.stringify(stripTransientState({
-        form: sceneForm.value,
-        variables: sceneVariables.value,
-        runtime: sceneRuntime.value,
-        uiFlowEnvelope: uiFlowEnvelope.value,
-        steps: scenarioSteps.value
-    }))
-}
+const getSceneSnapshot = () => JSON.stringify({
+    form: sceneForm.value,
+    variables: sceneVariables.value,
+    runtime: sceneRuntime.value,
+    uiFlowEnvelope: uiFlowEnvelope.value,
+    steps: snapshotStepTree(scenarioSteps.value)
+})
 
 const normalizeSceneRuntime = runtime => {
     const defaults = defaultSceneRuntime()
@@ -1971,33 +2028,97 @@ const getComponentDefaultConfig = component => {
     return JSON.parse(JSON.stringify({ ...schemaDefaults, ...defaultConfig }))
 }
 
+const FLOW_CHILD_FIELDS = ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']
+const cloneJsonValue = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+const isCustomComponentStep = step => step?.kind === 'custom' || step?.version !== undefined
+const isInlineComponentFlow = step => step?.kind === 'custom'
+    && step.version === undefined
+    && Array.isArray(step.steps)
+const getFlowChildren = step => {
+    if (isCustomComponentStep(step)) {
+        return isInlineComponentFlow(step) ? [{ field: 'steps', steps: step.steps }] : []
+    }
+    const children = []
+    for (const field of FLOW_CHILD_FIELDS) {
+        if (Array.isArray(step?.[field])) children.push({ field, steps: step[field] })
+        if (Array.isArray(step?.config?.[field])) children.push({ field, steps: step.config[field] })
+    }
+    return children
+}
+
+const snapshotStepTree = steps => (Array.isArray(steps) ? steps : []).map(step => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return step
+    const snapshot = { ...step }
+    delete snapshot._expanded
+    for (const key of Object.keys(snapshot)) {
+        if (key.startsWith('_sceneBuilder')) delete snapshot[key]
+    }
+    if (isCustomComponentStep(step)) {
+        if (isInlineComponentFlow(step)) snapshot.steps = snapshotStepTree(step.steps)
+    } else {
+        if (step.config && typeof step.config === 'object' && !Array.isArray(step.config)) {
+            snapshot.config = { ...step.config }
+            for (const field of FLOW_CHILD_FIELDS) {
+                if (Array.isArray(step.config[field])) snapshot.config[field] = snapshotStepTree(step.config[field])
+            }
+        }
+        for (const field of FLOW_CHILD_FIELDS) {
+            if (Array.isArray(step[field])) snapshot[field] = snapshotStepTree(step[field])
+        }
+    }
+    return snapshot
+})
+
 const normalizeStepTree = (steps, usedIds = new Set()) => (Array.isArray(steps) ? steps : []).map(rawStep => {
     const step = rawStep && typeof rawStep === 'object' && !Array.isArray(rawStep) ? { ...rawStep } : {}
+    const hasParams = step.kind === 'custom' && Object.prototype.hasOwnProperty.call(step, 'params')
+    if (hasParams) {
+        const rawParams = step.params
+        step._sceneBuilderParamsSource = true
+        if (rawParams === null || (rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams))) {
+            step.config = rawParams === null ? {} : cloneJsonValue(rawParams)
+        } else {
+            step.config = {}
+            step._sceneBuilderRawParams = cloneJsonValue(rawParams)
+        }
+        delete step.params
+    }
+
     let id = step.id
     if (!id || usedIds.has(id)) id = generateStepId()
     usedIds.add(id)
     step.id = id
     step.config = step.config && typeof step.config === 'object' && !Array.isArray(step.config) ? { ...step.config } : {}
     const definition = getComponentDefinitionForStep(step)
+    const inlineFlow = isInlineComponentFlow(step)
     for (const field of Object.keys(definition?.schema?.properties || {})) {
-        if (['id', 'type', 'name', 'kind', 'config'].includes(field) || (step.kind === 'custom' && field === 'steps')) continue
+        if (['id', 'type', 'name', 'kind', 'config', 'params'].includes(field) || (field === 'steps' && inlineFlow)) continue
         if (step.config[field] === undefined && step[field] !== undefined) step.config[field] = step[field]
         delete step[field]
     }
-    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-        if (Array.isArray(step.config[field])) step.config[field] = normalizeStepTree(step.config[field], usedIds)
+
+    if (isCustomComponentStep(step)) {
+        if (inlineFlow) step.steps = normalizeStepTree(step.steps, usedIds)
+    } else {
+        for (const field of FLOW_CHILD_FIELDS) {
+            if (Array.isArray(step.config[field])) step.config[field] = normalizeStepTree(step.config[field], usedIds)
+            if (Array.isArray(step[field])) step[field] = normalizeStepTree(step[field], usedIds)
+        }
     }
-    if (Array.isArray(step.steps)) step.steps = normalizeStepTree(step.steps, usedIds)
     if (step.kind === 'custom') step._expanded = false
     return step
 })
 
 const regenerateStepTreeIds = step => {
     step.id = generateStepId()
-    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-        if (Array.isArray(step.config?.[field])) step.config[field].forEach(regenerateStepTreeIds)
+    if (isCustomComponentStep(step)) {
+        if (isInlineComponentFlow(step)) step.steps.forEach(regenerateStepTreeIds)
+    } else {
+        for (const field of FLOW_CHILD_FIELDS) {
+            if (Array.isArray(step.config?.[field])) step.config[field].forEach(regenerateStepTreeIds)
+            if (Array.isArray(step[field])) step[field].forEach(regenerateStepTreeIds)
+        }
     }
-    if (Array.isArray(step.steps)) step.steps.forEach(regenerateStepTreeIds)
     return step
 }
 
@@ -2154,8 +2275,9 @@ const isJsonField = (field, def = activeComponentDef.value) => {
     return type === "array" || type === "object"
 }
 
-const isNestedStepsField = (field, def) => isJsonField(field, def)
-    && ["steps", "then_steps", "else_steps", "try_steps", "catch_steps", "finally_steps"].includes(field)
+const isNestedStepsField = (field, def, step) => !isCustomComponentStep(step)
+    && isJsonField(field, def)
+    && FLOW_CHILD_FIELDS.includes(field)
 
 const getJsonErrorKey = (step, field) => `${step?.id || 'scene'}:${field}`
 const getJsonFieldError = (step, field) => jsonFieldErrors.value[getJsonErrorKey(step, field)] || ''
@@ -2199,6 +2321,7 @@ const getTypedParameterInput = (step, field) => {
 }
 const parseTypedParameterLiteral = (value, property = {}) => {
     const type = property.type
+    if (value === undefined || value === null || value === '') return { valid: true, value }
     const typedResult = literal => {
         if (Array.isArray(property.enum) && property.enum.length) {
             const matches = property.enum.some(option => {
@@ -2246,6 +2369,14 @@ const parseTypedParameterLiteral = (value, property = {}) => {
         return valid ? typedResult(parsed) : { valid: false }
     }
     return { valid: false }
+}
+const getTypedScalarControlValue = (step, field, def) => {
+    const value = step?.config?.[field]
+    if (!isVersionedTypedParameter(step, field, def)) return value
+    const property = def?.schema?.properties?.[field] || {}
+    const parsed = parseTypedParameterLiteral(value, property)
+    if (property.type === 'boolean') return parsed.valid && parsed.value === true
+    return parsed.valid && typeof parsed.value === 'number' ? parsed.value : null
 }
 const setTypedParameterExpressionMode = (step, field, def, enabled) => {
     const key = getTypedParameterModeKey(step, field)
@@ -2348,7 +2479,7 @@ const formatSceneVariables = () => {
             scope: item.scope || "local",
             type: item.type || "string",
             value: item.sensitive === true
-                ? (item.value ?? "")
+                ? item.value
                 : parseSceneVariableValue(item.value, item.type),
             description: item.description || "",
             sensitive: item.sensitive === true,
@@ -2356,22 +2487,26 @@ const formatSceneVariables = () => {
 }
 
 const parseSceneVariableValue = (value, type) => {
+    if (value === null || value === undefined || value === '') return value
     if (type === "number") {
-        const num = Number(value)
-        return Number.isNaN(num) ? 0 : num
+        if (typeof value === 'number') return value
+        const raw = String(value).trim()
+        return raw ? Number(raw) : value
     }
     if (type === "boolean") {
-        if (typeof value === "boolean") {
-            return value
-        }
-        return String(value).trim().toLowerCase() === "true"
+        if (typeof value === "boolean") return value
+        const raw = String(value).trim().toLowerCase()
+        if (raw === 'true') return true
+        if (raw === 'false') return false
+        return value
     }
     if (type === "array" || type === "object") {
         if (typeof value === "string") {
+            if (!value.trim()) return value
             try {
                 return JSON.parse(value)
-            } catch (error) {
-                return type === "array" ? [] : {}
+            } catch {
+                return value
             }
         }
         return value
@@ -2390,18 +2525,22 @@ const loadSceneVariables = (rawVariables) => {
         sceneVariables.value = []
         return
     }
-    sceneVariables.value = rawVariables.map(item => ({
-        name: item.name || "",
-        scope: item.scope || "local",
-        type: item.type || "string",
-        value: item.sensitive === true
-            ? (item.value !== undefined && item.value !== null ? String(item.value) : "")
-            : (item.type === "array" || item.type === "object")
-                ? JSON.stringify(item.value || (item.type === "array" ? [] : {}))
-                : (item.value !== undefined && item.value !== null ? String(item.value) : ""),
-        description: item.description || "",
-        sensitive: item.sensitive === true,
-    }))
+    sceneVariables.value = rawVariables.map(item => {
+        const type = item.type || 'string'
+        const value = item.value === null || item.value === undefined
+            ? item.value
+            : item.sensitive === true || !['array', 'object'].includes(type)
+                ? String(item.value)
+                : typeof item.value === 'string' ? item.value : JSON.stringify(item.value)
+        return {
+            name: item.name || "",
+            scope: item.scope || "local",
+            type,
+            value: item.value === undefined ? '' : value,
+            description: item.description || "",
+            sensitive: item.sensitive === true,
+        }
+    })
 }
 
 const generateStepId = () => {
@@ -2432,6 +2571,7 @@ const cloneComponent = (item) => {
 }
 
 const addPaletteComponent = (item) => {
+    if (!sceneEditorReady.value) return null
     const step = cloneComponent(item)
     scenarioSteps.value.push(step)
     selectStep(scenarioSteps.value.length - 1)
@@ -2567,6 +2707,9 @@ const resetScene = async () => {
     if (recorderEnabled.value || recorderStarting.value || recorderLease.value) await stopRecorder()
     sceneContextGeneration.value += 1
     editingCaseId.value = null
+    caseDetailCaseId.value = null
+    caseDetailStatus.value = 'not-required'
+    loadedCaseUpdatedAt.value = null
     sceneForm.value = { name: "", description: "", project: null }
     sceneVariables.value = []
     sceneRuntime.value = defaultSceneRuntime()
@@ -2849,42 +2992,64 @@ const loadCustomComponentPalette = async () => {
 }
 
 const loadCaseDetail = async (caseId) => {
-    if (sceneBuilderUnmounted) return
+    if (sceneBuilderUnmounted) return false
     const contextGeneration = ++sceneContextGeneration.value
     const accountIdentity = captureAccountIdentity()
+    const requestDraftSnapshot = getSceneSnapshot()
+    caseDetailStatus.value = 'loading'
+    caseDetailCaseId.value = caseId
+    loadedCaseUpdatedAt.value = null
+    editingCaseId.value = caseId
     const isCurrent = () => !sceneBuilderUnmounted
         && contextGeneration === sceneContextGeneration.value
         && isAccountIdentityCurrent(accountIdentity)
     try {
         const response = await getTestCaseDetail(caseId)
-        if (!isCurrent()) return
+        if (!isCurrent()) return false
         const data = response.data || response
-        if (data && data.id) {
-            // 直接从 data 对象读取字段，匹配后端模型
-            sceneForm.value.name = data.name || ""
-            sceneForm.value.description = data.description || ""
-            sceneForm.value.project = data.project || null
-            loadSceneVariables(data.variables || [])
-            const sceneFlow = normalizeUiFlow(data.ui_flow)
-            uiFlowEnvelope.value = sceneFlow.envelope
-            sceneRuntime.value = normalizeSceneRuntime({
-                ...(sceneFlow.runtime && typeof sceneFlow.runtime === 'object' ? sceneFlow.runtime : {}),
-                ...(sceneFlow.runtimeConfig && typeof sceneFlow.runtimeConfig === 'object' ? sceneFlow.runtimeConfig : {}),
-                ...(data.runtime && typeof data.runtime === 'object' ? data.runtime : {}),
-                ...(data.runtime_config && typeof data.runtime_config === 'object' ? data.runtime_config : {})
-            })
-            scenarioSteps.value = normalizeStepTree(sceneFlow.steps)
-            scenarioSteps.value.forEach(step => applyDefaultConfig(step))
-            selectedStepId.value = null
-            selectedSubStepId.value = null
-            jsonFieldErrors.value = {}
-            typedExpressionModes.value = {}
-            sceneBaseline.value = getSceneSnapshot()
+        if (!data || !sameOptionalId(data.id, caseId)) {
+            caseDetailStatus.value = 'failed'
+            ElMessage.error(t('appAutomation.sceneBuilder.messages.loadCaseFailed'))
+            return false
         }
+        if (getSceneSnapshot() !== requestDraftSnapshot) {
+            caseDetailStatus.value = 'failed'
+            ElMessage.error(t('appAutomation.sceneBuilder.messages.caseChangedDuringLoad'))
+            return false
+        }
+
+        sceneForm.value.name = data.name || ""
+        sceneForm.value.description = data.description || ""
+        sceneForm.value.project = data.project || null
+        loadSceneVariables(data.variables || [])
+        const sceneFlow = normalizeUiFlow(data.ui_flow)
+        uiFlowEnvelope.value = sceneFlow.envelope
+        sceneRuntime.value = normalizeSceneRuntime({
+            ...(sceneFlow.runtime && typeof sceneFlow.runtime === 'object' ? sceneFlow.runtime : {}),
+            ...(sceneFlow.runtimeConfig && typeof sceneFlow.runtimeConfig === 'object' ? sceneFlow.runtimeConfig : {}),
+            ...(data.runtime && typeof data.runtime === 'object' ? data.runtime : {}),
+            ...(data.runtime_config && typeof data.runtime_config === 'object' ? data.runtime_config : {})
+        })
+        scenarioSteps.value = normalizeStepTree(sceneFlow.steps)
+        scenarioSteps.value.forEach(step => applyDefaultConfig(step))
+        selectedStepId.value = null
+        selectedSubStepId.value = null
+        jsonFieldErrors.value = {}
+        typedExpressionModes.value = {}
+        caseDetailCaseId.value = data.id
+        loadedCaseUpdatedAt.value = typeof data.updated_at === 'string' && data.updated_at.trim()
+            ? data.updated_at
+            : null
+        caseDetailStatus.value = 'loaded'
+        sceneBaseline.value = getSceneSnapshot()
+        return true
     } catch (error) {
-        if (!isCurrent()) return
+        if (!isCurrent()) return false
+        caseDetailStatus.value = 'failed'
+        loadedCaseUpdatedAt.value = null
         console.error("加载用例失败:", error)
         ElMessage.error(t('appAutomation.sceneBuilder.messages.loadCaseFailed'))
+        return false
     }
 }
 
@@ -2893,13 +3058,17 @@ const applyDefaultConfig = (step) => {
     if (!step.config || typeof step.config !== 'object' || Array.isArray(step.config)) step.config = {}
     const def = getComponentDefinitionForStep(step)
     const defaults = getComponentDefaultConfig(def)
-    Object.keys(defaults).forEach(key => {
-        if (step.config[key] === undefined) step.config[key] = JSON.parse(JSON.stringify(defaults[key]))
-    })
-    for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-        if (Array.isArray(step.config[field])) step.config[field].forEach(applyDefaultConfig)
+    for (const key of Object.keys(defaults)) {
+        if (step.config[key] === undefined) step.config[key] = cloneJsonValue(defaults[key])
     }
-    if (Array.isArray(step.steps)) step.steps.forEach(applyDefaultConfig)
+    if (isCustomComponentStep(step)) {
+        if (isInlineComponentFlow(step)) step.steps.forEach(applyDefaultConfig)
+        return
+    }
+    for (const field of FLOW_CHILD_FIELDS) {
+        if (Array.isArray(step.config[field])) step.config[field].forEach(applyDefaultConfig)
+        if (Array.isArray(step[field])) step[field].forEach(applyDefaultConfig)
+    }
 }
 
 // 字段分组辅助函数（通用：支持场景步骤和自定义组件编辑）
@@ -3601,7 +3770,13 @@ const downloadBlob = (blob, filename) => {
     window.URL.revokeObjectURL(url)
 }
 
-const normalizeJsonDrafts = (value, path = 'ui_flow', schema = null, allowTypedParameterExpressions = false) => {
+const normalizeJsonDrafts = (
+    value,
+    path = 'ui_flow',
+    schema = null,
+    allowTypedParameterExpressions = false,
+    preserveCustomCollections = false,
+) => {
     if (Array.isArray(value)) {
         for (let index = 0; index < value.length; index++) {
             const result = normalizeJsonDrafts(value[index], `${path}[${index + 1}]`)
@@ -3613,15 +3788,26 @@ const normalizeJsonDrafts = (value, path = 'ui_flow', schema = null, allowTypedP
     if (!value || typeof value !== 'object') return { value }
 
     const definition = value.type ? getComponentDefinitionForStep(value) : null
+    const customComponentStep = isCustomComponentStep(value)
     const versionedComponentReference = value.kind === 'custom' && value.version !== undefined
     const resultValue = {}
     for (const [key, child] of Object.entries(value)) {
         const field = key.endsWith('_input') ? key.slice(0, -6) : null
         if (field && schema?.properties?.[field]) continue
-        if (key === '_expanded') continue
+        const property = schema?.properties?.[key]
+        if (preserveCustomCollections && property && ['array', 'object'].includes(property.type)) {
+            resultValue[key] = child
+            continue
+        }
         const childSchema = key === 'config' ? definition?.schema : null
         const allowTypedExpressions = key === 'config' && versionedComponentReference
-        const result = normalizeJsonDrafts(child, `${path}.${key}`, childSchema, allowTypedExpressions)
+        const result = normalizeJsonDrafts(
+            child,
+            `${path}.${key}`,
+            childSchema,
+            allowTypedExpressions,
+            key === 'config' && customComponentStep,
+        )
         if (result.error) return result
         resultValue[key] = result.value
     }
@@ -3643,6 +3829,18 @@ const normalizeJsonDrafts = (value, path = 'ui_flow', schema = null, allowTypedP
                 return { error: t('appAutomation.sceneBuilder.messages.invalidJsonShapeAt', { path: `${path}.${field}` }) }
             }
             resultValue[field] = parsed
+        }
+        for (const [field, property] of Object.entries(schema.properties)) {
+            if (!['number', 'integer', 'boolean'].includes(property?.type)
+                || !Object.prototype.hasOwnProperty.call(value, field)) continue
+            const current = value[field]
+            if (current === null || current === '') continue
+            if (allowTypedParameterExpressions && isExactSceneVariableReference(current)) continue
+            const parsed = parseTypedParameterLiteral(current, property)
+            if (!parsed.valid) {
+                return { error: t('appAutomation.sceneBuilder.messages.invalidTypedParameterAt', { path: `${path}.${field}` }) }
+            }
+            resultValue[field] = parsed.value
         }
         if (allowTypedParameterExpressions) {
             for (const [field, property] of Object.entries(schema.properties)) {
@@ -3710,15 +3908,8 @@ const validateComponentDefinitions = (steps, path = 'ui_flow') => {
             }
         }
 
-        const config = { ...step, ...(step.config || {}) }
-        for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-            if (Array.isArray(config[field])) {
-                const issue = validateComponentDefinitions(config[field], `${stepPath}.${field}`)
-                if (issue) return issue
-            }
-        }
-        if (Array.isArray(step.steps)) {
-            const issue = validateComponentDefinitions(step.steps, `${stepPath}.steps`)
+        for (const child of getFlowChildren(step)) {
+            const issue = validateComponentDefinitions(child.steps, `${stepPath}.${getFieldLabel(child.field, step)}`)
             if (issue) return issue
         }
     }
@@ -3741,14 +3932,8 @@ const validateRequiredSteps = (steps, path = 'ui_flow') => {
                 })
             }
         }
-        for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
-            if (Array.isArray(config[field])) {
-                const issue = validateRequiredSteps(config[field], `${stepPath}.${getFieldLabel(field, step)}`)
-                if (issue) return issue
-            }
-        }
-        if (Array.isArray(step.steps)) {
-            const issue = validateRequiredSteps(step.steps, `${stepPath}.steps`)
+        for (const child of getFlowChildren(step)) {
+            const issue = validateRequiredSteps(child.steps, `${stepPath}.${getFieldLabel(child.field, step)}`)
             if (issue) return issue
         }
     }
@@ -3767,8 +3952,20 @@ const validateSceneVariables = () => {
             if (!isSecretReference(value)) return t('appAutomation.sceneData.secretHelp')
             continue
         }
-        if (!['array', 'object'].includes(item.type)) continue
-        if (!String(item.value ?? '').trim()) continue
+        if (item.type === 'number' && item.value !== null && item.value !== undefined) {
+            const raw = typeof item.value === 'number' ? String(item.value) : String(item.value).trim()
+            if (raw && (!/^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw) || !Number.isFinite(Number(raw)))) {
+                return t('appAutomation.sceneBuilder.messages.invalidVariableNumber', { name: item.name })
+            }
+        }
+        if (item.type === 'boolean' && item.value !== null && item.value !== undefined) {
+            const raw = typeof item.value === 'string' ? item.value.trim().toLowerCase() : item.value
+            if (raw !== '' && raw !== true && raw !== false && raw !== 'true' && raw !== 'false') {
+                return t('appAutomation.sceneBuilder.messages.invalidVariableBoolean', { name: item.name })
+            }
+        }
+        if (!['array', 'object'].includes(item.type) || item.value === null) continue
+        if (item.value === undefined || !String(item.value).trim()) continue
         let parsed
         try {
             parsed = JSON.parse(item.value)
@@ -3783,13 +3980,36 @@ const validateSceneVariables = () => {
     return ''
 }
 
-const removeTransientFields = value => {
-    if (Array.isArray(value)) return value.map(removeTransientFields)
-    if (!value || typeof value !== 'object') return value
-    return Object.fromEntries(Object.entries(value)
-        .filter(([key]) => key !== '_expanded')
-        .map(([key, child]) => [key, removeTransientFields(child)]))
-}
+const removeTransientFields = steps => (Array.isArray(steps) ? steps : []).map(step => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return step
+    const result = { ...step }
+    delete result._expanded
+    for (const key of Object.keys(result)) {
+        if (key.startsWith('_sceneBuilder')) delete result[key]
+    }
+
+    const customComponent = isCustomComponentStep(step)
+    if (step._sceneBuilderParamsSource === true) {
+        result.params = step._sceneBuilderRawParams === undefined
+            ? cloneJsonValue(step.config)
+            : cloneJsonValue(step._sceneBuilderRawParams)
+        delete result.config
+    }
+    if (customComponent) {
+        if (isInlineComponentFlow(step)) result.steps = removeTransientFields(step.steps)
+    } else {
+        if (step.config && typeof step.config === 'object' && !Array.isArray(step.config)) {
+            result.config = { ...step.config }
+            for (const field of FLOW_CHILD_FIELDS) {
+                if (Array.isArray(step.config[field])) result.config[field] = removeTransientFields(step.config[field])
+            }
+        }
+        for (const field of FLOW_CHILD_FIELDS) {
+            if (Array.isArray(step[field])) result[field] = removeTransientFields(step[field])
+        }
+    }
+    return result
+})
 
 const prepareStepsForSave = steps => {
     const source = JSON.parse(JSON.stringify(steps))
@@ -3845,7 +4065,7 @@ const setProjectComponentLoadState = state => {
 }
 
 const insertProjectComponent = item => {
-    if (!item || !item.type || !item.version) return
+    if (!sceneEditorReady.value || !item || !item.type || !item.version) return
     const step = {
         id: generateStepId(), kind: 'custom', type: item.type, version: String(item.version),
         name: `${item.name} · v${item.version}`,
@@ -3857,6 +4077,16 @@ const insertProjectComponent = item => {
 }
 
 const saveScene = async () => {
+    if (!sceneEditorReady.value) {
+        const editorLoadFailed = editorInitializationStatus.value === 'failed'
+            || caseDetailStatus.value === 'failed'
+            || componentDefinitionsStatus.value === 'failed'
+            || customComponentDefinitionsStatus.value === 'failed'
+        ElMessage.warning(t(editorLoadFailed
+            ? 'appAutomation.sceneBuilder.messages.editorLoadFailed'
+            : 'appAutomation.sceneBuilder.messages.editorInitializing'))
+        return
+    }
     if (saving.value) return
     if (!sceneForm.value.name?.trim()) {
         ElMessage.warning(t('appAutomation.sceneBuilder.messages.inputSceneName'))
@@ -3906,14 +4136,25 @@ const saveScene = async () => {
         }
 
         if (sceneBuilderUnmounted) return
-        const responseData = caseResponse.data || caseResponse
-        if (responseData && (responseData.id || responseData.success)) {
+        const responseData = caseResponse?.data?.data ?? caseResponse?.data ?? caseResponse
+        const saveAccepted = Boolean(responseData && (responseData.id || responseData.success))
+        if (saveAccepted) {
             ElMessage.success(submittedCaseId ? t('appAutomation.sceneBuilder.messages.sceneUpdateSuccess') : t('appAutomation.sceneBuilder.messages.sceneSaveSuccess'))
         } else {
             ElMessage.success(t('appAutomation.sceneBuilder.messages.sceneSubmitted'))
         }
         if (isSubmittedContextCurrent()) {
-            if (responseData?.id && !submittedCaseId) editingCaseId.value = responseData.id
+            if (saveAccepted) {
+                const savedCaseId = responseData?.id ?? submittedCaseId
+                if (savedCaseId) {
+                    editingCaseId.value = savedCaseId
+                    caseDetailCaseId.value = savedCaseId
+                    caseDetailStatus.value = 'loaded'
+                    loadedCaseUpdatedAt.value = typeof responseData.updated_at === 'string' && responseData.updated_at.trim()
+                        ? responseData.updated_at
+                        : null
+                }
+            }
             sceneBaseline.value = submittedSnapshot
         } else {
             ElMessage.warning(t('appAutomation.sceneBuilder.messages.saveContextChanged'))

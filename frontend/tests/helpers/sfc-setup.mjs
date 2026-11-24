@@ -42,6 +42,16 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
       createProjectComponent: async () => ({ data: {} }),
       executeSceneDataset: async () => ({ data: { success: true, data: { execution_ids: [] } } }),
     },
+    // Component tests mock IO at the aggregate device-list boundary. The real
+    // pagination helper has its own multi-page and error regressions.
+    '@/api/app-device-options': {
+      getAllAppDevices: async (params = {}) => {
+        const api = imports['@/api/app-automation'] || imports['@/api/app-automation.js']
+        const response = await api?.getDeviceList?.({ ...params, ordering: 'id', page: 1, page_size: 100 })
+        const body = response?.data?.data ?? response?.data ?? response
+        return Array.isArray(body) ? body : body?.results || []
+      },
+    },
     '../components/SceneDataPanel.vue': { default: {} },
     ...imports,
   }

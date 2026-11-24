@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from .scene_component_runtime import SceneComponentError, expand_project_flow
+from .scene_component_runtime import (
+    SceneComponentError,
+    expand_project_flow,
+    validate_legacy_component_references,
+)
 from .scene_data_runtime import SceneDataError
 from .scene_sensitive_flow import SensitiveFlowError, protect_sensitive_inputs
 from .scene_variable_compat import compatible_execution_variables
@@ -105,6 +109,7 @@ def prepare_scene_execution(
         variables = compatible_execution_variables(execution, test_case)
         if _contains_project_reference(flow):
             flow = expand_project_flow(execution, test_case, flow)
+        validate_legacy_component_references(flow)
         flow = protect_sensitive_inputs(flow, variables)
     except (SceneDataError, SceneComponentError, SensitiveFlowError):
         raise ScenePreparationError('场景数据、密钥或组件配置无效，请检查项目权限及配置') from None
