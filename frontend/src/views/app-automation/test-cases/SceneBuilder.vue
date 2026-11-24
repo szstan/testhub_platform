@@ -32,7 +32,7 @@
                     </el-col>
                     <el-col :span="8">
                         <el-form-item :label="$t('appAutomation.sceneBuilder.form.belongProject')">
-                            <el-select v-model="sceneForm.project" :placeholder="$t('appAutomation.sceneBuilder.form.pleaseSelectProject')" clearable filterable style="width:100%">
+                            <el-select v-model="sceneForm.project" :disabled="recorderEnabled || recorderStarting || recorderInteractionPending" :placeholder="$t('appAutomation.sceneBuilder.form.pleaseSelectProject')" clearable filterable style="width:100%">
                                 <el-option v-for="p in projectList" :key="p.id" :label="p.name" :value="p.id" />
                             </el-select>
                         </el-form-item>
@@ -147,7 +147,7 @@
                                 id="scene-recorder-device"
                                 v-model="recorderDeviceId"
                                 :placeholder="$t('appAutomation.recorder.selectDevice')"
-                                :disabled="recorderStarting || recorderEnabled"
+                                :disabled="recorderStarting || recorderEnabled || recorderInteractionPending || recorderUnresolvedCount > 0"
                                 filterable
                                 clearable
                             >
@@ -163,7 +163,7 @@
                                 size="small"
                                 :icon="Refresh"
                                 :loading="recorderDevicesLoading"
-                                :disabled="recorderStarting || recorderEnabled"
+                                :disabled="recorderStarting || recorderEnabled || recorderInteractionPending || recorderUnresolvedCount > 0"
                                 @click="loadRecorderDevices()"
                             >
                                 {{ $t('appAutomation.recorder.refreshDevices') }}
@@ -191,6 +191,8 @@
                         :get-screenshot="captureDeviceScreenshot"
                         :send-interaction="sendRecorderInteraction"
                         @recording-change="handleRecordingChange"
+                        @interaction-state="handleRecorderInteractionState"
+                        @unresolved-change="handleRecorderUnresolvedChange"
                         @step-staged="appendRecorderStep"
                         @error="handleRecorderError"
                     />
@@ -213,6 +215,7 @@
                     :project-id="sceneForm.project"
                     :get-steps="getProjectComponentSteps"
                     @components-loaded="setProjectComponents"
+                    @components-load-state="setProjectComponentLoadState"
                     @insert-component="insertProjectComponent"
                 />
             </el-collapse-item>
@@ -1091,6 +1094,9 @@ const recorderHeartbeatIntervalMs = leaseSeconds => Math.max(
 )
 const sameId = (left, right) => left !== null && left !== undefined && right !== null && right !== undefined
     && String(left) === String(right)
+const sameOptionalId = (left, right) => left === null || left === undefined
+    ? right === null || right === undefined
+    : right !== null && right !== undefined && String(left) === String(right)
 const currentRecorderUserId = () => {
     const id = userStore.user?.id ?? userStore.user?.pk
     if (Number.isSafeInteger(id) && id > 0) return id
@@ -1101,6 +1107,13 @@ const currentRecorderUserId = () => {
 const currentRecorderSessionGeneration = () => typeof userStore.getSessionGeneration === 'function'
     ? userStore.getSessionGeneration()
     : null
+const captureAccountIdentity = () => ({
+    userId: currentRecorderUserId(),
+    sessionGeneration: currentRecorderSessionGeneration(),
+})
+const isAccountIdentityCurrent = identity => sameOptionalId(currentRecorderUserId(), identity?.userId)
+    && (identity?.sessionGeneration === undefined
+        || currentRecorderSessionGeneration() === identity.sessionGeneration)
 
 // Reactive state
 const recorderDevices = ref([])
@@ -1110,6 +1123,11 @@ const recorderDevicesLoading = ref(false)
 const recorderStarting = ref(false)
 const recorderEnabled = ref(false)
 const recorderLease = ref(null)
+const recorderLeaseContext = ref(null)
+const recorderInteractionContext = ref(null)
+const deferredRecorderRelease = ref(null)
+const recorderUnresolvedCount = ref(0)
+const recorderInteractionPending = computed(() => Boolean(recorderInteractionContext.value || deferredRecorderRelease.value))
 const recorderErrorKey = ref('')
 const recorderEpoch = ref(0)
 const recorderSessionGeneration = ref(null)
@@ -1122,7 +1140,8 @@ const recorderHasOwnedLease = computed(() => Boolean(
     && recorderLease.value.sessionGeneration === currentRecorderSessionGeneration()
 ))
 const canStartRecorder = computed(() => Boolean(
-    !recorderEnabled.value && !recorderStarting.value && currentRecorderUserId() !== null
+    !recorderEnabled.value && !recorderStarting.value && !recorderInteractionContext.value
+    && !deferredRecorderRelease.value && currentRecorderUserId() !== null
     && recorderSelectedDevice.value && canSelectRecorderDevice(recorderSelectedDevice.value)
 ))
 const recorderOwnershipLabel = computed(() => {
@@ -1184,6 +1203,15 @@ const selectedSubIndex = computed({
 const jsonFieldErrors = ref({})
 const typedExpressionModes = ref({})
 const sceneBaseline = ref("")
+const sceneContextGeneration = ref(0)
+let sceneBuilderUnmounted = false
+const componentDefinitionsStatus = ref('loading')
+const customComponentDefinitionsStatus = ref('loading')
+const projectComponentDefinitionsStatus = ref({
+    projectId: null,
+    ...captureAccountIdentity(),
+    status: 'not-required',
+})
 const componentDefinitions = ref({})
 const customComponentDefinitions = ref({})
 const projectComponentDefinitions = ref({})
@@ -1381,16 +1409,22 @@ watch(() => activeStep.value?.config?.assert_type, (value) => {
 
 // Lifecycle hooks
 const beforeUnloadHandler = event => {
-    if (!isSceneDirty.value) return
+    if (!isSceneDirty.value && !recorderInteractionPending.value && !recorderUnresolvedCount.value) return
     event.preventDefault()
     event.returnValue = ''
 }
 
 onBeforeRouteLeave(async () => {
-    if (!isSceneDirty.value) return true
+    if (recorderInteractionPending.value) {
+        ElMessage.warning(t('appAutomation.recorder.errors.interactionInFlight'))
+        return false
+    }
+    if (!isSceneDirty.value && !recorderUnresolvedCount.value) return true
     try {
         await ElMessageBox.confirm(
-            t('appAutomation.sceneBuilder.messages.unsavedConfirm'),
+            t(recorderUnresolvedCount.value
+                ? 'appAutomation.recorder.unresolvedLeave'
+                : 'appAutomation.sceneBuilder.messages.unsavedConfirm'),
             t('appAutomation.sceneBuilder.messages.unsavedTitle'),
             { type: 'warning', confirmButtonText: t('appAutomation.common.confirm'), cancelButtonText: t('appAutomation.common.cancel') }
         )
@@ -1412,6 +1446,7 @@ onMounted(async () => {
             getAppProjects({ page_size: 100 }).then(res => { projectList.value = res.data.results || res.data || [] })
         ])
 
+        if (sceneBuilderUnmounted) return
         const caseId = route.query.case_id
         if (caseId) {
             editingCaseId.value = caseId
@@ -1420,11 +1455,14 @@ onMounted(async () => {
             sceneBaseline.value = getSceneSnapshot()
         }
     } catch (error) {
+        if (sceneBuilderUnmounted) return
         console.error('初始化组件数据失败:', error)
     }
 })
 
 onBeforeUnmount(() => {
+    sceneBuilderUnmounted = true
+    sceneContextGeneration.value += 1
     if (typeof window !== 'undefined') window.removeEventListener('beforeunload', beforeUnloadHandler)
     void stopRecorder({ silent: true, refresh: false })
 })
@@ -1520,10 +1558,22 @@ const stopRecorder = async ({ release = true, silent = false, refresh = true } =
     if (recorderHeartbeatTimer.value !== null) clearInterval(recorderHeartbeatTimer.value)
     recorderHeartbeatTimer.value = null
     const lease = recorderLease.value
+    const deferRelease = release && recorderInteractionUsesLease(recorderInteractionContext.value, lease)
+    if (deferRelease) {
+        deferredRecorderRelease.value = {
+            lease,
+            context: recorderInteractionContext.value,
+            silent,
+            refresh,
+        }
+    } else if (deferredRecorderRelease.value) {
+        deferredRecorderRelease.value.silent = deferredRecorderRelease.value.silent && silent
+        deferredRecorderRelease.value.refresh = deferredRecorderRelease.value.refresh && refresh
+    }
     recorderLease.value = null
     recorderSessionGeneration.value = null
-    if (lease && release) await releaseRecorderLease(lease, { silent })
-    if (lease && refresh) await loadRecorderDevices()
+    if (lease && release && !deferRelease) await releaseRecorderLease(lease, { silent })
+    if (lease && refresh && !deferRelease) await loadRecorderDevices()
 }
 
 const handleHeartbeatFailure = async (error) => {
@@ -1551,7 +1601,7 @@ const heartbeatRecorderLease = async lease => {
 }
 
 const startRecorder = async () => {
-    if (recorderStarting.value || recorderEnabled.value) return false
+    if (recorderStarting.value || recorderEnabled.value || recorderInteractionContext.value || deferredRecorderRelease.value) return false
     const selectedId = recorderDeviceId.value
     const expectedUserId = currentRecorderUserId()
     if (expectedUserId === null) {
@@ -1562,6 +1612,7 @@ const startRecorder = async () => {
 
     const generation = recorderEpoch.value
     const sessionGeneration = currentRecorderSessionGeneration()
+    const actionContext = getRecorderActionContext()
     recorderSessionGeneration.value = sessionGeneration
     recorderStarting.value = true
     recorderErrorKey.value = ''
@@ -1608,6 +1659,7 @@ const startRecorder = async () => {
             && sessionGeneration === currentRecorderSessionGeneration()
             && sameId(currentRecorderUserId(), expectedUserId)
             && sameId(recorderDeviceId.value, selectedId)
+            && isRecorderActionContextCurrent(actionContext)
         if (!stillCurrent) {
             if (sameId(currentRecorderUserId(), lease.expectedUserId)
                 && sessionGeneration === currentRecorderSessionGeneration()) {
@@ -1617,6 +1669,7 @@ const startRecorder = async () => {
         }
 
         recorderLease.value = lease
+        recorderLeaseContext.value = actionContext
         recorderDevices.value = recorderDevices.value.map(device => sameId(device.id, selectedId) ? lockedDevice : device)
         recorderEnabled.value = true
         recorderHeartbeatTimer.value = setInterval(
@@ -1648,9 +1701,62 @@ const handleRecordingChange = enabled => {
     void stopRecorder()
 }
 
+const getRecorderActionContext = () => ({
+    caseId: editingCaseId.value ?? null,
+    sceneGeneration: sceneContextGeneration.value,
+    projectId: sceneForm.value.project ?? null,
+    deviceId: recorderDeviceId.value ?? null,
+    userId: currentRecorderUserId(),
+    sessionGeneration: currentRecorderSessionGeneration(),
+})
+const isRecorderActionContextCurrent = context => Boolean(context)
+    && sameOptionalId(context.userId, currentRecorderUserId())
+    && context.sessionGeneration === currentRecorderSessionGeneration()
+    && context.sceneGeneration === sceneContextGeneration.value
+    && sameOptionalId(context.projectId, sceneForm.value.project)
+    && sameOptionalId(context.deviceId, recorderDeviceId.value)
+    && (context.caseId === null || context.caseId === undefined || sameOptionalId(context.caseId, editingCaseId.value))
+const sameRecorderActionContext = (left, right) => Boolean(left && right)
+    && sameOptionalId(left.caseId, right.caseId)
+    && left.sceneGeneration === right.sceneGeneration
+    && sameOptionalId(left.projectId, right.projectId)
+    && sameOptionalId(left.deviceId, right.deviceId)
+    && sameOptionalId(left.userId, right.userId)
+    && left.sessionGeneration === right.sessionGeneration
+const recorderInteractionUsesLease = (context, lease) => Boolean(context && lease)
+    && sameOptionalId(context.deviceId, lease.deviceId)
+    && sameOptionalId(context.userId, lease.expectedUserId)
+    && context.sessionGeneration === lease.sessionGeneration
+
+const completeDeferredRecorderRelease = async context => {
+    const deferred = deferredRecorderRelease.value
+    if (!deferred || !sameRecorderActionContext(deferred.context, context)) return
+    try {
+        await releaseRecorderLease(deferred.lease, { silent: deferred.silent })
+        if (deferred.refresh) await loadRecorderDevices()
+    } finally {
+        if (deferredRecorderRelease.value === deferred) deferredRecorderRelease.value = null
+    }
+}
+
+const handleRecorderInteractionState = ({ active, context } = {}) => {
+    if (active) {
+        recorderInteractionContext.value = context || null
+        return
+    }
+    if (!sameRecorderActionContext(recorderInteractionContext.value, context)) return
+    recorderInteractionContext.value = null
+    void completeDeferredRecorderRelease(context)
+}
+
+const handleRecorderUnresolvedChange = count => {
+    recorderUnresolvedCount.value = Number.isSafeInteger(count) && count > 0 ? count : 0
+}
+
 const sendRecorderInteraction = (deviceId, command) => {
     const lease = recorderLease.value
     if (!recorderEnabled.value || !lease
+        || !isRecorderActionContextCurrent(recorderLeaseContext.value)
         || !sameId(deviceId, lease.deviceId)
         || !sameId(currentRecorderUserId(), lease.expectedUserId)
         || lease.sessionGeneration !== currentRecorderSessionGeneration()) {
@@ -1669,29 +1775,44 @@ const sendRecorderInteraction = (deviceId, command) => {
         expected_user_id: lease.expectedUserId,
     })
 }
+sendRecorderInteraction.getActionContext = getRecorderActionContext
 
-const appendRecorderStep = staged => {
+const appendRecorderStep = (staged, capturedContext) => {
+    const context = staged?.step && staged?.context
+        ? staged.context
+        : capturedContext || recorderInteractionContext.value
+    const action = staged?.step && staged?.context ? staged.step : staged
     const lease = recorderLease.value
+    const hasActiveLease = Boolean(recorderEnabled.value && lease
+        && lease.sessionGeneration === currentRecorderSessionGeneration()
+        && sameId(currentRecorderUserId(), lease.expectedUserId)
+        && sameId(recorderDeviceId.value, lease.deviceId))
+    if (context) {
+        if (!isRecorderActionContextCurrent(context)) {
+            recorderErrorKey.value = 'appAutomation.recorder.errors.actionContextChanged'
+            return null
+        }
+    } else if (!hasActiveLease || !isRecorderActionContextCurrent(recorderLeaseContext.value)) {
+        recorderErrorKey.value = 'appAutomation.recorder.errors.actionContextChanged'
+        return null
+    }
     const isRatio = value => Number.isFinite(value) && value >= 0 && value <= 1
-    if (!recorderEnabled.value || !lease
-        || lease.sessionGeneration !== currentRecorderSessionGeneration()
-        || !sameId(currentRecorderUserId(), lease.expectedUserId)) return null
     let type
     let config
     let nameKey
-    if (staged?.action === 'tap' && isRatio(staged.x_ratio) && isRatio(staged.y_ratio)) {
+    if (action?.action === 'tap' && isRatio(action.x_ratio) && isRatio(action.y_ratio)) {
         type = 'click'
         nameKey = 'click'
         config = {
             selector_type: 'relative',
-            selector: `${staged.x_ratio},${staged.y_ratio}`,
+            selector: `${action.x_ratio},${action.y_ratio}`,
         }
-    } else if (staged?.action === 'swipe'
-        && isRatio(staged.start?.x_ratio) && isRatio(staged.start?.y_ratio)
-        && isRatio(staged.end?.x_ratio) && isRatio(staged.end?.y_ratio)
-        && Number.isFinite(staged.duration_ms) && staged.duration_ms > 0 && staged.duration_ms <= 1500) {
-        const deltaX = staged.end.x_ratio - staged.start.x_ratio
-        const deltaY = staged.end.y_ratio - staged.start.y_ratio
+    } else if (action?.action === 'swipe'
+        && isRatio(action.start?.x_ratio) && isRatio(action.start?.y_ratio)
+        && isRatio(action.end?.x_ratio) && isRatio(action.end?.y_ratio)
+        && Number.isFinite(action.duration_ms) && action.duration_ms > 0 && action.duration_ms <= 1500) {
+        const deltaX = action.end.x_ratio - action.start.x_ratio
+        const deltaY = action.end.y_ratio - action.start.y_ratio
         if (deltaX === 0 && deltaY === 0) return null
         const direction = Math.abs(deltaX) >= Math.abs(deltaY)
             ? (deltaX >= 0 ? 'right' : 'left')
@@ -1701,15 +1822,15 @@ const appendRecorderStep = staged => {
         config = {
             coordinate_space: 'image_ratio',
             selector_type: 'relative',
-            start: `${staged.start.x_ratio},${staged.start.y_ratio}`,
-            end: `${staged.end.x_ratio},${staged.end.y_ratio}`,
+            start: `${action.start.x_ratio},${action.start.y_ratio}`,
+            end: `${action.end.x_ratio},${action.end.y_ratio}`,
             direction,
-            duration: staged.duration_ms / 1000,
+            duration: action.duration_ms / 1000,
         }
-    } else if (staged?.action === 'key' && ['back', 'home', 'enter'].includes(staged.key)) {
+    } else if (action?.action === 'key' && ['back', 'home', 'enter'].includes(action.key)) {
         type = 'key_event'
         nameKey = 'key'
-        config = { key: staged.key.toUpperCase() }
+        config = { key: action.key.toUpperCase() }
     } else {
         return null
     }
@@ -1728,7 +1849,13 @@ const appendRecorderStep = staged => {
 const handleRecorderError = error => {
     const status = Number.isInteger(error?.status) ? error.status : undefined
     recorderErrorKey.value = mapRecorderError(error?.operation || 'interaction', status)
-    if (['interaction', 'screenshot'].includes(error?.operation) && [403, 409, 502, 503, 504].includes(status)) {
+    if (error?.recoveryRequired === true || error?.uncertain === true) {
+        deferredRecorderRelease.value = null
+        recorderErrorKey.value = error?.actionOutcome === 'completed'
+            ? 'appAutomation.recorder.errors.completedNeedsRecovery'
+            : 'appAutomation.recorder.errors.interactionUncertain'
+        void stopRecorder({ release: false, silent: true })
+    } else if (['interaction', 'screenshot'].includes(error?.operation) && [403, 409, 502, 503, 504].includes(status)) {
         void stopRecorder({ release: true, silent: true })
     }
 }
@@ -1810,13 +1937,38 @@ const normalizeSceneRuntime = runtime => {
     }
 }
 
+const isProjectComponentDefinitionsContextCurrent = () => {
+    const state = projectComponentDefinitionsStatus.value
+    return sameOptionalId(state.projectId, sceneForm.value.project)
+        && isAccountIdentityCurrent(state)
+}
+const getProjectComponentDefinitionsPhase = () => {
+    if (!isProjectComponentDefinitionsContextCurrent()) {
+        return sceneForm.value.project ? 'loading' : 'unavailable'
+    }
+    return projectComponentDefinitionsStatus.value.status
+}
+
 const getComponentDefinitionForStep = step => {
     if (!step) return null
     if (step.kind === 'custom' && step.version !== undefined) {
+        if (getProjectComponentDefinitionsPhase() !== 'loaded') return null
         return projectComponentDefinitions.value[`${step.type}@${step.version}`] || null
     }
     if (step.kind === 'custom') return customComponentDefinitions.value[step.type] || componentDefinitions.value[step.type] || null
     return componentDefinitions.value[step.type] || customComponentDefinitions.value[step.type] || null
+}
+
+const getComponentDefaultConfig = component => {
+    const properties = component?.schema?.properties || {}
+    const schemaDefaults = Object.fromEntries(Object.entries(properties)
+        .filter(([, property]) => Object.prototype.hasOwnProperty.call(property || {}, 'default'))
+        .map(([field, property]) => [field, property.default]))
+    const configured = component?.default_config ?? component?.defaultConfig ?? {}
+    const defaultConfig = configured && typeof configured === 'object' && !Array.isArray(configured)
+        ? configured
+        : {}
+    return JSON.parse(JSON.stringify({ ...schemaDefaults, ...defaultConfig }))
 }
 
 const normalizeStepTree = (steps, usedIds = new Set()) => (Array.isArray(steps) ? steps : []).map(rawStep => {
@@ -2266,7 +2418,7 @@ const cloneComponent = (item) => {
         type: item.type,
         name: item.name,
         kind: item.kind || "atomic",
-        config: JSON.parse(JSON.stringify(item.defaultConfig || item.default_config || {}))
+        config: getComponentDefaultConfig(item)
     }
     if (item.kind === "custom") {
         cloned.component_id = componentId
@@ -2347,7 +2499,7 @@ const addSubStep = (parentIndex) => {
         id: generateStepId(),
         type: 'click',
         name: t('appAutomation.sceneBuilder.action.click'),
-        config: { ...(componentDefinitions.value['click']?.default_config || { selector_type: 'image', timeout: 5 }) }
+        config: { selector_type: 'image', timeout: 5, ...getComponentDefaultConfig(componentDefinitions.value['click']) }
     }
     parentStep.steps.push(newStep)
     selectSubStep(parentIndex, parentStep.steps.length - 1)
@@ -2397,6 +2549,10 @@ const duplicateStep = (index) => {
 }
 
 const resetScene = async () => {
+    if (recorderInteractionPending.value) {
+        ElMessage.warning(t('appAutomation.recorder.errors.interactionInFlight'))
+        return
+    }
     if (isSceneDirty.value) {
         try {
             await ElMessageBox.confirm(
@@ -2408,6 +2564,9 @@ const resetScene = async () => {
             return
         }
     }
+    if (recorderEnabled.value || recorderStarting.value || recorderLease.value) await stopRecorder()
+    sceneContextGeneration.value += 1
+    editingCaseId.value = null
     sceneForm.value = { name: "", description: "", project: null }
     sceneVariables.value = []
     sceneRuntime.value = defaultSceneRuntime()
@@ -2488,9 +2647,7 @@ const addEditStep = () => {
         id: generateStepId(),
         type: item.type,
         name: item.name,
-        config: {
-            ...item.defaultConfig
-        }
+        config: getComponentDefaultConfig(item)
     }
     editingCustomSteps.value.push(step)
     editingSelectedIndex.value = editingCustomSteps.value.length - 1
@@ -2605,6 +2762,7 @@ const saveCustomComponent = () => {
 }
 
 const loadComponentPalette = async () => {
+    componentDefinitionsStatus.value = 'loading'
     try {
         const response = await getComponents({ enabled: 1 })
         const responseList = response.data?.data || response.data || []
@@ -2628,6 +2786,7 @@ const loadComponentPalette = async () => {
             }
             return acc
         }, {})
+        componentDefinitionsStatus.value = 'loaded'
         if (componentPalette.value.length === 0) {
             ElMessage.warning(t('appAutomation.sceneBuilder.messages.noComponentDef'))
         }
@@ -2636,10 +2795,12 @@ const loadComponentPalette = async () => {
         ElMessage.error(t('appAutomation.sceneBuilder.messages.loadPaletteFailed', { error: error.message || t('appAutomation.sceneBuilder.messages.unknownError') }))
         componentPalette.value = []
         componentDefinitions.value = {}
+        componentDefinitionsStatus.value = 'failed'
     }
 }
 
 const loadCustomComponentPalette = async () => {
+    customComponentDefinitionsStatus.value = 'loading'
     defaultCustomPalette.value = JSON.parse(JSON.stringify(customComponentPalette.value))
     try {
         const response = await getCustomComponents({ enabled: 1 })
@@ -2672,6 +2833,7 @@ const loadCustomComponentPalette = async () => {
                 return acc
             }, {})
         }
+        customComponentDefinitionsStatus.value = 'loaded'
     } catch (error) {
         console.error("加载自定义组件库失败:", error)
         customComponentPalette.value = defaultCustomPalette.value.map(item => ({
@@ -2682,12 +2844,20 @@ const loadCustomComponentPalette = async () => {
             if (item && item.type) acc[item.type] = { ...item, default_config: item.defaultConfig || item.default_config || {} }
             return acc
         }, {})
+        customComponentDefinitionsStatus.value = 'failed'
     }
 }
 
 const loadCaseDetail = async (caseId) => {
+    if (sceneBuilderUnmounted) return
+    const contextGeneration = ++sceneContextGeneration.value
+    const accountIdentity = captureAccountIdentity()
+    const isCurrent = () => !sceneBuilderUnmounted
+        && contextGeneration === sceneContextGeneration.value
+        && isAccountIdentityCurrent(accountIdentity)
     try {
         const response = await getTestCaseDetail(caseId)
+        if (!isCurrent()) return
         const data = response.data || response
         if (data && data.id) {
             // 直接从 data 对象读取字段，匹配后端模型
@@ -2712,6 +2882,7 @@ const loadCaseDetail = async (caseId) => {
             sceneBaseline.value = getSceneSnapshot()
         }
     } catch (error) {
+        if (!isCurrent()) return
         console.error("加载用例失败:", error)
         ElMessage.error(t('appAutomation.sceneBuilder.messages.loadCaseFailed'))
     }
@@ -2721,7 +2892,7 @@ const applyDefaultConfig = (step) => {
     if (!step || typeof step !== 'object') return
     if (!step.config || typeof step.config !== 'object' || Array.isArray(step.config)) step.config = {}
     const def = getComponentDefinitionForStep(step)
-    const defaults = def?.default_config || def?.defaultConfig || {}
+    const defaults = getComponentDefaultConfig(def)
     Object.keys(defaults).forEach(key => {
         if (step.config[key] === undefined) step.config[key] = JSON.parse(JSON.stringify(defaults[key]))
     })
@@ -3508,6 +3679,52 @@ const linkedElementFieldFor = field => ({
     target_selector: 'target_element_id'
 })[field]
 
+const LEGACY_SUPPORTED_ACTIONS = new Set(['touch', 'text', 'sleep'])
+
+const validateComponentDefinitions = (steps, path = 'ui_flow') => {
+    for (let index = 0; index < steps.length; index++) {
+        const step = steps[index]
+        const stepPath = `${path}[${index + 1}]`
+        const isVersionedComponent = step.kind === 'custom' && step.version !== undefined
+        if (isVersionedComponent) {
+            const phase = getProjectComponentDefinitionsPhase()
+            if (phase === 'loading') return t('appAutomation.sceneBuilder.messages.projectComponentDefinitionsLoading')
+            if (phase !== 'loaded' || !projectComponentDefinitions.value[`${step.type}@${step.version}`]) {
+                return t('appAutomation.sceneBuilder.messages.projectComponentDefinitionsUnavailable', {
+                    type: step.type, version: step.version,
+                })
+            }
+        } else if (!getComponentDefinitionForStep(step)) {
+            const isLegacyInlineComponent = step.kind === 'custom'
+                && !isVersionedComponent && Array.isArray(step.steps)
+            const isLegacyAction = step.kind !== 'custom'
+                && LEGACY_SUPPORTED_ACTIONS.has(String(step.type || '').toLowerCase())
+            if (!isLegacyInlineComponent && !isLegacyAction) {
+                const statuses = step.kind === 'custom'
+                    ? [customComponentDefinitionsStatus.value, componentDefinitionsStatus.value]
+                    : [componentDefinitionsStatus.value]
+                if (statuses.some(status => status === 'loading')) {
+                    return t('appAutomation.sceneBuilder.messages.componentDefinitionsLoading')
+                }
+                return t('appAutomation.sceneBuilder.messages.componentDefinitionsUnavailable', { type: step.type })
+            }
+        }
+
+        const config = { ...step, ...(step.config || {}) }
+        for (const field of ['steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps']) {
+            if (Array.isArray(config[field])) {
+                const issue = validateComponentDefinitions(config[field], `${stepPath}.${field}`)
+                if (issue) return issue
+            }
+        }
+        if (Array.isArray(step.steps)) {
+            const issue = validateComponentDefinitions(step.steps, `${stepPath}.steps`)
+            if (issue) return issue
+        }
+    }
+    return ''
+}
+
 const validateRequiredSteps = (steps, path = 'ui_flow') => {
     for (let index = 0; index < steps.length; index++) {
         const step = steps[index]
@@ -3576,8 +3793,11 @@ const removeTransientFields = value => {
 
 const prepareStepsForSave = steps => {
     const source = JSON.parse(JSON.stringify(steps))
+    source.forEach(applyDefaultConfig)
     const parsed = normalizeJsonDrafts(source)
     if (parsed.error) return parsed
+    const definitionIssue = validateComponentDefinitions(parsed.value)
+    if (definitionIssue) return { error: definitionIssue }
     const issue = validateRequiredSteps(parsed.value)
     if (issue) return { error: issue }
     return { value: removeTransientFields(parsed.value) }
@@ -3601,6 +3821,27 @@ const setProjectComponents = items => {
     projectComponentDefinitions.value = Object.fromEntries(
         projectComponentPalette.value.map(item => [item.optionKey, item])
     )
+    projectComponentDefinitionsStatus.value = {
+        projectId: sceneForm.value.project ?? null,
+        ...captureAccountIdentity(),
+        status: 'loaded',
+    }
+}
+
+const setProjectComponentLoadState = state => {
+    if (!state || !['not-required', 'loading', 'loaded', 'failed'].includes(state.status)) return
+    const next = {
+        projectId: state.projectId ?? null,
+        userId: state.userId ?? null,
+        sessionGeneration: state.sessionGeneration,
+        status: state.status,
+    }
+    if (!sameOptionalId(next.projectId, sceneForm.value.project) || !isAccountIdentityCurrent(next)) return
+    projectComponentDefinitionsStatus.value = next
+    if (next.status !== 'loaded') {
+        projectComponentPalette.value = []
+        projectComponentDefinitions.value = {}
+    }
 }
 
 const insertProjectComponent = item => {
@@ -3608,7 +3849,7 @@ const insertProjectComponent = item => {
     const step = {
         id: generateStepId(), kind: 'custom', type: item.type, version: String(item.version),
         name: `${item.name} · v${item.version}`,
-        config: JSON.parse(JSON.stringify(item.default_config || {})),
+        config: getComponentDefaultConfig(item),
     }
     scenarioSteps.value.push(step)
     selectedStepId.value = step.id
@@ -3616,6 +3857,7 @@ const insertProjectComponent = item => {
 }
 
 const saveScene = async () => {
+    if (saving.value) return
     if (!sceneForm.value.name?.trim()) {
         ElMessage.warning(t('appAutomation.sceneBuilder.messages.inputSceneName'))
         return
@@ -3645,6 +3887,16 @@ const saveScene = async () => {
             variables: formatSceneVariables(),
             runtime_config: normalizeSceneRuntime(sceneRuntime.value)
         }
+        const submittedSnapshot = getSceneSnapshot()
+        const submittedContextGeneration = sceneContextGeneration.value
+        const submittedCaseId = editingCaseId.value
+        const submittedProjectId = caseData.project
+        const submittedAccountIdentity = captureAccountIdentity()
+        const isSubmittedContextCurrent = () => sceneContextGeneration.value === submittedContextGeneration
+            && editingCaseId.value === submittedCaseId
+            && sameOptionalId(sceneForm.value.project || null, submittedProjectId)
+            && isAccountIdentityCurrent(submittedAccountIdentity)
+            && !sceneBuilderUnmounted
 
         let caseResponse = null
         if (editingCaseId.value) {
@@ -3653,15 +3905,21 @@ const saveScene = async () => {
             caseResponse = await createTestCase(caseData)
         }
 
+        if (sceneBuilderUnmounted) return
         const responseData = caseResponse.data || caseResponse
         if (responseData && (responseData.id || responseData.success)) {
-            ElMessage.success(editingCaseId.value ? t('appAutomation.sceneBuilder.messages.sceneUpdateSuccess') : t('appAutomation.sceneBuilder.messages.sceneSaveSuccess'))
-            if (responseData.id && !editingCaseId.value) editingCaseId.value = responseData.id
+            ElMessage.success(submittedCaseId ? t('appAutomation.sceneBuilder.messages.sceneUpdateSuccess') : t('appAutomation.sceneBuilder.messages.sceneSaveSuccess'))
         } else {
             ElMessage.success(t('appAutomation.sceneBuilder.messages.sceneSubmitted'))
         }
-        sceneBaseline.value = getSceneSnapshot()
+        if (isSubmittedContextCurrent()) {
+            if (responseData?.id && !submittedCaseId) editingCaseId.value = responseData.id
+            sceneBaseline.value = submittedSnapshot
+        } else {
+            ElMessage.warning(t('appAutomation.sceneBuilder.messages.saveContextChanged'))
+        }
     } catch (error) {
+        if (sceneBuilderUnmounted) return
         console.error("保存场景失败")
         const errorMsg = (error.response && error.response.data && error.response.data.msg) || error.message
         ElMessage.error(t('appAutomation.sceneBuilder.messages.saveSceneFailed', { error: errorMsg }))

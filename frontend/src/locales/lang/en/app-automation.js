@@ -609,6 +609,12 @@ export default {
       error: 'Recorder operation failed.'
     },
     stepNames: { click: 'Recorded click', swipe: 'Recorded swipe', key: 'Recorded key event' },
+    unresolvedAction: 'Some device actions were not added to the scene. Check their origin and device state before continuing.',
+    unresolvedOrigin: 'Originating case: {caseId}',
+    unresolvedDraftOrigin: 'Origin: an unsaved scene',
+    unresolvedUnknown: 'Result unconfirmed; inspect the device before retrying.',
+    unresolvedLeave: 'There are recorded actions that have not been added to the scene. Leaving will discard these recovery details. Leave anyway?',
+    clearUnresolved: 'Clear unresolved actions',
     errors: {
       signIn: 'Sign in before recording.',
       deviceListFailed: 'Could not load devices.',
@@ -618,6 +624,10 @@ export default {
       lockUnverified: 'The device lock could not be verified; recording remains disabled.',
       leaseLost: 'The device lease is no longer valid. Recording has been disabled.',
       accountChanged: 'The signed-in account changed. Recording has been disabled.',
+      actionContextChanged: 'A confirmed recorder action was not added because the account, project, or scene changed.',
+      interactionInFlight: 'A device action is still in progress. Wait for it to finish before leaving or resetting.',
+      interactionUncertain: 'The device action result is unconfirmed. Check the device before retrying.',
+      completedNeedsRecovery: 'The device action completed and was recorded. Device recovery is required before continuing.',
       maintenance: 'The device entered maintenance mode after an uncertain interaction. Recording has been disabled.',
       serviceUnavailable: 'The device service is unavailable.',
       conflict: 'The device is busy or the account fence was rejected. Recording has been disabled.',
@@ -639,6 +649,7 @@ export default {
     viewResult: 'View execution result',
     accountChanged: 'The signed-in account or session changed. The diagnostic was cancelled.',
     submitted: 'Single-step diagnostic submitted.',
+    submittedAfterContextChange: 'The diagnostic was submitted for the previously selected step.',
     failed: 'Single-step diagnostic failed.'
   },
 
@@ -696,6 +707,7 @@ export default {
       selectComponent: 'Select a step component',
       addStep: 'Add Step',
       empty: 'No steps',
+      inlineComponentSteps: 'Inline component steps',
       maxDepthReached: 'The maximum nested flow depth has been reached'
     },
     config: {
@@ -905,6 +917,11 @@ export default {
       saveFailedWithError: 'Save failed: {error}',
       noComponentDef: 'No component definitions. Please initialize the component library first (run on backend: python manage.py init_components)',
       loadPaletteFailed: 'Failed to load component library: {error}',
+      componentDefinitionsLoading: 'Component definitions are still loading. Wait before saving.',
+      componentDefinitionsUnavailable: 'The definition for component "{type}" is unavailable. Refresh the component library before saving.',
+      projectComponentDefinitionsLoading: 'Project component definitions are still loading. Wait before saving.',
+      projectComponentDefinitionsUnavailable: 'Component "{type}" version {version} is unavailable in the selected project.',
+      saveContextChanged: 'The save finished after the editor context changed. The active scene was left unchanged.',
       unknownError: 'Unknown error',
       loadCaseFailed: 'Failed to load case',
       selectStepFirst: 'Please select a step first',

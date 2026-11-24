@@ -62,7 +62,7 @@ const props = defineProps({
   projectId: { type: [String, Number], default: null },
   getSteps: { type: Function, required: true },
 })
-const emit = defineEmits(['insert-component', 'components-loaded'])
+const emit = defineEmits(['insert-component', 'components-loaded', 'components-load-state'])
 const { t } = useI18n()
 const userStore = useUserStore()
 const activeTab = ref('datasets')
@@ -83,17 +83,24 @@ const requiredParameters = ref('')
 let loadGeneration = 0
 
 const captureAccountIdentity = () => ({
-  userId: userStore.user?.id,
+  userId: userStore.user?.id ?? userStore.user?.pk,
   sessionGeneration: typeof userStore.getSessionGeneration === 'function'
     ? userStore.getSessionGeneration()
     : undefined,
 })
 const isAccountIdentityCurrent = identity =>
-  String(userStore.user?.id) === String(identity.userId) &&
+  String(userStore.user?.id ?? userStore.user?.pk) === String(identity.userId) &&
   (identity.sessionGeneration === undefined || (
     typeof userStore.getSessionGeneration === 'function' &&
     userStore.getSessionGeneration() === identity.sessionGeneration
   ))
+
+const emitComponentLoadState = (status, projectId, identity) => emit('components-load-state', {
+  projectId: projectId ?? null,
+  userId: identity.userId,
+  sessionGeneration: identity.sessionGeneration,
+  status,
+})
 
 const rowsFrom = response => {
   const body = response?.data ?? response
@@ -113,9 +120,11 @@ const load = async () => {
   emit('components-loaded', [])
   if (!project) {
     loading.value = false
+    emitComponentLoadState('not-required', project, identity)
     return
   }
   loading.value = true
+  emitComponentLoadState('loading', project, identity)
   try {
     const [datasetResponse, componentResponse] = await Promise.all([
       getAllSceneDatasets(project), getAllProjectComponents(project),
@@ -124,8 +133,12 @@ const load = async () => {
     datasets.value = rowsFrom(datasetResponse)
     components.value = rowsFrom(componentResponse)
     emit('components-loaded', components.value)
+    emitComponentLoadState('loaded', project, identity)
   } catch {
-    if (isCurrent()) ElMessage.error(t('appAutomation.sceneData.loadFailed'))
+    if (isCurrent()) {
+      emitComponentLoadState('failed', project, identity)
+      ElMessage.error(t('appAutomation.sceneData.loadFailed'))
+    }
   } finally {
     if (generation === loadGeneration) loading.value = false
   }
@@ -193,7 +206,11 @@ const saveComponent = async () => {
   }
 }
 
-watch(() => [props.projectId, userStore.user], () => {
+watch(() => [
+  props.projectId,
+  userStore.user,
+  typeof userStore.getSessionGeneration === 'function' ? userStore.getSessionGeneration() : undefined,
+], () => {
   selectedFile.value = null
   load()
 }, { immediate: true })

@@ -609,6 +609,12 @@ export default {
       error: '录制器操作失败。'
     },
     stepNames: { click: '录制的点击', swipe: '录制的滑动', key: '录制的按键事件' },
+    unresolvedAction: '部分设备操作未加入场景，请核对来源和设备状态后再继续。',
+    unresolvedOrigin: '来源用例：{caseId}',
+    unresolvedDraftOrigin: '来源：未保存的场景',
+    unresolvedUnknown: '执行结果尚未确认，请检查设备后再重试。',
+    unresolvedLeave: '仍有未加入场景的录制操作，离开后将丢失这些恢复提示。确认离开吗？',
+    clearUnresolved: '清除未暂存的操作',
     errors: {
       signIn: '请先登录再开始录制。',
       deviceListFailed: '无法加载设备列表。',
@@ -618,6 +624,10 @@ export default {
       lockUnverified: '无法验证设备锁，录制保持关闭。',
       leaseLost: '设备租约已失效，录制已关闭。',
       accountChanged: '登录账号已变化，录制已关闭。',
+      actionContextChanged: '账号、项目或场景已变化，已确认的录制操作未加入当前场景。',
+      interactionInFlight: '设备操作仍在进行，请等待完成后再离开或重置。',
+      interactionUncertain: '设备操作结果尚未确认，请检查设备后再重试。',
+      completedNeedsRecovery: '设备操作已完成并已记录，请先恢复设备状态后再继续。',
       maintenance: '设备因状态未确认而进入维护模式，录制已关闭。',
       serviceUnavailable: '设备服务不可用。',
       conflict: '设备正忙或账号校验失败，录制已关闭。',
@@ -639,6 +649,7 @@ export default {
     viewResult: '查看执行结果',
     accountChanged: '登录账号或会话已变化，已取消单步诊断。',
     submitted: '单步诊断已提交。',
+    submittedAfterContextChange: '单步诊断已提交，执行的是之前选中的步骤。',
     failed: '单步诊断失败。'
   },
 
@@ -696,6 +707,7 @@ export default {
       selectComponent: '选择步骤组件',
       addStep: '添加步骤',
       empty: '暂无步骤',
+      inlineComponentSteps: '内联组件步骤',
       maxDepthReached: '已达到嵌套流程的最大深度'
     },
     config: {
@@ -905,6 +917,11 @@ export default {
       saveFailedWithError: '保存失败: {error}',
       noComponentDef: '暂无组件定义，请先初始化组件库（后端运行：python manage.py init_components）',
       loadPaletteFailed: '加载组件库失败: {error}',
+      componentDefinitionsLoading: '组件定义仍在加载，请加载完成后再保存。',
+      componentDefinitionsUnavailable: '组件“{type}”的定义不可用，请刷新组件库后再保存。',
+      projectComponentDefinitionsLoading: '项目组件定义仍在加载，请加载完成后再保存。',
+      projectComponentDefinitionsUnavailable: '所选项目中没有可用的组件“{type}”版本 {version}。',
+      saveContextChanged: '保存完成时编辑上下文已切换，当前场景内容未被覆盖。',
       unknownError: '未知错误',
       loadCaseFailed: '加载用例失败',
       selectStepFirst: '请先选择步骤',

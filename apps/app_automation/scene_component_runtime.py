@@ -24,7 +24,35 @@ _SCENE_VARIABLE_REFERENCE = re.compile(
 )
 _PARAM_REFERENCE = re.compile(r'^\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$')
 _PARAM_TOKEN = re.compile(r'\{\{\s*params\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}')
-_SENSITIVE_NAME = re.compile(r'password|passwd|secret|token|credential|api[_-]?key|密码|密钥|令牌', re.I)
+_SENSITIVE_NAME = re.compile(r'password|passwd|secret|token|credential|api[_-]?key|密码|密钥|令牌', re.IGNORECASE)
+
+
+def _bounded_json_size(value, limit, *, compact=True, message='组件累计处理大小超过限制'):
+    """Count encoded JSON bytes without materializing an unbounded payload string."""
+    if type(limit) is not int or limit < 0:
+        raise SceneComponentError(message)
+    options = {'ensure_ascii': False, 'allow_nan': False}
+    if compact:
+        options['separators'] = (',', ':')
+    size = 0
+    try:
+        for chunk in json.JSONEncoder(**options).iterencode(value):
+            if len(chunk) > limit - size:
+                raise SceneComponentError(message)
+            size += len(chunk.encode('utf-8'))
+            if size > limit:
+                raise SceneComponentError(message)
+    except SceneComponentError:
+        raise
+    except (TypeError, ValueError, RecursionError, UnicodeEncodeError):
+        raise SceneComponentError(message) from None
+    return size
+
+
+def _charge_component_source(budget, size):
+    if budget['source_bytes'] + size > _MAX_BYTES:
+        raise SceneComponentError('组件累计源数据超过大小限制')
+    budget['source_bytes'] += size
 
 
 def _is_sensitive_parameter_spec(spec):
@@ -394,6 +422,28 @@ def validate_component_definition_sensitive_data(schema, configured_defaults, st
     )
 
 
+def _effective_input_expression(step):
+    config = step.get('config') if isinstance(step.get('config'), dict) else {}
+    action = str(step.get('type', '')).lower()
+    fields = ('text', 'value') if action == 'text' else ('value',)
+    for field in fields:
+        if field in step:
+            return step[field]
+        if field in config:
+            return config[field]
+    return None
+
+
+def _sensitive_input_values(step):
+    config = step.get('config') if isinstance(step.get('config'), dict) else {}
+    return [
+        container[field]
+        for container in (step, config)
+        for field in ('value', 'text')
+        if field in container
+    ]
+
+
 def _sensitive_template_parameters(steps):
 
     sensitive = set()
@@ -411,18 +461,11 @@ def _sensitive_template_parameters(steps):
                 containers.append(config)
             if (isinstance(action, str) and action.lower() in {'input', 'text'}
                     and any(container.get('sensitive') is True for container in containers)):
-                for container in containers:
-                    for key in ('value', 'text'):
-                        if key not in container:
-                            continue
-                        value = container[key]
-                        if _empty_sensitive_value(value) or _safe_sensitive_value(value):
-                            continue
-                        if isinstance(value, str):
-                            parameter = _PARAM_REFERENCE.fullmatch(value)
-                            if parameter:
-                                sensitive.add(parameter.group(1))
-                                continue
+                for value in _sensitive_input_values(step):
+                    parameter_names = _template_parameter_names(value)
+                    if isinstance(value, str) and parameter_names:
+                        sensitive.update(parameter_names)
+                    elif not _empty_sensitive_value(value) and not _safe_sensitive_value(value):
                         raise SceneComponentError('敏感组件输入配置无效')
 
             nested_containers = [step]
@@ -473,6 +516,26 @@ def _substitute_template_params(value, params):
     return _PARAM_TOKEN.sub(replace, value)
 
 
+def _substitute_template_step(step, params):
+    result = {}
+    inline_custom = step.get('kind') == 'custom' and isinstance(step.get('steps'), list)
+    for key, value in step.items():
+        if (key == 'steps' and inline_custom) or (key in _STEP_FIELDS and isinstance(value, list)):
+            result[key] = copy.deepcopy(value)
+        elif key == 'config' and isinstance(value, dict):
+            result[key] = {
+                config_key: (
+                    copy.deepcopy(config_value)
+                    if config_key in _STEP_FIELDS and isinstance(config_value, list)
+                    else _substitute_template_params(config_value, params)
+                )
+                for config_key, config_value in value.items()
+            }
+        else:
+            result[key] = _substitute_template_params(value, params)
+    return result
+
+
 def _definition_defaults(properties, configured_defaults):
     result = {}
     for name, spec in properties.items():
@@ -480,6 +543,18 @@ def _definition_defaults(properties, configured_defaults):
             result[name] = copy.deepcopy(spec['default'])
     result.update(copy.deepcopy(configured_defaults))
     return result
+
+
+def _effective_component_parameters(source, definition):
+    properties, configured_defaults = _parameter_specs(definition)
+    selected = source.get('params', source.get('config', {}))
+    if selected is None:
+        selected = {}
+    if not isinstance(selected, dict):
+        raise SceneComponentError('组件参数配置无效')
+    effective = _definition_defaults(properties, configured_defaults)
+    effective.update(copy.deepcopy(selected))
+    return effective
 
 
 def _template_parameter_names(value):
@@ -493,6 +568,65 @@ def _template_parameter_names(value):
     elif isinstance(value, str):
         names.update(match.group(1) for match in _PARAM_TOKEN.finditer(value))
     return names
+
+
+def _component_parameter_names(definition):
+    properties, configured_defaults = _parameter_specs(definition)
+    names = {
+        name for name in properties
+        if isinstance(name, str) and _PARAM_REFERENCE.fullmatch(f'{{{{params.{name}}}}}')
+    }
+    names.update(
+        name for name in configured_defaults
+        if isinstance(name, str) and _PARAM_REFERENCE.fullmatch(f'{{{{params.{name}}}}}')
+    )
+    names.update(_template_parameter_names(definition.get('steps')))
+    return names
+
+
+def _mark_sensitive_component_inputs(steps, sensitive_names):
+    result = copy.deepcopy(steps)
+
+    def visit(sequence, sensitive_names, depth=0):
+        if depth > _MAX_DEPTH or not isinstance(sequence, list):
+            raise SceneComponentError('组件嵌套过深或步骤格式无效')
+        for step in sequence:
+            if not isinstance(step, dict):
+                raise SceneComponentError('场景步骤格式无效')
+            if step.get('kind') == 'custom' and isinstance(step.get('steps'), list):
+                inline_params = step.get('params', step.get('config', {}))
+                if inline_params is None:
+                    inline_params = {}
+                if not isinstance(inline_params, dict):
+                    raise SceneComponentError('组件参数配置无效')
+                inline_sensitive = set(sensitive_names) - set(inline_params)
+                inline_sensitive.update(
+                    name for name, value in inline_params.items()
+                    if _template_parameter_names(value) & sensitive_names
+                )
+                visit(step['steps'], inline_sensitive, depth + 1)
+                continue
+            action = step.get('type')
+            if (isinstance(action, str) and action.lower() in {'input', 'text'}
+                    and _template_parameter_names(_effective_input_expression(step)) & sensitive_names):
+                config = step.get('config')
+                if isinstance(config, dict):
+                    config['sensitive'] = True
+                else:
+                    step['sensitive'] = True
+            containers = [step]
+            if step.get('kind') != 'custom' and isinstance(step.get('config'), dict):
+                containers.append(step['config'])
+            for container in containers:
+                for field in _STEP_FIELDS:
+                    nested = container.get(field)
+                    if nested is not None:
+                        if not isinstance(nested, list):
+                            raise SceneComponentError('嵌套步骤格式无效')
+                        visit(nested, sensitive_names, depth + 1)
+
+    visit(result, set(sensitive_names))
+    return result
 
 
 def _validate_component_reference(source, definition, sensitive_parameters=None):
@@ -542,13 +676,24 @@ def _validate_component_reference(source, definition, sensitive_parameters=None)
 
 
 def validate_project_component_references(flow, project, user):
-    """Reject persisted sensitive literals in project refs, including nested refs."""
+    """Validate project refs and return their transitive sensitivity contracts."""
     if not isinstance(flow, list):
-        return
+        return {}
 
     cache = {}
     access = {'allowed': None}
-    budget = {'steps': 0}
+    budget = {'steps': 0, 'source_bytes': 0, 'expander_source_bytes': 0,
+              'prepared_bytes': 0, 'flow_size_checked': False}
+    definition_sizes = {}
+    contract_source_budget = {'bytes': 0}
+
+    def ensure_flow_size():
+        if not budget['flow_size_checked']:
+            _bounded_json_size(
+                flow, _MAX_BYTES, compact=False,
+                message='场景流程格式无效或超过大小限制',
+            )
+            budget['flow_size_checked'] = True
 
     def resolve(component_type, version):
         if project is None or not isinstance(component_type, str) or not component_type:
@@ -578,6 +723,26 @@ def validate_project_component_references(flow, project, user):
             }
         return cache[identity]
 
+    def measure_definition(identity, definition):
+        if identity not in definition_sizes:
+            definition_sizes[identity] = (
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=False,
+                    message='组件源数据超过大小限制',
+                ),
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=True,
+                    message='组件源数据超过大小限制',
+                ),
+            )
+        return definition_sizes[identity]
+
+    def charge_definition(identity, definition):
+        validation_size, expansion_size = measure_definition(identity, definition)
+        _charge_component_source(budget, validation_size)
+        budget['expander_source_bytes'] += expansion_size
+        return expansion_size
+
     sensitivity_cache = {}
     sensitivity_budget = {'steps': 0}
 
@@ -585,6 +750,10 @@ def validate_project_component_references(flow, project, user):
         identity = (component_type, version)
         if depth > _MAX_DEPTH or identity in active:
             raise SceneComponentError('组件嵌套过深或存在循环引用')
+        validation_size, _ = measure_definition(identity, definition)
+        if contract_source_budget['bytes'] + validation_size > _MAX_BYTES:
+            raise SceneComponentError('组件累计源数据超过大小限制')
+        contract_source_budget['bytes'] += validation_size
         if identity in sensitivity_cache:
             return sensitivity_cache[identity]
 
@@ -599,16 +768,17 @@ def validate_project_component_references(flow, project, user):
         sensitive.update(_sensitive_template_parameters(definition.get('steps')))
         inherited_schemas = {name: [spec] for name, spec in properties.items()}
 
-        parameter_names = {
-            name for name in properties
-            if isinstance(name, str) and _PARAM_REFERENCE.fullmatch(f'{{{{params.{name}}}}}')
-        }
-        parameter_names.update(
-            name for name in configured_defaults
-            if isinstance(name, str) and _PARAM_REFERENCE.fullmatch(f'{{{{params.{name}}}}}')
-        )
-        parameter_names.update(_template_parameter_names(definition.get('steps')))
+        parameter_names = _component_parameter_names(definition)
+        additional = definition.get('schema', {}).get('additionalProperties')
+        if type(additional) is dict and _schema_contains_sensitive(additional):
+            sensitive.update(parameter_names)
+            for name in parameter_names:
+                inherited = inherited_schemas.setdefault(name, [])
+                if additional not in inherited:
+                    inherited.append(additional)
         symbolic_params = {name: f'{{{{params.{name}}}}}' for name in parameter_names}
+
+        input_parameters = set()
 
         def inspect(sequence, params, flow_depth):
             if flow_depth > _MAX_DEPTH or not isinstance(sequence, list):
@@ -617,7 +787,7 @@ def validate_project_component_references(flow, project, user):
                 sensitivity_budget['steps'] += 1
                 if sensitivity_budget['steps'] > _MAX_STEPS or not isinstance(original, dict):
                     raise SceneComponentError('组件步骤数量超过限制')
-                step = _substitute_template_params(original, params)
+                step = _substitute_template_step(original, params)
                 if step.get('kind') == 'custom':
                     inline_steps = step.get('steps')
                     if inline_steps is not None and not isinstance(inline_steps, list):
@@ -665,11 +835,19 @@ def validate_project_component_references(flow, project, user):
                         for spec in specs:
                             if spec not in inherited:
                                 inherited.append(spec)
+                    child_parameters = _effective_component_parameters(step, child_definition)
+                    for name in child_contract['input_parameters']:
+                        input_parameters.update(_template_parameter_names(child_parameters.get(name)))
                     continue
 
+                action = step.get('type')
+                if isinstance(action, str) and action.lower() in {'input', 'text'}:
+                    input_parameters.update(
+                        _template_parameter_names(_effective_input_expression(step))
+                    )
                 nested_containers = [step]
                 config = step.get('config')
-                if step.get('kind') != 'custom' and isinstance(config, dict):
+                if isinstance(config, dict):
                     nested_containers.append(config)
                 for nested_container in nested_containers:
                     for field in _STEP_FIELDS:
@@ -684,7 +862,17 @@ def validate_project_component_references(flow, project, user):
             definition.get('schema', {}), configured_defaults,
             sensitive_names=sensitive, extra_schemas=inherited_schemas,
         )
-        contract = {'sensitive': frozenset(sensitive), 'schemas': inherited_schemas}
+        input_sensitive = set(sensitive)
+        input_sensitive.update(
+            name for name, specs in inherited_schemas.items()
+            if any(_schema_contains_sensitive(spec) for spec in specs)
+        )
+        contract = {
+            'sensitive': frozenset(sensitive),
+            'input_sensitive': frozenset(input_sensitive),
+            'input_parameters': frozenset(input_parameters),
+            'schemas': inherited_schemas,
+        }
         sensitivity_cache[identity] = contract
         return contract
 
@@ -697,7 +885,7 @@ def validate_project_component_references(flow, project, user):
                 raise SceneComponentError('组件步骤数量超过限制')
             if not isinstance(original, dict):
                 raise SceneComponentError('场景步骤格式无效')
-            step = _substitute_template_params(original, params or {}) if params is not None else original
+            step = _substitute_template_step(original, params or {}) if params is not None else original
             if step.get('kind') == 'custom':
                 inline_steps = step.get('steps')
                 if inline_steps is not None and not isinstance(inline_steps, list):
@@ -719,15 +907,41 @@ def validate_project_component_references(flow, project, user):
                 component_type = step.get('type')
                 if not isinstance(version, str) or not version:
                     raise SceneComponentError('项目组件版本无效')
+                ensure_flow_size()
                 definition = resolve(component_type, version)
                 identity = (component_type, version)
                 if identity in active:
                     raise SceneComponentError('组件引用循环')
+                source_before = budget['expander_source_bytes']
+                charge_definition(identity, definition)
                 sensitive_contract = component_sensitive_contract(
                     component_type, version, definition, active, depth,
                 )
                 effective = _validate_component_reference(step, definition, sensitive_contract)
                 visit(definition.get('steps'), effective, active + (identity,), depth + 1, True)
+                if not in_template:
+                    local_source_size = (
+                        budget['expander_source_bytes'] - source_before
+                        + _bounded_json_size(
+                            [step], _MAX_BYTES, compact=True,
+                            message='组件源数据超过大小限制',
+                        )
+                    )
+                    remaining = _MAX_BYTES - budget['prepared_bytes']
+                    try:
+                        expanded = expand_steps(
+                            [step], project_id=project.pk,
+                            resolve_template=lambda _project_id, kind, revision: resolve(kind, revision),
+                            max_depth=_MAX_DEPTH, max_steps=_MAX_STEPS,
+                            max_payload_bytes=min(_MAX_BYTES, remaining + local_source_size),
+                        )
+                        expanded_size = _bounded_json_size(
+                            expanded, remaining, compact=True,
+                            message='组件累计展开数据超过大小限制',
+                        )
+                    except ComponentTemplateError:
+                        raise SceneComponentError('项目组件参数或配置无效') from None
+                    budget['prepared_bytes'] += expanded_size
                 continue
 
             action = step.get('type')
@@ -736,11 +950,10 @@ def validate_project_component_references(flow, project, user):
             if isinstance(config, dict):
                 containers.append(config)
             if (in_template and isinstance(action, str) and action.lower() in {'input', 'text'}
-                    and any(container.get('sensitive') is True for container in containers)):
-                for container in containers:
-                    for key in ('value', 'text'):
-                        if key in container and not _safe_sensitive_value(container[key]):
-                            raise SceneComponentError('敏感输入配置无效')
+                    and any(container.get('sensitive') is True for container in containers)
+                    and any(not _safe_sensitive_value(value)
+                            for value in _sensitive_input_values(step))):
+                raise SceneComponentError('敏感输入配置无效')
 
             nested_containers = [step]
             if isinstance(config, dict):
@@ -754,6 +967,7 @@ def validate_project_component_references(flow, project, user):
                         visit(nested, params, active, depth + 1, in_template)
 
     visit(flow)
+    return sensitivity_cache
 
 
 def _validate_expanded_sensitive_inputs(steps):
@@ -772,11 +986,10 @@ def _validate_expanded_sensitive_inputs(steps):
             if isinstance(config, dict):
                 containers.append(config)
             if (isinstance(action, str) and action.lower() in {'input', 'text'}
-                    and any(container.get('sensitive') is True for container in containers)):
-                for container in containers:
-                    for key in ('value', 'text'):
-                        if key in container and not _safe_sensitive_value(container[key]):
-                            raise SceneComponentError('展开后的敏感输入配置无效')
+                    and any(container.get('sensitive') is True for container in containers)
+                    and any(not _safe_sensitive_value(value)
+                            for value in _sensitive_input_values(step))):
+                raise SceneComponentError('展开后的敏感输入配置无效')
 
             nested_containers = [step]
             if step.get('kind') != 'custom' and isinstance(config, dict):
@@ -801,38 +1014,227 @@ def expand_project_flow(execution, test_case, flow):
     remain under the existing runner's compatibility behavior.
     """
     try:
-        payload = json.dumps(flow, ensure_ascii=False, allow_nan=False).encode('utf-8')
-    except (TypeError, ValueError, RecursionError, UnicodeEncodeError):
-        raise SceneComponentError('场景流程格式无效') from None
-    if not isinstance(flow, list) or len(payload) > _MAX_BYTES:
+        payload_size = _bounded_json_size(
+            flow, _MAX_BYTES, compact=False,
+            message='场景流程格式无效或超过大小限制',
+        )
+    except SceneComponentError:
+        raise SceneComponentError('场景流程格式无效或超过大小限制') from None
+    if not isinstance(flow, list):
         raise SceneComponentError('场景流程格式无效或超过大小限制')
 
-    validate_project_component_references(flow, test_case.project, execution.user)
+    sensitivity_contracts = validate_project_component_references(
+        flow, test_case.project, execution.user,
+    )
 
     access_checked = {'allowed': None}
+    definition_cache = {}
+    definition_sizes = {}
+    prepared_definitions = {}
+    budget = {
+        'steps': 0,
+        'plan_steps': 0,
+        'bytes': payload_size,
+        'source_bytes': 0,
+        'expander_source_bytes': 0,
+    }
 
-    def resolve(project_id, component_type, version):
+    def load_definition(project_id, component_type, version):
         if execution.user is None or test_case.project_id != project_id:
             return None
         if access_checked['allowed'] is None:
             access_checked['allowed'] = project_accessible(execution.user, test_case.project)
         if not access_checked['allowed']:
             return None
-        component = AppProjectComponent.objects.filter(
-            project_id=project_id, type=component_type, version=version,
-        ).first()
-        if component is None:
-            return None
-        return {
-            'project_id': component.project_id,
-            'type': component.type,
-            'version': component.version,
-            'schema': component.schema,
-            'default_config': component.default_config,
-            'steps': component.steps,
-        }
+        identity = (project_id, component_type, version)
+        if identity not in definition_cache:
+            component = AppProjectComponent.objects.filter(
+                project_id=project_id, type=component_type, version=version,
+            ).first()
+            if component is None:
+                return None
+            definition_cache[identity] = {
+                'project_id': component.project_id,
+                'type': component.type,
+                'version': component.version,
+                'schema': component.schema,
+                'default_config': component.default_config,
+                'steps': component.steps,
+            }
+        return definition_cache[identity]
 
-    budget = {'steps': 0, 'bytes': len(payload)}
+    def measure_runtime_definition(project_id, component_type, version, definition):
+        identity = (project_id, component_type, version)
+        if identity not in definition_sizes:
+            definition_sizes[identity] = (
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=False,
+                    message='组件源数据超过大小限制',
+                ),
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=True,
+                    message='组件源数据超过大小限制',
+                ),
+            )
+        return definition_sizes[identity]
+
+    def charge_definition_base(project_id, component_type, version, definition):
+        base_size, _ = measure_runtime_definition(
+            project_id, component_type, version, definition,
+        )
+        _charge_component_source(budget, base_size)
+
+    def prepare_definition(project_id, component_type, version, sensitive_names,
+                           *, source_charged=False):
+        base = load_definition(project_id, component_type, version)
+        if base is None:
+            return None
+        identity = (project_id, component_type, version)
+        base_size, _ = measure_runtime_definition(
+            project_id, component_type, version, base,
+        )
+        if not source_charged:
+            _charge_component_source(budget, base_size)
+
+        contract = sensitivity_contracts.get((component_type, version))
+        names = (contract['input_sensitive'] if sensitive_names is None
+                 else sensitive_names) if contract else frozenset()
+        prepared_key = (identity, frozenset(names))
+        if prepared_key not in prepared_definitions:
+            definition = dict(base)
+            if contract:
+                definition['steps'] = _mark_sensitive_component_inputs(
+                    definition['steps'], names,
+                )
+            prepared_definitions[prepared_key] = (
+                definition,
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=False,
+                    message='组件源数据超过大小限制',
+                ),
+                _bounded_json_size(
+                    definition, _MAX_BYTES, compact=True,
+                    message='组件源数据超过大小限制',
+                ),
+            )
+        definition, prepared_size, prepared_compact_size = prepared_definitions[prepared_key]
+        if prepared_size > base_size:
+            _charge_component_source(budget, prepared_size - base_size)
+        budget['expander_source_bytes'] += prepared_compact_size
+        return definition, prepared_compact_size
+
+    def prepared_definition(project_id, component_type, version, sensitive_names):
+        if test_case.project_id != project_id:
+            return None
+        identity = (project_id, component_type, version)
+        contract = sensitivity_contracts.get((component_type, version))
+        names = (contract['input_sensitive'] if sensitive_names is None
+                 else sensitive_names) if contract else frozenset()
+        return prepared_definitions.get((identity, frozenset(names)), (None,))[0]
+
+    def component_expansion_plan(source):
+        component_type = source.get('type')
+        version = source.get('version')
+        identity = (component_type, version)
+        contract = sensitivity_contracts.get(identity)
+        if contract is None:
+            raise SceneComponentError('项目组件参数配置无效')
+        plan = []
+        state = {'expander_source_bytes': 0}
+
+        def visit_component(kind, revision, active, depth, sensitive_names,
+                            *, source_charged=False):
+            item_identity = (kind, revision)
+            if depth > _MAX_DEPTH or item_identity in active:
+                raise SceneComponentError('组件嵌套过深或存在循环引用')
+            prepared = prepare_definition(
+                test_case.project_id, kind, revision, sensitive_names,
+                source_charged=source_charged,
+            )
+            if prepared is None:
+                raise SceneComponentError('项目组件不存在或无权访问')
+            item_definition, source_size = prepared
+            plan.append((item_identity, frozenset(sensitive_names)))
+            state['expander_source_bytes'] += source_size
+            symbolic_params = {
+                name: f'{{{{params.{name}}}}}'
+                for name in _component_parameter_names(item_definition)
+            }
+            visit_steps(item_definition.get('steps'), symbolic_params, set(sensitive_names),
+                        active + (item_identity,), depth)
+
+        def visit_steps(sequence, params, sensitive_names, active, depth):
+            if depth > _MAX_DEPTH or not isinstance(sequence, list):
+                raise SceneComponentError('组件嵌套过深或步骤格式无效')
+            for original in sequence:
+                budget['plan_steps'] += 1
+                if budget['plan_steps'] > _MAX_STEPS or not isinstance(original, dict):
+                    raise SceneComponentError('组件步骤数量超过限制')
+                step = _substitute_template_step(original, params)
+                if step.get('kind') == 'custom':
+                    inline_steps = step.get('steps')
+                    if inline_steps is not None and not isinstance(inline_steps, list):
+                        raise SceneComponentError('组件步骤格式无效')
+                    if isinstance(inline_steps, list):
+                        inline_params = step.get('params', step.get('config', {}))
+                        if inline_params is None:
+                            inline_params = {}
+                        if not isinstance(inline_params, dict):
+                            raise SceneComponentError('组件参数配置无效')
+                        child_params = dict(params)
+                        child_params.update(inline_params)
+                        child_sensitive = set(sensitive_names) - set(inline_params)
+                        child_sensitive.update(
+                            name for name, value in inline_params.items()
+                            if _template_parameter_names(value) & sensitive_names
+                        )
+                        visit_steps(inline_steps, child_params, child_sensitive, active, depth + 1)
+                        continue
+                    child_version = step.get('version')
+                    if child_version is None:
+                        continue
+                    child_type = step.get('type')
+                    if not isinstance(child_type, str) or not isinstance(child_version, str) or not child_version:
+                        raise SceneComponentError('项目组件版本无效')
+                    child_identity = (child_type, child_version)
+                    if child_identity in active:
+                        raise SceneComponentError('组件嵌套过深或存在循环引用')
+                    child_contract = sensitivity_contracts.get(child_identity)
+                    child_definition = load_definition(
+                        test_case.project_id, child_type, child_version,
+                    )
+                    if child_contract is None or child_definition is None:
+                        raise SceneComponentError('项目组件不存在或无权访问')
+                    charge_definition_base(
+                        test_case.project_id, child_type, child_version, child_definition,
+                    )
+                    child_parameters = _effective_component_parameters(step, child_definition)
+                    child_sensitive = set(child_contract['input_sensitive'])
+                    for name in child_contract['input_parameters']:
+                        if _template_parameter_names(child_parameters.get(name)) & sensitive_names:
+                            child_sensitive.add(name)
+                    visit_component(
+                        child_type, child_version, active, depth + 1, child_sensitive,
+                        source_charged=True,
+                    )
+                    continue
+
+                nested_containers = [step]
+                config = step.get('config')
+                if isinstance(config, dict):
+                    nested_containers.append(config)
+                for nested_container in nested_containers:
+                    for field in _STEP_FIELDS:
+                        nested = nested_container.get(field)
+                        if nested is not None:
+                            if not isinstance(nested, list):
+                                raise SceneComponentError('嵌套步骤格式无效')
+                            visit_steps(nested, params, sensitive_names, active, depth + 1)
+
+        visit_component(
+            component_type, version, (), 0, contract['input_sensitive'],
+        )
+        return plan, state['expander_source_bytes']
 
     def visit_sequence(sequence, depth):
         if depth > _MAX_DEPTH or not isinstance(sequence, list):
@@ -844,17 +1246,46 @@ def expand_project_flow(execution, test_case, flow):
             if source.get('kind') == 'custom' and source.get('version') is not None:
                 if test_case.project_id is None:
                     raise SceneComponentError('项目组件需要关联项目')
+                plan, local_source_size = component_expansion_plan(source)
+                plan_index = 0
+                root_source_size = _bounded_json_size(
+                    [source], _MAX_BYTES, compact=True,
+                    message='组件源数据超过大小限制',
+                )
+                remaining_payload = _MAX_BYTES - budget['bytes']
+                expansion_limit = min(
+                    _MAX_BYTES, remaining_payload + local_source_size + root_source_size,
+                )
+
+                def resolve_for_expansion(project_id, component_type, version, _plan=plan):
+                    nonlocal plan_index
+                    if plan_index >= len(_plan):
+                        raise SceneComponentError('项目组件展开顺序无效')
+                    expected_identity, sensitive_names = _plan[plan_index]
+                    if expected_identity != (component_type, version):
+                        raise SceneComponentError('项目组件展开顺序无效')
+                    plan_index += 1
+                    return prepared_definition(
+                        project_id, component_type, version, sensitive_names,
+                    )
+
                 try:
                     expanded = expand_steps(
-                        [source], project_id=test_case.project_id, resolve_template=resolve,
-                        max_depth=_MAX_DEPTH, max_steps=_MAX_STEPS, max_payload_bytes=_MAX_BYTES,
+                        [source], project_id=test_case.project_id,
+                        resolve_template=resolve_for_expansion,
+                        max_depth=_MAX_DEPTH, max_steps=_MAX_STEPS,
+                        max_payload_bytes=expansion_limit,
                     )
                 except ComponentTemplateError:
                     raise SceneComponentError('项目组件不存在、无权访问或配置无效') from None
+                if plan_index != len(plan):
+                    raise SceneComponentError('项目组件展开顺序无效')
                 _validate_expanded_sensitive_inputs(expanded)
-                budget['bytes'] += len(json.dumps(expanded, ensure_ascii=False, allow_nan=False).encode('utf-8'))
-                if budget['bytes'] > _MAX_BYTES:
-                    raise SceneComponentError('展开后的场景超过大小限制')
+                expanded_size = _bounded_json_size(
+                    expanded, remaining_payload, compact=False,
+                    message='展开后的场景超过大小限制',
+                )
+                budget['bytes'] += expanded_size
                 output.extend(visit_sequence(expanded, depth + 1))
                 continue
             step = copy.deepcopy(source)
@@ -880,8 +1311,10 @@ def expand_project_flow(execution, test_case, flow):
 
     try:
         result = visit_sequence(flow, 0)
-        if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode('utf-8')) > _MAX_BYTES:
-            raise SceneComponentError('展开后的场景超过大小限制')
+        _bounded_json_size(
+            result, _MAX_BYTES, compact=False,
+            message='展开后的场景超过大小限制',
+        )
     except (RecursionError, TypeError, ValueError) as exc:
         if isinstance(exc, SceneComponentError):
             raise

@@ -11,7 +11,36 @@ class SensitiveFlowError(ValueError):
 
 _STEP_FIELDS = ('steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps')
 _REFERENCE = re.compile(r'\{\{\s*([^}]+?)\s*\}\}|\$\{\s*([^}]+?)\s*\}')
-_SECRET_NAME = re.compile(r'password|passwd|secret|token|credential|api[_-]?key|密码|密钥|令牌', re.I)
+_EXACT_SCENE_REFERENCE = re.compile(
+    r'(?:\{\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*?)\s*\}\}'
+    r'|\$\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*?)\s*\})\Z'
+)
+_SECRET_NAME = re.compile(r'password|passwd|secret|token|credential|api[_-]?key|密码|密钥|令牌', re.IGNORECASE)
+
+
+def _input_expression(step):
+    config = step.get('config') if isinstance(step.get('config'), dict) else {}
+    action = str(step.get('type', '')).lower()
+    fields = ('text', 'value') if action == 'text' else ('value',)
+    for field in fields:
+        if field in step:
+            return step[field]
+        if field in config:
+            return config[field]
+    return None
+
+
+def _safe_sensitive_input_value(value):
+    if (
+        value is None
+        or isinstance(value, str) and not value.strip()
+        or type(value) in (list, dict) and not value
+    ):
+        return True
+    if not isinstance(value, str):
+        return False
+    match = _EXACT_SCENE_REFERENCE.fullmatch(value)
+    return bool(match and (match.group(1) or match.group(2)) != 'params')
 
 
 def protect_sensitive_inputs(flow, variables):
@@ -94,7 +123,13 @@ def protect_sensitive_inputs(flow, variables):
         if str(step.get('type', '')).lower() not in {'input', 'text'}:
             continue
         config = step.get('config') if isinstance(step.get('config'), dict) else None
-        value = step.get('value', step.get('text', (config or {}).get('value', (config or {}).get('text'))))
+        value = _input_expression(step)
+        containers = [step] + ([config] if config is not None else [])
+        if any(container.get('sensitive') is True for container in containers):
+            for container in containers:
+                for field in ('value', 'text'):
+                    if field in container and not _safe_sensitive_input_value(container[field]):
+                        raise SensitiveFlowError('敏感输入配置无效')
         if is_sensitive(value):
             if config is not None:
                 config['sensitive'] = True

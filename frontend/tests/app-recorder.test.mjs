@@ -252,7 +252,7 @@ test('failed interactions are not staged and emit only a safe operation code', a
 
   assert.equal(recorder.state.steps.value.length, 0)
   assert.deepEqual(JSON.parse(JSON.stringify(recorder.emitted.filter(([name]) => name === 'error'))), [
-    ['error', { operation: 'interaction' }],
+    ['error', { operation: 'interaction', uncertain: true }],
   ])
   assert.equal(JSON.stringify(recorder.emitted).includes('private fixture'), false)
 })

@@ -37,7 +37,26 @@ const { t } = useI18n()
 const router = useRouter()
 const userStore = useUserStore()
 const submitting = ref(false)
-const lastExecutionId = ref(null)
+const lastExecution = ref(null)
+const currentUserId = () => userStore.user?.id ?? userStore.user?.pk ?? null
+const currentSessionGeneration = () => userStore.getSessionGeneration?.()
+const sameIdentifier = (left, right) => (
+  left === null || left === undefined || right === null || right === undefined
+    ? left === right
+    : String(left) === String(right)
+)
+const sessionMatches = snapshot => sameIdentifier(currentUserId(), snapshot.userId)
+  && currentSessionGeneration() === snapshot.sessionGeneration
+const editorContextMatches = snapshot => sameIdentifier(props.caseId, snapshot.caseId)
+  && sameIdentifier(props.deviceId, snapshot.deviceId)
+  && props.stepIndex === snapshot.stepIndex
+  && props.dirty === snapshot.dirty
+  && props.recording === snapshot.recording
+  && props.nested === snapshot.nested
+const lastExecutionId = computed(() => {
+  const execution = lastExecution.value
+  return execution && sessionMatches(execution) ? execution.id : null
+})
 const reasonKey = computed(() => {
   if (!props.caseId || props.dirty) return 'appAutomation.stepDiagnostics.saveFirst'
   if (props.recording) return 'appAutomation.stepDiagnostics.stopRecording'
@@ -50,14 +69,15 @@ const canRun = computed(() => !reasonKey.value && !submitting.value)
 const runStep = async () => {
   if (!canRun.value) return false
   const snapshot = {
-    caseId: props.caseId, stepIndex: props.stepIndex, deviceId: props.deviceId,
-    userId: userStore.user?.id, sessionGeneration: userStore.getSessionGeneration?.(),
+    caseId: props.caseId,
+    stepIndex: props.stepIndex,
+    deviceId: props.deviceId,
+    dirty: props.dirty,
+    recording: props.recording,
+    nested: props.nested,
+    userId: currentUserId(),
+    sessionGeneration: currentSessionGeneration(),
   }
-  const current = () => String(userStore.user?.id) === String(snapshot.userId)
-    && (snapshot.sessionGeneration === undefined || userStore.getSessionGeneration?.() === snapshot.sessionGeneration)
-    && String(props.caseId) === String(snapshot.caseId)
-    && String(props.deviceId) === String(snapshot.deviceId)
-    && props.stepIndex === snapshot.stepIndex && !props.dirty && !props.recording && !props.nested
   if (!snapshot.userId) {
     ElMessage.error(t('appAutomation.stepDiagnostics.accountChanged'))
     return false
@@ -66,23 +86,40 @@ const runStep = async () => {
   try {
     const device = await prepareAppDeviceForExecution({
       selectedId: snapshot.deviceId, userId: snapshot.userId, sessionGeneration: snapshot.sessionGeneration,
-      getCurrentUserId: () => userStore.user?.id,
-      getCurrentSessionGeneration: () => userStore.getSessionGeneration?.(),
+      getCurrentUserId: currentUserId,
+      getCurrentSessionGeneration: currentSessionGeneration,
       getDevice: getAppDevice, t,
     })
-    if (!current()) throw new Error('stale diagnostic')
+    if (!sessionMatches(snapshot)) throw new Error('diagnostic account changed')
+    if (!editorContextMatches(snapshot)) return false
     const response = await runSavedSceneStep(snapshot.caseId, {
       device_id: device.device_id, auto_lock: true, expected_user_id: snapshot.userId,
       step_index: snapshot.stepIndex,
     })
-    if (!current()) throw new Error('stale diagnostic')
     const data = response?.data ?? response
     if (data?.success === false) throw new Error('diagnostic rejected')
-    lastExecutionId.value = data?.execution?.id || data?.data?.execution_id || data?.execution_id || null
-    ElMessage.success(t('appAutomation.stepDiagnostics.submitted'))
+    if (!sessionMatches(snapshot)) {
+      ElMessage.error(t('appAutomation.stepDiagnostics.accountChanged'))
+      return false
+    }
+    const executionId = data?.execution?.id
+      ?? data?.data?.execution_id
+      ?? data?.execution_id
+      ?? data?.data?.execution?.id
+      ?? null
+    if (executionId !== null && executionId !== undefined) {
+      lastExecution.value = {
+        id: executionId,
+        userId: snapshot.userId,
+        sessionGeneration: snapshot.sessionGeneration,
+      }
+    }
+    ElMessage.success(t(editorContextMatches(snapshot)
+      ? 'appAutomation.stepDiagnostics.submitted'
+      : 'appAutomation.stepDiagnostics.submittedAfterContextChange'))
     return true
   } catch (error) {
-    const message = current()
+    const message = sessionMatches(snapshot)
       ? getAppExecutionErrorMessage(error, t('appAutomation.stepDiagnostics.failed'))
       : t('appAutomation.stepDiagnostics.accountChanged')
     ElMessage.error(message)

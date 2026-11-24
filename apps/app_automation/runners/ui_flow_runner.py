@@ -170,6 +170,8 @@ class UiFlowRunner:
         # 初始化上下文
         self._init_context(variables, runtime)
         self._assertions_executed = 0
+        self._ui_flow_unsafe_failure_seen = False
+        self._ui_flow_proof_token = object()
         
         # 执行所有步骤
         total_steps = len(ui_flow)
@@ -184,13 +186,13 @@ class UiFlowRunner:
 
             if progress_callback:
                 try:
-                    progress_callback(idx, total_steps, step_name, 'running')
+                    progress_callback(idx, total_steps, self._safe_log_value(step_name), 'running')
                 except Exception as cb_err:
                     logger.debug('Progress callback failed (%s)', type(cb_err).__name__)
 
             try:
-                logger.info('Executing step %s/%s (%s)', idx, total_steps, step_type)
-                step_title = f"步骤{idx}-{step_type}"
+                logger.info('Executing step %s/%s', idx, total_steps)
+                step_title = f"步骤{idx}"
                 if ALLURE_AVAILABLE:
                     with allure.step(step_title):
                         self._execute_step(step)
@@ -200,34 +202,31 @@ class UiFlowRunner:
 
                 if progress_callback:
                     try:
-                        progress_callback(idx, total_steps, step_name, 'passed')
+                        progress_callback(idx, total_steps, self._safe_log_value(step_name), 'passed')
                     except Exception as cb_err:
                         logger.debug('Progress callback failed (%s)', type(cb_err).__name__)
 
             except Exception as e:
+                self._sanitize_exception_for_reporting(e)
                 if self._is_uncertain_device_error(e):
                     self._quarantine_uncertain_device_error(e)
                     raise
                 logger.error('Step %s failed (%s)', idx, type(e).__name__)
                 failed_steps += 1
-                self._attach_allure(f"step-{idx}-{step_type}-error", step)
+                safe_step_type = self._safe_log_value(step_type)
+                self._attach_allure(f"step-{idx}-{safe_step_type}-error", step)
 
                 if progress_callback:
                     try:
-                        progress_callback(idx, total_steps, step_name, 'failed')
+                        progress_callback(idx, total_steps, self._safe_log_value(step_name), 'failed')
                     except Exception as cb_err:
                         logger.debug('Progress callback failed (%s)', type(cb_err).__name__)
 
                 if runtime and runtime.get('stop_on_error', False):
-                    assertion_action = (
-                        step.get('type') or step.get('action') or ''
-                    ) if isinstance(step, dict) else ''
-                    if (
-                        isinstance(e, AssertionError)
-                        and isinstance(assertion_action, str)
-                        and assertion_action.lower() in _READ_ONLY_BUSINESS_ASSERTION_ACTIONS
-                    ):
-                        raise ReadOnlyBusinessAssertionFailure(str(e)) from e
+                    if self._is_completed_read_only_assertion_failure(e):
+                        raise ReadOnlyBusinessAssertionFailure(
+                            'Read-only business assertion failed'
+                        ) from e
                     raise
         
         logger.info(f"UI Flow 执行完成，通过: {passed_steps}，失败: {failed_steps}")
@@ -237,7 +236,7 @@ class UiFlowRunner:
             'passed': passed_steps,
             'failed': failed_steps,
             'assertions': self._assertions_executed,
-            'outputs': self.context.get('outputs', {}),
+            'outputs': self._sanitize_sensitive_value(self.context.get('outputs', {})),
         }
     
     def _init_context(self, variables: Optional[List[Dict[str, Any]]] = None, runtime: Optional[Dict[str, Any]] = None):
@@ -335,7 +334,11 @@ class UiFlowRunner:
 
     def _references_sensitive_variable(self, value):
         if isinstance(value, dict):
-            return any(self._references_sensitive_variable(child) for child in value.values())
+            return any(
+                self._references_sensitive_variable(key)
+                or self._references_sensitive_variable(child)
+                for key, child in value.items()
+            )
         if isinstance(value, (list, tuple)):
             return any(self._references_sensitive_variable(child) for child in value)
         if not isinstance(value, str):
@@ -358,13 +361,132 @@ class UiFlowRunner:
 
     def _contains_sensitive_value(self, value):
         if isinstance(value, dict):
-            return any(self._contains_sensitive_value(child) for child in value.values())
+            return any(
+                self._contains_sensitive_value(key)
+                or self._contains_sensitive_value(child)
+                for key, child in value.items()
+            )
         if isinstance(value, (list, tuple)):
             return any(self._contains_sensitive_value(child) for child in value)
         if value is None:
             return False
         rendered = str(value)
         return any(secret in rendered for secret in getattr(self, '_sensitive_variable_values', set()))
+
+    def _sanitize_sensitive_value(self, value):
+        if isinstance(value, dict):
+            return {
+                self._sanitize_sensitive_value(key): self._sanitize_sensitive_value(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [self._sanitize_sensitive_value(child) for child in value]
+        if isinstance(value, tuple):
+            return tuple(self._sanitize_sensitive_value(child) for child in value)
+        if isinstance(value, str) and (
+            self._references_sensitive_variable(value) or self._contains_sensitive_value(value)
+        ):
+            return '[REDACTED]'
+        return value
+
+    def _safe_log_value(self, value):
+        return self._sanitize_sensitive_value(value)
+
+    def _sanitize_exception_for_reporting(self, error, seen=None):
+        """Redact exception messages and structured attributes before reporting."""
+        if not isinstance(error, BaseException):
+            return
+        seen = set() if seen is None else seen
+        if id(error) in seen:
+            return
+        seen.add(id(error))
+
+        try:
+            args = tuple(self._sanitize_sensitive_value(arg) for arg in error.args)
+            if args != error.args:
+                error.args = args
+        except Exception:
+            pass
+
+        try:
+            attributes = getattr(error, '__dict__', None)
+            if isinstance(attributes, dict):
+                safe_attributes = self._sanitize_sensitive_value(attributes)
+                if safe_attributes != attributes:
+                    attributes.clear()
+                    attributes.update(safe_attributes)
+        except Exception:
+            pass
+
+        attribute_names = {'errno', 'strerror', 'filename', 'filename2', 'winerror'}
+        for error_type in type(error).__mro__:
+            slots = error_type.__dict__.get('__slots__', ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot_name in slots:
+                if slot_name in {'__dict__', '__weakref__'}:
+                    continue
+                if slot_name.startswith('__') and not slot_name.endswith('__'):
+                    slot_name = f"_{error_type.__name__.lstrip('_')}{slot_name}"
+                attribute_names.add(slot_name)
+
+        for attribute_name in attribute_names:
+            try:
+                value = getattr(error, attribute_name)
+                safe_value = self._sanitize_sensitive_value(value)
+                if safe_value != value:
+                    setattr(error, attribute_name, safe_value)
+            except Exception:
+                pass
+
+        notes = getattr(error, '__notes__', None)
+        if isinstance(notes, list):
+            try:
+                error.__notes__ = [self._sanitize_sensitive_value(note) for note in notes]
+            except Exception:
+                pass
+
+        try:
+            message = str(error)
+        except Exception:
+            message = ''
+        safe_message = self._sanitize_sensitive_value(message)
+        if safe_message != message:
+            try:
+                error.args = (safe_message,)
+            except Exception:
+                pass
+
+        self._sanitize_exception_for_reporting(error.__cause__, seen)
+        self._sanitize_exception_for_reporting(error.__context__, seen)
+
+    def _is_completed_read_only_assertion_failure(self, error):
+        return (
+            isinstance(error, AssertionError)
+            and getattr(error, '_ui_flow_read_only_assertion_failure', False) is True
+            and getattr(error, '_ui_flow_read_only_assertion_run', None)
+            is getattr(self, '_ui_flow_proof_token', None)
+            and not getattr(self, '_ui_flow_unsafe_failure_seen', False)
+        )
+
+    def _track_step_failure(self, action, error):
+        if (
+            getattr(error, '_ui_flow_read_only_assertion_run', None)
+            is getattr(self, '_ui_flow_proof_token', None)
+        ):
+            return
+        if (
+            isinstance(error, AssertionError)
+            and action in _READ_ONLY_BUSINESS_ASSERTION_ACTIONS
+            and not getattr(self, '_ui_flow_unsafe_failure_seen', False)
+        ):
+            try:
+                error._ui_flow_read_only_assertion_failure = True
+                error._ui_flow_read_only_assertion_run = self._ui_flow_proof_token
+                return
+            except Exception:
+                pass
+        self._ui_flow_unsafe_failure_seen = True
 
     def _set_variable(self, name: str, value: Any, scope: str = 'local'):
         """设置变量"""
@@ -510,6 +632,14 @@ class UiFlowRunner:
             raise ValueError('assert_response requires configured source and path')
 
     def _execute_step(self, step: Dict[str, Any]):
+        """Sanitize step failures before Allure or enclosing control flow sees them."""
+        try:
+            return self._execute_step_impl(step)
+        except Exception as error:
+            self._sanitize_exception_for_reporting(error)
+            raise
+
+    def _execute_step_impl(self, step: Dict[str, Any]):
         """执行单个步骤，支持基础组件和自定义组件"""
         # 使用 type 字段获取步骤类型
         action_type = step.get('type', '')
@@ -617,7 +747,12 @@ class UiFlowRunner:
             retry_times = 0
 
         def dispatch_and_record():
-            output = self._dispatch_step(step, action)
+            try:
+                output = self._dispatch_step(step, action)
+            except Exception as error:
+                proof_action = action if step.get('kind') != 'custom' else ''
+                self._track_step_failure(proof_action, error)
+                raise
             self._record_step_output(step, output)
             return output
 
@@ -633,9 +768,7 @@ class UiFlowRunner:
                     last_error = e
                     if attempt < retry_times:
                         logger.warning(
-                            'Step retry %s/%s failed (%s); retrying in %.1fs, %s retries remain',
-                            attempt + 1, retry_times, type(e).__name__,
-                            retry_interval, retry_times - attempt - 1,
+                            'Step retry failed (%s)', type(e).__name__,
                         )
                         sleep(retry_interval)
             raise last_error
@@ -781,12 +914,12 @@ class UiFlowRunner:
                 if key not in ('type', 'name', 'kind', 'steps'):
                     self._set_variable(key, value, 'local')
         
-        logger.info(f"展开自定义组件 '{comp_name}' ({comp_type})，共 {len(sub_steps)} 个子步骤")
+        logger.info('Expanding custom component (%s steps)', len(sub_steps))
         
         last_output = None
         for sub_idx, sub_step in enumerate(sub_steps, 1):
             sub_name = sub_step.get('name', sub_step.get('type', 'unknown'))
-            logger.info(f"  自定义组件子步骤 {sub_idx}/{len(sub_steps)}: {sub_name}")
+            logger.info('Custom component child step %s/%s', sub_idx, len(sub_steps))
             output = self._execute_step(sub_step)
             if output is not None:
                 last_output = output
@@ -808,8 +941,15 @@ class UiFlowRunner:
     def _screenshot_path(self, name_prefix: str) -> str:
         root = os.path.realpath(self.screenshots_dir)
         os.makedirs(root, exist_ok=True)
+        if (
+            self._references_sensitive_variable(name_prefix)
+            or self._contains_sensitive_value(name_prefix)
+        ):
+            safe_name_prefix = '[REDACTED]'
+        else:
+            safe_name_prefix = self._sanitize_sensitive_value(name_prefix)
         filename = (
-            f"{self._safe_filename(name_prefix)}_{int(time.time())}_"
+            f"{self._safe_filename(safe_name_prefix)}_{int(time.time())}_"
             f"{uuid.uuid4().hex}.png"
         )
         path = os.path.abspath(os.path.join(root, filename))
@@ -846,11 +986,13 @@ class UiFlowRunner:
     def _attach_allure(self, name: str, step: Optional[Dict[str, Any]] = None) -> None:
         if not ALLURE_AVAILABLE:
             return
-        safe_name = self._safe_filename(name)
+        safe_name = self._safe_filename(self._sanitize_sensitive_value(name))
         if step is not None:
             try:
                 from apps.quality_intelligence.services.redaction import redact_payload
-                safe_step = redact_payload(copy.deepcopy(step))
+                safe_step = self._sanitize_sensitive_value(copy.deepcopy(step))
+                safe_step = redact_payload(safe_step)
+                safe_step = self._sanitize_sensitive_value(safe_step)
                 if str(step.get('type', '')).lower() in {'input', 'text', 'set_variable'}:
                     for item in (safe_step, safe_step.get('config', {})):
                         if isinstance(item, dict):
@@ -872,7 +1014,7 @@ class UiFlowRunner:
         path = self._capture_screenshot(safe_name)
         if path:
             try:
-                allure.attach.file(path, name=self._safe_filename(name), attachment_type=allure.attachment_type.PNG)
+                allure.attach.file(path, name=safe_name, attachment_type=allure.attachment_type.PNG)
             except Exception as exc:
                 logger.warning('Allure screenshot attachment failed (%s)', type(exc).__name__)
     
@@ -938,7 +1080,7 @@ class UiFlowRunner:
         width, height = self._device_resolution()
         return round(x_ratio * (width - 1)), round(y_ratio * (height - 1))
 
-    def _find_native_match(self, step, *, timeout=None, probe=False):
+    def _find_native_match(self, step, *, timeout=None, probe=False, active_only=False, all_matches=False):
         selector_type = step.get('selector_type', 'resource_id')
         strategy = {
             'resource_id': 'resource_id',
@@ -954,14 +1096,18 @@ class UiFlowRunner:
         try:
             lookup_timeout = step.get('timeout', 5) if timeout is None else timeout
             lookup_timeout = float(lookup_timeout)
-            if not probe:
-                lookup_timeout = max(lookup_timeout, 0.001)
+            if lookup_timeout <= 0:
+                lookup_timeout = _MAX_NATIVE_STATE_PROBE_TIMEOUT
             interval = max(float(step.get('interval', 0.5)), 0.001)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError('Native lookup timeout and interval must be numeric') from exc
         device = self._require_device()
         if probe:
-            return native_locator.probe_native_element(
+            probe_method = (
+                native_locator.probe_native_elements if all_matches
+                else native_locator.probe_native_element
+            )
+            return probe_method(
                 getattr(device, 'adb', None), strategy, selector.strip(),
                 timeout=lookup_timeout,
                 match=step.get('selector_match', 'exact'),
@@ -971,6 +1117,7 @@ class UiFlowRunner:
             timeout=lookup_timeout,
             interval=min(interval, lookup_timeout),
             match=step.get('selector_match', 'exact'),
+            active_only=active_only,
         )
 
     def _resolve_selector(self, step: Dict[str, Any]) -> Any:
@@ -994,14 +1141,14 @@ class UiFlowRunner:
         if selector_type == 'image':
             # 图片选择器
             if not selector:
-                logger.warning('Image selector is empty for step type %s', step.get('type', 'unknown'))
+                logger.warning('Image selector is empty')
                 return None
             
             image_scope = step.get('image_scope', 'common')
             image_path = self._safe_image_path(image_scope, selector)
 
             if not os.path.isfile(image_path):
-                logger.warning('Image file is unavailable for selector type %s', selector_type)
+                logger.warning('Image file is unavailable')
                 return None
             
             threshold = step.get('image_threshold', 0.7)
@@ -1011,7 +1158,7 @@ class UiFlowRunner:
             return self._scale_ratio_pair(selector, 'Relative selector')
 
         elif selector_type in {'resource_id', 'text', 'content_desc', 'class'}:
-            match = self._find_native_match(step)
+            match = self._find_native_match(step, active_only=True)
             return match.center if match is not None else None
 
         elif selector_type == 'pos':
@@ -1038,7 +1185,7 @@ class UiFlowRunner:
             logger.warning('Invalid region selector configuration')
             return None
         
-        logger.warning(f"未知的选择器类型: {selector_type}")
+        logger.warning('Unknown selector type')
         return None
     
     def _resolve_element_by_id(self, element_id: int) -> Any:
@@ -1048,7 +1195,7 @@ class UiFlowRunner:
             
             element = AppElement.objects.filter(id=element_id, is_active=True).first()
             if not element:
-                logger.warning(f"未找到元素: element_id={element_id}")
+                logger.warning('Configured element was not found')
                 return None
             
             # 记录使用次数
@@ -1083,7 +1230,7 @@ class UiFlowRunner:
                 return (x1, y1, x2, y2)
             
         except Exception as exc:
-            logger.error('Unable to resolve element (element_id=%s, error=%s)', element_id, type(exc).__name__)
+            logger.error('Unable to resolve element (error=%s)', type(exc).__name__)
             return None
     
     @staticmethod
@@ -1172,7 +1319,7 @@ class UiFlowRunner:
 
         if start is None and end is None:
             direction = str(step.get('direction', 'up')).lower()
-            logger.info('Executing directional swipe: %s', direction)
+            logger.info('Executing directional swipe')
             self._swipe_by_direction(direction, duration=duration)
             return
         if start is None or end is None:
@@ -1229,10 +1376,10 @@ class UiFlowRunner:
         if target:
             if isinstance(target, (tuple, list)):
                 raise ValueError('等待元素出现需要图片元素；坐标或区域可用于点击，纯等待请清空定位')
-            logger.info('Waiting for target element (timeout=%ss)', timeout)
+            logger.info('Waiting for target element')
             wait(target, timeout=timeout)
         else:
-            logger.info(f"等待 {timeout} 秒")
+            logger.info('Waiting without a selector')
             sleep(timeout)
     
     def _validated_element_poll(self, step, *, timeout_default=5):
@@ -1251,21 +1398,23 @@ class UiFlowRunner:
         selector_type = step.get('selector_type', 'image')
         self._require_device()
         if selector_type in {'resource_id', 'text', 'content_desc', 'class'}:
-            match = self._find_native_match(step, timeout=lookup_timeout, probe=True)
+            matches = self._find_native_match(
+                step, timeout=lookup_timeout, probe=True, all_matches=True,
+            )
             if state == 'visible':
-                return match is not None and match.visible
+                return any(match.visible for match in matches)
             if state == 'hidden':
-                return match is None or not match.visible
-            if match is None:
+                return not any(match.visible for match in matches)
+            if not matches:
                 return False
-            return {
-                'enabled': match.enabled,
-                'disabled': not match.enabled,
-                'checked': match.checked,
-                'unchecked': not match.checked,
-                'selected': match.selected,
-                'unselected': not match.selected,
+            attribute = {
+                'enabled': 'enabled', 'disabled': 'enabled',
+                'checked': 'checked', 'unchecked': 'checked',
+                'selected': 'selected', 'unselected': 'selected',
             }[state]
+            if state in {'enabled', 'checked', 'selected'}:
+                return any(getattr(match, attribute) for match in matches)
+            return all(not getattr(match, attribute) for match in matches)
         if selector_type != 'image':
             raise ValueError('Element state checks support image or native selectors')
         if state not in {'visible', 'hidden'}:
@@ -1510,7 +1659,7 @@ class UiFlowRunner:
             if 'value_type' in step:
                 value = self._convert_variable_value(value, step['value_type'])
             self._set_variable(name, value, scope)
-            logger.info(f"设置变量: {scope}.{name}")
+            logger.info('Variable set')
     
     def _action_assert(self, step: Dict[str, Any]):
         """
@@ -1587,20 +1736,26 @@ class UiFlowRunner:
         selector_type = step.get('ocr_selector_type') or step.get('selector_type', 'region')
         
         if not selector:
-            raise ValueError("断言需要 selector 或 ocr_selector 参数来指定 OCR 区域")
+            raise ValueError('OCR assertion requires a region selector')
         
         if selector_type != 'region':
-            raise ValueError(f"OCR 断言仅支持 selector_type=region，当前: {selector_type}")
+            raise ValueError('OCR assertions only support region selectors')
         
         if isinstance(selector, str):
-            parts = [int(p.strip()) for p in selector.split(',')]
-            if len(parts) != 4:
-                raise ValueError(f"region 格式错误，需要 4 个值 (x1,y1,x2,y2): {selector}")
-            return tuple(parts)
+            try:
+                parts = selector.split(',')
+                if len(parts) != 4:
+                    raise ValueError
+                return tuple(int(part.strip()) for part in parts)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('Invalid OCR region') from None
         elif isinstance(selector, (list, tuple)) and len(selector) >= 4:
-            return tuple(int(x) for x in selector[:4])
+            try:
+                return tuple(int(value) for value in selector[:4])
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('Invalid OCR region') from None
         else:
-            raise ValueError(f"无法解析 region: {selector}")
+            raise ValueError('Invalid OCR region')
     
     def _ocr_recognize_text(self, region: tuple) -> str:
         """OCR 识别指定区域的文本"""
@@ -1637,7 +1792,7 @@ class UiFlowRunner:
         if not passed:
             raise AssertionError('Text assertion failed')
         
-        logger.info('Text assertion passed (%s)', match_mode)
+        logger.info('Text assertion passed')
     
     def _assert_number(self, step: Dict[str, Any]):
         """数值断言：OCR 识别数字（去逗号），与期望值精确匹配"""
@@ -1726,7 +1881,7 @@ class UiFlowRunner:
         elif not expected_exists and result:
             raise AssertionError(f"期望元素不存在，但实际存在")
         
-        logger.info(f"存在性断言成功: 期望存在={expected_exists}, 实际存在={result}")
+        logger.info('Existence assertion passed')
     
     def _assert_image(self, step: Dict[str, Any]):
         """图片断言：在屏幕上查找期望图片是否存在"""
@@ -1753,8 +1908,15 @@ class UiFlowRunner:
     def _run_assertion_until(self, check, timeout, interval):
         deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if timeout > 0 and remaining <= 0:
+                raise AssertionError('Text assertion timed out')
+            lookup_timeout = (
+                _MAX_NATIVE_STATE_PROBE_TIMEOUT
+                if timeout == 0 else min(interval, remaining)
+            )
             try:
-                check()
+                check(lookup_timeout)
                 return
             except AssertionError:
                 remaining = deadline - time.monotonic()
@@ -1775,7 +1937,7 @@ class UiFlowRunner:
         match = self._find_native_match(step, timeout=timeout)
         if match is None:
             raise AssertionError('Native text element was not found')
-        if match.text is not None:
+        if match.text:
             return match.text
         return match.content_desc or ''
 
@@ -1790,8 +1952,8 @@ class UiFlowRunner:
         if match_mode not in {'exact', 'contains', 'regex'}:
             raise ValueError('Unsupported assert_text match mode')
 
-        def check():
-            actual = str(self._read_text_selector(step, max(min(interval, timeout), 0.001)))
+        def check(lookup_timeout):
+            actual = str(self._read_text_selector(step, lookup_timeout))
             if match_mode == 'exact':
                 passed = actual == expected
             elif match_mode == 'contains':
@@ -1839,7 +2001,9 @@ class UiFlowRunner:
         if scope not in {'local', 'global'}:
             raise ValueError('extract_text scope must be local or global')
         timeout, _interval = self._validated_element_poll(step)
-        value = self._read_text_selector(step, max(timeout, 0.001))
+        value = self._read_text_selector(
+            step, timeout if timeout > 0 else _MAX_NATIVE_STATE_PROBE_TIMEOUT,
+        )
         self._set_variable(name, value, scope)
         logger.info('Extracted UI text into a variable')
 
@@ -1886,7 +2050,7 @@ class UiFlowRunner:
         
         if target is None:
             raise ValueError('长按步骤无法解析目标元素')
-        logger.info(f"长按: {target}, 时长: {duration}秒")
+        logger.info('Long-press action')
         touch(target, duration=duration)
     
     def _action_drag(self, step: Dict[str, Any]):
@@ -1911,7 +2075,7 @@ class UiFlowRunner:
         
         if start is None or end is None:
             raise ValueError('拖拽步骤无法解析起点或终点')
-        logger.info(f"拖拽: {start} -> {end}")
+        logger.info('Drag action')
         swipe(start, end, duration=duration)
     
     def _action_swipe_to(self, step: Dict[str, Any]):
@@ -1936,7 +2100,7 @@ class UiFlowRunner:
                 return
             if i == max_swipes:
                 break
-            logger.info('Directional swipe search %s/%s: %s', i + 1, max_swipes, direction)
+            logger.info('Directional swipe search')
             self._swipe_by_direction(direction, duration=duration)
             if interval:
                 time.sleep(interval)
@@ -2006,7 +2170,7 @@ class UiFlowRunner:
         
         if name and scope in self.context and name in self.context[scope]:
             del self.context[scope][name]
-            logger.info(f"删除变量: {scope}.{name}")
+            logger.info('Variable removed')
     
     def _action_extract_output(self, step: Dict[str, Any]):
         """
@@ -2030,20 +2194,20 @@ class UiFlowRunner:
         
         source_value = self._resolve_reference(source)
         if source_value is _MISSING:
-            raise ValueError(f"来源变量不存在: {source}")
+            raise ValueError('extract_output source variable was not found')
 
         if path:
             current = source_value
             for key in self._parse_path(path):
                 current = self._lookup_path_value(current, key)
                 if current is _MISSING:
-                    raise ValueError(f"提取失败: 路径 '{path}' 在 '{key}' 处找不到值")
+                    raise ValueError('extract_output path value was not found')
             extracted = current
         else:
             extracted = source_value
 
         self._set_variable(name, extracted, scope)
-        logger.info('提取成功: %s.%s -> %s.%s', source, path, scope, name)
+        logger.info('Output extracted into a variable')
     
     @staticmethod
     def _parse_path(path: str) -> List[str]:
@@ -2117,7 +2281,7 @@ class UiFlowRunner:
             params = {k: self._render_value(v) if isinstance(v, str) else v
                       for k, v in params.items()}
         
-        logger.info('HTTP request: %s', method)
+        logger.info('HTTP request started')
         
         try:
             response = guarded_request(
@@ -2144,7 +2308,7 @@ class UiFlowRunner:
             'body': body
         }
         
-        logger.info(f"HTTP响应: {response.status_code}")
+        logger.info('HTTP response received')
         
         # 状态码校验
         if expected_status is not None:
@@ -2180,7 +2344,7 @@ class UiFlowRunner:
                             f"api_request extracts path '{e_path}' could not be resolved at '{key}'"
                         )
                 self._set_variable(e_name, current, e_scope)
-                logger.info('api_request extracted %s into %s.%s', e_path, e_scope, e_name)
+                logger.info('API response field extracted')
         return result
     
     @staticmethod
@@ -2216,7 +2380,7 @@ class UiFlowRunner:
         
         condition = self._eval_condition(left, operator, right)
         
-        logger.info('Condition evaluated: %s', condition)
+        logger.info('Evaluating conditional branch')
         
         # 执行分支
         if condition:
@@ -2325,9 +2489,9 @@ class UiFlowRunner:
         if mode == 'count':
             # 计数循环
             times = self._validated_loop_integer(step.get('times', 1), 'times', 0, _MAX_LOOP_COUNT)
-            logger.info(f"计数循环: {times} 次")
+            logger.info('Starting count loop')
             for i in range(times):
-                logger.info(f"循环第 {i+1}/{times} 次")
+                logger.info('Count loop iteration')
                 for sub_step in steps:
                     self._execute_step(sub_step)
                 if interval > 0:
@@ -2341,9 +2505,9 @@ class UiFlowRunner:
             item_var = step.get('item_var', 'item')
             item_scope = step.get('item_scope', 'local')
             
-            logger.info(f"遍历循环: {len(items)} 个元素")
+            logger.info('Starting foreach loop')
             for idx, item in enumerate(items):
-                logger.info(f"循环第 {idx+1}/{len(items)} 次, {item_var}")
+                logger.info('Foreach loop iteration')
                 self._set_variable(item_var, item, item_scope)
                 for sub_step in steps:
                     self._execute_step(sub_step)
@@ -2359,7 +2523,7 @@ class UiFlowRunner:
             max_loops = self._validated_loop_integer(
                 step.get('max_loops', 10), 'max_loops', 0, _MAX_LOOP_COUNT,
             )
-            logger.info('Conditional loop: operator=%s max_loops=%s', operator, max_loops)
+            logger.info('Starting conditional loop')
             loop_count = 0
             while loop_count < max_loops:
                 left_val = self._render_value(left)
@@ -2368,7 +2532,7 @@ class UiFlowRunner:
                     break
 
                 loop_count += 1
-                logger.info('Conditional loop iteration %s', loop_count)
+                logger.info('Conditional loop iteration')
                 for sub_step in steps:
                     self._execute_step(sub_step)
                 if interval > 0:
@@ -2379,7 +2543,7 @@ class UiFlowRunner:
     def _action_sequence(self, step: Dict[str, Any]):
         """顺序执行子步骤"""
         steps = step.get('steps', [])
-        logger.info(f"顺序执行 {len(steps)} 个子步骤")
+        logger.info('Executing sequence')
         for sub_step in steps:
             self._execute_step(sub_step)
     
@@ -2398,15 +2562,18 @@ class UiFlowRunner:
                 for sub_step in try_steps:
                     self._execute_step(sub_step)
             except Exception as e:
+                self._ui_flow_unsafe_failure_seen = True
                 if self._is_uncertain_device_error(e):
                     skip_finally = True
                     raise
                 logger.warning('Caught error in try block (%s)', type(e).__name__)
+                self._sanitize_exception_for_reporting(e)
                 self._set_variable(error_var, str(e), error_scope)
                 for sub_step in catch_steps:
                     try:
                         self._execute_step(sub_step)
                     except Exception as catch_error:
+                        self._ui_flow_unsafe_failure_seen = True
                         if self._is_uncertain_device_error(catch_error):
                             skip_finally = True
                         raise
@@ -2549,7 +2716,7 @@ class UiFlowRunner:
         for index in range(max_loops):
             if time.monotonic() >= deadline:
                 break
-            logger.info('foreach_assert iteration %s/%s', index + 1, max_loops)
+            logger.info('foreach_assert iteration')
             touch(click_target)
             attempts += 1
 
@@ -2562,7 +2729,7 @@ class UiFlowRunner:
             if matcher():
                 matched_count += 1
 
-        logger.info('foreach_assert completed: attempts=%s matches=%s', attempts, matched_count)
+        logger.info('foreach_assert completed')
         if matched_count < min_match:
             raise AssertionError(
                 f'foreach_assert failed: expected at least {min_match} matches, got {matched_count}'

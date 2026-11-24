@@ -37,6 +37,31 @@
       {{ t(statusKey) }}
     </p>
 
+    <div v-if="visibleUnresolvedActions.length" class="unresolved-actions" role="alert">
+      <p>{{ t('appAutomation.recorder.unresolvedAction') }}</p>
+      <ul>
+        <li v-for="item in visibleUnresolvedActions" :key="item.id">
+          <span>{{ t(`appAutomation.recorder.actions.${item.step.action}`) }}</span>
+          <code v-if="item.step.action === 'tap'">
+            {{ item.step.x_ratio.toFixed(3) }}, {{ item.step.y_ratio.toFixed(3) }}
+          </code>
+          <code v-else-if="item.step.action === 'swipe'">
+            {{ item.step.start.x_ratio.toFixed(3) }}, {{ item.step.start.y_ratio.toFixed(3) }}
+            -> {{ item.step.end.x_ratio.toFixed(3) }}, {{ item.step.end.y_ratio.toFixed(3) }}
+          </code>
+          <span v-else>{{ t(`appAutomation.recorder.keyNames.${item.step.key}`) }}</span>
+          <strong v-if="item.uncertain">{{ t('appAutomation.recorder.unresolvedUnknown') }}</strong>
+          <small v-if="item.context.caseId !== null" class="unresolved-origin">
+            {{ t('appAutomation.recorder.unresolvedOrigin', { caseId: item.context.caseId }) }}
+          </small>
+          <small v-else class="unresolved-origin">{{ t('appAutomation.recorder.unresolvedDraftOrigin') }}</small>
+        </li>
+      </ul>
+      <button type="button" @click="clearUnresolvedActions">
+        {{ t('appAutomation.recorder.clearUnresolved') }}
+      </button>
+    </div>
+
     <div class="screen-stage">
       <p v-if="!screenshotUrl" class="empty-state">
         {{ t('appAutomation.recorder.empty') }}
@@ -114,7 +139,7 @@ const props = defineProps({
   sendInteraction: { type: Function, required: true },
 })
 
-const emit = defineEmits(['update:steps', 'step-staged', 'recording-change', 'error'])
+const emit = defineEmits(['update:steps', 'step-staged', 'recording-change', 'interaction-state', 'action-unresolved', 'unresolved-change', 'error'])
 const { t } = useI18n()
 const modes = ['tap', 'swipe', 'key']
 const androidKeys = ['back', 'home', 'enter']
@@ -127,12 +152,52 @@ const recordingMode = computed(() => props.recordingEnabled)
 const loadingScreenshot = ref(false)
 const interactionBusy = ref(false)
 const activePointer = ref(null)
-const actionGeneration = ref(0)
+const screenshotGeneration = ref(0)
+const unresolvedActions = ref([])
+let unresolvedSequence = 0
 const statusKey = ref('appAutomation.recorder.status.idle')
 const canRecord = computed(() => recordingMode.value && !interactionBusy.value && !loadingScreenshot.value)
 const canInteract = computed(() => canRecord.value && imageSize.value.width > 0)
+const currentActionContext = () => {
+  const context = props.sendInteraction?.getActionContext?.() || {}
+  return Object.freeze({
+    caseId: context.caseId ?? null,
+    sceneGeneration: context.sceneGeneration ?? null,
+    projectId: context.projectId ?? null,
+    deviceId: props.deviceId ?? null,
+    userId: context.userId ?? null,
+    sessionGeneration: context.sessionGeneration ?? null,
+  })
+}
+const sameIdentifier = (left, right) => (
+  left === null || left === undefined || right === null || right === undefined
+    ? left === right
+    : String(left) === String(right)
+)
+const sameRecorderSession = (left, right) => sameIdentifier(left.userId, right.userId)
+  && left.sessionGeneration === right.sessionGeneration
+const sameActionContext = (left, right) => sameRecorderSession(left, right)
+  && (sameIdentifier(left.caseId, right.caseId) || (left.caseId === null && right.caseId !== null))
+  && left.sceneGeneration === right.sceneGeneration
+  && sameIdentifier(left.projectId, right.projectId)
+  && sameIdentifier(left.deviceId, right.deviceId)
+const hasActionOrigin = context => context.sceneGeneration !== null
+  && context.deviceId !== null
+  && context.userId !== null
+  && context.sessionGeneration !== null
+const visibleUnresolvedActions = computed(() => {
+  const current = currentActionContext()
+  if (!hasActionOrigin(current)) return []
+  return unresolvedActions.value.filter(item => hasActionOrigin(item.context)
+    && sameRecorderSession(item.context, current))
+})
+watch(() => visibleUnresolvedActions.value.length, count => emit('unresolved-change', count), {
+  immediate: true,
+  flush: 'sync',
+})
 
 const unwrap = response => response?.data ?? response
+const ACTION_OUTCOMES = new Set(['completed', 'not_dispatched', 'unknown'])
 
 const screenshotContent = response => {
   const body = unwrap(response)
@@ -142,7 +207,7 @@ const screenshotContent = response => {
 
 const refreshScreenshot = async () => {
   if (!props.canViewScreenshot || loadingScreenshot.value || interactionBusy.value || props.deviceId === null || props.deviceId === undefined) return false
-  const generation = actionGeneration.value
+  const generation = screenshotGeneration.value
   const deviceId = props.deviceId
   loadingScreenshot.value = true
   statusKey.value = 'appAutomation.recorder.status.loading'
@@ -150,7 +215,7 @@ const refreshScreenshot = async () => {
     const response = await props.getScreenshot(deviceId)
     const content = screenshotContent(response)
     if (typeof content !== 'string' || !content) throw new Error('empty screenshot')
-    if (generation !== actionGeneration.value || !props.canViewScreenshot || String(props.deviceId) !== String(deviceId)) return false
+    if (generation !== screenshotGeneration.value || !props.canViewScreenshot || String(props.deviceId) !== String(deviceId)) return false
     screenshotUrl.value = content
     imageSize.value = { width: 0, height: 0 }
     statusKey.value = recordingMode.value
@@ -158,7 +223,7 @@ const refreshScreenshot = async () => {
       : 'appAutomation.recorder.status.idle'
     return true
   } catch (error) {
-    if (generation === actionGeneration.value) {
+    if (generation === screenshotGeneration.value) {
       statusKey.value = 'appAutomation.recorder.status.error'
       const status = Number.isInteger(error?.response?.status) ? error.response.status : undefined
       emit('error', { operation: 'screenshot', ...(status ? { status } : {}) })
@@ -200,30 +265,95 @@ const imageMetadata = () => ({
   image_height: imageSize.value.height,
 })
 
+const stageCompletedInteraction = (context, step) => {
+  const current = currentActionContext()
+  const acknowledgedStep = { ...step, index: steps.value.length + 1 }
+  if (sameActionContext(context, current) && (props.recordingEnabled || hasActionOrigin(context))) {
+    steps.value = [...steps.value, acknowledgedStep]
+    emit('update:steps', steps.value.slice())
+    emit('step-staged', hasActionOrigin(context) ? { step: acknowledgedStep, context } : acknowledgedStep)
+    statusKey.value = props.recordingEnabled
+      ? 'appAutomation.recorder.status.recording'
+      : 'appAutomation.recorder.status.idle'
+    return true
+  }
+
+  if (sameRecorderSession(context, current) && hasActionOrigin(context) && hasActionOrigin(current)) {
+    const unresolved = { id: ++unresolvedSequence, step: acknowledgedStep, context }
+    unresolvedActions.value = [...unresolvedActions.value, unresolved]
+    emit('action-unresolved', unresolved)
+  }
+  statusKey.value = 'appAutomation.recorder.status.idle'
+  return false
+}
+
 const stageSuccessfulInteraction = async (command, step) => {
   if (!canRecord.value) return false
-  const generation = actionGeneration.value
-  const deviceId = props.deviceId
+  const context = currentActionContext()
   interactionBusy.value = true
+  emit('interaction-state', { active: true, context, action: step.action })
   try {
-    const result = await props.sendInteraction(deviceId, command)
-    if (unwrap(result)?.success === false) throw new Error('interaction rejected')
-    if (generation !== actionGeneration.value || !props.recordingEnabled || String(props.deviceId) !== String(deviceId)) return false
-    const stagedStep = { ...step, index: steps.value.length + 1 }
-    steps.value = [...steps.value, stagedStep]
-    emit('update:steps', steps.value.slice())
-    emit('step-staged', stagedStep)
-    statusKey.value = 'appAutomation.recorder.status.recording'
-    return true
+    const result = await props.sendInteraction(context.deviceId, command)
+    const body = unwrap(result)
+    const explicitlyCompleted = body?.action_outcome === 'completed'
+    const legacySuccess = body?.action_outcome === undefined && body?.success === true
+    if (explicitlyCompleted || legacySuccess) {
+      const staged = stageCompletedInteraction(context, step)
+      const recoveryRequired = explicitlyCompleted
+        ? body.recovery_required !== false
+        : body.recovery_required === true
+      if (recoveryRequired) {
+        const status = Number.isInteger(result?.status) ? result.status : undefined
+        emit('error', {
+          operation: 'interaction',
+          ...(status ? { status } : {}),
+          ...(explicitlyCompleted ? { actionOutcome: 'completed' } : {}),
+          recoveryRequired: true,
+        })
+      }
+      return staged
+    }
+
+    const error = new Error('interaction outcome was not completed')
+    error.response = { status: result?.status, data: body }
+    error.recorderOutcomeUnknown = !ACTION_OUTCOMES.has(body?.action_outcome)
+    throw error
   } catch (error) {
-    if (generation === actionGeneration.value) {
+    const current = currentActionContext()
+    if (sameRecorderSession(context, current)) {
       statusKey.value = 'appAutomation.recorder.status.error'
       const status = Number.isInteger(error?.response?.status) ? error.response.status : undefined
-      emit('error', { operation: 'interaction', ...(status ? { status } : {}) })
+      const body = unwrap(error?.response?.data)
+      const outcome = ACTION_OUTCOMES.has(body?.action_outcome) ? body.action_outcome : null
+      if (outcome === 'completed') stageCompletedInteraction(context, step)
+      const uncertain = outcome === 'unknown'
+        || error?.recorderOutcomeUnknown === true
+        || (outcome === null && (status === undefined || status >= 500))
+      const recoveryRequired = body?.recovery_required === true
+        || outcome === 'unknown'
+        || (outcome === 'completed' && status !== undefined && status >= 400)
+      if (uncertain && hasActionOrigin(context) && hasActionOrigin(current)) {
+        const unresolved = {
+          id: ++unresolvedSequence,
+          step: { ...step, index: steps.value.length + 1 },
+          context,
+          uncertain: true,
+        }
+        unresolvedActions.value = [...unresolvedActions.value, unresolved]
+        emit('action-unresolved', unresolved)
+      }
+      emit('error', {
+        operation: 'interaction',
+        ...(status ? { status } : {}),
+        ...(outcome ? { actionOutcome: outcome } : {}),
+        ...(uncertain ? { uncertain: true } : {}),
+        ...(recoveryRequired ? { recoveryRequired: true } : {}),
+      })
     }
     return false
   } finally {
     interactionBusy.value = false
+    emit('interaction-state', { active: false, context, action: step.action })
   }
 }
 
@@ -329,8 +459,15 @@ const clearSteps = () => {
   emit('update:steps', [])
 }
 
+const clearUnresolvedActions = () => {
+  const current = currentActionContext()
+  unresolvedActions.value = hasActionOrigin(current)
+    ? unresolvedActions.value.filter(item => !sameRecorderSession(item.context, current))
+    : unresolvedActions.value
+}
+
 watch(() => props.deviceId, () => {
-  actionGeneration.value += 1
+  screenshotGeneration.value += 1
   screenshotUrl.value = ''
   imageSize.value = { width: 0, height: 0 }
   activePointer.value = null
@@ -339,8 +476,18 @@ watch(() => props.deviceId, () => {
   emit('update:steps', [])
 })
 
+watch(() => {
+  const context = currentActionContext()
+  return [context.userId, context.sessionGeneration]
+}, () => {
+  const current = currentActionContext()
+  unresolvedActions.value = hasActionOrigin(current)
+    ? unresolvedActions.value.filter(item => hasActionOrigin(item.context)
+      && sameRecorderSession(item.context, current))
+    : []
+})
+
 watch(() => props.recordingEnabled, enabled => {
-  actionGeneration.value += 1
   activePointer.value = null
   statusKey.value = enabled
     ? 'appAutomation.recorder.status.recording'
@@ -349,7 +496,7 @@ watch(() => props.recordingEnabled, enabled => {
 
 watch(() => props.canViewScreenshot, canView => {
   if (canView) return
-  actionGeneration.value += 1
+  screenshotGeneration.value += 1
   screenshotUrl.value = ''
   imageSize.value = { width: 0, height: 0 }
   activePointer.value = null
@@ -429,6 +576,38 @@ watch(() => props.canViewScreenshot, canView => {
   min-height: 1.4em;
   margin: 0;
   color: #52616a;
+}
+
+.unresolved-actions {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border-left: 3px solid #b45b40;
+  background: #fff6f2;
+  color: #693b2d;
+}
+
+.unresolved-actions p,
+.unresolved-actions ul {
+  margin: 0;
+}
+
+.unresolved-actions ul {
+  display: grid;
+  gap: 4px;
+  padding-inline-start: 20px;
+}
+
+.unresolved-actions li {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.unresolved-actions code {
+  color: #41525a;
+  overflow-wrap: anywhere;
 }
 
 .screen-stage {

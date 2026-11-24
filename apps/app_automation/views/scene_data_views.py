@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import re
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connections, transaction
+from django.db.models import Func, IntegerField
 from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -135,6 +136,27 @@ class AppProjectComponentSerializer(_ProjectScopedSerializer):
         return attrs
 
 
+class _DatasetArrayLength(Func):
+    """Count JSON array elements in the database without fetching dataset rows."""
+
+    arity = 1
+    output_field = IntegerField()
+
+    def as_sql(self, compiler, connection, **extra_context):
+        expression, params = compiler.compile(self.source_expressions[0])
+        functions = {
+            'sqlite': ('JSON_TYPE', 'JSON_ARRAY_LENGTH', 'array'),
+            'mysql': ('JSON_TYPE', 'JSON_LENGTH', 'ARRAY'),
+            'postgresql': ('jsonb_typeof', 'jsonb_array_length', 'array'),
+        }
+        type_function, length_function, array_name = functions[connection.vendor]
+        sql = (
+            f'CASE WHEN {type_function}({expression}) = %s '
+            f'THEN {length_function}({expression}) ELSE 0 END'
+        )
+        return sql, (*params, array_name, *params)
+
+
 class AppDataSetSerializer(serializers.ModelSerializer):
     row_count = serializers.SerializerMethodField()
 
@@ -151,6 +173,8 @@ class AppDataSetSerializer(serializers.ModelSerializer):
             self.fields.pop('rows', None)
 
     def get_row_count(self, obj):
+        if '_dataset_row_count' in obj.__dict__:
+            return obj.__dict__['_dataset_row_count']
         return len(obj.rows) if isinstance(obj.rows, list) else 0
 
 
@@ -188,6 +212,8 @@ class ProjectDataSetViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
 
     def get_queryset(self):
         queryset = scope_project(AppDataSet.objects.select_related('project'), self.request.user)
+        if self.action == 'list' and connections[queryset.db].vendor in {'sqlite', 'mysql', 'postgresql'}:
+            queryset = queryset.defer('rows').annotate(_dataset_row_count=_DatasetArrayLength('rows'))
         project = self.request.query_params.get('project')
         if project is not None:
             queryset = queryset.filter(project_id=project) if _valid_id(project) else queryset.none()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import math
 import posixpath
 import re
@@ -37,6 +38,7 @@ class DatasetLimits:
     max_uncompressed_bytes: int = 20 * 1024 * 1024
     max_zip_entries: int = 256
     max_compression_ratio: int = 1_000
+    max_serialized_bytes: int = 20 * 1024 * 1024
 
     def __post_init__(self) -> None:
         caps = {
@@ -45,6 +47,7 @@ class DatasetLimits:
             "max_columns": 100,
             "max_cell_chars": 16_384,
             "max_uncompressed_bytes": 20 * 1024 * 1024,
+            "max_serialized_bytes": 20 * 1024 * 1024,
             "max_zip_entries": 256,
             "max_compression_ratio": 1_000,
         }
@@ -204,6 +207,67 @@ def bind_row_variables(
     return result
 
 
+def _serialized_string_size(value: str) -> int:
+    """Return the byte length of json.dumps(value) without building its output."""
+    size = 2  # Quotation marks.
+    for char in value:
+        codepoint = ord(char)
+        if char in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
+            size += 2
+        elif codepoint < 0x20 or codepoint > 0x7E:
+            size += 12 if codepoint > 0xFFFF else 6
+        else:
+            size += 1
+    return size
+
+
+def _serialized_scalar_size(value: Any) -> int:
+    if isinstance(value, str):
+        return _serialized_string_size(value)
+    if value is None:
+        return 4
+    if isinstance(value, bool):
+        return 4 if value else 5
+    try:
+        return len(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError, OverflowError):
+        raise DatasetError("dataset contains a value that cannot be serialized safely.") from None
+
+
+class _SerializedDatasetBudget:
+    """Incrementally bound the JSON representation persisted for parsed rows."""
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.size = 1  # Opening list bracket.
+        self.row_count = 0
+
+    def add_row(self, headers: Sequence[str], values: Sequence[Any]) -> None:
+        row_size = 2  # Object braces.
+        for position, (header, value) in enumerate(zip(headers, values)):
+            if position:
+                row_size += 2  # Dict item separator and space.
+            row_size += _serialized_string_size(header) + 2  # Quoted key and colon-space.
+            row_size += _serialized_scalar_size(value)
+        if self.row_count:
+            row_size += 2  # List item separator and space.
+
+        next_size = self.size + row_size
+        if next_size + 1 > self.max_bytes:  # Reserve the closing list bracket.
+            self._raise_limit()
+        self.size = next_size
+        self.row_count += 1
+
+    def finish(self) -> None:
+        if self.size + 1 > self.max_bytes:
+            self._raise_limit()
+
+    def _raise_limit(self) -> None:
+        raise DatasetError(
+            f"decoded dataset exceeds the {self.max_bytes}-byte JSON serialization limit."
+        )
+
+
 def _parse_csv(data: bytes, limits: DatasetLimits) -> list[dict[str, Any]]:
     try:
         text = data.decode("utf-8-sig", errors="strict")
@@ -222,6 +286,7 @@ def _parse_csv(data: bytes, limits: DatasetLimits) -> list[dict[str, Any]]:
         _raise_csv_error(reader, limits, exc)
 
     headers = _validate_headers(headers, limits)
+    serialized_budget = _SerializedDatasetBudget(limits.max_serialized_bytes)
     rows: list[dict[str, Any]] = []
     data_record_count = 0
     try:
@@ -240,9 +305,11 @@ def _parse_csv(data: bytes, limits: DatasetLimits) -> list[dict[str, Any]]:
                 )
             for column, value in zip(headers, values):
                 _validate_scalar(value, column, limits.max_cell_chars)
+            serialized_budget.add_row(headers, values)
             rows.append(dict(zip(headers, values)))
     except csv.Error as exc:
         _raise_csv_error(reader, limits, exc)
+    serialized_budget.finish()
     return rows
 
 
@@ -355,6 +422,7 @@ def _parse_xlsx(data: bytes, limits: DatasetLimits, sheet_name: str | None) -> l
         ]
         headers = _validate_headers(_trim_trailing_none(header_values), limits)
 
+        serialized_budget = _SerializedDatasetBudget(limits.max_serialized_bytes)
         rows: list[dict[str, Any]] = []
         for row_number, cells in enumerate(iterator, start=2):
             values = [
@@ -371,7 +439,9 @@ def _parse_xlsx(data: bytes, limits: DatasetLimits, sheet_name: str | None) -> l
                     f"XLSX row {row_number} has {len(values)} populated columns; expected at most {len(headers)}."
                 )
             values.extend([None] * (len(headers) - len(values)))
+            serialized_budget.add_row(headers, values)
             rows.append(dict(zip(headers, values)))
+        serialized_budget.finish()
         return rows
     except DatasetError:
         raise

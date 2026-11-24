@@ -73,7 +73,9 @@ def test_allowlisted_interactions_use_fixed_adb_arguments_and_validate_lease(
         response = post_interaction(user, device, payload)
 
     assert response.status_code == 200
-    assert response.data == {'success': True}
+    assert response.data == {
+        'action_outcome': 'completed', 'recovery_required': False, 'success': True,
+    }
     validate_lease.assert_called_once_with(device.pk, user, 'fixture-token')
     assert run.call_args.args[0] == [
         '/fake/adb', '-s', device.device_id, *adb_args,
@@ -102,6 +104,8 @@ def test_active_execution_blocks_interaction(recorder_device, execution_status):
         )
 
     assert response.status_code == 409
+    assert response.data['action_outcome'] == 'not_dispatched'
+    assert response.data['recovery_required'] is False
     run.assert_not_called()
 
 
@@ -126,6 +130,8 @@ def test_invalid_payloads_are_rejected_without_lease_or_adb_calls(recorder_devic
         response = post_interaction(user, device, payload)
 
     assert response.status_code == 400
+    assert response.data['action_outcome'] == 'not_dispatched'
+    assert response.data['recovery_required'] is False
     assert 'private fixture text' not in str(response.data)
     validate_lease.assert_not_called()
     run.assert_not_called()
@@ -164,17 +170,18 @@ def test_authentication_and_lease_are_required(recorder_device, has_authenticati
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ('failure', 'expected_status', 'expected_detail'),
+    ('failure', 'expected_status', 'expected_outcome', 'recovery_required', 'expected_detail'),
     [
-        (subprocess.TimeoutExpired(['/private/serial'], 8), 504,
+        (subprocess.TimeoutExpired(['/private/serial'], 8), 504, 'unknown', True,
          '设备交互超时，设备已进入维护模式，请管理员确认设备状态'),
         (subprocess.CalledProcessError(1, ['/private/serial'], stderr='private fixture detail'),
-         502, '设备交互状态未确认，设备已进入维护模式，请管理员检查'),
-        (FileNotFoundError('/private/adb/path'), 503, 'ADB 服务不可用'),
+         502, 'unknown', True, '设备交互状态未确认，设备已进入维护模式，请管理员检查'),
+        (FileNotFoundError('/private/adb/path'), 503, 'not_dispatched', False, 'ADB 服务不可用'),
     ],
 )
 def test_adb_failures_return_generic_errors_without_logging_or_echoing_details(
-    recorder_device, caplog, failure, expected_status, expected_detail,
+    recorder_device, caplog, failure, expected_status, expected_outcome,
+    recovery_required, expected_detail,
 ):
     user, device = recorder_device
     with (
@@ -188,7 +195,11 @@ def test_adb_failures_return_generic_errors_without_logging_or_echoing_details(
         )
 
     assert response.status_code == expected_status
-    assert response.data == {'detail': expected_detail}
+    assert response.data == {
+        'action_outcome': expected_outcome,
+        'recovery_required': recovery_required,
+        'detail': expected_detail,
+    }
     assert 'private fixture' not in str(response.data)
     assert device.device_id not in str(response.data)
     assert '/private/' not in str(response.data)
@@ -230,6 +241,8 @@ def test_account_switch_is_rejected_before_lease_or_device_access(recorder_devic
             'action': 'tap', 'x': 1, 'y': 2, 'expected_user_id': user.pk + 1,
         })
     assert response.status_code == 409
+    assert response.data['action_outcome'] == 'not_dispatched'
+    assert response.data['recovery_required'] is False
     validate.assert_not_called()
     run.assert_not_called()
 
@@ -244,9 +257,71 @@ def test_timeout_quarantines_device_and_blocks_even_the_existing_owner(recorder_
     ):
         response = post_interaction(user, device, {'action': 'tap', 'x': 1, 'y': 2})
     assert response.status_code == 504
+    assert response.data['action_outcome'] == 'unknown'
+    assert response.data['recovery_required'] is True
     device.refresh_from_db()
     assert device.maintenance_mode is True
     with patch('apps.app_automation.views.recorder_views.subprocess.run') as run:
         second = post_interaction(user, device, {'action': 'tap', 'x': 1, 'y': 2})
     assert second.status_code == 403
     run.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_successful_command_with_failed_fence_cleanup_reports_completion_and_recovery(recorder_device):
+    user, device = recorder_device
+    with (
+        patch_valid_lease(device),
+        patch('apps.app_automation.views.recorder_views.get_adb_path', return_value='/fake/adb'),
+        patch('apps.app_automation.views.recorder_views.subprocess.run') as run,
+        patch(
+            'apps.app_automation.views.recorder_views.finish_device_action',
+            side_effect=RuntimeError('private database detail'),
+        ),
+    ):
+        response = post_interaction(
+            user, device, {'action': 'tap', 'x': 1, 'y': 2, 'lease_token': 'fixture-token'},
+        )
+
+    assert response.status_code == 503
+    assert response.data == {
+        'action_outcome': 'completed',
+        'recovery_required': True,
+        'detail': '设备交互已完成但状态未能安全确认，设备占用已保留，请管理员恢复设备',
+    }
+    assert 'private database detail' not in str(response.data)
+    run.assert_called_once()
+    device.refresh_from_db()
+    assert device.device_action_pending is True
+    assert device.maintenance_mode is False
+
+
+@pytest.mark.django_db
+def test_adb_spawn_failure_with_failed_fence_cleanup_is_not_dispatched(recorder_device):
+    user, device = recorder_device
+    with (
+        patch_valid_lease(device),
+        patch('apps.app_automation.views.recorder_views.get_adb_path', return_value='/fake/adb'),
+        patch(
+            'apps.app_automation.views.recorder_views.subprocess.run',
+            side_effect=FileNotFoundError('/private/adb/path'),
+        ),
+        patch(
+            'apps.app_automation.views.recorder_views.finish_device_action',
+            side_effect=RuntimeError('private database detail'),
+        ),
+    ):
+        response = post_interaction(
+            user, device, {'action': 'tap', 'x': 1, 'y': 2, 'lease_token': 'fixture-token'},
+        )
+
+    assert response.status_code == 503
+    assert response.data == {
+        'action_outcome': 'not_dispatched',
+        'recovery_required': True,
+        'detail': 'ADB 服务不可用，设备占用已保留，请管理员恢复设备',
+    }
+    assert 'private database detail' not in str(response.data)
+    device.refresh_from_db()
+    assert device.device_action_pending is True
+    assert device.maintenance_mode is False

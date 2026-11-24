@@ -209,7 +209,10 @@ def test_adb_dump_timeout_is_bounded_and_returns_none(monkeypatch):
         def cmd(self, _commands, timeout=None):
             self.timeouts.append(timeout)
             clock["now"] += timeout
-            raise RuntimeError("private hierarchy secret")
+            raise RuntimeError(
+                f"Command ['adb'] timed out after {timeout} seconds: "
+                "stdout['private hierarchy secret'], stderr['']"
+            )
 
     adb = BlockingADB()
     result = find_native_element(adb, "text", "target", timeout=0.5, interval=0.1)

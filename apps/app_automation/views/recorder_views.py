@@ -28,6 +28,21 @@ KEY_EVENTS = {
     'home': 'KEYCODE_HOME',
     'enter': 'KEYCODE_ENTER',
 }
+ACTION_OUTCOMES = {'completed', 'not_dispatched', 'unknown'}
+
+
+def _interaction_response(*, outcome, recovery_required, status_code, detail=None, success=False):
+    if outcome not in ACTION_OUTCOMES:
+        raise ValueError('Invalid recorder action outcome')
+    payload = {
+        'action_outcome': outcome,
+        'recovery_required': bool(recovery_required),
+    }
+    if success:
+        payload['success'] = True
+    if detail is not None:
+        payload['detail'] = detail
+    return Response(payload, status=status_code)
 
 
 class RecorderPayloadError(ValueError):
@@ -114,21 +129,27 @@ class RecordInteractionView(APIView):
         try:
             lease_token, interaction_command, expected_user_id = _parse_interaction(request.data)
         except RecorderPayloadError:
-            return Response(
-                {'detail': '交互参数无效，仅支持点击、滑动和返回/主页/确认键'},
-                status=status.HTTP_400_BAD_REQUEST,
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='交互参数无效，仅支持点击、滑动和返回/主页/确认键',
+                status_code=status.HTTP_400_BAD_REQUEST,
             )
 
         if not execution_user_matches(request.user, expected_user_id):
-            return Response(
-                {'detail': '登录账号已变化，请重新打开录制器'},
-                status=status.HTTP_409_CONFLICT,
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='登录账号已变化，请重新打开录制器',
+                status_code=status.HTTP_409_CONFLICT,
             )
 
         try:
             adb_path = get_adb_path()
         except Exception:
-            return Response({'detail': 'ADB 服务不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='ADB 服务不可用',
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         try:
             device_serial, generation = begin_device_action(
@@ -138,19 +159,28 @@ class RecordInteractionView(APIView):
                 lease_validator=validate_device_lease,
             )
         except AppDevice.DoesNotExist:
-            return Response({'detail': '设备不存在'}, status=status.HTTP_404_NOT_FOUND)
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='设备不存在', status_code=status.HTTP_404_NOT_FOUND,
+            )
         except DeviceActionBusy:
-            return Response(
-                {'detail': '设备存在待执行或待安全恢复的动作'},
-                status=status.HTTP_409_CONFLICT,
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='设备存在待执行或待安全恢复的动作',
+                status_code=status.HTTP_409_CONFLICT,
             )
         except DeviceLeaseError:
-            return Response(
-                {'detail': '设备租约无效、已过期或不属于当前用户'},
-                status=status.HTTP_403_FORBIDDEN,
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=False,
+                detail='设备租约无效、已过期或不属于当前用户',
+                status_code=status.HTTP_403_FORBIDDEN,
             )
         except Exception:
-            return Response({'detail': '设备交互暂不可用'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=True,
+                detail='设备交互暂不可用',
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         command = [adb_path, '-s', str(device_serial), *interaction_command]
         try:
@@ -168,28 +198,43 @@ class RecordInteractionView(APIView):
                 '设备交互超时，设备已进入维护模式，请管理员确认设备状态'
                 if quarantined else '设备交互超时，设备占用已保留，请管理员恢复设备'
             )
-            return Response({'detail': detail}, status=status.HTTP_504_GATEWAY_TIMEOUT)
+            return _interaction_response(
+                outcome='unknown', recovery_required=True, detail=detail,
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
         except (FileNotFoundError, PermissionError):
+            recovery_required = False
             try:
                 finish_device_action(device_id, request.user, generation)
             except Exception:
+                recovery_required = True
                 detail = 'ADB 服务不可用，设备占用已保留，请管理员恢复设备'
             else:
                 detail = 'ADB 服务不可用'
-            return Response({'detail': detail}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return _interaction_response(
+                outcome='not_dispatched', recovery_required=recovery_required,
+                detail=detail, status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except Exception:
             quarantined = _quarantine_uncertain_device(device_id, request.user, generation)
             detail = (
                 '设备交互状态未确认，设备已进入维护模式，请管理员检查'
                 if quarantined else '设备交互状态未确认，设备占用已保留，请管理员恢复设备'
             )
-            return Response({'detail': detail}, status=status.HTTP_502_BAD_GATEWAY)
+            return _interaction_response(
+                outcome='unknown', recovery_required=True, detail=detail,
+                status_code=status.HTTP_502_BAD_GATEWAY,
+            )
 
         try:
             finish_device_action(device_id, request.user, generation)
         except Exception:
-            return Response(
-                {'detail': '设备交互已完成但状态未能安全确认，设备占用已保留，请管理员恢复设备'},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            return _interaction_response(
+                outcome='completed', recovery_required=True,
+                detail='设备交互已完成但状态未能安全确认，设备占用已保留，请管理员恢复设备',
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        return Response({'success': True}, status=status.HTTP_200_OK)
+        return _interaction_response(
+            outcome='completed', recovery_required=False, success=True,
+            status_code=status.HTTP_200_OK,
+        )

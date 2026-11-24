@@ -28,6 +28,10 @@ _MAX_COORDINATE = 1_000_000
 _TRAILING_DUMP_STATUS = re.compile(
     rb"\r?\nUI hierchary dumped to: /dev/tty(?:\r?\n)?\Z"
 )
+_AIRTEST_TIMEOUT_MESSAGE = re.compile(
+    r"^Command(?: .+)? timed out after [0-9]+(?:\.[0-9]+)? seconds: stdout\[.*\], stderr\[.*\]$",
+    re.DOTALL,
+)
 
 Bounds = Tuple[int, int, int, int]
 Point = Tuple[int, int]
@@ -80,7 +84,9 @@ def find_native_element(
     interval: float = 0.5,
     match: str = "exact",
     *,
+    active_only: bool = False,
     _one_shot: bool = False,
+    _all_matches: bool = False,
 ) -> Optional[NativeElementMatch]:
     """Find an Android hierarchy node using a fixed, timed Airtest ADB call.
 
@@ -91,15 +97,18 @@ def find_native_element(
 
     Missing boolean attributes use Android view defaults: visible/enabled are
     true; checked/selected are false. A ``visible-to-user`` attribute takes
-    precedence over ``visible`` when present. Each fixed ``adb.cmd`` invocation
-    receives the remaining overall timeout.
+    precedence over ``visible`` when present. ``active_only`` skips hidden or
+    disabled nodes. Each fixed ``adb.cmd`` invocation receives the remaining
+    overall timeout.
     """
     _validate_lookup(strategy, value, timeout, interval, match)
     if _one_shot:
         if timeout <= 0:
             raise NativeLocatorInputError("timeout must be greater than zero for a hierarchy probe")
-        return _probe_native_element(adb, strategy, value, timeout, match)
-    return _find_native_element(adb, strategy, value, timeout, interval, match, False)
+        return _probe_native_element(
+            adb, strategy, value, timeout, match, all_matches=_all_matches,
+        )
+    return _find_native_element(adb, strategy, value, timeout, interval, match, active_only)
 
 
 def probe_native_element(
@@ -119,7 +128,25 @@ def probe_native_element(
     )
 
 
-def _probe_native_element(adb, strategy, value, timeout, match):
+def probe_native_elements(
+    adb, strategy: str, value: str, timeout: float = 2.0, match: str = "exact",
+) -> Tuple[NativeElementMatch, ...]:
+    """Read one hierarchy and return every matching node with validated bounds."""
+    _validate_lookup(strategy, value, timeout, 0.5, match)
+    if timeout <= 0:
+        raise NativeLocatorInputError("timeout must be greater than zero for a hierarchy probe")
+    result = find_native_element(
+        adb, strategy, value, timeout=timeout, interval=0.5, match=match,
+        _one_shot=True, _all_matches=True,
+    )
+    if result is None:
+        return ()
+    if isinstance(result, (list, tuple)):
+        return tuple(result)
+    return (result,)
+
+
+def _probe_native_element(adb, strategy, value, timeout, match, *, all_matches=False):
     try:
         command = getattr(adb, "cmd", None)
     except Exception:
@@ -133,19 +160,28 @@ def _probe_native_element(adb, strategy, value, timeout, match):
     deadline = time.monotonic() + timeout
     try:
         output = command(list(_HIERARCHY_DUMP_ARGS), timeout=timeout)
-    except TimeoutError:
-        raise NativeLocatorTimeout("Reading the Android UI hierarchy timed out") from None
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, TimeoutError) or _is_airtest_timeout(exc):
+            raise NativeLocatorTimeout("Reading the Android UI hierarchy timed out") from None
         raise NativeLocatorUnsupportedDevice(
             "Unable to read the Android UI hierarchy from this device"
         ) from None
 
     hierarchy = _parse_hierarchy(
-        output, strategy, value, match, require_match_bounds=True,
+        output, strategy, value, match, require_match_bounds=True, collect_all=all_matches,
     )
     if time.monotonic() >= deadline:
         raise NativeLocatorTimeout("Reading the Android UI hierarchy timed out")
     return hierarchy
+
+
+def _is_airtest_timeout(error):
+    if not isinstance(error, RuntimeError):
+        return False
+    try:
+        return _AIRTEST_TIMEOUT_MESSAGE.fullmatch(str(error)) is not None
+    except Exception:
+        return False
 
 
 def find_native_element_any(
@@ -191,9 +227,13 @@ def _find_native_element(adb, strategy, value, timeout, interval, match, active_
             break
         try:
             output = command(list(_HIERARCHY_DUMP_ARGS), timeout=remaining)
-        except Exception:
-            if time.monotonic() >= deadline:
-                return None
+        except Exception as exc:
+            if isinstance(exc, TimeoutError) or _is_airtest_timeout(exc):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(interval, remaining))
+                continue
             raise NativeLocatorUnsupportedDevice(
                 "Unable to read the Android UI hierarchy from this device"
             ) from None
@@ -242,7 +282,10 @@ def _strip_trailing_dump_status(xml_bytes):
     return xml_bytes
 
 
-def _parse_hierarchy(output, strategy, value, match, *, active_only=False, require_match_bounds=False):
+def _parse_hierarchy(
+    output, strategy, value, match, *, active_only=False, require_match_bounds=False,
+    collect_all=False,
+):
     xml_bytes = _strip_trailing_dump_status(_as_bounded_bytes(output))
     root_start = xml_bytes.find(b"<hierarchy")
     if root_start < 0:
@@ -266,7 +309,7 @@ def _parse_hierarchy(output, strategy, value, match, *, active_only=False, requi
         "class": "class",
     }[strategy]
     state = {
-        "depth": 0, "nodes": 0, "result": None, "root_seen": False,
+        "depth": 0, "nodes": 0, "result": None, "results": [], "root_seen": False,
         "matched_without_bounds": False,
     }
     parser = expat.ParserCreate()
@@ -285,7 +328,7 @@ def _parse_hierarchy(output, strategy, value, match, *, active_only=False, requi
         if state["nodes"] > _MAX_HIERARCHY_NODES:
             raise NativeLocatorHierarchyError("The Android hierarchy exceeds the node limit")
 
-        if state["result"] is None:
+        if collect_all or state["result"] is None:
             candidate = attributes.get(attribute_name)
             if candidate is not None and _matches(candidate, value, match):
                 bounds = _parse_bounds(attributes.get("bounds"))
@@ -295,9 +338,11 @@ def _parse_hierarchy(output, strategy, value, match, *, active_only=False, requi
                 else:
                     visible = _boolean_attribute(attributes, ("visible-to-user", "visible"), True)
                     enabled = _boolean_attribute(attributes, ("enabled",), True)
+                    checked = _boolean_attribute(attributes, ("checked",), False)
+                    selected = _boolean_attribute(attributes, ("selected",), False)
                     if not active_only or (visible and enabled):
                         left, top, right, bottom = bounds
-                        state["result"] = NativeElementMatch(
+                        result = NativeElementMatch(
                             strategy=strategy,
                             query=candidate if isinstance(value, tuple) else value,
                             matched_value=candidate,
@@ -309,9 +354,13 @@ def _parse_hierarchy(output, strategy, value, match, *, active_only=False, requi
                             center=((left + right) // 2, (top + bottom) // 2),
                             visible=visible,
                             enabled=enabled,
-                            checked=_boolean_attribute(attributes, ("checked",), False),
-                            selected=_boolean_attribute(attributes, ("selected",), False),
+                            checked=checked,
+                            selected=selected,
                         )
+                        if collect_all:
+                            state["results"].append(result)
+                        else:
+                            state["result"] = result
         state["depth"] += 1
 
     def on_end(_name):
@@ -336,9 +385,11 @@ def _parse_hierarchy(output, strategy, value, match, *, active_only=False, requi
 
     if not state["root_seen"] or state["depth"] != 0:
         raise NativeLocatorHierarchyError("The Android hierarchy XML is incomplete")
-    if state["matched_without_bounds"] and state["result"] is None:
+    if state["matched_without_bounds"] and (
+        collect_all or state["result"] is None
+    ):
         raise NativeLocatorHierarchyError("A matching Android element has invalid bounds")
-    return state["result"]
+    return state["results"] if collect_all else state["result"]
 
 
 def _as_bounded_bytes(output):

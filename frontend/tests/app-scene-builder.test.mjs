@@ -24,7 +24,7 @@ const stepDefinition = {
 
 async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSeconds = 90 } = {}) {
   const writes = []
-  const calls = { acquisitions: [], releases: [], heartbeats: [], heartbeatIntervals: [], interactions: [] }
+  const calls = { acquisitions: [], releases: [], heartbeats: [], heartbeatIntervals: [], interactions: [], confirmations: [], routeGuard: null }
   const session = { generation: 1 }
   const userStore = reactive({
     user: { id: userId, username: 'recorder-owner' },
@@ -82,7 +82,7 @@ async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSecon
   }
   const icons = Object.fromEntries(['Upload', 'Download', 'FolderAdd', 'DocumentCopy', 'Check', 'Search', 'Link', 'Refresh', 'Camera'].map(name => [name, {}]))
   const instance = await loadSfcSetup('src/views/app-automation/test-cases/SceneBuilder.vue', {
-    'vue-router': { useRoute: () => ({ query: {} }), onBeforeRouteLeave() {} },
+    'vue-router': { useRoute: () => ({ query: {} }), onBeforeRouteLeave: guard => { calls.routeGuard = guard } },
     '@element-plus/icons-vue': icons,
     vuedraggable: { default: {} },
     '../elements/components/CaptureElementDialog.vue': { default: {} },
@@ -91,7 +91,7 @@ async function loadBuilder(detail = null, { userId = 7, devices = [], leaseSecon
     './NestedFlowEditor.vue': { default: {} },
     '@/stores/user': { useUserStore: () => userStore },
     '@/api/app-automation': api,
-  }, { setInterval: (callback, delay) => {
+  }, { confirm: async (...args) => { calls.confirmations.push(args); return true }, setInterval: (callback, delay) => {
     calls.heartbeatIntervals.push({ callback, delay })
     return calls.heartbeatIntervals.length
   }, clearInterval() {} })
@@ -413,6 +413,41 @@ test('device changes stop recording and release only the recorder-owned lease to
   }]])
 })
 
+test('recorder lease release waits until its active interaction settles', async () => {
+  const device = {
+    id: 43, device_id: 'pending-interaction-serial', status: 'online', locked_by: null,
+    maintenance_mode: false, lease_requires_token: false,
+  }
+  const { state, calls } = await loadBuilder(null, { devices: [device] })
+  state.recorderDevices.value = [device]
+  state.recorderDeviceId.value = device.id
+  assert.equal(await state.startRecorder(), true)
+
+  const context = state.sendRecorderInteraction.getActionContext()
+  state.handleRecorderInteractionState({ active: true, context })
+  await state.stopRecorder()
+
+  assert.equal(state.recorderEnabled.value, false)
+  assert.equal(state.canStartRecorder.value, false)
+  assert.deepEqual(calls.releases, [])
+
+  state.handleRecorderInteractionState({
+    active: false,
+    context: { ...context, sceneGeneration: context.sceneGeneration + 1 },
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(calls.releases, [])
+  assert.ok(state.deferredRecorderRelease.value)
+
+  state.handleRecorderInteractionState({ active: false, context })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.deepEqual(plain(calls.releases), [[43, {
+    expected_user_id: 7, lease_token: 'fixture-token-43',
+  }]])
+  assert.equal(state.deferredRecorderRelease.value, null)
+})
+
 test('recorded gestures append runnable relative-coordinate ui_flow steps', async () => {
   const idleDevice = {
     id: 36, device_id: 'staging-serial', status: 'online', locked_by: null,
@@ -427,6 +462,9 @@ test('recorded gestures append runnable relative-coordinate ui_flow steps', asyn
     swipe: { schema: { required: ['direction'], properties: {
       direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
       selector_type: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' },
+    } } },
+    key_event: { schema: { required: ['key'], properties: {
+      key: { type: 'string', enum: ['BACK', 'HOME', 'ENTER'] },
     } } },
   }
   state.recorderDevices.value = [idleDevice]
@@ -596,4 +634,88 @@ test('sensitive scene variables round-trip as aliases and block plaintext saves'
   const source = await readFile(new URL('../src/views/app-automation/test-cases/SceneBuilder.vue', import.meta.url), 'utf8')
   assert.match(source, /v-model="item\.sensitive">\{\{ \$t\('appAutomation\.sceneData\.sensitiveVariable'\) \}\}<\/el-checkbox>/)
   assert.match(source, /appAutomation\.sceneData\.secretHelp/)
+})
+
+test('in-flight recorder action blocks navigation and reset, and fences a changed project', async () => {
+  const device = {
+    id: 43, device_id: 'fixture-device', status: 'online', locked_by: null,
+    maintenance_mode: false, lease_requires_token: false,
+  }
+  const { state, calls } = await loadBuilder(null, { devices: [device] })
+  state.sceneForm.value.name = 'Original scene'
+  state.recorderDevices.value = [device]
+  state.recorderDeviceId.value = device.id
+  assert.equal(await state.startRecorder(), true)
+  const context = state.sendRecorderInteraction.getActionContext()
+  state.handleRecorderInteractionState({ active: true, context, action: 'key' })
+
+  let prevented = false
+  state.beforeUnloadHandler({ preventDefault: () => { prevented = true }, returnValue: undefined })
+  assert.equal(prevented, true)
+  assert.equal(await calls.routeGuard(), false)
+  await state.resetScene()
+  assert.equal(state.sceneForm.value.name, 'Original scene')
+
+  state.sceneForm.value.project = 99
+  await assert.rejects(state.sendRecorderInteraction(device.id, { action: 'key', key: 'back' }))
+  assert.deepEqual(calls.interactions, [])
+  state.sceneForm.value.project = null
+  state.handleRecorderInteractionState({ active: false, context, action: 'key' })
+  await state.stopRecorder()
+})
+
+test('unresolved recorder actions trigger an explicit leave warning', async () => {
+  const { state, calls } = await loadBuilder()
+  state.handleRecorderUnresolvedChange(1)
+  let prevented = false
+  state.beforeUnloadHandler({ preventDefault: () => { prevented = true }, returnValue: undefined })
+  assert.equal(prevented, true)
+  assert.equal(await calls.routeGuard(), true)
+  assert.equal(calls.confirmations.at(-1)[0], 'appAutomation.recorder.unresolvedLeave')
+  state.handleRecorderUnresolvedChange(0)
+})
+
+test('an uncertain recorder result disables recording without releasing its lease', async () => {
+  const device = {
+    id: 44, device_id: 'fixture-device', status: 'online', locked_by: null,
+    maintenance_mode: false, lease_requires_token: false,
+  }
+  const { state, calls } = await loadBuilder(null, { devices: [device] })
+  state.recorderDevices.value = [device]
+  state.recorderDeviceId.value = device.id
+  assert.equal(await state.startRecorder(), true)
+  const context = state.sendRecorderInteraction.getActionContext()
+  state.handleRecorderInteractionState({ active: true, context, action: 'tap' })
+  state.handleRecorderError({ operation: 'interaction', uncertain: true })
+  await nextTick()
+
+  assert.equal(state.recorderEnabled.value, false)
+  assert.equal(state.recorderErrorKey.value, 'appAutomation.recorder.errors.interactionUncertain')
+  assert.deepEqual(calls.releases, [])
+  state.handleRecorderInteractionState({ active: false, context, action: 'tap' })
+})
+
+test('a completed action needing device recovery cancels a deferred lease release', async () => {
+  const device = {
+    id: 45, device_id: 'fixture-device', status: 'online', locked_by: null,
+    maintenance_mode: false, lease_requires_token: false,
+  }
+  const { state, calls } = await loadBuilder(null, { devices: [device] })
+  state.recorderDevices.value = [device]
+  state.recorderDeviceId.value = device.id
+  assert.equal(await state.startRecorder(), true)
+  const context = state.sendRecorderInteraction.getActionContext()
+  state.handleRecorderInteractionState({ active: true, context, action: 'tap' })
+  await state.stopRecorder()
+  assert.ok(state.deferredRecorderRelease.value)
+  assert.ok(state.appendRecorderStep({ step: { action: 'key', key: 'back' }, context }))
+  state.handleRecorderError({ operation: 'interaction', actionOutcome: 'completed', recoveryRequired: true, status: 503 })
+  state.handleRecorderInteractionState({ active: false, context, action: 'tap' })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(state.recorderEnabled.value, false)
+  assert.equal(state.deferredRecorderRelease.value, null)
+  assert.equal(state.scenarioSteps.value.length, 1)
+  assert.equal(state.recorderErrorKey.value, 'appAutomation.recorder.errors.completedNeedsRecovery')
+  assert.deepEqual(calls.releases, [])
 })

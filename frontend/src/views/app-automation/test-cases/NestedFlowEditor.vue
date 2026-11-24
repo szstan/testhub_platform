@@ -141,6 +141,19 @@
                         <div v-else class="nested-flow-empty">
                             {{ $t('appAutomation.sceneBuilder.config.noSchema') }}
                         </div>
+                        <NestedFlowEditor
+                            v-if="hasInlineComponentSteps(element)"
+                            class="nested-inline-component-steps"
+                            :model-value="element.steps"
+                            :label="$t('appAutomation.sceneBuilder.nested.inlineComponentSteps')"
+                            :components="components"
+                            :component-definitions="componentDefinitions"
+                            :field-label="fieldLabel"
+                            :field-options="fieldOptions"
+                            :depth="depth + 1"
+                            :max-depth="maxDepth"
+                            @update:model-value="element.steps = $event"
+                        />
                     </div>
                 </article>
             </template>
@@ -178,6 +191,24 @@ const steps = computed({
 
 const makeId = () => `nested_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 const clone = value => JSON.parse(JSON.stringify(value))
+
+const getComponentDefaultConfig = (component, definition = getDefinition(component)) => {
+    const properties = definition?.schema?.properties || component?.schema?.properties || {}
+    const schemaDefaults = Object.fromEntries(Object.entries(properties)
+        .filter(([, property]) => Object.prototype.hasOwnProperty.call(property || {}, 'default'))
+        .map(([field, property]) => [field, property.default]))
+    const configuredDefaults = {
+        ...(definition?.default_config || {}),
+        ...(definition?.defaultConfig || {}),
+        ...(component?.default_config || {}),
+        ...(component?.defaultConfig || {}),
+    }
+    return clone({ ...schemaDefaults, ...configuredDefaults })
+}
+
+const hasInlineComponentSteps = step => step?.kind === 'custom'
+    && step.version === undefined
+    && Array.isArray(step.steps)
 
 const regenerateStepTreeIds = step => {
     step.id = makeId()
@@ -370,7 +401,7 @@ const addStep = () => {
         name: source.name || source.type,
         ...(source.kind === 'custom' ? { kind: 'custom' } : {}),
         ...(source.version !== undefined ? { version: String(source.version) } : {}),
-        config: clone(source.defaultConfig || source.default_config || def.default_config || {}),
+        config: getComponentDefaultConfig(source, def),
     }
     if (source.kind === 'custom' && source.version === undefined && Array.isArray(source.steps)) {
         step.steps = clone(source.steps)
