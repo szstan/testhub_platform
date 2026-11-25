@@ -18,7 +18,7 @@
             <el-button type="primary" :loading="savingDataset" @click="uploadDataset">{{ t('appAutomation.sceneData.upload') }}</el-button>
           </div>
           <p class="hint">{{ t('appAutomation.sceneData.secretHelp') }}</p>
-          <el-table v-loading="loading" :data="datasets" :empty-text="t('appAutomation.sceneData.emptyDatasets')" size="small">
+          <el-table v-loading="datasetsLoading" :data="datasets" :empty-text="t('appAutomation.sceneData.emptyDatasets')" size="small">
             <el-table-column prop="name" :label="t('appAutomation.sceneData.name')" />
             <el-table-column prop="version" :label="t('appAutomation.sceneData.version')" width="100" />
             <el-table-column prop="row_count" :label="t('appAutomation.sceneData.rows')" width="100" />
@@ -35,7 +35,7 @@
             <el-button type="primary" :loading="savingComponent" @click="saveComponent">{{ t('appAutomation.sceneData.saveVersion') }}</el-button>
           </div>
           <p class="hint">{{ t('appAutomation.sceneData.parameterHelp') }}</p>
-          <el-table v-loading="loading" :data="components" :empty-text="t('appAutomation.sceneData.emptyComponents')" size="small">
+          <el-table v-loading="componentsLoading" :data="components" :empty-text="t('appAutomation.sceneData.emptyComponents')" size="small">
             <el-table-column prop="name" :label="t('appAutomation.sceneData.name')" />
             <el-table-column prop="type" :label="t('appAutomation.sceneData.type')" />
             <el-table-column prop="version" :label="t('appAutomation.sceneData.version')" width="100" />
@@ -68,7 +68,8 @@ const userStore = useUserStore()
 const activeTab = ref('datasets')
 const datasets = ref([])
 const components = ref([])
-const loading = ref(false)
+const datasetsLoading = ref(false)
+const componentsLoading = ref(false)
 const savingDataset = ref(false)
 const savingComponent = ref(false)
 const datasetName = ref('')
@@ -118,30 +119,45 @@ const load = async () => {
   datasets.value = []
   components.value = []
   emit('components-loaded', [])
+  datasetsLoading.value = Boolean(project)
+  componentsLoading.value = Boolean(project)
   if (!project) {
-    loading.value = false
     emitComponentLoadState('not-required', project, identity)
     return
   }
-  loading.value = true
   emitComponentLoadState('loading', project, identity)
-  try {
-    const [datasetResponse, componentResponse] = await Promise.all([
-      getAllSceneDatasets(project), getAllProjectComponents(project),
-    ])
-    if (!isCurrent()) return
-    datasets.value = rowsFrom(datasetResponse)
-    components.value = rowsFrom(componentResponse)
-    emit('components-loaded', components.value)
-    emitComponentLoadState('loaded', project, identity)
-  } catch {
-    if (isCurrent()) {
-      emitComponentLoadState('failed', project, identity)
+  let errorReported = false
+  const reportLoadError = () => {
+    if (isCurrent() && !errorReported) {
+      errorReported = true
       ElMessage.error(t('appAutomation.sceneData.loadFailed'))
     }
-  } finally {
-    if (generation === loadGeneration) loading.value = false
   }
+  const loadDatasets = async () => {
+    try {
+      const response = await getAllSceneDatasets(project)
+      if (isCurrent()) datasets.value = rowsFrom(response)
+    } catch {
+      reportLoadError()
+    } finally {
+      if (generation === loadGeneration) datasetsLoading.value = false
+    }
+  }
+  const loadComponents = async () => {
+    try {
+      const response = await getAllProjectComponents(project)
+      if (!isCurrent()) return
+      components.value = rowsFrom(response)
+      emit('components-loaded', components.value)
+      emitComponentLoadState('loaded', project, identity)
+    } catch {
+      if (isCurrent()) emitComponentLoadState('failed', project, identity)
+      reportLoadError()
+    } finally {
+      if (generation === loadGeneration) componentsLoading.value = false
+    }
+  }
+  await Promise.all([loadDatasets(), loadComponents()])
 }
 
 const selectFile = event => { selectedFile.value = event.target.files?.[0] || null }

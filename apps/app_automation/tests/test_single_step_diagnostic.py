@@ -385,20 +385,23 @@ def test_run_step_locks_case_and_device_in_execution_safe_order(diagnostic_resou
     dispatch.assert_called_once()
 
 
-def test_debug_worker_environment_does_not_require_case_package(monkeypatch):
+def test_bound_worker_environment_does_not_require_package_or_debug_selection(monkeypatch):
     for name in (
         'APP_DEVICE_ID', 'APP_TEST_CASE_ID', 'APP_EXECUTION_ID', 'APP_PACKAGE_NAME',
         'APP_DEBUG_STEP_INDEX', 'APP_DEBUG_CASE_UPDATED_AT',
     ):
         monkeypatch.delenv(name, raising=False)
+    assert not test_app_flow._worker_environment_ready()
     monkeypatch.setenv('APP_DEVICE_ID', 'synthetic-device')
     monkeypatch.setenv('APP_TEST_CASE_ID', '1')
     monkeypatch.setenv('APP_EXECUTION_ID', '2')
-    assert not test_app_flow._worker_environment_ready()
+    assert test_app_flow._worker_environment_ready()
 
     monkeypatch.setenv('APP_DEBUG_STEP_INDEX', '0')
     monkeypatch.setenv('APP_DEBUG_CASE_UPDATED_AT', '2026-01-02T03:04:05+00:00')
     assert test_app_flow._worker_environment_ready()
+    monkeypatch.delenv('APP_DEVICE_ID')
+    assert not test_app_flow._worker_environment_ready()
 
 
 @pytest.mark.django_db

@@ -50,6 +50,48 @@ def test_airtest_base_passes_resolved_adb_path_to_airtest(init_device, tmp_path)
     )
 
 
+def test_app_launch_exception_is_sanitized_and_dispatched_once():
+    airtest_base = AirtestBase.__new__(AirtestBase)
+    airtest_base.is_connected = True
+    start = Mock(side_effect=RuntimeError('private-device-response'))
+    with (
+        patch.object(airtest_base_module, 'start_app', start),
+        patch.object(airtest_base_module.time, 'sleep') as sleep,
+    ):
+        with pytest.raises(RuntimeError, match='result is uncertain') as error:
+            airtest_base.open_app('org.example.app', retry_count=3, retry_interval=0)
+
+    start.assert_called_once_with('org.example.app')
+    sleep.assert_not_called()
+    assert 'private-device-response' not in str(error.value)
+
+
+def test_app_launch_retries_readiness_checks_without_redispatching():
+    airtest_base = AirtestBase.__new__(AirtestBase)
+    airtest_base.is_connected = True
+    start = Mock()
+    airtest_base.is_app_running = Mock(side_effect=[False, False, True])
+    with (
+        patch.object(airtest_base_module, 'start_app', start),
+        patch.object(airtest_base_module.time, 'sleep') as sleep,
+    ):
+        assert airtest_base.open_app('org.example.app', retry_count=3, retry_interval=1)
+
+    start.assert_called_once_with('org.example.app')
+    assert airtest_base.is_app_running.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [2, 1, 2, 1, 2]
+
+
+def test_invalid_package_is_rejected_before_app_launch():
+    airtest_base = AirtestBase.__new__(AirtestBase)
+    airtest_base.is_connected = True
+    with patch.object(airtest_base_module, 'start_app') as start:
+        with pytest.raises(ValueError, match='非法 Android package name'):
+            airtest_base.open_app('not a package')
+
+    start.assert_not_called()
+
+
 def test_preflight_checks_python_packages_adb_and_allure(tmp_path):
     executor = AppTestExecutor(base_path=str(tmp_path))
 

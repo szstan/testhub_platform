@@ -165,7 +165,9 @@ def test_suite_with_unverified_case_is_not_reported_as_passed():
     project = AppProject.objects.create(name='suite verdict', owner=owner)
     first = AppTestCase.objects.create(name='one', project=project, created_by=owner)
     second = AppTestCase.objects.create(name='two', project=project, created_by=owner)
-    suite = AppTestSuite.objects.create(name='suite', project=project, created_by=owner)
+    suite = AppTestSuite.objects.create(
+        name='suite', project=project, created_by=owner, execution_status='running',
+    )
     device = AppDevice.objects.create(device_id='suite-verdict-fixture', status='online')
     device.lock(owner)
     rows = [AppTestExecution.objects.create(test_case=case, test_suite=suite, device=device, user=owner,
@@ -190,7 +192,9 @@ def test_suite_assertion_failure_clears_completed_worker_marker():
     owner = get_user_model().objects.create_user(username='suite-assertion-owner')
     project = AppProject.objects.create(name='suite assertion project', owner=owner)
     case = AppTestCase.objects.create(name='assertion case', project=project, created_by=owner)
-    suite = AppTestSuite.objects.create(name='assertion suite', project=project, created_by=owner)
+    suite = AppTestSuite.objects.create(
+        name='assertion suite', project=project, created_by=owner, execution_status='running',
+    )
     device = AppDevice.objects.create(device_id='suite-assertion-device', status='online')
     device.lock(owner)
     execution = AppTestExecution.objects.create(

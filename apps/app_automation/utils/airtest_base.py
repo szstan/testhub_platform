@@ -15,6 +15,7 @@ import threading
 import queue
 from typing import Optional
 from django.conf import settings
+from .. import screenshot_privacy
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +152,12 @@ class AirtestBase:
                 init_kwargs = {}
                 if self.adb_path:
                     init_kwargs['adb_path'] = self.adb_path
+                screenshot_privacy.enforce_current_device()
                 if uuid:
                     init_device(platform=platform, uuid=uuid, **init_kwargs)
                 else:
                     init_device(platform=platform, **init_kwargs)
+                screenshot_privacy.enforce_current_device()
                 logger.info(f"线程中 init_device() 调用完成")
                 result_queue.put(True)
             except Exception as e:
@@ -227,6 +230,9 @@ class AirtestBase:
         Returns:
             截图路径，失败返回空字符串
         """
+        if screenshot_privacy.persistence_disabled():
+            screenshot_privacy.enforce_current_device()
+            return ""
         if not self.is_device_connected():
             logger.warning("设备未连接，无法截图")
             return ""
@@ -234,7 +240,9 @@ class AirtestBase:
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(self.screenshots_dir, f'{name}_{timestamp}.png')
-            snapshot(filename=screenshot_path)
+            captured, _result = screenshot_privacy.capture_to_file(snapshot, screenshot_path)
+            if not captured:
+                return ""
             logger.info("Screenshot saved")
             return screenshot_path
         except Exception as e:
@@ -249,7 +257,7 @@ class AirtestBase:
 
     def open_app(self, package_name: str, retry_count: int = 3, retry_interval: int = 5) -> bool:
         """
-        启动指定包名的应用，包含智能重试机制
+        启动指定包名的应用，并对启动状态进行有限轮询
         
         Args:
             package_name: 应用包名
@@ -264,32 +272,27 @@ class AirtestBase:
             logger.error("设备未连接，无法启动应用")
             return False
         
+        if retry_count <= 0:
+            logger.error("经过 %s 次状态检查后，启动应用失败", retry_count)
+            return False
+
+        try:
+            logger.info("派发应用启动操作")
+            start_app(package_name)
+        except Exception as e:
+            logger.error("App launch failed (error_type=%s)", type(e).__name__)
+            raise RuntimeError("App launch result is uncertain") from None
+
         for attempt in range(retry_count):
-            try:
-                logger.info(f"尝试启动应用 (尝试 {attempt+1}/{retry_count})")
-                start_app(package_name)
-                
-                # 等待应用启动
-                time.sleep(2)
-                
-                # 验证应用是否真正启动成功
-                if self.is_app_running(package_name):
-                    logger.info("应用已启动")
-                    return True
-                else:
-                    logger.warning("应用启动后未检测到运行状态")
-                
-                if attempt < retry_count - 1:
-                    logger.info(f"{retry_interval}秒后重试启动应用...")
-                    time.sleep(retry_interval)
-                    
-            except Exception as e:
-                logger.error("App launch failed (error_type=%s)", type(e).__name__)
-                if attempt < retry_count - 1:
-                    logger.info(f"{retry_interval}秒后重试启动应用...")
-                    time.sleep(retry_interval)
-        
-        logger.error(f"经过 {retry_count} 次尝试后，启动应用失败")
+            time.sleep(2)
+            if self.is_app_running(package_name):
+                logger.info("应用已启动")
+                return True
+            logger.warning("应用启动后未检测到运行状态")
+            if attempt < retry_count - 1:
+                time.sleep(retry_interval)
+
+        logger.error("经过 %s 次状态检查后，启动应用失败", retry_count)
         return False
     
     def close_app(self, package_name: str) -> bool:

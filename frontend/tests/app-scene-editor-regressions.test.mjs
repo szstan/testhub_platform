@@ -672,3 +672,48 @@ test('project definition load states are tagged and stale project responses are 
   assert.equal(emitted.some(([name, value]) => name === 'components-load-state'
     && value.status === 'loaded' && value.projectId === 8), false)
 })
+
+test('dataset list failure cannot block saving a valid version-pinned project component scene', async () => {
+  const builder = await loadBuilder()
+  builder.state.sceneForm.value.name = 'Project component scene'
+  builder.state.sceneForm.value.project = 8
+  await nextTick()
+  const component = {
+    id: 4, project: 8, name: 'Login', type: 'login_flow', version: '2',
+    schema: { properties: {}, required: [] }, default_config: {},
+  }
+  const panel = await loadSfcSetup('src/views/app-automation/components/SceneDataPanel.vue', {
+    vue: {
+      ...vue,
+      watch: (source, callback, options) => source()[0] == null ? () => {} : vue.watch(source, callback, options),
+      onBeforeUnmount() {},
+    },
+    '@/stores/user': { useUserStore: () => builder.userStore },
+    '@/api/app-scene-data': {
+      createProjectComponent: async () => ({}), uploadSceneDataset: async () => ({}),
+      getAllSceneDatasets: async () => { throw new Error('Invalid scene data pagination metadata: count 1001') },
+      getAllProjectComponents: async () => [component],
+    },
+  })
+  const scope = effectScope()
+  const props = reactive({ projectId: 8, getSteps: () => [] })
+  const state = scope.run(() => panel.component.setup(props, {
+    expose() {},
+    emit: (event, value) => {
+      if (event === 'components-loaded') builder.state.setProjectComponents(value)
+      if (event === 'components-load-state') builder.state.setProjectComponentLoadState(value)
+    },
+  }))
+  instances.push({ dispose: () => { scope.stop(); panel.dispose() } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(plain(state.datasets.value), [])
+  assert.equal(builder.state.projectComponentDefinitionsStatus.value.status, 'loaded')
+  assert.equal(builder.state.projectComponentDefinitions.value['login_flow@2'].version, '2')
+  builder.state.insertProjectComponent(component)
+  await builder.state.saveScene()
+  assert.equal(builder.writes.length, 1)
+  const saved = builder.writes[0].payload.ui_flow[0]
+  assert.equal(saved.type, 'login_flow')
+  assert.equal(saved.version, '2')
+  assert.equal(saved.kind, 'custom')
+})

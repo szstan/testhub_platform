@@ -128,6 +128,106 @@ def release_device_if_idle(device_id, user, generation):
         return release_device_execution_lease(device_id, user, generation)
 
 
+def summarize_app_suite_dispatch(suite_id, *, execution_ids, dispatch_id=''):
+    """Summarize persisted outcomes for one suite dispatch, including stopped rows."""
+    rows = AppTestExecution.objects.filter(
+        pk__in=execution_ids,
+        test_suite_id=suite_id,
+    )
+    if dispatch_id:
+        rows = rows.filter(task_id=dispatch_id)
+    outcomes = list(rows.values_list('status', 'result'))
+    passed = sum(status == 'completed' and result == 'passed' for status, result in outcomes)
+    failed = sum(
+        status == 'error'
+        or (status == 'completed' and result not in {'passed', 'unverified', 'skipped'})
+        for status, result in outcomes
+    )
+    unverified = sum(
+        status == 'completed' and result == 'unverified'
+        for status, result in outcomes
+    )
+    skipped = sum(
+        status == 'stopped' or (status == 'completed' and result == 'skipped')
+        for status, result in outcomes
+    )
+    if failed:
+        result = 'failed'
+    elif unverified or (passed and skipped):
+        result = 'unverified'
+    elif passed:
+        result = 'passed'
+    else:
+        result = 'skipped'
+    return {'result': result, 'passed_count': passed, 'failed_count': failed}
+
+
+def settle_app_suite_if_idle(
+    suite_id,
+    *,
+    execution_ids,
+    dispatch_id='',
+    status,
+    result,
+    passed_count,
+    failed_count,
+    last_run_at=None,
+):
+    """Settle only the latest running suite dispatch after its children are terminal.
+
+    The suite row lock serializes competing terminal updates. The parent records
+    the latest dispatch; older batches retain their own execution rows and must
+    not keep a finished latest dispatch running or overwrite its result.
+    """
+    from .models import AppTestSuite
+
+    batch_ids = set(execution_ids or [])
+    if not batch_ids:
+        return False
+    now = timezone.now()
+    with transaction.atomic():
+        suite = AppTestSuite.objects.select_for_update().filter(pk=suite_id).first()
+        if suite is None or suite.execution_status != 'running':
+            return False
+        latest = AppTestExecution.objects.filter(
+            test_suite_id=suite_id,
+        ).order_by('-created_at', '-pk').values('pk', 'task_id').first()
+        if latest is not None:
+            if dispatch_id:
+                if latest['task_id'] != dispatch_id:
+                    return False
+            elif latest['pk'] not in batch_ids:
+                return False
+        if not AppTestExecution.objects.filter(
+            pk__in=batch_ids,
+            test_suite_id=suite_id,
+            **({'task_id': dispatch_id} if dispatch_id else {}),
+        ).exists():
+            return False
+        active_rows = AppTestExecution.objects.filter(
+            test_suite_id=suite_id,
+            status__in=ACTIVE_EXECUTION_STATUSES,
+        )
+        active_dispatch_id = dispatch_id or (latest['task_id'] if latest else '')
+        if active_dispatch_id:
+            active_rows = active_rows.filter(task_id=active_dispatch_id)
+        else:
+            active_rows = active_rows.filter(pk__in=batch_ids)
+        if active_rows.exists():
+            return False
+        return AppTestSuite.objects.filter(
+            pk=suite_id,
+            execution_status='running',
+        ).update(
+            execution_status=status,
+            execution_result=result,
+            passed_count=passed_count,
+            failed_count=failed_count,
+            last_run_at=last_run_at or now,
+            updated_at=now,
+        ) == 1
+
+
 def claim_app_execution_batch(execution_ids, *, suite_id=None):
     """Claim a durable batch while holding its device row lock, before any I/O."""
     from .device_pool import assert_device_execution_lease

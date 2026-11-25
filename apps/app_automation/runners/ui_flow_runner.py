@@ -17,7 +17,7 @@ import regex as bounded_regex
 from django.conf import settings
 from django.db import transaction
 from ..runtime_config import validate_base_url
-from .. import device_actions, native_locator, secret_input
+from .. import device_actions, native_locator, screenshot_privacy, secret_input
 from ..bounded_inference import BoundedInference, InferenceBusy, InferenceTimeout
 from apps.core.http_transport import guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
@@ -54,6 +54,11 @@ _MAX_RETRY_INTERVAL = 10.0
 _MAX_LOOP_COUNT = 10_000
 _MAX_LOOP_INTERVAL = 300.0
 _MAX_FOREACH_ASSERT_WAIT = 300.0
+_MAX_FOREACH_ASSERT_EXPECTED_ITEMS = 256
+_MAX_FOREACH_ASSERT_EXPECTED_ENTRY_BYTES = 4096
+_MAX_FOREACH_ASSERT_EXPECTED_TOTAL_BYTES = 65_536
+_MAX_FOREACH_ASSERT_IMAGE_BYTES = 16 * 1024 * 1024
+_MAX_FOREACH_ASSERT_IMAGE_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_NATIVE_STATE_PROBE_TIMEOUT = 2.0
 _MAX_IMAGE_LOOKUP_TIMEOUT = 2.0
 _IMAGE_INFERENCE = BoundedInference('app-image-inference')
@@ -246,6 +251,7 @@ class UiFlowRunner:
     
     def _init_context(self, variables: Optional[List[Dict[str, Any]]] = None, runtime: Optional[Dict[str, Any]] = None):
         """初始化上下文"""
+        screenshot_privacy.enforce_current_device()
         self.context = {
             'global': {},
             'local': {},
@@ -1135,8 +1141,13 @@ class UiFlowRunner:
 
     def _capture_screenshot(self, name_prefix: str) -> Optional[str]:
         try:
+            if screenshot_privacy.persistence_disabled():
+                screenshot_privacy.enforce_current_device()
+                return None
             full_path = self._screenshot_path(name_prefix)
-            result = snapshot(filename=full_path)
+            captured, result = screenshot_privacy.capture_to_file(snapshot, full_path)
+            if not captured:
+                return None
             if isinstance(result, dict):
                 path = result.get('screen')
                 if path and os.path.exists(path) and self._is_screenshot_path(path):
@@ -1729,11 +1740,15 @@ class UiFlowRunner:
         )
 
     def _action_snapshot(self, step: Dict[str, Any]):
-        """Capture a screenshot using a generated filename confined to the screenshot directory."""
+        """Capture a screenshot only while persistence is allowed."""
+        if screenshot_privacy.persistence_disabled():
+            screenshot_privacy.enforce_current_device()
+            return
         name = step.get('name', f'snapshot_{int(time.time())}')
         filepath = self._screenshot_path(name)
-        logger.info('Saving screenshot inside screenshot directory')
-        snapshot(filename=filepath)
+        captured, _result = screenshot_privacy.capture_to_file(snapshot, filepath)
+        if captured:
+            logger.info('Saving screenshot inside screenshot directory')
     
     def _action_text(self, step: Dict[str, Any]):
         """Input text without logging the value; sensitive text bypasses Airtest log wrappers."""
@@ -1751,7 +1766,9 @@ class UiFlowRunner:
         return step.get('sensitive') is True or config.get('sensitive') is True
 
     def _enter_sensitive_text(self, value):
-        secret_input.enter_sensitive_text(self._require_device(), value)
+        device = self._require_device()
+        screenshot_privacy.latch(device)
+        secret_input.enter_sensitive_text(device, value)
 
     def _quarantine_execution_device(self):
         execution_id = getattr(self, 'execution_id', None)
@@ -2284,6 +2301,9 @@ class UiFlowRunner:
     
     def _action_input(self, step: Dict[str, Any]):
         """输入文本"""
+        sensitive = self._is_sensitive_input(step)
+        if sensitive:
+            screenshot_privacy.latch(self._require_device())
         target = self._resolve_action_target(self._resolve_selector(step))
         if target is None and (step.get('element_id') or step.get('selector')):
             raise ValueError('输入步骤无法解析已配置的目标元素')
@@ -2297,7 +2317,7 @@ class UiFlowRunner:
             device_actions.clear_focused_input(self._require_device())
 
         logger.info('Executing text input; content is hidden')
-        if self._is_sensitive_input(step):
+        if sensitive:
             self._enter_sensitive_text(value)
         else:
             from apps.core.variable_resolver import resolve_variables
@@ -2889,6 +2909,11 @@ class UiFlowRunner:
             raise RuntimeError('foreach_assert 需要 OCR 支持，请安装 easyocr')
         if not isinstance(expected_list, list) or not expected_list:
             raise ValueError('foreach_assert requires a non-empty expected_list')
+        if len(expected_list) > _MAX_FOREACH_ASSERT_EXPECTED_ITEMS:
+            raise ValueError(
+                f'foreach_assert expected_list must contain at most {_MAX_FOREACH_ASSERT_EXPECTED_ITEMS} entries'
+            )
+
         max_loops = self._validated_loop_integer(
             options.get('max_loops', 5), 'max_loops', 1, _MAX_LOOP_COUNT,
         )
@@ -2898,9 +2923,13 @@ class UiFlowRunner:
         min_match = self._validated_loop_integer(
             min_match_value, 'min_match', 0, max_loops,
         )
+        interval_raw = options.get('interval', 0.5)
+        timeout_raw = options.get('timeout', 5)
+        if any(isinstance(value, str) and len(value) > 64 for value in (interval_raw, timeout_raw)):
+            raise ValueError('foreach_assert interval and timeout must be numeric')
         try:
-            interval = float(options.get('interval', 0.5))
-            timeout = float(options.get('timeout', 5))
+            interval = float(interval_raw)
+            timeout = float(timeout_raw)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError('foreach_assert interval and timeout must be numeric') from exc
         if (
@@ -2912,98 +2941,212 @@ class UiFlowRunner:
             raise ValueError(
                 f'foreach_assert interval and timeout must be from 0 to {_MAX_FOREACH_ASSERT_WAIT} seconds'
             )
+
+        deadline = time.monotonic() + (
+            timeout if timeout > 0 else _MAX_FOREACH_ASSERT_WAIT
+        )
+
+        def check_deadline(phase):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'foreach_assert {phase} exceeded its deadline')
+
+        expected_text = []
+        expected_numbers = []
+        expected_names = []
+        expected_bytes = 0
+        for expected in expected_list:
+            check_deadline('expectation preparation')
+            if assert_type == 'image':
+                if not isinstance(expected, str) or not expected:
+                    raise ValueError('Image expected_list entries must be non-empty filenames')
+                rendered = expected
+            else:
+                if expected is not None and not isinstance(expected, (str, int, float, bool)):
+                    raise ValueError('foreach_assert expected_list entries must be scalar values')
+                try:
+                    rendered = str(expected)
+                except Exception as exc:
+                    raise ValueError('Invalid foreach_assert expected_list entry') from exc
+            if len(rendered) > _MAX_FOREACH_ASSERT_EXPECTED_ENTRY_BYTES:
+                raise ValueError(
+                    f'foreach_assert expected_list entries must be at most '
+                    f'{_MAX_FOREACH_ASSERT_EXPECTED_ENTRY_BYTES} UTF-8 bytes'
+                )
+            try:
+                rendered_bytes = len(rendered.encode('utf-8'))
+            except UnicodeEncodeError as exc:
+                raise ValueError('foreach_assert expected_list entry is invalid') from exc
+            if rendered_bytes > _MAX_FOREACH_ASSERT_EXPECTED_ENTRY_BYTES:
+                raise ValueError(
+                    f'foreach_assert expected_list entries must be at most '
+                    f'{_MAX_FOREACH_ASSERT_EXPECTED_ENTRY_BYTES} UTF-8 bytes'
+                )
+            expected_bytes += rendered_bytes
+            if expected_bytes > _MAX_FOREACH_ASSERT_EXPECTED_TOTAL_BYTES:
+                raise ValueError(
+                    f'foreach_assert expected_list must be at most '
+                    f'{_MAX_FOREACH_ASSERT_EXPECTED_TOTAL_BYTES} UTF-8 bytes'
+                )
+            if assert_type == 'image':
+                expected_names.append(expected)
+            else:
+                expected_text.append(rendered)
+                if assert_type == 'number':
+                    try:
+                        expected_numbers.append(int(rendered.replace(',', '').replace(' ', '')))
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError('Number expected_list entries must be integers') from exc
+
         if assert_type == 'text' and match_mode not in {'exact', 'contains'}:
             raise ValueError(f'Unsupported text match mode: {match_mode}')
         if assert_type == 'text' and match_mode == 'contains' and any(
-            expected is None or (isinstance(expected, str) and expected == '')
-            for expected in expected_list
+            expected is None or rendered == ''
+            for expected, rendered in zip(expected_list, expected_text)
         ):
             raise ValueError('foreach_assert text contains expected entries must be non-empty')
+
+        def validate_threshold(value, label):
+            if isinstance(value, str) and len(value) > 64:
+                raise ValueError(f'{label} must be a number from 0 to 1')
+            try:
+                threshold_value = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f'{label} must be a number from 0 to 1') from exc
+            if not math.isfinite(threshold_value) or not 0 <= threshold_value <= 1:
+                raise ValueError(f'{label} must be a number from 0 to 1')
+            return threshold_value
+
+        expected_image_scope = None
+        expected_image_threshold = None
+        if assert_type == 'image':
+            expected_image_scope = options.get('expected_image_scope') or options.get('image_scope', 'common')
+            expected_image_threshold = validate_threshold(
+                options.get('expected_image_threshold', options.get('image_threshold', 0.7)),
+                'foreach_assert expected_image_threshold',
+            )
 
         click_config = {
             'selector_type': options.get('click_selector_type', 'image'),
             'selector': options.get('click_selector'),
             'image_scope': options.get('image_scope', 'common'),
-            'image_threshold': options.get('image_threshold', 0.7),
+            'image_threshold': validate_threshold(
+                options.get('image_threshold', 0.7), 'foreach_assert image_threshold',
+            ),
         }
-        click_target = self._resolve_selector(click_config)
-        if click_target is None:
-            raise ValueError('foreach_assert requires a valid click_selector')
-
+        check_deadline('preparation')
+        if click_config['selector_type'] == 'image' and click_config['selector']:
+            click_path = self._safe_image_path(
+                click_config['image_scope'], click_config['selector'],
+            )
+            if os.path.isfile(click_path):
+                try:
+                    click_size = os.path.getsize(click_path)
+                except OSError as exc:
+                    raise ValueError('Click image does not exist') from exc
+                if click_size > _MAX_FOREACH_ASSERT_IMAGE_BYTES:
+                    raise ValueError('Click image exceeds the foreach_assert size limit')
+                check_deadline('template preparation')
         matcher = None
-        ocr_region = None
         if assert_type == 'image':
-            image_scope = options.get('expected_image_scope') or options.get('image_scope', 'common')
-            threshold = options.get('expected_image_threshold', options.get('image_threshold', 0.7))
+            threshold = expected_image_threshold
             expected_images = []
-            for expected in expected_list:
-                if not isinstance(expected, str) or not expected:
-                    raise ValueError('Image expected_list entries must be non-empty filenames')
-                image_path = self._safe_image_path(image_scope, expected)
+            image_bytes = 0
+            for expected in expected_names:
+                check_deadline('template preparation')
+                image_path = self._safe_image_path(expected_image_scope, expected)
                 if not os.path.isfile(image_path):
                     raise ValueError('Expected image does not exist')
+                try:
+                    image_size = os.path.getsize(image_path)
+                except OSError as exc:
+                    raise ValueError('Expected image does not exist') from exc
+                if image_size > _MAX_FOREACH_ASSERT_IMAGE_BYTES:
+                    raise ValueError('Expected image exceeds the foreach_assert size limit')
+                image_bytes += image_size
+                if image_bytes > _MAX_FOREACH_ASSERT_IMAGE_TOTAL_BYTES:
+                    raise ValueError('Expected images exceed the foreach_assert total size limit')
+                check_deadline('template preparation')
                 expected_images.append(Template(image_path, threshold=threshold))
+                check_deadline('template preparation')
 
-            def match_image(deadline):
+            def match_image(match_deadline):
                 for target in expected_images:
-                    remaining = deadline - time.monotonic()
+                    remaining = match_deadline - time.monotonic()
                     if remaining <= 0:
                         return False
-                    if self._image_lookup_once(
+                    result = self._image_lookup_once(
                         target, timeout=min(_MAX_IMAGE_LOOKUP_TIMEOUT, remaining),
-                    ) is not None:
+                    )
+                    if time.monotonic() >= match_deadline:
+                        return False
+                    if result is not None:
                         return True
                 return False
 
             matcher = match_image
         else:
-            if not OCR_AVAILABLE:
-                raise RuntimeError('Text/number foreach_assert requires OCR support')
             selector = options.get('ocr_selector')
             if options.get('ocr_selector_type', 'region') != 'region' or not selector:
                 raise ValueError('Text/number foreach_assert requires an OCR region selector')
-            if isinstance(selector, str):
-                parts = [int(part.strip()) for part in selector.split(',')]
-                if len(parts) != 4:
-                    raise ValueError(f'Invalid OCR region: {selector}')
-                ocr_region = tuple(parts)
-            elif isinstance(selector, (list, tuple)) and len(selector) >= 4:
-                ocr_region = tuple(int(value) for value in selector[:4])
-            else:
-                raise ValueError(f'Invalid OCR region: {selector}')
-
-            if assert_type == 'text' and match_mode not in {'exact', 'contains'}:
-                raise ValueError(f'Unsupported text match mode: {match_mode}')
+            if isinstance(selector, str) and (
+                len(selector) > 256 or len(selector.encode('utf-8')) > 256
+            ):
+                raise ValueError('Invalid OCR region')
+            ocr_region = self._parse_ocr_region({
+                'ocr_selector': selector, 'ocr_selector_type': 'region',
+            })
+            if ocr_region[0] < 0 or ocr_region[1] < 0 or ocr_region[2] <= ocr_region[0] or ocr_region[3] <= ocr_region[1]:
+                raise ValueError('Invalid OCR region')
+            check_deadline('OCR preparation')
             ocr = self._get_ocr_helper()
+            check_deadline('OCR preparation')
+            recognize = (
+                ocr.recognize_region_number if assert_type == 'number'
+                else ocr.recognize_region_text
+            )
+            if not callable(recognize):
+                raise RuntimeError('foreach_assert OCR helper is unavailable')
 
-            def match_ocr_value(deadline):
-                actual = (
-                    ocr.recognize_region_number(ocr_region, deadline=deadline)
-                    if assert_type == 'number'
-                    else ocr.recognize_region_text(ocr_region, deadline=deadline)
-                )
-                for expected in expected_list:
-                    if assert_type == 'number':
-                        try:
-                            expected_value = int(str(expected).replace(',', '').replace(' ', ''))
-                        except (TypeError, ValueError) as exc:
-                            raise ValueError('Number expected_list entries must be integers') from exc
+            def match_ocr_value(match_deadline):
+                if time.monotonic() >= match_deadline:
+                    return False
+                actual = recognize(ocr_region, deadline=match_deadline)
+                if time.monotonic() >= match_deadline:
+                    return False
+                if assert_type == 'number':
+                    for expected_value in expected_numbers:
+                        if time.monotonic() >= match_deadline:
+                            return False
                         if actual == expected_value:
                             return True
-                    elif (
-                        (match_mode == 'exact' and str(actual) == str(expected))
-                        or (match_mode == 'contains' and str(expected) in str(actual))
-                    ):
-                        return True
+                else:
+                    actual_text = str(actual)
+                    if time.monotonic() >= match_deadline:
+                        return False
+                    for expected_value in expected_text:
+                        if time.monotonic() >= match_deadline:
+                            return False
+                        if (
+                            (match_mode == 'exact' and actual_text == expected_value)
+                            or (match_mode == 'contains' and expected_value in actual_text)
+                        ):
+                            return True
                 return False
 
             matcher = match_ocr_value
 
+        check_deadline('preparation')
+        # Validate expectations before a native selector can read the device.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('foreach_assert preparation exceeded its deadline')
+        click_config['timeout'] = min(5.0, remaining)
+        click_target = self._resolve_selector(click_config)
+        check_deadline('preparation')
+        if click_target is None:
+            raise ValueError('foreach_assert requires a valid click_selector')
         matched_count = 0
         # A zero timeout keeps count-driven behavior under the same hard deadline.
-        deadline = time.monotonic() + (
-            timeout if timeout > 0 else _MAX_FOREACH_ASSERT_WAIT
-        )
         for index in range(max_loops):
             remaining = deadline - time.monotonic()
             # Avoid another click when its settling interval cannot fit.

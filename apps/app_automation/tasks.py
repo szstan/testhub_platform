@@ -159,8 +159,8 @@ def settle_undispatched_app_executions(
     release_device_lease=False,
 ):
     """Fail an unclaimed publish and release only the lease it acquired."""
-    from .models import AppDevice, AppTestExecution, AppTestSuite
-    from .execution_admission import release_device_if_idle
+    from .models import AppDevice, AppTestExecution
+    from .execution_admission import release_device_if_idle, settle_app_suite_if_idle
 
     execution_ids = list(dict.fromkeys(execution_ids or []))
     now = timezone.now()
@@ -193,15 +193,18 @@ def settle_undispatched_app_executions(
                 finished_at=now,
                 updated_at=now,
             )
-            if suite_id:
-                suite_executions = AppTestExecution.objects.filter(test_suite_id=suite_id)
-                AppTestSuite.objects.filter(pk=suite_id).update(
-                    execution_status='error',
-                    execution_result=None,
+            if suite_id and settled_count:
+                suite_executions = AppTestExecution.objects.filter(
+                    test_suite_id=suite_id, pk__in=execution_ids,
+                )
+                settle_app_suite_if_idle(
+                    suite_id,
+                    execution_ids=execution_ids,
+                    status='error',
+                    result=None,
                     passed_count=suite_executions.filter(status='completed', result='passed').count(),
                     failed_count=suite_executions.filter(status='error').count() or settled_count,
                     last_run_at=now,
-                    updated_at=now,
                 )
             if release_device_lease and device_id is not None and lease_owner is not None:
                 release_device_if_idle(device_id, lease_owner, lease_generation)
@@ -815,7 +818,9 @@ def execute_app_suite_task(
         mark_device_action_pending,
         release_device_if_idle,
         settle_app_execution_failure,
+        settle_app_suite_if_idle,
         start_next_app_execution,
+        summarize_app_suite_dispatch,
     )
     from .executors.test_executor import (
         AppTestExecutor,
@@ -1087,21 +1092,25 @@ def execute_app_suite_task(
 
         cancel_check()
         if suite:
-            suite.execution_status = 'completed'
             if failed:
-                suite.execution_result = 'failed'
+                suite_result = 'failed'
             elif unverified or (passed and skipped):
-                suite.execution_result = 'unverified'
+                suite_result = 'unverified'
             elif passed:
-                suite.execution_result = 'passed'
+                suite_result = 'passed'
             else:
-                suite.execution_result = 'skipped'
-            suite.passed_count = passed
-            suite.failed_count = failed
-            suite.last_run_at = timezone.now()
-            suite.save(update_fields=[
-                'execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'
-            ])
+                suite_result = 'skipped'
+            settle_app_suite_if_idle(
+                suite.pk,
+                execution_ids=execution_ids,
+                dispatch_id=dispatch_id,
+                status='completed',
+                result=suite_result,
+                passed_count=passed,
+                failed_count=failed,
+                last_run_at=timezone.now(),
+            )
+            suite.refresh_from_db()
             logger.info('套件执行完成: 通过: %s, 失败: %s', passed, failed)
         else:
             logger.info('APP批量执行完成: 通过 %s, 失败 %s', passed, failed)
@@ -1150,14 +1159,29 @@ def execute_app_suite_task(
                 result=None,
             )
         if suite and settled_ids and not unsafe_termination:
-            suite.execution_status = 'error'
-            suite.execution_result = None
-            suite.failed_count = max(failed, len(settled_ids))
-            suite.passed_count = passed
-            suite.last_run_at = timezone.now()
-            suite.save(update_fields=[
-                'execution_status', 'execution_result', 'passed_count', 'failed_count', 'last_run_at'
-            ])
+            settled_statuses = list(
+                AppTestExecution.objects.filter(pk__in=settled_ids)
+                .values_list('status', flat=True)
+            )
+            cooperative_cancel = bool(settled_statuses) and all(
+                status == 'stopped' for status in settled_statuses
+            )
+            suite_summary = summarize_app_suite_dispatch(
+                suite.pk,
+                execution_ids=[item.pk for item in executions],
+                dispatch_id=dispatch_id,
+            )
+            settle_app_suite_if_idle(
+                suite.pk,
+                execution_ids=[item.pk for item in executions],
+                dispatch_id=dispatch_id,
+                status='completed' if cooperative_cancel else 'error',
+                result=suite_summary['result'] if cooperative_cancel else None,
+                passed_count=suite_summary['passed_count'],
+                failed_count=suite_summary['failed_count'],
+                last_run_at=timezone.now(),
+            )
+            suite.refresh_from_db()
 
         if scheduled_task_id and scheduler_lease_token and not unsafe_termination:
             try:

@@ -11,13 +11,30 @@ from apps.app_automation.runners import ui_flow_runner as flow_module
 from apps.app_automation.runners.ui_flow_runner import UiFlowRunner
 
 
+@pytest.fixture(autouse=True)
+def isolate_screenshot_privacy_state(monkeypatch):
+    from airtest.core import api as airtest_api
+    from airtest.core import cv as airtest_cv
+    from apps.app_automation import screenshot_privacy
+
+    monkeypatch.setattr(screenshot_privacy, '_persistence_disabled', False)
+    monkeypatch.setattr(airtest_api.ST, 'SAVE_IMAGE', airtest_api.ST.SAVE_IMAGE)
+    monkeypatch.setattr(airtest_api, 'try_log_screen', airtest_api.try_log_screen)
+    monkeypatch.setattr(airtest_cv, 'try_log_screen', airtest_cv.try_log_screen)
+
+
 class FakeDevice:
     def __init__(self, resolution=(101, 201)):
         self.adb = object()
         self.resolution = resolution
+        self.snapshot_calls = []
 
     def get_current_resolution(self):
         return self.resolution
+
+    def snapshot(self, filename=None, **kwargs):
+        self.snapshot_calls.append(filename)
+        return b'fake-screen-bytes'
 
 
 def make_runner(tmp_path, *, execution_id=None):
@@ -593,3 +610,172 @@ def test_pre_device_validation_failure_clears_worker_marker():
     clear_marker.assert_called_once_with(77)
     fake_airtest.open_app.assert_not_called()
     runner.assert_not_called()
+
+
+def test_worker_gate_requires_explicit_bindings_but_not_package(monkeypatch):
+    from apps.app_automation.tests import test_app_flow
+
+    required = ('APP_DEVICE_ID', 'APP_TEST_CASE_ID', 'APP_EXECUTION_ID')
+    for name in (*required, 'APP_PACKAGE_NAME'):
+        monkeypatch.delenv(name, raising=False)
+    assert not test_app_flow._worker_environment_ready()
+
+    for name in required:
+        monkeypatch.setenv(name, f'fixture-{name.lower()}')
+    assert test_app_flow._worker_environment_ready()
+
+    monkeypatch.delenv('APP_EXECUTION_ID')
+    assert not test_app_flow._worker_environment_ready()
+
+
+def test_empty_package_worker_still_executes_scene_steps(tmp_path):
+    from apps.app_automation.tests import test_app_flow
+
+    case = SimpleNamespace(
+        pk=1,
+        name='flow case',
+        app_package=None,
+        ui_flow=[{'type': 'assert_value', 'left': 1, 'operator': '==', 'right': 1}],
+        variables=[],
+        runtime_config={},
+    )
+    execution = SimpleNamespace(pk=77, dataset=None, user=None)
+    execution_query = SimpleNamespace(get=Mock(return_value=execution))
+    fake_airtest = SimpleNamespace(open_app=Mock())
+    runner = make_runner(tmp_path)
+    clear_marker = Mock()
+
+    with (
+        patch.object(test_app_flow.AppTestCase.objects, 'get', return_value=case),
+        patch.object(test_app_flow.AppTestExecution.objects, 'select_related', return_value=execution_query),
+        patch.object(test_app_flow, 'prepare_scene_execution', return_value=(case.ui_flow, [])),
+        patch.object(test_app_flow, '_clear_device_action_marker', clear_marker),
+        patch.object(test_app_flow, '_make_progress_callback', return_value=None),
+        patch.object(test_app_flow, 'UiFlowRunner', return_value=runner),
+        patch.object(test_app_flow.allure.dynamic, 'title'),
+        patch.object(test_app_flow.allure.dynamic, 'suite'),
+        patch.object(test_app_flow.allure, 'attach'),
+    ):
+        test_app_flow.TestAppFlow().test_execute_ui_flow(
+            1, '', 77, fake_airtest, 'fixture-user',
+        )
+
+    fake_airtest.open_app.assert_not_called()
+    assert runner._assertions_executed == 1
+    assert runner.runtime['stop_on_error'] is True
+    assert 'package_name' not in runner.runtime
+    clear_marker.assert_called_once_with(77)
+
+
+def test_sensitive_input_latches_airtest_and_explicit_screenshot_persistence(
+    tmp_path, monkeypatch,
+):
+    from airtest.core import api as airtest_api
+    from airtest.core import cv as airtest_cv
+    from airtest.utils.logwraper import Logwrap
+    from apps.app_automation import screenshot_privacy
+    from apps.app_automation.utils import airtest_base as airtest_base_module
+    from apps.app_automation.utils.airtest_base import AirtestBase
+
+    monkeypatch.setattr(screenshot_privacy, '_persistence_disabled', False)
+    monkeypatch.setattr(airtest_api, 'try_log_screen', airtest_api.try_log_screen)
+    monkeypatch.setattr(airtest_cv, 'try_log_screen', airtest_cv.try_log_screen)
+    monkeypatch.setattr(airtest_api.ST, 'SAVE_IMAGE', True)
+    monkeypatch.setattr(airtest_api.ST, 'LOG_DIR', str(tmp_path))
+    device = FakeDevice()
+    monkeypatch.setattr(flow_module, 'G', SimpleNamespace(DEVICE=device))
+    monkeypatch.setattr(airtest_api, 'G', SimpleNamespace(DEVICE=device))
+    monkeypatch.setattr(airtest_base_module, 'G', SimpleNamespace(DEVICE=device))
+    dispatched = []
+
+    def enter_sensitive_text(_device, value):
+        assert screenshot_privacy.persistence_disabled()
+        assert airtest_api.ST.SAVE_IMAGE is False
+        dispatched.append(value)
+
+    monkeypatch.setattr(flow_module.secret_input, 'enter_sensitive_text', enter_sensitive_text)
+    runner = make_runner(tmp_path)
+
+    with (
+        patch.object(flow_module, 'ALLURE_AVAILABLE', True),
+        patch.object(flow_module.allure, 'attach') as attach,
+    ):
+        result = runner.run([
+            {'type': 'text', 'value': 'private-screen-fixture', 'sensitive': True},
+            {'type': 'assert_value', 'left': 1, 'operator': '==', 'right': 2},
+        ], runtime={'retry_times': 0})
+        runner._action_snapshot({'name': 'after-sensitive-input'})
+        assert runner._capture_screenshot('ordinary-failure') is None
+        attach.file.assert_not_called()
+
+    assert result['failed'] == 1
+    assert dispatched == ['private-screen-fixture']
+    assert not list(tmp_path.glob('*.png'))
+
+    airtest_api.ST.SAVE_IMAGE = True
+    explicit_path = tmp_path / 'airtest-explicit.png'
+    airtest_api.snapshot(filename=str(explicit_path))
+    assert not explicit_path.exists()
+    assert device.snapshot_calls == [None]
+
+    base = AirtestBase.__new__(AirtestBase)
+    base.screenshots_dir = str(tmp_path)
+    base.is_connected = True
+    assert base.screenshot('after-sensitive-input') == ''
+    assert device.snapshot_calls == [None]
+
+    next_runner = make_runner(tmp_path)
+    next_runner._init_context(runtime={'retry_times': 0})
+    next_runner._action_snapshot({'name': 'after-runner-reinitialization'})
+    before_auto_capture = len(device.snapshot_calls)
+
+    def automatic_operation(snapshot=False):
+        return None
+
+    log = SimpleNamespace(running_stack=[], log=Mock())
+    Logwrap(automatic_operation, log)(snapshot=True)
+    assert airtest_api.ST.SAVE_IMAGE is False
+    assert len(device.snapshot_calls) == before_auto_capture
+    assert device.snapshot() == b'fake-screen-bytes'
+    assert not list(tmp_path.glob('*.png'))
+    assert 'private-screen-fixture' not in str(attach.call_args)
+
+
+def test_unknown_app_launch_result_keeps_device_marker(tmp_path):
+    from apps.app_automation import device_actions
+    from apps.app_automation.tests import test_app_flow
+    from apps.app_automation.utils import airtest_base as airtest_base_module
+    from apps.app_automation.utils.airtest_base import AirtestBase
+
+    case = SimpleNamespace(
+        pk=1, name='flow case', app_package='org.example.app',
+        ui_flow=[], variables=[], runtime_config={},
+    )
+    execution = SimpleNamespace(pk=77, dataset=None, user=None)
+    execution_query = SimpleNamespace(get=Mock(return_value=execution))
+    airtest = AirtestBase.__new__(AirtestBase)
+    airtest.is_connected = True
+    start = Mock(side_effect=RuntimeError('private-device-response'))
+    clear_marker = Mock()
+    clear_safe_failure = Mock()
+
+    with (
+        patch.object(test_app_flow.AppTestCase.objects, 'get', return_value=case),
+        patch.object(test_app_flow.AppTestExecution.objects, 'select_related', return_value=execution_query),
+        patch.object(test_app_flow, 'prepare_scene_execution', return_value=([], [])),
+        patch.object(test_app_flow, '_clear_device_action_marker', clear_marker),
+        patch.object(test_app_flow, '_clear_device_action_marker_on_safe_failure', clear_safe_failure),
+        patch.object(airtest_base_module, 'start_app', start),
+        patch.object(airtest_base_module.time, 'sleep') as sleep,
+        patch.object(test_app_flow.allure.dynamic, 'title'),
+        patch.object(test_app_flow.allure.dynamic, 'suite'),
+        pytest.raises(device_actions.DeviceActionUncertainError),
+    ):
+        test_app_flow.TestAppFlow().test_execute_ui_flow(
+            1, 'org.example.app', 77, airtest, 'fixture-user',
+        )
+
+    start.assert_called_once_with('org.example.app')
+    sleep.assert_not_called()
+    clear_marker.assert_not_called()
+    clear_safe_failure.assert_not_called()

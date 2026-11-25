@@ -326,6 +326,7 @@ def test_foreach_assert_does_not_count_a_late_match(runner, monkeypatch, assert_
     monkeypatch.setattr(flow_module, 'OCR_AVAILABLE', True)
     monkeypatch.setattr(runner, '_resolve_selector', Mock(return_value=(1, 1)))
     monkeypatch.setattr(flow_module.os.path, 'isfile', lambda _path: True)
+    monkeypatch.setattr(flow_module.os.path, 'getsize', lambda _path: 1)
     monkeypatch.setattr(flow_module, 'Template', lambda *_args, **_kwargs: object())
     touch = Mock()
     monkeypatch.setattr(flow_module, 'touch', touch)

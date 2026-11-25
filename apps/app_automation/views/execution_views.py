@@ -113,6 +113,35 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
                         status__in=['pending', 'running'],
                     )
                 active_rows = list(rows.order_by('pk'))
+                active_ids = {item.pk for item in active_rows}
+                authorized_ids = set(scope_executions(
+                    AppTestExecution.objects.filter(pk__in=active_ids), request.user
+                ).values_list('pk', flat=True))
+                if authorized_ids != active_ids:
+                    return Response({
+                        'success': False,
+                        'message': '无权停止该批次中的全部执行记录',
+                    }, status=status.HTTP_403_FORBIDDEN)
+
+                suite_execution_ids = set(active_ids)
+                if current.test_suite_id:
+                    suite_rows = AppTestExecution.objects.filter(
+                        test_suite_id=current.test_suite_id,
+                    )
+                    if current.task_id:
+                        suite_rows = suite_rows.filter(task_id=current.task_id)
+                    else:
+                        suite_rows = suite_rows.filter(pk=current.pk)
+                    suite_execution_ids = set(suite_rows.values_list('pk', flat=True))
+                    suite_authorized_ids = set(scope_executions(
+                        AppTestExecution.objects.filter(pk__in=suite_execution_ids), request.user
+                    ).values_list('pk', flat=True))
+                    if suite_authorized_ids != suite_execution_ids:
+                        return Response({
+                            'success': False,
+                            'message': '无权停止该批次中的全部执行记录',
+                        }, status=status.HTTP_403_FORBIDDEN)
+
                 running_rows = [item for item in active_rows if item.status == 'running']
                 pending_rows = [item for item in active_rows if item.status == 'pending']
                 now = timezone.now()
@@ -124,6 +153,27 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
                 for item in running_rows:
                     item.stop_requested = True
                     item.save(update_fields=['stop_requested', 'updated_at'])
+
+                if current.test_suite_id and pending_rows and not running_rows:
+                    from ..execution_admission import (
+                        settle_app_suite_if_idle,
+                        summarize_app_suite_dispatch,
+                    )
+                    suite_summary = summarize_app_suite_dispatch(
+                        current.test_suite_id,
+                        execution_ids=suite_execution_ids,
+                        dispatch_id=current.task_id,
+                    )
+                    settle_app_suite_if_idle(
+                        current.test_suite_id,
+                        execution_ids=suite_execution_ids,
+                        dispatch_id=current.task_id,
+                        status='completed',
+                        result=suite_summary['result'],
+                        passed_count=suite_summary['passed_count'],
+                        failed_count=suite_summary['failed_count'],
+                        last_run_at=now,
+                    )
 
                 if (
                     not running_rows

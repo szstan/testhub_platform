@@ -44,6 +44,7 @@ async function loadSceneDataApi(request) {
 async function setupPanel(api, { projectId = 8, userStore = vue.reactive({
   user: { id: 7 }, generation: 1, getSessionGeneration() { return this.generation },
 }) } = {}) {
+  const unmountCallbacks = []
   const loaded = await loadSfcSetup('src/views/app-automation/components/SceneDataPanel.vue', {
     vue: {
       ...vue,
@@ -53,7 +54,7 @@ async function setupPanel(api, { projectId = 8, userStore = vue.reactive({
           ? () => {}
           : watch(source, callback, options)
       },
-      onBeforeUnmount: () => {},
+      onBeforeUnmount: callback => unmountCallbacks.push(callback),
     },
     '@/api/app-scene-data': {
       createProjectComponent: async () => ({ data: {} }),
@@ -66,10 +67,15 @@ async function setupPanel(api, { projectId = 8, userStore = vue.reactive({
   const props = vue.reactive({ projectId, getSteps: () => [{ type: 'wait', config: { timeout: 1 } }] })
   const scope = effectScope()
   const state = scope.run(() => loaded.component.setup(props, { expose() {}, emit: (...args) => emitted.push(args) }))
-  instances.push({ dispose: () => { scope.stop(); loaded.dispose() } })
+  const dispose = () => {
+    unmountCallbacks.forEach(callback => callback())
+    scope.stop()
+    loaded.dispose()
+  }
+  instances.push({ dispose })
   await nextTick()
   await new Promise(resolve => setImmediate(resolve))
-  return { state, emitted, props, userStore, loaded, messages: loaded.messages }
+  return { state, emitted, props, userStore, loaded, dispose, messages: loaded.messages }
 }
 
 test('project panel uploads a bounded file and emits project versions without resolving secrets', async () => {
@@ -283,14 +289,63 @@ test('panel discards responses from prior projects and accounts', async () => {
   assert.ok(calls.every(([, project]) => project === 8 || project === 9))
 })
 
-test('panel clears list and reports pagination failures instead of showing partial data', async () => {
+test('dataset pagination failure preserves independently loaded component definitions', async () => {
+  const api = await loadSceneDataApi(async config => ({ data: config.url.endsWith('/scene-datasets/')
+    ? { count: 1001, next: '/ignored', results: [] }
+    : { count: 1, next: null, results: [{ id: 1, type: 'login_flow', version: '1' }] } }))
+  const panel = await setupPanel(api)
+  assert.deepEqual(plain(panel.state.datasets.value), [])
+  assert.deepEqual(plain(panel.state.components.value), [{ id: 1, type: 'login_flow', version: '1' }])
+  assert.ok(panel.emitted.some(([name, value]) => name === 'components-load-state' && value.status === 'loaded'))
+  assert.equal(panel.emitted.some(([name, value]) => name === 'components-load-state' && value.status === 'failed'), false)
+  assert.ok(panel.messages.some(message => message.type === 'error' && message.text === 'appAutomation.sceneData.loadFailed'))
+})
+
+test('component load completes while dataset request remains pending', async () => {
+  const dataset = deferred()
   const panel = await setupPanel({
-    getAllSceneDatasets: async () => { throw new Error('page limit') },
+    getAllSceneDatasets: () => dataset.promise,
     getAllProjectComponents: async () => [{ id: 1 }],
   })
+  assert.deepEqual(plain(panel.state.components.value), [{ id: 1 }])
+  assert.equal(panel.state.componentsLoading.value, false)
+  assert.equal(panel.state.datasetsLoading.value, true)
+  assert.ok(panel.emitted.some(([name, value]) => name === 'components-load-state' && value.status === 'loaded'))
+  dataset.reject(new Error('late dataset failure'))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(plain(panel.state.components.value), [{ id: 1 }])
+  assert.equal(panel.state.datasetsLoading.value, false)
+  assert.equal(panel.emitted.some(([name, value]) => name === 'components-load-state' && value.status === 'failed'), false)
+})
+
+test('component failure keeps successful datasets and reports component failure truthfully', async () => {
+  const panel = await setupPanel({
+    getAllSceneDatasets: async () => [{ id: 2 }],
+    getAllProjectComponents: async () => { throw new Error('component failed') },
+  })
+  assert.deepEqual(plain(panel.state.datasets.value), [{ id: 2 }])
+  assert.deepEqual(plain(panel.state.components.value), [])
+  assert.ok(panel.emitted.some(([name, value]) => name === 'components-load-state' && value.status === 'failed'))
+  assert.equal(panel.state.datasetsLoading.value, false)
+  assert.equal(panel.state.componentsLoading.value, false)
+})
+
+test('unmount suppresses both independent responses and late failure feedback', async () => {
+  const dataset = deferred()
+  const component = deferred()
+  const panel = await setupPanel({
+    getAllSceneDatasets: () => dataset.promise,
+    getAllProjectComponents: () => component.promise,
+  })
+  panel.dispose()
+  const emittedBefore = panel.emitted.length
+  dataset.reject(new Error('late failure'))
+  component.resolve([{ id: 'late' }])
+  await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(plain(panel.state.datasets.value), [])
   assert.deepEqual(plain(panel.state.components.value), [])
-  assert.ok(panel.messages.some(message => message.type === 'error' && message.text === 'appAutomation.sceneData.loadFailed'))
+  assert.equal(panel.emitted.length, emittedBefore)
+  assert.deepEqual(panel.messages, [])
 })
 
 test('dataset selector ignores older project and account responses', async () => {

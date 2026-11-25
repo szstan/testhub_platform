@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,6 +13,18 @@ from apps.app_automation.views.test_case_views import AppTestCaseViewSet
 from apps.users.models import User
 
 
+@pytest.fixture(autouse=True)
+def isolate_privacy_latch_for_taint_unit_tests(monkeypatch):
+    from airtest.core import api as airtest_api, cv as airtest_cv
+    from apps.app_automation import screenshot_privacy
+
+    monkeypatch.setattr(screenshot_privacy, '_persistence_disabled', False)
+    monkeypatch.setattr(airtest_api.ST, 'SAVE_IMAGE', airtest_api.ST.SAVE_IMAGE)
+    for module, name in ((airtest_api, 'snapshot'), (airtest_api, 'try_log_screen'),
+                         (airtest_cv, 'try_log_screen')):
+        monkeypatch.setattr(module, name, getattr(module, name))
+
+
 class JsonResponse:
     status_code = 200
     headers = {'Content-Type': 'application/json'}
@@ -23,6 +36,7 @@ class JsonResponse:
 def _runner():
     runner = object.__new__(UiFlowRunner)
     runner._init_context([], {})
+    runner._require_device = Mock(return_value=SimpleNamespace(snapshot=lambda **_kwargs: b'fake-screen'))
     runner._load_custom_component_defs = lambda: {}
     return runner
 
@@ -128,6 +142,7 @@ def test_legacy_global_component_sensitive_schema_rejects_literal_and_protects_r
     prepared, variables = prepare_scene_execution(case, execution)
     runner = object.__new__(UiFlowRunner)
     runner._init_context(variables, {})
+    runner._require_device = Mock(return_value=SimpleNamespace(snapshot=lambda **_kwargs: b'fake-screen'))
     protected = Mock()
     ordinary = Mock()
     runner._enter_sensitive_text = protected

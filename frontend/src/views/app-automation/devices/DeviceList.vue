@@ -335,6 +335,8 @@ const emptyText = ref(t('appAutomation.device.emptyText'))
 const refreshTimer = ref(null)
 let disposed = false
 let deviceLoadGeneration = 0
+let deviceLoadPromise = null
+let deviceReloadRequested = false
 
 const remoteDeviceForm = ref({
   ip_address: '',
@@ -356,42 +358,70 @@ const remoteDeviceRules = computed(() => ({
 }))
 
 // 方法
-const getDevices = async () => {
-  if (disposed || loading.value) return
+const captureDeviceSession = () => ({
+  userId: userStore.user?.id ?? userStore.user?.pk ?? null,
+  sessionGeneration: userStore.getSessionGeneration?.()
+})
+
+const isDeviceSessionCurrent = session => !disposed
+  && String(userStore.user?.id ?? userStore.user?.pk ?? null) === String(session.userId)
+  && userStore.getSessionGeneration?.() === session.sessionGeneration
+
+const getDevices = () => {
+  if (disposed) return Promise.resolve(false)
+  deviceReloadRequested = true
+  if (deviceLoadPromise) return deviceLoadPromise
   const generation = ++deviceLoadGeneration
-  const userId = userStore.user?.id ?? userStore.user?.pk ?? null
-  const sessionGeneration = userStore.getSessionGeneration?.()
-  const current = () => !disposed && generation === deviceLoadGeneration
-    && String(userStore.user?.id ?? userStore.user?.pk ?? null) === String(userId)
-    && userStore.getSessionGeneration?.() === sessionGeneration
   loading.value = true
-  try {
-    const rows = await getAllAppDevices()
-    if (!current()) return
-    devices.value = rows
-    if (devices.value.length === 0) {
-      emptyText.value = t('appAutomation.device.emptyText')
+  // Share one drain promise so mutation callers wait for the queued fresh read.
+  deviceLoadPromise = Promise.resolve().then(async () => {
+    let loaded = false
+    try {
+      while (deviceReloadRequested && !disposed) {
+        deviceReloadRequested = false
+        const session = captureDeviceSession()
+        const current = () => generation === deviceLoadGeneration && isDeviceSessionCurrent(session)
+        loaded = false
+        try {
+          const rows = await getAllAppDevices()
+          if (!current()) continue
+          devices.value = rows
+          if (devices.value.length === 0) {
+            emptyText.value = t('appAutomation.device.emptyText')
+          }
+          loaded = true
+        } catch (error) {
+          if (!current()) continue
+          console.error('获取设备列表失败:', error)
+          ElMessage.error(t('appAutomation.device.messages.loadFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
+        }
+      }
+      return loaded
+    } finally {
+      deviceLoadPromise = null
+      if (generation === deviceLoadGeneration) loading.value = false
     }
-  } catch (error) {
-    if (!current()) return
-    console.error('获取设备列表失败:', error)
-    ElMessage.error(t('appAutomation.device.messages.loadFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
-  } finally {
-    if (generation === deviceLoadGeneration) loading.value = false
-  }
+  })
+  return deviceLoadPromise
 }
 
 const refreshDevices = async () => {
+  if (disposed || refreshing.value) return
+  const session = captureDeviceSession()
   refreshing.value = true
   try {
     const res = await discoverDevices()
+    if (!isDeviceSessionCurrent(session)) return
     if (res.data.success) {
-      await getDevices()
-      ElMessage.success(res.data.message || t('appAutomation.device.messages.refreshedSuccess'))
+      const loaded = await getDevices()
+      if (loaded && isDeviceSessionCurrent(session)) {
+        ElMessage.success(res.data.message || t('appAutomation.device.messages.refreshedSuccess'))
+      }
     } else {
       ElMessage.error(res.data.message || t('appAutomation.device.messages.refreshFailed'))
     }
   } catch (error) {
+    if (!isDeviceSessionCurrent(session)) return
     console.error('刷新设备列表失败:', error)
     ElMessage.error(t('appAutomation.device.messages.refreshFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
@@ -711,9 +741,9 @@ const isRemoteDevice = (type) => {
 onMounted(() => {
   getDevices()
 
-  // 30秒自动刷新设备列表
+  // 30秒自动刷新设备列表，不延长正在等待发现结果的刷新队列
   refreshTimer.value = setInterval(() => {
-    getDevices()
+    if (!loading.value) getDevices()
   }, 30000)
 })
 

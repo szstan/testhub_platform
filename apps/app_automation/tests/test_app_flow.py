@@ -25,12 +25,7 @@ from apps.app_automation.scene_execution import (
 
 def _worker_environment_ready():
     required = ('APP_DEVICE_ID', 'APP_TEST_CASE_ID', 'APP_EXECUTION_ID')
-    if not all(os.environ.get(name) for name in required):
-        return False
-    debug_requested = any(name in os.environ for name in (
-        'APP_DEBUG_STEP_INDEX', 'APP_DEBUG_CASE_UPDATED_AT'
-    ))
-    return debug_requested or bool(os.environ.get('APP_PACKAGE_NAME'))
+    return all(os.environ.get(name) for name in required)
 
 
 # The production worker selects this marker explicitly; security boundary tests

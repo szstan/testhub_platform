@@ -9,6 +9,18 @@ from apps.app_automation.runners import ui_flow_runner as flow_module
 from apps.app_automation.runners.ui_flow_runner import UiFlowRunner
 
 
+@pytest.fixture(autouse=True)
+def isolate_screenshot_privacy_state(monkeypatch):
+    from airtest.core import api as airtest_api
+    from airtest.core import cv as airtest_cv
+    from apps.app_automation import screenshot_privacy
+
+    monkeypatch.setattr(screenshot_privacy, '_persistence_disabled', False)
+    monkeypatch.setattr(airtest_api.ST, 'SAVE_IMAGE', airtest_api.ST.SAVE_IMAGE)
+    monkeypatch.setattr(airtest_api, 'try_log_screen', airtest_api.try_log_screen)
+    monkeypatch.setattr(airtest_cv, 'try_log_screen', airtest_cv.try_log_screen)
+
+
 class FakeDevice:
     pass
 
@@ -191,6 +203,7 @@ def test_zero_min_match_keeps_legacy_loop_but_does_not_count_as_business_asserti
         patch.object(runner, '_resolve_selector', return_value=(1, 1)),
         patch.object(runner, '_safe_image_path', return_value=str(tmp_path / 'expected.png')),
         patch.object(flow_module.os.path, 'isfile', return_value=True),
+        patch.object(flow_module.os.path, 'getsize', return_value=1),
         patch.object(flow_module, 'Template', return_value='expected-template'),
         patch.object(runner, '_image_lookup_once', return_value=(4, 5)),
         patch.object(flow_module, 'touch') as touch,

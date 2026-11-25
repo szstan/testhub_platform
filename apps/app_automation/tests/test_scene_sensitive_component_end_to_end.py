@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +18,18 @@ from apps.app_automation.scene_sensitive_flow import (
 )
 from apps.app_automation.views.test_case_views import AppTestCaseViewSet
 from apps.users.models import User
+
+
+@pytest.fixture(autouse=True)
+def isolate_privacy_latch_for_component_unit_tests(monkeypatch):
+    from airtest.core import api as airtest_api, cv as airtest_cv
+    from apps.app_automation import screenshot_privacy
+
+    monkeypatch.setattr(screenshot_privacy, '_persistence_disabled', False)
+    monkeypatch.setattr(airtest_api.ST, 'SAVE_IMAGE', airtest_api.ST.SAVE_IMAGE)
+    for module, name in ((airtest_api, 'snapshot'), (airtest_api, 'try_log_screen'),
+                         (airtest_cv, 'try_log_screen')):
+        monkeypatch.setattr(module, name, getattr(module, name))
 
 
 @pytest.fixture
@@ -113,6 +126,7 @@ def test_nested_component_forwarding_preserves_schema_taint_for_secure_input_pat
     expanded, variables = prepare_scene_execution(case, execution)
     runner = object.__new__(UiFlowRunner)
     runner._init_context(variables, {})
+    runner._require_device = Mock(return_value=SimpleNamespace(snapshot=lambda **_kwargs: b'fake-screen'))
     protected_input = Mock()
     ordinary_input = Mock()
     runner._enter_sensitive_text = protected_input
@@ -360,6 +374,7 @@ def test_sensitive_parent_parameter_reaches_only_matching_nested_inputs(
 
     runner = object.__new__(UiFlowRunner)
     runner._init_context(variables, {})
+    runner._require_device = Mock(return_value=SimpleNamespace(snapshot=lambda **_kwargs: b'fake-screen'))
     protected_input = Mock()
     ordinary_input = Mock()
     runner._enter_sensitive_text = protected_input
