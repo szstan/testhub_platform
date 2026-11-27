@@ -20,21 +20,53 @@ from urllib3.exceptions import (
     NewConnectionError,
 )
 
+from urllib3.util import parse_url
+
 from apps.core.network import UnsafeOutboundURL, resolve_outbound_addresses
+
+
+def _normalize_hostname(hostname):
+    """Normalize DNS names to Requests/urllib3's ASCII IDNA representation."""
+    value = str(hostname or '').strip().strip('[]').rstrip('.')
+    if not value:
+        raise UnsafeOutboundURL('目标主机格式非法')
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+
+    try:
+        prepared_url = requests.Request('GET', f'http://{value}/').prepare().url
+        parsed = parse_url(prepared_url)
+    except (requests.RequestException, UnicodeError, ValueError) as exc:
+        raise UnsafeOutboundURL('目标主机格式非法') from exc
+    if (not parsed.host or parsed.auth is not None or parsed.port is not None
+            or parsed.path not in (None, '/')):
+        raise UnsafeOutboundURL('目标主机格式非法')
+    try:
+        parsed.host.encode('ascii')
+    except UnicodeEncodeError as exc:
+        raise UnsafeOutboundURL('目标主机 IDNA 格式非法') from exc
+    return parsed.host.lower().rstrip('.')
 
 
 class _PinnedConnectionMixin:
     def __init__(self, *args, pinned_addresses=None, pinned_host=None,
                  allow_private=False, **kwargs):
         self._pinned_addresses = tuple(pinned_addresses) if pinned_addresses is not None else None
-        self._pinned_host = str(pinned_host or '').strip('[]').lower().rstrip('.')
+        self._pinned_host = pinned_host
         self._allow_private = allow_private
         super().__init__(*args, **kwargs)
 
     def _new_conn(self):
         try:
-            hostname = str(self._dns_host).strip('[]').lower().rstrip('.')
-            if self._pinned_addresses is not None and hostname == self._pinned_host:
+            if self._pinned_addresses is not None:
+                hostname = _normalize_hostname(self._dns_host)
+                pinned_host = _normalize_hostname(self._pinned_host)
+                if hostname != pinned_host:
+                    raise UnsafeOutboundURL('固定目标主机与连接主机不匹配')
+                if not self._pinned_addresses:
+                    raise UnsafeOutboundURL('固定目标地址列表为空')
                 numeric_addresses = []
                 for pinned in self._pinned_addresses:
                     try:
@@ -119,13 +151,20 @@ class _PinnedHTTPAdapter(HTTPAdapter):
         }
 
     def _pin_pool(self, pool, url):
-        if (self.pinned_addresses is not None
-                and httpx.URL(url).host.lower().rstrip('.') == self.pinned_host.lower().rstrip('.')):
-            pool.conn_kw.update(
-                pinned_addresses=self.pinned_addresses,
-                pinned_host=self.pinned_host,
-                allow_private=self.allow_private,
-            )
+        if self.pinned_addresses is None:
+            return pool
+        if not self.pinned_addresses:
+            raise UnsafeOutboundURL('固定目标地址列表为空')
+        request_host = _normalize_hostname(httpx.URL(url).host)
+        pool_host = _normalize_hostname(getattr(pool, 'host', None))
+        pinned_host = _normalize_hostname(self.pinned_host)
+        if request_host != pinned_host or pool_host != pinned_host:
+            raise UnsafeOutboundURL('固定目标主机与请求主机不匹配')
+        pool.conn_kw.update(
+            pinned_addresses=self.pinned_addresses,
+            pinned_host=pinned_host,
+            allow_private=self.allow_private,
+        )
         return pool
 
     def get_connection(self, url, proxies=None):
@@ -195,8 +234,10 @@ def guarded_request(method, url, *, allow_private=False, pinned_addresses=None, 
         raise ValueError("Guarded Requests do not allow explicit proxies")
 
     parsed_host = httpx.URL(url).host
-    if pinned_addresses is not None and not pinned_addresses:
-        raise ValueError("pinned_addresses must contain at least one address")
+    if pinned_addresses is not None:
+        if not pinned_addresses:
+            raise ValueError("pinned_addresses must contain at least one address")
+        parsed_host = _normalize_hostname(parsed_host)
 
     with requests.Session() as session:
         session.trust_env = False

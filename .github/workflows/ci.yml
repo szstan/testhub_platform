@@ -343,9 +343,25 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: npm --prefix frontend run test:interface-management-pagination
 
+      - name: Test UI project date handling (Asia/Shanghai)
+        working-directory: ${{ github.workspace }}
+        env:
+          TZ: Asia/Shanghai
+        run: npm --prefix frontend run test:ui-project-base-url
+
+      - name: Test UI project date handling (America/Los_Angeles)
+        working-directory: ${{ github.workspace }}
+        env:
+          TZ: America/Los_Angeles
+        run: npm --prefix frontend run test:ui-project-base-url
+
       - name: Test UI automation workbench
         working-directory: ${{ github.workspace }}
         run: npm --prefix frontend run test:ui-workbench
+
+      - name: Test APP automation authoring and execution
+        working-directory: ${{ github.workspace }}
+        run: node --test --test-concurrency=1 frontend/tests/app-*.test.mjs
 
       - name: Lint frontend
         run: npm run lint
@@ -359,10 +375,6 @@ jobs:
           python-version: '3.12'
 
       - name: Run release integrity regressions with frontend dependencies
-      - name: Test APP automation authoring and execution
-        working-directory: ${{ github.workspace }}
-        run: node --test --test-concurrency=1 frontend/tests/app-*.test.mjs
-
         working-directory: ${{ github.workspace }}
         run: |
           python -m pip install pytest==8.4.1

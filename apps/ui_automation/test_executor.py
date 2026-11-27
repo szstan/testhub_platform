@@ -7,15 +7,16 @@ import time
 import json
 from datetime import datetime
 from django.utils import timezone
-from django.conf import settings
 from django.db import connection
-from apps.core.browser_proxy import create_guarded_selenium_driver
-from apps.core.network import (
-    configure_selenium_network_guard,
-    guard_playwright_route_sync,
-    validate_outbound_url,
-)
+from apps.core.browser_proxy import GuardedBrowserProxy
+from apps.core.network import guard_playwright_route_sync
 from apps.core.scheduler import ScheduleClaimLost
+from .network_policy import (
+    create_ui_guarded_selenium_driver as create_guarded_selenium_driver,
+    get_ui_network_policy,
+    playwright_launch_network_options,
+    validate_ui_outbound_url,
+)
 from playwright.sync_api import sync_playwright
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -372,7 +373,8 @@ class TestExecutor:
                 case_execution.status = 'running'
                 case_execution.save()
 
-                # 为每个测试用例启动新的浏览器实例
+                browser = None
+                network_proxy = None
                 try:
                     # 公共浏览器参数
                     common_args = [
@@ -381,32 +383,34 @@ class TestExecutor:
                         '--allow-insecure-localhost',  # 允许不安全localhost
                         '--disable-web-security',  # 禁用web安全限制（跨域）
                     ]
-                    # 选择浏览器
+                    policy = get_ui_network_policy()
+                    network_proxy = GuardedBrowserProxy(
+                        allowed_private_cidrs=policy['allowed_private_cidrs'],
+                    ).start()
+                    launch_options = playwright_launch_network_options(self.browser, network_proxy.url)
+                    launch_options['headless'] = self.headless
+                    launch_args = common_args + launch_options.pop('args', [])
+                    launch_options['args'] = launch_args
+
                     if self.browser == 'firefox':
-                        browser = p.firefox.launch(headless=self.headless, args=common_args)
+                        browser_launcher = p.firefox
                     elif self.browser == 'safari':
-                        browser = p.webkit.launch(headless=self.headless, args=common_args)
-                    else:  # chrome or edge
-                        # 添加防检测参数
-                        browser = p.chromium.launch(
-                            headless=self.headless,
-                            args=common_args
-                        )
+                        browser_launcher = p.webkit
+                    else:
+                        browser_launcher = p.chromium
+                    browser = browser_launcher.launch(**launch_options)
 
                     print(f"✓ 浏览器已启动")
 
                     # 配置上下文（User Agent 和 Viewport）
                     self.context = browser.new_context(
                         viewport={'width': 1920, 'height': 1080},
-                        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+                        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+                        service_workers='block',
                     )
                     self.context.route(
                         '**/*',
-                        lambda route: guard_playwright_route_sync(
-                            route,
-                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
-                        ),
+                        lambda route: guard_playwright_route_sync(route, **policy),
                     )
                     self.current_page = self.context.new_page()
 
@@ -420,10 +424,8 @@ class TestExecutor:
                             is_linux = platform.system() == 'Linux'
 
                             # Validate immediately before the browser request.
-                            safe_base_url = validate_outbound_url(
+                            safe_base_url = validate_ui_outbound_url(
                                 self.test_suite.project.base_url,
-                                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
                             )
                             self._check_cancelled()
                             self.current_page.goto(safe_base_url, wait_until='networkidle',
@@ -455,8 +457,6 @@ class TestExecutor:
                                 status='failed',
                                 error_message=f"导航到基础URL失败: {str(e)}",
                             )
-                            browser.close()
-                            print(f"✓ 浏览器已关闭")
                             continue
 
                     # 执行测试用例（不再传递page参数，使用self.current_page）
@@ -518,12 +518,18 @@ class TestExecutor:
                     case_execution.save()
 
                 finally:
-                    # 确保每个用例执行后都关闭浏览器
                     try:
-                        browser.close()
-                        print(f"✓ 浏览器已关闭\n")
-                    except:
+                        if browser is not None:
+                            browser.close()
+                            print(f"✓ 浏览器已关闭\n")
+                    except BaseException:
                         pass
+                    finally:
+                        if network_proxy is not None:
+                            try:
+                                network_proxy.close()
+                            except BaseException:
+                                pass
 
         # 注意：每个用例的执行记录已在执行过程中实时更新，不需要在这里统一更新
 
@@ -1603,19 +1609,13 @@ class TestExecutor:
                         is_linux = platform.system() == 'Linux'
 
                         # Validate immediately before the browser request.
-                        safe_base_url = validate_outbound_url(
+                        safe_base_url = validate_ui_outbound_url(
                             self.test_suite.project.base_url,
-                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
                         )
                         self._check_cancelled()
                         driver.get(safe_base_url)
                         final_url = getattr(driver, 'current_url', safe_base_url) or safe_base_url
-                        validate_outbound_url(
-                            final_url,
-                            allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                                       getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
-                        )
+                        validate_ui_outbound_url(final_url)
 
                         # 等待页面基本加载完成
                         # 在服务器环境（特别是无头模式）需要更长的等待时间
@@ -1767,8 +1767,7 @@ class TestExecutor:
             full_error = f"{error_msg}\n\n💡 安装命令（macOS）：{tip}" if tip else error_msg
             raise Exception(full_error)
 
-        allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                    getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+        allow_private = False
         if self.browser == 'chrome':
             options = ChromeOptions()
             if self.headless:
@@ -1932,8 +1931,14 @@ class TestExecutor:
                 webdriver.Chrome, options, browser_type='chrome', allow_private=allow_private, service=service
             )
 
-        driver.implicitly_wait(3)
-        configure_selenium_network_guard(driver, allow_private=allow_private)
+        try:
+            driver.implicitly_wait(3)
+        except BaseException:
+            try:
+                driver.quit()
+            except BaseException:
+                pass
+            raise
         return driver
 
     def execute_test_case_selenium_no_db(self, driver, case_data):

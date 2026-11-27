@@ -84,7 +84,7 @@
     
     <!-- 创建项目对话框 -->
     <el-dialog v-model="showCreateDialog" :title="$t('uiAutomation.project.createProject')" width="min(500px, calc(100vw - 32px))" :close-on-click-modal="false">
-      <el-form ref="createFormRef" :model="createForm" :rules="formRules" label-width="80px">
+      <el-form ref="createFormRef" :model="createForm" :rules="createFormRules" label-width="80px">
         <el-form-item :label="$t('uiAutomation.project.projectName')" prop="name">
           <el-input v-model="createForm.name" :placeholder="$t('uiAutomation.project.rules.nameRequired')" />
         </el-form-item>
@@ -98,20 +98,21 @@
             <el-option :label="$t('uiAutomation.status.completed')" value="COMPLETED" />
           </el-select>
         </el-form-item>
-        <el-form-item label="基础URL" prop="base_url">
-          <el-input 
-            v-model="createForm.base_url" 
-            placeholder="请输入基础URL（如：https://www.example.com）"
+        <el-form-item :label="$t('uiAutomation.project.baseUrl')" prop="base_url">
+          <el-input
+            v-model="createForm.base_url"
+            :placeholder="$t('uiAutomation.project.baseUrlPlaceholder')"
+            @input="handleCreateUrlInput"
           >
             <template #prepend>
-              <el-select v-model="urlProtocol" placeholder="协议" style="width: 100px">
+              <el-select v-model="urlProtocol" :placeholder="$t('uiAutomation.project.urlProtocol')" style="width: 100px">
                 <el-option label="https://" value="https://" />
                 <el-option label="http://" value="http://" />
               </el-select>
             </template>
           </el-input>
           <div style="color: #909399; font-size: 12px; margin-top: 4px;">
-            提示：请输入完整的URL地址，包含协议（http:// 或 https://）
+            {{ $t('uiAutomation.project.baseUrlHint') }}
           </div>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.project.startDate')" prop="start_date">
@@ -131,7 +132,7 @@
     
     <!-- 编辑项目对话框 -->
     <el-dialog v-model="showEditDialog" :title="$t('uiAutomation.project.editProject')" width="500px" :close-on-click-modal="false">
-      <el-form ref="editFormRef" :model="editForm" :rules="formRules" label-width="80px">
+      <el-form ref="editFormRef" :model="editForm" :rules="editFormRules" label-width="80px">
         <el-form-item :label="$t('uiAutomation.project.projectName')" prop="name">
           <el-input v-model="editForm.name" :placeholder="$t('uiAutomation.project.rules.nameRequired')" />
         </el-form-item>
@@ -145,20 +146,21 @@
             <el-option :label="$t('uiAutomation.status.completed')" value="COMPLETED" />
           </el-select>
         </el-form-item>
-        <el-form-item label="基础URL" prop="base_url">
-          <el-input 
-            v-model="editForm.base_url" 
-            placeholder="请输入基础URL（如：https://www.example.com）"
+        <el-form-item :label="$t('uiAutomation.project.baseUrl')" prop="base_url">
+          <el-input
+            v-model="editForm.base_url"
+            :placeholder="$t('uiAutomation.project.baseUrlPlaceholder')"
+            @input="handleEditUrlInput"
           >
             <template #prepend>
-              <el-select v-model="editUrlProtocol" placeholder="协议" style="width: 100px">
+              <el-select v-model="editUrlProtocol" :placeholder="$t('uiAutomation.project.urlProtocol')" style="width: 100px">
                 <el-option label="https://" value="https://" />
                 <el-option label="http://" value="http://" />
               </el-select>
             </template>
           </el-input>
           <div style="color: #909399; font-size: 12px; margin-top: 4px;">
-            提示：请输入完整的URL地址，包含协议（http:// 或 https://）
+            {{ $t('uiAutomation.project.baseUrlHint') }}
           </div>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.project.startDate')" prop="start_date">
@@ -265,38 +267,95 @@ const editForm = reactive({
   end_date: null
 })
 
-// 表单验证规则
-const formRules = computed(() => ({
+// 粘贴完整 URL 时同步协议选择，避免界面显示重复的协议。
+const syncUrlInput = (value, form, protocol) => {
+  const match = (value || '').match(/^\s*(https?:\/\/)/i)
+  if (match) {
+    protocol.value = match[1].toLowerCase()
+    form.base_url = value.slice(match[0].length)
+  }
+}
+
+const handleCreateUrlInput = value => syncUrlInput(value, createForm, urlProtocol)
+const handleEditUrlInput = value => syncUrlInput(value, editForm, editUrlProtocol)
+
+const completeUrlPattern = /^[a-z][a-z0-9+.-]*:\/\/[^/\s?#]+/i
+const protocolLessHostWithPortPattern = /^(?:\[[\da-f:.]+\]|[a-z\d.-]+):\d+(?:[/?#]|$)/i
+const knownProtocolNames = new Set(['http', 'https', 'ftp', 'ws', 'wss', 'file', 'ssh', 'smtp', 'tcp', 'udp'])
+
+const hasMalformedExplicitScheme = value => {
+  const trimmed = (value || '').trim()
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(trimmed)
+  if (!scheme || completeUrlPattern.test(trimmed)) return false
+  if (knownProtocolNames.has(scheme[1].toLowerCase())) return true
+  return !protocolLessHostWithPortPattern.test(trimmed)
+}
+
+// Keep complete URLs as entered, reject incomplete schemes, and prefix host-only inputs.
+const buildBaseUrl = (value, protocol) => {
+  const trimmed = (value || '').trim()
+  if (!trimmed) return ''
+  return completeUrlPattern.test(trimmed) || hasMalformedExplicitScheme(trimmed)
+    ? trimmed
+    : protocol + trimmed
+}
+
+const makeFormRules = protocol => ({
   name: [
     { required: true, message: t('uiAutomation.project.rules.nameRequired'), trigger: 'blur' },
     { min: 2, max: 200, message: t('uiAutomation.project.rules.nameLength'), trigger: 'blur' }
   ],
   base_url: [
-    { required: true, message: '请输入基础URL', trigger: 'blur' },
-    { 
+    { required: true, message: t('uiAutomation.project.rules.baseUrlRequired'), trigger: 'blur' },
+    {
       validator: (rule, value, callback) => {
-        if (!value) {
-          callback(new Error('请输入基础URL'))
-        } else if (!value.startsWith('http://') && !value.startsWith('https://')) {
-          callback(new Error('URL必须以 http:// 或 https:// 开头'))
-        } else {
-          // 简单的URL格式验证
-          try {
-            new URL(value)
-            callback()
-          } catch (e) {
-            callback(new Error('请输入有效的URL格式'))
-          }
+        const trimmed = (value || '').trim()
+        if (hasMalformedExplicitScheme(trimmed)) {
+          callback(new Error(t('uiAutomation.project.rules.baseUrlMalformedProtocol')))
+          return
         }
-      }, 
-      trigger: 'blur' 
+        const baseUrl = buildBaseUrl(trimmed, protocol.value)
+        if (!baseUrl) {
+          callback(new Error(t('uiAutomation.project.rules.baseUrlRequired')))
+          return
+        }
+        // Django URLField limits the complete URL, including the selected protocol, to 200 characters.
+        if (Array.from(baseUrl).length > 200) {
+          callback(new Error(t('uiAutomation.project.rules.baseUrlLength')))
+          return
+        }
+        try {
+          const parsed = new URL(baseUrl)
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            callback(new Error(t('uiAutomation.project.rules.baseUrlHttpOnly')))
+          } else if (parsed.username || parsed.password || /^(?:https?):\/\/[^/?#]*@/i.test(baseUrl)) {
+            callback(new Error(t('uiAutomation.project.rules.baseUrlNoCredentials')))
+          } else {
+            callback()
+          }
+        } catch (e) {
+          callback(new Error(t('uiAutomation.project.rules.baseUrlInvalid')))
+        }
+      },
+      trigger: 'blur'
     }
   ]
-}))
+})
+
+const createFormRules = computed(() => makeFormRules(urlProtocol))
+const editFormRules = computed(() => makeFormRules(editUrlProtocol))
 
 // 格式化日期
 const formatDate = (row, column, cellValue) => {
   if (!cellValue) return ''
+  const dateOnly = typeof cellValue === 'string' && /^(\d{4})-(\d{2})-(\d{2})$/.exec(cellValue)
+  if (dateOnly) {
+    return new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3])).toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    })
+  }
   return new Date(cellValue).toLocaleString('zh-CN', {
     year: 'numeric',
     month: '2-digit',
@@ -396,6 +455,14 @@ const goToProjectDetail = (id) => {
   }
 }
 
+// API date-only values represent calendar days, not UTC timestamps.
+const parseProjectDate = date => {
+  if (!date) return null
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!match) return new Date(date)
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+}
+
 // 编辑项目
 const editProject = (project) => {
   currentEditId.value = project.id
@@ -405,9 +472,11 @@ const editProject = (project) => {
     description: project.description,
     status: project.status,
     base_url: project.base_url,
-    start_date: project.start_date ? new Date(project.start_date) : null,
-    end_date: project.end_date ? new Date(project.end_date) : null
+    start_date: parseProjectDate(project.start_date),
+    end_date: parseProjectDate(project.end_date)
   })
+  editUrlProtocol.value = 'https://'
+  syncUrlInput(editForm.base_url, editForm, editUrlProtocol)
   showEditDialog.value = true
 }
 
@@ -433,13 +502,24 @@ const deleteProject = async (id) => {
 // 导入用户store
 import { useUserStore } from '@/stores/user'
 
+const getProjectSaveErrorMessage = (error, fallback) => {
+  const response = error?.response?.data || {}
+  const baseUrlError = Array.isArray(response.base_url) ? response.base_url[0] : response.base_url
+  const messages = [baseUrlError, response.detail].filter(message => typeof message === 'string')
+  if (messages.some(message => /受限网络|restricted network/i.test(message))) {
+    return t('uiAutomation.project.messages.baseUrlRestrictedNetwork')
+  }
+  return messages[0] || fallback
+}
+
 // 日期格式化辅助函数
 const formatDateToISO = (date) => {
   if (!date) return null
-  // 确保是Date对象
   const d = new Date(date)
-  // 格式化为YYYY-MM-DD格式
-  return d.toISOString().split('T')[0]
+  const year = d.getFullYear()
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 // 处理创建项目
@@ -463,16 +543,10 @@ const createProject = async () => {
       await userStore.fetchProfile()
     }
     
-    // 确保 base_url 包含协议
-    let baseUrl = createForm.base_url.trim()
-    if (baseUrl && !baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
-      baseUrl = urlProtocol.value + baseUrl
-    }
-    
     // 创建包含owner字段的项目数据，并格式化日期字段
     const projectData = {
       ...createForm,
-      base_url: baseUrl,
+      base_url: buildBaseUrl(createForm.base_url, urlProtocol.value),
       owner: userStore.user.id,  // 添加owner字段，值为当前登录用户ID
       // 格式化日期为YYYY-MM-DD格式
       start_date: formatDateToISO(createForm.start_date),
@@ -497,7 +571,7 @@ const createProject = async () => {
     
     if (!(continueSetup && projectId)) loadProjects()
   } catch (error) {
-    ElMessage.error(error.response?.data?.base_url?.[0] || error.response?.data?.detail || '项目创建失败')
+    ElMessage.error(getProjectSaveErrorMessage(error, t('uiAutomation.project.messages.createFailed')))
     console.error('创建项目失败:', error)
   }
 }
@@ -508,16 +582,10 @@ const handleEdit = async () => {
   if (!validate) return
   
   try {
-    // 确保 base_url 包含协议
-    let baseUrl = editForm.base_url.trim()
-    if (baseUrl && !baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
-      baseUrl = editUrlProtocol.value + baseUrl
-    }
-    
     // 创建包含格式化日期字段的项目数据
     const projectData = {
       ...editForm,
-      base_url: baseUrl,
+      base_url: buildBaseUrl(editForm.base_url, editUrlProtocol.value),
       // 格式化日期为YYYY-MM-DD格式
       start_date: formatDateToISO(editForm.start_date),
       end_date: formatDateToISO(editForm.end_date)
@@ -528,7 +596,7 @@ const handleEdit = async () => {
     showEditDialog.value = false
     loadProjects()
   } catch (error) {
-    ElMessage.error(error.response?.data?.base_url?.[0] || error.response?.data?.detail || '项目更新失败')
+    ElMessage.error(getProjectSaveErrorMessage(error, t('uiAutomation.project.messages.updateFailed')))
     console.error('更新项目失败:', error)
   }
 }

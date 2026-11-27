@@ -11,10 +11,10 @@ from .models import (
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from .access import project_accessible, is_ui_admin, selenium_compatibility_enabled
-
 from .execution_summary import INTERNAL_SUITE_EXECUTION_ERROR, public_case_diagnostics, public_execution_evidence, public_suite_error
 
-from apps.core.network import UnsafeOutboundURL, validate_outbound_url
+from apps.core.network import UnsafeOutboundURL
+from .network_policy import validate_ui_outbound_url
 
 
 def _serializer_user(serializer):
@@ -71,11 +71,7 @@ class UiProjectCreateSerializer(serializers.ModelSerializer):
 
     def validate_base_url(self, value):
         try:
-            return validate_outbound_url(
-                value,
-                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
-            )
+            return validate_ui_outbound_url(value)
         except UnsafeOutboundURL as exc:
             raise serializers.ValidationError(str(exc)) from exc
 
@@ -87,11 +83,7 @@ class UiProjectUpdateSerializer(serializers.ModelSerializer):
 
     def validate_base_url(self, value):
         try:
-            return validate_outbound_url(
-                value,
-                allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                           getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
-            )
+            return validate_ui_outbound_url(value)
         except UnsafeOutboundURL as exc:
             raise serializers.ValidationError(str(exc)) from exc
 

@@ -727,6 +727,10 @@ PERF_FORBIDDEN_HOSTS = [
 ]
 # Internal/loopback targets are denied by default. Test environments may opt in explicitly.
 PERF_ALLOW_PRIVATE_TARGETS = config('PERF_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
+UI_ALLOW_PRIVATE_TARGETS = config(
+    'UI_ALLOW_PRIVATE_TARGETS', default=False, cast=bool,
+)
+UI_ALLOWED_PRIVATE_CIDRS = config('UI_ALLOWED_PRIVATE_CIDRS', default='', cast=parse_csv)
 MONITOR_ALLOW_PRIVATE_TARGETS = config('MONITOR_ALLOW_PRIVATE_TARGETS', default=False, cast=bool)
 
 # 数据保留策略

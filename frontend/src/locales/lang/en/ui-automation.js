@@ -146,6 +146,9 @@ export default {
     projectName: 'Project Name',
     projectDesc: 'Description',
     baseUrl: 'Base URL',
+    baseUrlPlaceholder: 'Enter an address (e.g. example.com/admin/)',
+    baseUrlHint: 'Choose a protocol and enter an address, or paste a full URL including its protocol.',
+    urlProtocol: 'Protocol',
     owner: 'Owner',
     startDate: 'Start Date',
     endDate: 'End Date',
@@ -160,6 +163,10 @@ export default {
       nameRequired: 'Please enter project name',
       nameLength: 'Project name must be 2-200 characters',
       baseUrlRequired: 'Please enter base URL',
+      baseUrlMalformedProtocol: 'The URL must include a complete protocol (http:// or https://).',
+      baseUrlHttpOnly: 'The URL must start with http:// or https://.',
+      baseUrlNoCredentials: 'The URL must not include a username or password.',
+      baseUrlLength: 'The base URL must not exceed 200 characters.',
       baseUrlInvalid: 'Please enter a valid URL',
       selectStatus: 'Please select project status'
     },
@@ -170,6 +177,7 @@ export default {
       createFailed: 'Failed to create project',
       updateSuccess: 'Project updated successfully',
       updateFailed: 'Failed to update project',
+      baseUrlRestrictedNetwork: 'This address cannot currently be used for testing. Use a publicly accessible website address, or contact your administrator to ask whether access can be enabled.',
       deleteConfirm: 'Are you sure to delete this project? This action cannot be undone.',
       deleteSuccess: 'Project deleted successfully',
       deleteFailed: 'Failed to delete project'

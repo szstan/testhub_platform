@@ -1,4 +1,5 @@
 """Test settings shared by the core and upstream feature suites."""
+from decouple import config
 from backend.settings import *  # noqa: F401,F403
 
 SECRET_KEY = 'test-secret-key-for-unit-tests-32chars'
@@ -40,6 +41,12 @@ CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
 
 PERF_ALLOW_PRIVATE_TARGETS = True
+UI_ALLOW_PRIVATE_TARGETS = config(
+    'UI_ALLOW_PRIVATE_TARGETS', default=False, cast=bool,
+)
+UI_ALLOWED_PRIVATE_CIDRS = config('UI_ALLOWED_PRIVATE_CIDRS', default='', cast=lambda value: [
+    item.strip() for item in value.split(',') if item.strip()
+])
 MONITOR_ALLOW_PRIVATE_TARGETS = True
 MONITOR_ALLOW_PRIVATE_TARGETS = True
 MCP_ENABLED = True

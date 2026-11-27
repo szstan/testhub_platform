@@ -134,6 +134,98 @@ def test_requests_connection_uses_prevalidated_address_without_dns(monkeypatch):
     assert connect.call_args.args[0] == ("93.184.216.34", 80)
 
 
+def test_requests_connection_pins_punycode_dns_host_to_unicode_pinned_host(monkeypatch):
+    getaddrinfo = Mock(return_value=[_answer('127.0.0.1', 80)])
+    connect = Mock(return_value=_FakeSocket())
+    monkeypatch.setattr(network.socket, 'getaddrinfo', getaddrinfo)
+    monkeypatch.setattr(urllib3_connection.connection, 'create_connection', connect)
+
+    connection = _PinnedHTTPConnection(
+        'xn--bcher-kva.example',
+        80,
+        pinned_addresses=('93.184.216.34',),
+        pinned_host='bücher.example',
+        allow_private=True,
+    )
+
+    assert isinstance(connection._new_conn(), _FakeSocket)
+    getaddrinfo.assert_not_called()
+    assert connect.call_args.args[0] == ('93.184.216.34', 80)
+
+
+def test_requests_connection_rejects_pinned_hostname_mismatch_without_dns(monkeypatch):
+    getaddrinfo = Mock(side_effect=AssertionError('pinned hostname mismatch must not resolve'))
+    connect = Mock()
+    monkeypatch.setattr(network.socket, 'getaddrinfo', getaddrinfo)
+    monkeypatch.setattr(urllib3_connection.connection, 'create_connection', connect)
+
+    connection = _PinnedHTTPConnection(
+        'actual.example.test',
+        80,
+        pinned_host='authorized.example.test',
+        pinned_addresses=('93.184.216.34',),
+        allow_private=True,
+    )
+    with pytest.raises(urllib3_connection.NewConnectionError, match='主机不匹配'):
+        connection._new_conn()
+
+    getaddrinfo.assert_not_called()
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('hostname', 'canonical_hostname'),
+    [
+        ('täst.example.test', 'xn--tst-qla.example.test'),
+        ('faß.example.test', 'xn--fa-hia.example.test'),
+    ],
+)
+def test_requests_adapter_normalizes_idn_pin_to_pool_hostname(
+    monkeypatch,
+    hostname,
+    canonical_hostname,
+):
+    getaddrinfo = Mock(side_effect=AssertionError('pinned IDN request must not resolve'))
+    connect = Mock(return_value=_FakeSocket())
+    monkeypatch.setattr(network.socket, 'getaddrinfo', getaddrinfo)
+    monkeypatch.setattr(urllib3_connection.connection, 'create_connection', connect)
+
+    adapter = _PinnedHTTPAdapter(
+        pinned_host=hostname,
+        pinned_addresses=('10.1.2.3',),
+        allow_private=True,
+    )
+    request = requests.Request('GET', f'http://{hostname}/').prepare()
+    pool = adapter.get_connection_with_tls_context(request, verify=True)
+    assert pool.host == canonical_hostname
+    assert pool.conn_kw['pinned_host'] == pool.host
+    connection = pool._new_conn()
+    assert isinstance(connection._new_conn(), _FakeSocket)
+
+    adapter.close()
+    getaddrinfo.assert_not_called()
+    assert connect.call_args.args[0] == ('10.1.2.3', 80)
+
+
+def test_requests_adapter_fails_closed_when_url_host_differs_from_pin(monkeypatch):
+    getaddrinfo = Mock(side_effect=AssertionError('pinned hostname mismatch must not resolve'))
+    connect = Mock()
+    monkeypatch.setattr(network.socket, 'getaddrinfo', getaddrinfo)
+    monkeypatch.setattr(urllib3_connection.connection, 'create_connection', connect)
+
+    adapter = _PinnedHTTPAdapter(
+        pinned_host='authorized.example.test',
+        pinned_addresses=('93.184.216.34',),
+    )
+    request = requests.Request('GET', 'http://different.example.test/').prepare()
+    with pytest.raises(UnsafeOutboundURL, match='请求主机不匹配'):
+        adapter.get_connection_with_tls_context(request, verify=True)
+
+    adapter.close()
+    getaddrinfo.assert_not_called()
+    connect.assert_not_called()
+
+
 def test_requests_blocks_rebound_dns_before_socket_connect(monkeypatch):
     monkeypatch.setattr(
         network.socket,

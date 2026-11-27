@@ -9,14 +9,84 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PlaywrightTimeout
 import logging
-from django.conf import settings
-from apps.core.network import (
-    guard_playwright_route,
-    validate_outbound_url,
+from apps.core.network import guard_playwright_route
+from apps.core.browser_proxy import GuardedBrowserProxy
+from .network_policy import (
+    get_ui_network_policy,
+    playwright_launch_network_options,
+    validate_ui_outbound_url,
 )
 from .variable_resolver import resolve_variables
 
 logger = logging.getLogger(__name__)
+
+_ASYNC_RESOURCE_CLOSE_TIMEOUT = 5.0
+
+
+async def _capture_async_close(resource, closer):
+    try:
+        await getattr(resource, closer)()
+    except BaseException as error:
+        return error
+    return None
+
+
+def _consume_cleanup_task_result(task):
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def _close_async_resources(resources, proxy=None):
+    """Close all resources with bounded waits, returning the first fatal signal."""
+    fatal_error = None
+    for resource, closer in resources:
+        if resource is None:
+            continue
+
+        close_task = asyncio.create_task(_capture_async_close(resource, closer))
+        try:
+            done, _ = await asyncio.wait(
+                {close_task},
+                timeout=_ASYNC_RESOURCE_CLOSE_TIMEOUT,
+            )
+        except BaseException as error:
+            close_task.cancel()
+            close_task.add_done_callback(_consume_cleanup_task_result)
+            if isinstance(error, Exception):
+                logger.warning("Closing Playwright resource failed: %s", error)
+            elif fatal_error is None:
+                fatal_error = error
+            continue
+
+        if not done:
+            close_task.cancel()
+            close_task.add_done_callback(_consume_cleanup_task_result)
+            logger.warning("Closing Playwright resource timed out: %s", closer)
+            continue
+
+        error = close_task.result()
+        if error is None:
+            continue
+        if isinstance(error, Exception):
+            logger.warning("Closing Playwright resource failed: %s", error)
+        elif fatal_error is None:
+            fatal_error = error
+
+    if proxy is not None:
+        try:
+            proxy.close()
+        except Exception as error:
+            logger.warning("Closing browser network proxy failed: %s", error)
+        except BaseException as error:
+            if fatal_error is None:
+                fatal_error = error
+
+    return fatal_error
+
 
 class PlaywrightTestEngine:
     """Playwright测试执行引擎"""
@@ -35,6 +105,7 @@ class PlaywrightTestEngine:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.network_proxy = None
 
     @staticmethod
     def normalize_browser_type(browser_type='chromium'):
@@ -56,8 +127,22 @@ class PlaywrightTestEngine:
         return f"python -m playwright install {normalized_browser}"
 
     @staticmethod
+    def _unsupported_browser_message(browser_type):
+        normalized_browser = PlaywrightTestEngine.normalize_browser_type(browser_type)
+        if normalized_browser == 'webkit':
+            return (
+                "WebKit/Safari 不支持 UI 自动化：受限网络策略无法保证其所有流量经过 DNS 固定代理，"
+                "因此已拒绝启动。请改用 Chromium 或 Firefox。"
+            )
+        return None
+
+    @staticmethod
     def _format_environment_error(browser_type, error_msg):
         """格式化 Playwright 环境错误提示"""
+        unsupported_message = PlaywrightTestEngine._unsupported_browser_message(browser_type)
+        if unsupported_message:
+            return unsupported_message
+
         normalized_browser = PlaywrightTestEngine.normalize_browser_type(browser_type)
         browser_name_map = {
             'chromium': 'Chromium/Chrome',
@@ -82,6 +167,9 @@ class PlaywrightTestEngine:
     def check_execution_environment_sync(browser_type='chromium'):
         """同步检查 Playwright 执行环境"""
         normalized_browser = PlaywrightTestEngine.normalize_browser_type(browser_type)
+        unsupported_message = PlaywrightTestEngine._unsupported_browser_message(normalized_browser)
+        if unsupported_message:
+            return False, unsupported_message
 
         try:
             from playwright.sync_api import sync_playwright
@@ -95,44 +183,124 @@ class PlaywrightTestEngine:
 
         playwright = None
         browser = None
+        context = None
+        proxy = None
+        result = None
+        startup_signal = None
+        cleanup_error = None
+        cleanup_signal = None
         try:
             playwright = sync_playwright().start()
             browser_launcher = getattr(playwright, normalized_browser)
-            browser = browser_launcher.launch(headless=True)
-            return True, None
+            policy = get_ui_network_policy()
+            proxy = GuardedBrowserProxy(
+                allowed_private_cidrs=policy['allowed_private_cidrs'],
+            ).start()
+            launch_options = playwright_launch_network_options(normalized_browser, proxy.url)
+            browser = browser_launcher.launch(headless=True, **launch_options)
+            context = browser.new_context(service_workers='block')
+            result = (True, None)
         except Exception as e:
             logger.error(f"同步检查 Playwright 执行环境失败: {str(e)}")
-            return False, PlaywrightTestEngine._format_environment_error(normalized_browser, str(e))
-        finally:
+            result = (False, PlaywrightTestEngine._format_environment_error(normalized_browser, str(e)))
+        except BaseException as error:
+            startup_signal = error
+
+        for resource, closer in (
+            (context, 'close'),
+            (browser, 'close'),
+            (playwright, 'stop'),
+        ):
+            if resource is None:
+                continue
             try:
-                if browser:
-                    browser.close()
-            finally:
-                if playwright:
-                    playwright.stop()
+                getattr(resource, closer)()
+            except Exception as error:
+                logger.warning("Closing Playwright resource failed: %s", error)
+                if cleanup_error is None:
+                    cleanup_error = error
+            except BaseException as error:
+                logger.warning("Closing Playwright resource raised a process-control signal: %s", error)
+                if cleanup_signal is None:
+                    cleanup_signal = error
+
+        if proxy is not None:
+            try:
+                proxy.close()
+            except Exception as error:
+                logger.warning("Closing browser network proxy failed: %s", error)
+                if cleanup_error is None:
+                    cleanup_error = error
+            except BaseException as error:
+                logger.warning("Closing browser network proxy raised a process-control signal: %s", error)
+                if cleanup_signal is None:
+                    cleanup_signal = error
+
+        if startup_signal is not None:
+            raise startup_signal
+        if cleanup_signal is not None:
+            raise cleanup_signal
+        if result[0] and cleanup_error is not None:
+            return False, (
+                f"Playwright 环境检查清理失败，检查结果不可信：{cleanup_error}。"
+                "请检查浏览器资源状态后重试。"
+            )
+        return result
 
     @staticmethod
     async def check_execution_environment(browser_type='chromium'):
         """异步检查 Playwright 执行环境"""
         normalized_browser = PlaywrightTestEngine.normalize_browser_type(browser_type)
+        unsupported_message = PlaywrightTestEngine._unsupported_browser_message(normalized_browser)
+        if unsupported_message:
+            return False, unsupported_message
 
         playwright = None
         browser = None
+        context = None
+        proxy = None
+        result = None
+        original_error = None
         try:
             playwright = await async_playwright().start()
             browser_launcher = getattr(playwright, normalized_browser)
-            browser = await browser_launcher.launch(headless=True)
-            return True, None
-        except Exception as e:
-            logger.error(f"异步检查 Playwright 执行环境失败: {str(e)}")
-            return False, PlaywrightTestEngine._format_environment_error(normalized_browser, str(e))
-        finally:
-            try:
-                if browser:
-                    await browser.close()
-            finally:
-                if playwright:
-                    await playwright.stop()
+            policy = get_ui_network_policy()
+            proxy = GuardedBrowserProxy(
+                allowed_private_cidrs=policy['allowed_private_cidrs'],
+            ).start()
+            launch_options = playwright_launch_network_options(normalized_browser, proxy.url)
+            browser = await browser_launcher.launch(headless=True, **launch_options)
+            context = await browser.new_context(service_workers='block')
+            result = (True, None)
+        except Exception as error:
+            logger.error(f"异步检查 Playwright 执行环境失败: {str(error)}")
+            result = (
+                False,
+                PlaywrightTestEngine._format_environment_error(normalized_browser, str(error)),
+            )
+            original_error = error
+        except BaseException as error:
+            original_error = error
+
+        cleanup_error = await _close_async_resources(
+            (
+                (context, 'close'),
+                (browser, 'close'),
+                (playwright, 'stop'),
+            ),
+            proxy,
+        )
+        if original_error is not None:
+            if isinstance(original_error, Exception):
+                if isinstance(cleanup_error, asyncio.CancelledError):
+                    raise cleanup_error
+                if cleanup_error is not None:
+                    logger.warning("Cleanup failed after Playwright environment error: %s", cleanup_error)
+                return result
+            raise original_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        return result
 
     async def start(self):
         """启动浏览器"""
@@ -150,26 +318,28 @@ class PlaywrightTestEngine:
             else:
                 browser_launcher = self.playwright.chromium
 
-            # 启动浏览器
+            policy = get_ui_network_policy()
+            self.network_proxy = GuardedBrowserProxy(
+                allowed_private_cidrs=policy['allowed_private_cidrs'],
+            ).start()
+            launch_options = playwright_launch_network_options(
+                normalized_browser,
+                self.network_proxy.url,
+            )
             self.browser = await browser_launcher.launch(
                 headless=self.headless,
-                args=[]
+                **launch_options,
             )
 
-            # 创建浏览器上下文
+            # Browser contexts block service workers; network traffic still goes through the DNS-pinned proxy.
             self.context = await self.browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+                service_workers='block',
             )
-            # Guard every navigation, redirect, and subresource request.  A
-            # stored public base URL can still redirect into private space.
             await self.context.route(
                 '**/*',
-                lambda route: guard_playwright_route(
-                    route,
-                    allow_private=bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                               getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False))),
-                ),
+                lambda route: guard_playwright_route(route, **policy),
             )
 
             # 创建页面
@@ -177,24 +347,40 @@ class PlaywrightTestEngine:
 
             logger.info(f"浏览器启动成功: {self.browser_type}, headless={self.headless}")
 
-        except Exception as e:
-            logger.error(f"启动浏览器失败: {str(e)}")
+        except BaseException as startup_error:
+            try:
+                await self.stop()
+            except asyncio.CancelledError:
+                if isinstance(startup_error, Exception):
+                    raise
+                logger.warning("Playwright startup cleanup was also cancelled")
+            except BaseException as cleanup_error:
+                logger.warning("Playwright startup cleanup failed: %s", cleanup_error)
             raise
 
     async def stop(self):
         """关闭浏览器"""
+        proxy = self.network_proxy
         try:
-            if self.page:
-                await self.page.close()
-            if self.context:
-                await self.context.close()
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-            logger.info("浏览器已关闭")
-        except Exception as e:
-            logger.error(f"关闭浏览器失败: {str(e)}")
+            fatal_error = await _close_async_resources(
+                (
+                    (self.page, 'close'),
+                    (self.context, 'close'),
+                    (self.browser, 'close'),
+                    (self.playwright, 'stop'),
+                ),
+                proxy,
+            )
+        finally:
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            self.network_proxy = None
+
+        if fatal_error is not None:
+            raise fatal_error
+        logger.info("浏览器已关闭")
 
     async def execute_step(self, step, element_data: Dict) -> Tuple[bool, str, Optional[str]]:
         """
@@ -859,9 +1045,9 @@ class PlaywrightTestEngine:
             (是否成功, 日志信息)
         """
         try:
-            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
-            safe_url = validate_outbound_url(url, allow_private=allow_private)
+            safe_url = validate_ui_outbound_url(url)
+            if self.network_proxy is None:
+                raise RuntimeError('受限网络策略要求使用已启动的 DNS 固定代理')
             # 检验紧邻导航请求，避免 a stored URL changing between setup and use.
             await self.page.goto(safe_url, wait_until='networkidle', timeout=30000)
 

@@ -146,6 +146,9 @@ export default {
     projectName: '项目名称',
     projectDesc: '项目描述',
     baseUrl: '基础URL',
+    baseUrlPlaceholder: '请输入地址（如：example.com/admin/）',
+    baseUrlHint: '提示：选择协议并输入地址，也可以粘贴包含协议的完整URL',
+    urlProtocol: '协议',
     owner: '负责人',
     startDate: '开始日期',
     endDate: '结束日期',
@@ -160,6 +163,10 @@ export default {
       nameRequired: '请输入项目名称',
       nameLength: '项目名称长度在 2 到 200 个字符',
       baseUrlRequired: '请输入基础URL',
+      baseUrlMalformedProtocol: 'URL必须包含完整协议（http:// 或 https://）',
+      baseUrlHttpOnly: 'URL必须以 http:// 或 https:// 开头',
+      baseUrlNoCredentials: 'URL中不能包含用户名或密码',
+      baseUrlLength: '基础URL不能超过200个字符',
       baseUrlInvalid: '请输入有效的URL',
       selectStatus: '请选择项目状态'
     },
@@ -170,6 +177,7 @@ export default {
       createFailed: '项目创建失败',
       updateSuccess: '项目更新成功',
       updateFailed: '项目更新失败',
+      baseUrlRestrictedNetwork: '该地址目前无法用于测试。请改用公开可访问的网站地址，或联系管理员确认是否可以开放访问。',
       deleteConfirm: '确定要删除这个项目吗？删除后数据将无法恢复。',
       deleteSuccess: '项目删除成功',
       deleteFailed: '项目删除失败'

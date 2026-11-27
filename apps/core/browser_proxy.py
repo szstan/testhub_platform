@@ -10,9 +10,14 @@ from threading import Thread
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
+from urllib3.util import parse_url
 
 from apps.core.http_transport import guarded_request
-from apps.core.network import UnsafeOutboundURL, resolve_outbound_addresses
+from apps.core.network import (
+    UnsafeOutboundURL,
+    _normalize_allowed_private_cidrs,
+    resolve_outbound_addresses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +27,19 @@ _HOP_BY_HOP_HEADERS = {
 }
 
 
-def _open_pinned_connection(host, port, *, timeout=15):
-    """Connect only to an address returned by the guarded resolver."""
-    addresses = resolve_outbound_addresses(host, port)
+def _open_pinned_connection(
+    host,
+    port,
+    *,
+    timeout=15,
+    allowed_private_cidrs=None,
+):
+    """Resolve, validate, and connect directly to one authorized numeric address."""
+    addresses = resolve_outbound_addresses(
+        host,
+        port,
+        allowed_private_cidrs=allowed_private_cidrs,
+    )
     last_error = None
     for address in addresses:
         try:
@@ -84,7 +99,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         upstream = None
         try:
             host, port = _parse_authority(self.path)
-            upstream = _open_pinned_connection(host, port)
+            upstream = _open_pinned_connection(
+                host,
+                port,
+                allowed_private_cidrs=self.server.allowed_private_cidrs,
+            )
             self.send_response(200, 'Connection Established')
             self.end_headers()
             self.close_connection = True
@@ -110,12 +129,20 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError
             path = urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
             target_url = urlunsplit(('http', parsed.netloc, parsed.path or '/', parsed.query, ''))
+            target_url = requests.Request('GET', target_url).prepare().url
+            parsed_host = parse_url(target_url).host
+            if not parsed_host:
+                raise ValueError('proxy target host normalization failed')
         except ValueError as exc:
             raise UnsafeOutboundURL('invalid HTTP proxy request target') from exc
-        return parsed.hostname, port, path, target_url
+        return parsed_host.lower().rstrip('.'), port, path, target_url
 
     def _forward_upgrade(self, host, port, path):
-        upstream = _open_pinned_connection(host, port)
+        upstream = _open_pinned_connection(
+            host,
+            port,
+            allowed_private_cidrs=self.server.allowed_private_cidrs,
+        )
         try:
             upstream.sendall(f'{self.command} {path} {self.request_version}\r\n'.encode('iso-8859-1'))
             for name, value in self.headers.raw_items():
@@ -168,10 +195,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 if name.lower() not in _HOP_BY_HOP_HEADERS
             }
             headers['Connection'] = 'close'
+            pinned_host = parse_url(target_url).host
+            if not pinned_host or pinned_host.lower().rstrip('.') != host:
+                raise UnsafeOutboundURL('固定目标主机规范化不一致')
+            addresses = resolve_outbound_addresses(
+                pinned_host,
+                port,
+                allowed_private_cidrs=self.server.allowed_private_cidrs,
+            )
             response = guarded_request(
                 self.command,
                 target_url,
-                allow_private=False,
+                allow_private=True,
+                pinned_addresses=addresses,
                 headers=headers,
                 data=body,
                 allow_redirects=False,
@@ -213,9 +249,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
 
 class GuardedBrowserProxy:
-    """An ephemeral proxy that connects only to validated public addresses."""
+    """An ephemeral proxy that connects only to validated numeric addresses."""
 
-    def __init__(self):
+    def __init__(self, *, allowed_private_cidrs=None):
+        self.allowed_private_cidrs = _normalize_allowed_private_cidrs(allowed_private_cidrs)
         self._server = None
         self._thread = None
 
@@ -227,10 +264,21 @@ class GuardedBrowserProxy:
         return f'http://{host}:{port}'
 
     def start(self):
-        self._server = ThreadingHTTPServer(('127.0.0.1', 0), _ProxyHandler)
-        self._server.daemon_threads = True
-        self._thread = Thread(target=self._server.serve_forever, name='selenium-egress-proxy', daemon=True)
-        self._thread.start()
+        if self._server is not None:
+            return self
+        server = ThreadingHTTPServer(('127.0.0.1', 0), _ProxyHandler)
+        server.allowed_private_cidrs = self.allowed_private_cidrs
+        server.daemon_threads = True
+        thread = Thread(target=server.serve_forever, name='selenium-egress-proxy', daemon=True)
+        self._server = server
+        self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            self._server = None
+            self._thread = None
+            server.server_close()
+            raise
         return self
 
     def close(self):
@@ -239,7 +287,8 @@ class GuardedBrowserProxy:
         server, thread = self._server, self._thread
         self._server = None
         self._thread = None
-        server.shutdown()
+        if thread is not None and thread.is_alive():
+            server.shutdown()
         server.server_close()
         if thread is not None:
             thread.join(timeout=2)
@@ -270,11 +319,22 @@ def _configure_browser_proxy(options, browser_type, proxy_url):
     raise RuntimeError(f'Selenium {browser_type or "unknown"} cannot enforce guarded browser egress')
 
 
-def create_guarded_selenium_driver(driver_factory, options=None, *, browser_type, allow_private=False, **kwargs):
-    """Create a Selenium driver with all HTTP(S) requests forced through the guarded proxy."""
+def create_guarded_selenium_driver(
+    driver_factory,
+    options=None,
+    *,
+    browser_type,
+    allow_private=False,
+    allowed_private_cidrs=None,
+    **kwargs,
+):
+    """Create Selenium with HTTP(S) forced through the guarded outbound proxy."""
     proxy = None
-    if not allow_private:
-        proxy = GuardedBrowserProxy().start()
+    scoped_mode = allowed_private_cidrs is not None
+    if not allow_private or scoped_mode:
+        proxy = GuardedBrowserProxy(
+            allowed_private_cidrs=allowed_private_cidrs,
+        ).start()
         try:
             _configure_browser_proxy(options, browser_type, proxy.url)
         except Exception:

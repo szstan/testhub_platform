@@ -15,9 +15,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
-from django.conf import settings
-from apps.core.browser_proxy import create_guarded_selenium_driver
-from apps.core.network import configure_selenium_network_guard, validate_outbound_url
+from .network_policy import (
+    configure_selenium_network_guard,
+    create_ui_guarded_selenium_driver as create_guarded_selenium_driver,
+    validate_ui_outbound_url,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,12 @@ class SeleniumTestEngine:
     @staticmethod
     def check_execution_environment(browser_type='chrome'):
         """检查 Selenium 执行前所需的浏览器与驱动环境"""
+        if str(browser_type or '').lower() == 'safari':
+            return False, (
+                "Selenium Safari 不支持 UI 自动化：受限网络策略无法保证其所有流量经过 DNS 固定代理，"
+                "因此已拒绝启动。请改用 Chrome、Firefox 或 Edge。"
+            )
+
         is_available, browser_msg = SeleniumTestEngine.check_browser_available(browser_type)
         if not is_available:
             return False, browser_msg
@@ -186,8 +194,7 @@ class SeleniumTestEngine:
                 raise Exception(full_error)
             if error_msg:
                 logger.info(f"Selenium 执行环境提示: {error_msg}")
-            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+            allow_private = False
             if self.browser_type == 'chrome':
                 from selenium.webdriver.chrome.options import Options
                 from selenium.webdriver.chrome.service import Service
@@ -351,8 +358,6 @@ class SeleniumTestEngine:
 
             # 设置隐式等待
             self.driver.implicitly_wait(3)
-            # The proxy pins the actual connection; browser-level checks are supplementary.
-            configure_selenium_network_guard(self.driver, allow_private=allow_private)
 
             logger.info(f"浏览器启动成功: {self.browser_type}, headless={self.headless}")
 
@@ -1069,17 +1074,15 @@ class SeleniumTestEngine:
             (是否成功, 日志信息)
         """
         try:
-            allow_private = bool(getattr(settings, 'UI_ALLOW_PRIVATE_TARGETS',
-                                        getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
-            safe_url = validate_outbound_url(url, allow_private=allow_private)
+            safe_url = validate_ui_outbound_url(url)
             # Install request interception before navigation so every redirect
             # and subresource URL is checked before Chromium accesses it.
-            configure_selenium_network_guard(self.driver, allow_private=allow_private)
+            configure_selenium_network_guard(self.driver)
             self.driver.get(safe_url)
 
             # Reject redirects not caught by the browser deny list.
             final_url = getattr(self.driver, 'current_url', safe_url) or safe_url
-            validate_outbound_url(final_url, allow_private=allow_private)
+            validate_ui_outbound_url(final_url)
 
             # 等待页面基本加载完成
             # 在服务器环境（特别是无头模式）需要更长的等待时间
