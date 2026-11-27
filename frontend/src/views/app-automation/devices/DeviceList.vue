@@ -93,7 +93,7 @@
         </template>
       </el-table-column>
 
-      <el-table-column :label="$t('appAutomation.common.operation')" width="250" fixed="right">
+      <el-table-column :label="$t('appAutomation.common.operation')" width="360" fixed="right">
         <template #default="{ row }">
           <el-button
             v-if="row.status === 'available' || row.status === 'online'"
@@ -106,6 +106,8 @@
           </el-button>
           <el-button
             v-if="row.status === 'locked'"
+            :disabled="!canLegacyUnlock(row)"
+            :title="row.lease_requires_token ? $t('appAutomation.device.messages.executionTokenLeaseUnavailable') : ''"
             link
             size="small"
             type="success"
@@ -122,6 +124,28 @@
             @click="reconnectDevice(row)"
           >
             {{ $t('appAutomation.device.reconnect') }}
+          </el-button>
+          <el-button
+            v-if="canRecoverPendingAction(row)"
+            link
+            size="small"
+            type="warning"
+            :icon="Refresh"
+            :loading="recoveringDevices[row.id]"
+            @click="recoverPendingAction(row)"
+          >
+            {{ $t('appAutomation.device.recoverPendingAction') }}
+          </el-button>
+          <el-button
+            v-if="canClearMaintenance(row)"
+            link
+            size="small"
+            type="danger"
+            :icon="CircleClose"
+            :loading="clearingMaintenanceDevices[row.id]"
+            @click="clearMaintenanceMode(row)"
+          >
+            {{ $t('appAutomation.device.clearMaintenance') }}
           </el-button>
           <el-button
             link
@@ -272,9 +296,8 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Plus } from '@element-plus/icons-vue'
+import { Refresh, Plus, CircleClose } from '@element-plus/icons-vue'
 import {
-  getDeviceList,
   discoverDevices,
   lockDevice as apiLockDevice,
   unlockDevice as apiUnlockDevice,
@@ -282,10 +305,17 @@ import {
   disconnectDevice as apiDisconnectDevice,
   deleteDevice
 } from '@/api/app-automation'
+import { getAllAppDevices } from '@/api/app-device-options'
+import {
+  recoverPendingDeviceAction,
+  clearDeviceMaintenanceMode
+} from '@/api/app-device-recovery'
+import { useUserStore } from '@/stores/user'
 import { getDeviceStatusType, getDeviceStatusText, formatDateTime } from '@/utils/app-automation-helpers'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
+const userStore = useUserStore()
 
 // Refs
 const remoteDeviceFormRef = ref(null)
@@ -296,11 +326,15 @@ const loading = ref(false)
 const refreshing = ref(false)
 const connecting = ref(false)
 const reconnectingDevices = ref({})
+const recoveringDevices = ref({})
+const clearingMaintenanceDevices = ref({})
 const addRemoteDialogVisible = ref(false)
 const deviceInfoDialogVisible = ref(false)
 const selectedDevice = ref(null)
 const emptyText = ref(t('appAutomation.device.emptyText'))
 const refreshTimer = ref(null)
+let disposed = false
+let deviceLoadGeneration = 0
 
 const remoteDeviceForm = ref({
   ip_address: '',
@@ -323,18 +357,27 @@ const remoteDeviceRules = computed(() => ({
 
 // 方法
 const getDevices = async () => {
+  if (disposed || loading.value) return
+  const generation = ++deviceLoadGeneration
+  const userId = userStore.user?.id ?? userStore.user?.pk ?? null
+  const sessionGeneration = userStore.getSessionGeneration?.()
+  const current = () => !disposed && generation === deviceLoadGeneration
+    && String(userStore.user?.id ?? userStore.user?.pk ?? null) === String(userId)
+    && userStore.getSessionGeneration?.() === sessionGeneration
   loading.value = true
   try {
-    const res = await getDeviceList({ page: 1, page_size: 1000 })
-    devices.value = res.data.results || []
+    const rows = await getAllAppDevices()
+    if (!current()) return
+    devices.value = rows
     if (devices.value.length === 0) {
       emptyText.value = t('appAutomation.device.emptyText')
     }
   } catch (error) {
+    if (!current()) return
     console.error('获取设备列表失败:', error)
     ElMessage.error(t('appAutomation.device.messages.loadFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
-    loading.value = false
+    if (generation === deviceLoadGeneration) loading.value = false
   }
 }
 
@@ -343,7 +386,7 @@ const refreshDevices = async () => {
   try {
     const res = await discoverDevices()
     if (res.data.success) {
-      devices.value = res.data.devices || []
+      await getDevices()
       ElMessage.success(res.data.message || t('appAutomation.device.messages.refreshedSuccess'))
     } else {
       ElMessage.error(res.data.message || t('appAutomation.device.messages.refreshFailed'))
@@ -353,6 +396,95 @@ const refreshDevices = async () => {
     ElMessage.error(t('appAutomation.device.messages.refreshFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
     refreshing.value = false
+  }
+}
+
+const canRecoverPendingAction = (device) => Boolean(
+  userStore.isAdmin && device?.has_pending_action === true
+)
+
+const canClearMaintenance = (device) => Boolean(
+  userStore.isAdmin && device?.maintenance_mode === true && device?.has_pending_action === false
+)
+
+const isDialogCancelled = (error) => error === 'cancel' || error === 'close'
+
+const captureAdminActionSession = () => ({
+  userId: userStore.user?.id,
+  sessionGeneration: userStore.getSessionGeneration()
+})
+
+const isAdminActionSessionCurrent = (session) => Boolean(
+  session.userId !== undefined &&
+  session.userId !== null &&
+  userStore.isAdmin &&
+  String(userStore.user?.id) === String(session.userId) &&
+  userStore.getSessionGeneration() === session.sessionGeneration
+)
+
+const recoverPendingAction = async (device) => {
+  if (!canRecoverPendingAction(device) || recoveringDevices.value[device.id]) return
+  const session = captureAdminActionSession()
+  if (!isAdminActionSessionCurrent(session)) return
+  recoveringDevices.value[device.id] = true
+  try {
+    await ElMessageBox.confirm(
+      t('appAutomation.device.messages.recoverPendingActionConfirm', {
+        name: device.name || device.device_id
+      }),
+      t('appAutomation.device.tip'),
+      {
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
+        type: 'warning'
+      }
+    )
+
+    if (!isAdminActionSessionCurrent(session)) return
+    await recoverPendingDeviceAction(device.id, session.userId)
+    if (!isAdminActionSessionCurrent(session)) return
+    ElMessage.success(t('appAutomation.device.messages.pendingActionRecovered'))
+    await getDevices()
+  } catch (error) {
+    if (!isDialogCancelled(error) && isAdminActionSessionCurrent(session)) {
+      console.error('恢复设备待处理动作失败')
+      ElMessage.error(t('appAutomation.device.messages.recoverPendingActionFailed'))
+    }
+  } finally {
+    recoveringDevices.value[device.id] = false
+  }
+}
+
+const clearMaintenanceMode = async (device) => {
+  if (!canClearMaintenance(device) || clearingMaintenanceDevices.value[device.id]) return
+  const session = captureAdminActionSession()
+  if (!isAdminActionSessionCurrent(session)) return
+  clearingMaintenanceDevices.value[device.id] = true
+  try {
+    await ElMessageBox.confirm(
+      t('appAutomation.device.messages.clearMaintenanceConfirm', {
+        name: device.name || device.device_id
+      }),
+      t('appAutomation.device.tip'),
+      {
+        confirmButtonText: t('appAutomation.common.confirm'),
+        cancelButtonText: t('appAutomation.common.cancel'),
+        type: 'warning'
+      }
+    )
+
+    if (!isAdminActionSessionCurrent(session)) return
+    await clearDeviceMaintenanceMode(device.id, session.userId)
+    if (!isAdminActionSessionCurrent(session)) return
+    ElMessage.success(t('appAutomation.device.messages.maintenanceCleared'))
+    await getDevices()
+  } catch (error) {
+    if (!isDialogCancelled(error) && isAdminActionSessionCurrent(session)) {
+      console.error('解除设备维护模式失败')
+      ElMessage.error(t('appAutomation.device.messages.clearMaintenanceFailed'))
+    }
+  } finally {
+    clearingMaintenanceDevices.value[device.id] = false
   }
 }
 
@@ -485,7 +617,14 @@ const lockDevice = async (device) => {
   }
 }
 
+const canLegacyUnlock = device => device?.lease_requires_token !== true
+  && device?.has_pending_action !== true
+
 const unlockDevice = async (device) => {
+  if (!canLegacyUnlock(device)) {
+    ElMessage.warning(t('appAutomation.device.messages.executionTokenLeaseUnavailable'))
+    return false
+  }
   try {
     await ElMessageBox.confirm(
       t('appAutomation.device.messages.unlockConfirm', { name: device.name || device.device_id }),
@@ -579,6 +718,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  deviceLoadGeneration += 1
   if (refreshTimer.value) {
     clearInterval(refreshTimer.value)
   }

@@ -44,6 +44,7 @@ class Command(BaseCommand):
             try:
                 now = timezone.localtime(timezone.now())
                 self.stdout.write(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 开始检查任务...")
+                device_lease_recovery_count = self.reap_expired_app_device_leases()
                 retry_count = self.consume_retry_outbox()
                 generation_recovery_count = self.recover_stale_generation_tasks()
                 self.reconcile_execution_claims()
@@ -55,11 +56,12 @@ class Command(BaseCommand):
                     self.schedule_app_tasks(),
                     self.schedule_perf_tasks(),
                 )
-                total_count = sum(counts) + retry_count + generation_recovery_count
+                total_count = sum(counts) + retry_count + generation_recovery_count + device_lease_recovery_count
                 if total_count:
                     self.stdout.write(self.style.SUCCESS(
                         f'✓ 本次调度执行了 {total_count} 个任务 '
                         f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, '
+                        f'device leases recovered: {device_lease_recovery_count}, '
                         f'retry: {retry_count}, generation recovery: {generation_recovery_count})'))
                 else:
                     self.stdout.write('  没有需要执行的任务')
@@ -77,6 +79,25 @@ class Command(BaseCommand):
                 if run_once:
                     break
                 time.sleep(interval)
+
+    def reap_expired_app_device_leases(self):
+        """Schedule Appium teardown and reclaim leases on the scheduler cadence."""
+        try:
+            from apps.app_automation.appium_sessions import close_expired_interactive_sessions
+
+            close_expired_interactive_sessions()
+        except Exception as exc:
+            logger.error('expired APP session cleanup failed (error_type=%s)', type(exc).__name__)
+        try:
+            from apps.app_automation.device_pool import reap_expired_device_leases
+
+            reclaimed = reap_expired_device_leases()
+            if reclaimed:
+                logger.info('expired APP device leases reclaimed: %s', reclaimed)
+            return reclaimed
+        except Exception as exc:  # noqa: BLE001 - optional cleanup cannot stop dispatch
+            logger.error('expired APP device lease reaping failed (error_type=%s)', type(exc).__name__)
+            return 0
 
     def reconcile_execution_claims(self):
         try:
@@ -220,12 +241,14 @@ class Command(BaseCommand):
 
     def schedule_app_tasks(self):
         try:
-            from apps.app_automation.models import AppScheduledTask, AppTestExecution
+            from apps.app_automation.models import AppDevice, AppScheduledTask, AppTestExecution
             from apps.app_automation.tasks import (
                 execute_app_suite_task,
                 execute_app_test_task,
                 settle_undispatched_app_executions,
             )
+            from apps.app_automation.execution_admission import assert_device_execution_idle
+            from apps.app_automation.execution_dispatch import enqueue_app_task, new_execution_dispatch_id
 
             count = 0
             for task_id in AppScheduledTask.objects.filter(status='ACTIVE').values_list('pk', flat=True):
@@ -240,10 +263,7 @@ class Command(BaseCommand):
                 try:
                     if not task.device:
                         raise ValueError('scheduled APP task has no device')
-                    from apps.app_automation.device_pool import (
-                        acquire_specific_device,
-                        release_device_execution_lease,
-                    )
+                    from apps.app_automation.device_pool import acquire_specific_device
                     leased_device, _lease_token = acquire_specific_device(
                         task.device_id,
                         task.created_by,
@@ -251,53 +271,73 @@ class Command(BaseCommand):
                     )
                     lease_generation = leased_device.lease_generation
                     package_name = task.app_package.package_name if task.app_package else ''
-                    if task.task_type == 'TEST_SUITE' and task.test_suite:
-                        suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
-                        if not suite_cases.exists():
-                            raise ValueError('scheduled APP suite has no test cases')
-                        for sc in suite_cases:
+                    dispatch_id = new_execution_dispatch_id()
+                    suite_cases = []
+                    with transaction.atomic():
+                        leased_device = AppDevice.objects.select_for_update().get(pk=leased_device.pk)
+                        assert_device_execution_idle(leased_device.pk)
+                        if task.task_type == 'TEST_SUITE' and task.test_suite:
+                            suite_cases = list(task.test_suite.suite_cases.select_related('test_case').all())
+                            if not suite_cases:
+                                raise ValueError('scheduled APP suite has no test cases')
+                            for sc in suite_cases:
+                                executions.append(AppTestExecution.objects.create(
+                                    test_case=sc.test_case,
+                                    test_suite=task.test_suite,
+                                    device=leased_device,
+                                    user=task.created_by,
+                                    status='pending',
+                                    task_id=dispatch_id,
+                                    device_lease_generation=lease_generation,
+                                    release_device_lease_on_stop=True,
+                                ))
+                            task.test_suite.execution_status = 'running'
+                            task.test_suite.save(update_fields=['execution_status'])
+                        elif task.task_type == 'TEST_CASE' and task.test_case:
                             executions.append(AppTestExecution.objects.create(
-                                test_case=sc.test_case,
-                                test_suite=task.test_suite,
+                                test_case=task.test_case,
                                 device=leased_device,
                                 user=task.created_by,
                                 status='pending',
+                                task_id=dispatch_id,
                                 device_lease_generation=lease_generation,
+                                release_device_lease_on_stop=True,
                             ))
-                        task.test_suite.execution_status = 'running'
-                        task.test_suite.save(update_fields=['execution_status'])
-                        execute_app_suite_task.delay(
-                            suite_id=task.test_suite_id,
-                            execution_ids=[execution.pk for execution in executions],
-                            package_name=package_name,
-                            scheduled_task_id=task.pk,
-                            scheduler_lease_token=claim.token,
-                            lease_seconds=self.lease_seconds,
-                            lease_generation=lease_generation,
-                            device_id=leased_device.pk,
-                            device_lease_owner_id=task.created_by_id,
+                        else:
+                            raise ValueError('scheduled APP task configuration is incomplete')
+
+                    if task.task_type == 'TEST_SUITE':
+                        enqueue_app_task(
+                            execute_app_suite_task,
+                            dispatch_id=dispatch_id,
+                            kwargs={
+                                'suite_id': task.test_suite_id,
+                                'execution_ids': [execution.pk for execution in executions],
+                                'package_name': package_name,
+                                'scheduled_task_id': task.pk,
+                                'scheduler_lease_token': claim.token,
+                                'lease_seconds': self.lease_seconds,
+                                'lease_generation': lease_generation,
+                                'device_id': leased_device.pk,
+                                'device_lease_owner_id': task.created_by_id,
+                                'dispatch_id': dispatch_id,
+                                'release_device_lease': True,
+                            },
                         )
-                    elif task.task_type == 'TEST_CASE' and task.test_case:
-                        execution = AppTestExecution.objects.create(
-                            test_case=task.test_case,
-                            device=leased_device,
-                            user=task.created_by,
-                            status='pending',
-                            device_lease_generation=lease_generation,
-                        )
-                        executions.append(execution)
-                        celery_task = execute_app_test_task.delay(
-                            execution.pk,
-                            package_name=package_name,
-                            scheduled_task_id=task.pk,
-                            scheduler_lease_token=claim.token,
-                            lease_seconds=self.lease_seconds,
-                            lease_generation=lease_generation,
-                        )
-                        execution.task_id = celery_task.id
-                        execution.save(update_fields=['task_id'])
                     else:
-                        raise ValueError('scheduled APP task configuration is incomplete')
+                        enqueue_app_task(
+                            execute_app_test_task,
+                            dispatch_id=dispatch_id,
+                            args=(executions[0].pk,),
+                            kwargs={
+                                'package_name': package_name,
+                                'scheduled_task_id': task.pk,
+                                'scheduler_lease_token': claim.token,
+                                'lease_seconds': self.lease_seconds,
+                                'lease_generation': lease_generation,
+                                'release_device_lease': True,
+                            },
+                        )
                     count += 1
                 except Exception as exc:  # noqa: BLE001
                     try:
@@ -305,16 +345,13 @@ class Command(BaseCommand):
                             [item.pk for item in executions],
                             exc,
                             suite_id=suite_id,
+                            device_id=leased_device.pk if leased_device else None,
+                            lease_owner=task.created_by if leased_device else None,
+                            lease_generation=lease_generation,
+                            release_device_lease=bool(leased_device and lease_generation is not None),
                         )
                     except Exception:  # noqa: BLE001 - failure to record cannot hide the dispatch error
                         logger.exception('failed to settle undispatched APP executions')
-                    if leased_device is not None and lease_generation is not None:
-                        try:
-                            release_device_execution_lease(
-                                leased_device.pk, task.created_by, lease_generation
-                            )
-                        except Exception:  # noqa: BLE001 - still record the schedule failure
-                            logger.exception('failed to release APP device lease after dispatch failure')
                     logger.error('APP task dispatch failed: %s', exc, exc_info=True)
                     self._mark_dispatch_failure(AppScheduledTask, task.pk, claim.token, due_field='next_run_time', error=exc)
             return count

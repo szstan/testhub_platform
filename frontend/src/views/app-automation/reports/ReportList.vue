@@ -165,11 +165,13 @@
           <el-table-column :label="$t('appAutomation.report.stepPassRate')" min-width="140">
             <template #default="{ row }">
               <el-progress
+                v-if="row.result !== 'unverified'"
                 :percentage="row.pass_rate || 0"
                 :color="getPassRateColor(row.pass_rate)"
                 :stroke-width="16"
                 :text-inside="true"
               />
+              <span v-else>—</span>
             </template>
           </el-table-column>
           <el-table-column :label="$t('appAutomation.report.stepStatistics')" min-width="180">
@@ -195,7 +197,7 @@
           <el-table-column :label="$t('appAutomation.common.operation')" min-width="150">
             <template #default="{ row }">
               <el-button type="primary" link size="small" @click="viewCaseDetail(row)">{{ $t('appAutomation.common.details') }}</el-button>
-              <el-button v-if="row.report_path" type="success" link size="small" @click="viewAllureReport(row)">{{ $t('appAutomation.report.allureReport') }}</el-button>
+              <el-button v-if="row.report_access_token" type="success" link size="small" @click="viewAllureReport(row)">{{ $t('appAutomation.report.allureReport') }}</el-button>
               <el-button type="danger" link size="small" @click="deleteCaseReport(row)">{{ $t('appAutomation.common.delete') }}</el-button>
             </template>
           </el-table-column>
@@ -303,7 +305,7 @@
         </el-table-column>
         <el-table-column :label="$t('appAutomation.common.operation')" width="120" fixed="right">
           <template #default="{ row }">
-            <el-button v-if="row.report_path" type="success" link size="small" @click="viewAllureReport(row)">{{ $t('appAutomation.report.allureReport') }}</el-button>
+            <el-button v-if="row.report_access_token" type="success" link size="small" @click="viewAllureReport(row)">{{ $t('appAutomation.report.allureReport') }}</el-button>
             <el-button v-if="row.error_message" type="danger" link size="small" @click="viewCaseDetail(row)">{{ $t('appAutomation.common.error') }}</el-button>
           </template>
         </el-table-column>
@@ -364,7 +366,7 @@
           <el-alert :title="selectedCase.error_message" type="error" show-icon :closable="false" />
         </div>
 
-        <div v-if="selectedCase.report_path" class="detail-section" style="text-align:center">
+        <div v-if="selectedCase.report_access_token" class="detail-section" style="text-align:center">
           <el-button type="primary" @click="viewAllureReport(selectedCase)">
             <el-icon><DataAnalysis /></el-icon>
             {{ $t('appAutomation.report.viewFullAllureReport') }}
@@ -384,11 +386,12 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, DataAnalysis } from '@element-plus/icons-vue'
 import {
-  getExecutionList, deleteExecution,
+  getExecutionList, getExecutionDetail, deleteExecution,
   getTestSuiteList, getTestSuiteExecutions,
   getAppProjects,
 } from '@/api/app-automation.js'
 import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers.js'
+import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
 
 const { t } = useI18n()
 
@@ -424,8 +427,9 @@ const suiteStatsCards = computed(() => {
   const executed = data.filter(s => s.last_run_at)
   const success = executed.filter(s => s.execution_result === 'passed')
   const failed = executed.filter(s => s.execution_result === 'failed')
-  const avgRate = executed.length > 0
-    ? Math.round(executed.reduce((sum, s) => sum + getSuitePassRate(s), 0) / executed.length)
+  const evaluated = executed.filter(s => !['unverified', 'skipped'].includes(s.execution_result))
+  const avgRate = evaluated.length > 0
+    ? Math.round(evaluated.reduce((sum, s) => sum + getSuitePassRate(s), 0) / evaluated.length)
     : 0
   return [
     { label: t('appAutomation.report.suiteTotal'), value: suitePagination.total, color: '#409eff' },
@@ -469,18 +473,20 @@ async function viewSuiteExecutions(suite) {
   finally { suiteExecLoading.value = false }
 }
 
+function notifyReportFailure(result) {
+  if (!result.opened) {
+    const key = result.reason === 'blocked' ? 'reportPopupBlocked' : result.reason === 'failed' ? 'reportOpenFailed' : 'reportUnavailable'
+    ElMessage.warning(t(`appAutomation.common.${key}`))
+  }
+}
+
 async function viewSuiteAllureReport(suite) {
-  // 获取该套件最近的执行记录，找到有 Allure 报告的
-  try {
+  const result = await openAppExecutionReport(async () => {
     const res = await getTestSuiteExecutions(suite.id)
     const records = res.data.data || res.data.results || res.data || []
-    const withReport = records.find(r => r.report_path)
-    if (withReport) {
-      window.open(`/api/app-automation/executions/${withReport.id}/report/${encodeURIComponent(withReport.report_access_token)}/`, '_blank')
-    } else {
-      ElMessage.warning(t('appAutomation.report.messages.noAllureReport'))
-    }
-  } catch { ElMessage.error(t('appAutomation.report.messages.fetchReportFailed')) }
+    return records.find(record => record.report_access_token)?.id
+  }, { fetchExecution: getExecutionDetail })
+  notifyReportFailure(result)
 }
 
 async function deleteSuiteReport(suite) {
@@ -508,6 +514,7 @@ function getSuiteDisplayStatus(row) {
   if (result === 'passed') return { type: 'success', text: t('appAutomation.status.passed') }
   if (result === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
   if (result === 'skipped') return { type: 'warning', text: t('appAutomation.report.skipped') }
+  if (result === 'unverified') return { type: 'warning', text: t('appAutomation.status.unverified') }
   // 向后兼容
   if (status === 'success') return { type: 'success', text: t('appAutomation.status.passed') }
   if (status === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
@@ -528,8 +535,9 @@ const caseStatsCards = computed(() => {
   const data = caseReports.value
   const success = data.filter(r => r.result === 'passed').length
   const failed = data.filter(r => r.result === 'failed').length
-  const avgRate = data.length > 0
-    ? Math.round(data.reduce((sum, r) => sum + (r.pass_rate || 0), 0) / data.length)
+  const evaluated = data.filter(r => !['unverified', 'skipped'].includes(r.result))
+  const avgRate = evaluated.length > 0
+    ? Math.round(evaluated.reduce((sum, r) => sum + (r.pass_rate || 0), 0) / evaluated.length)
     : 0
   return [
     { label: t('appAutomation.report.totalReports'), value: casePagination.total, color: '#409eff' },
@@ -568,9 +576,8 @@ function viewCaseDetail(row) {
   caseDetailVisible.value = true
 }
 
-function viewAllureReport(row) {
-  if (!row.report_path || !row.report_access_token) return ElMessage.warning(t('appAutomation.report.messages.noAllureReportForRecord'))
-  window.open(`/api/app-automation/executions/${row.id}/report/${encodeURIComponent(row.report_access_token)}/`, '_blank')
+async function viewAllureReport(row) {
+  notifyReportFailure(await openAppExecutionReport(row?.id, { fetchExecution: getExecutionDetail }))
 }
 
 async function deleteCaseReport(row) {

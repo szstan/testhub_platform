@@ -3,7 +3,13 @@ from django.db import models
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from .constants import DeviceStatus, ExecutionStatus, ExecutionResult, ElementType
+from .constants import (
+    DeviceStatus,
+    ElementType,
+    ExecutionEngine,
+    ExecutionResult,
+    ExecutionStatus,
+)
 
 User = get_user_model()
 
@@ -18,6 +24,7 @@ class AppProject(models.Model):
 
     name = models.CharField(max_length=200, verbose_name='项目名称')
     description = models.TextField(blank=True, default='', verbose_name='项目描述')
+    appium_enabled = models.BooleanField(default=False, verbose_name='启用 Appium 引擎')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_PROGRESS', verbose_name='项目状态')
     start_date = models.DateField(null=True, blank=True, verbose_name='开始日期')
     end_date = models.DateField(null=True, blank=True, verbose_name='结束日期')
@@ -101,12 +108,19 @@ class AppDevice(models.Model):
     lease_acquired_at = models.DateTimeField(null=True, blank=True, verbose_name='租约开始时间')
     lease_expires_at = models.DateTimeField(null=True, blank=True, verbose_name='租约过期时间')
     last_heartbeat_at = models.DateTimeField(null=True, blank=True, verbose_name='最后心跳时间')
+    lease_max_seconds = models.PositiveIntegerField(
+        null=True, blank=True, default=None, verbose_name='租约续期上限(秒)',
+    )
 
     # 设备规格和资源池治理信息
     device_specs = models.JSONField(default=dict, verbose_name='设备规格', help_text='RAM, CPU, 分辨率等信息')
     capabilities = models.JSONField(default=dict, blank=True, verbose_name='设备能力')
     health_status = models.CharField(max_length=20, default='unknown', verbose_name='健康状态')
     maintenance_mode = models.BooleanField(default=False, verbose_name='维护模式')
+    device_action_pending = models.BooleanField(default=False, verbose_name='设备动作待安全恢复')
+    device_action_epoch = models.PositiveBigIntegerField(
+        default=0, editable=False, verbose_name='设备动作世代',
+    )
     last_seen_at = models.DateTimeField(null=True, blank=True, verbose_name='最后在线时间')
     description = models.TextField(blank=True, default='', verbose_name='设备描述')
     location = models.CharField(max_length=200, blank=True, default='', verbose_name='设备位置')
@@ -147,15 +161,19 @@ class AppDevice(models.Model):
             current.save(update_fields=_lease_fields())
             self.__dict__.update(current.__dict__)
 
-    def unlock(self, *, expected_generation=None, expected_owner_id=None):
-        """Compare-and-release this snapshot, including calls from legacy paths."""
-        from .device_pool import release_device_execution_lease
+    def unlock(self, *, expected_generation=None, expected_owner_id=None, lease_token=''):
+        """Compare-and-release the current lease, requiring its token when present."""
+        from .device_pool import release_device_snapshot
 
         generation = self.lease_generation if expected_generation is None else expected_generation
         owner_id = self.locked_by_id if expected_owner_id is None else expected_owner_id
-        # The release helper needs only an identity, never a user credential.
         from types import SimpleNamespace
-        released = release_device_execution_lease(self.pk, SimpleNamespace(id=owner_id), generation)
+        released = release_device_snapshot(
+            self.pk,
+            SimpleNamespace(id=owner_id),
+            generation,
+            lease_token,
+        )
         if released:
             self.refresh_from_db()
         return released
@@ -175,6 +193,7 @@ class AppElement(models.Model):
         (ElementType.IMAGE, '图片元素'),
         (ElementType.POS, '坐标元素'),
         (ElementType.REGION, '区域元素'),
+        (ElementType.NATIVE, '原生元素'),
     ]
 
     project = models.ForeignKey(
@@ -335,6 +354,48 @@ class AppCustomComponent(models.Model):
         return f"{self.name} ({self.type})"
 
 
+class AppDataSet(models.Model):
+    """Immutable project-scoped data version used by queued scene executions."""
+
+    project = models.ForeignKey(AppProject, on_delete=models.CASCADE, related_name='data_sets')
+    name = models.CharField(max_length=100)
+    version = models.PositiveIntegerField(default=1)
+    columns = models.JSONField(default=list)
+    rows = models.JSONField(default=list)
+    sensitive_columns = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='created_app_data_sets')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'app_scene_data_sets'
+        ordering = ['name', '-version']
+        constraints = [models.UniqueConstraint(fields=['project', 'name', 'version'],
+                                               name='app_dataset_project_name_version_uniq')]
+
+
+class AppProjectComponent(models.Model):
+    """Versioned reusable scene component visible only within its project."""
+
+    project = models.ForeignKey(AppProject, on_delete=models.CASCADE, related_name='scene_components')
+    name = models.CharField(max_length=100)
+    type = models.CharField(max_length=50)
+    version = models.CharField(max_length=32)
+    description = models.TextField(blank=True, default='')
+    schema = models.JSONField(default=dict)
+    default_config = models.JSONField(default=dict)
+    steps = models.JSONField(default=list)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='created_app_scene_components')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'app_project_components'
+        ordering = ['name', '-created_at']
+        constraints = [models.UniqueConstraint(fields=['project', 'type', 'version'],
+                                               name='app_component_project_type_version_uniq')]
+
+
 class AppComponentPackage(models.Model):
     """APP UI组件包(用于导入/安装组件定义)"""
     SOURCE_CHOICES = [
@@ -431,6 +492,7 @@ class AppTestSuite(models.Model):
         ('passed', '通过'),
         ('failed', '失败'),
         ('skipped', '跳过'),
+        ('unverified', '未验证'),
     ]
 
     project = models.ForeignKey(
@@ -537,6 +599,16 @@ class AppTestCase(models.Model):
     )
     ui_flow = models.JSONField(default=dict, verbose_name='UI流程定义', help_text='UI Flow JSON配置')
     variables = models.JSONField(default=list, verbose_name='变量定义', help_text='测试变量列表')
+    runtime_config = models.JSONField(
+        default=dict, blank=True, verbose_name='场景运行时配置',
+        help_text='重试参数及 OCR 配置；GPU 选项仅作用于执行服务端，不代表移动设备兼容性',
+    )
+    engine = models.CharField(
+        max_length=20,
+        choices=[(ExecutionEngine.LEGACY, 'Legacy'), (ExecutionEngine.APPIUM, 'Appium')],
+        default=None,
+        verbose_name='执行引擎',
+    )
     
     # 用例配置
     timeout = models.IntegerField(default=300, verbose_name='超时时间(秒)', help_text='默认5分钟')
@@ -563,6 +635,14 @@ class AppTestCase(models.Model):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        if self._state.adding and self.engine is None:
+            enabled = self.project_id and AppProject.objects.filter(
+                pk=self.project_id, appium_enabled=True,
+            ).exists()
+            self.engine = ExecutionEngine.APPIUM if enabled else ExecutionEngine.LEGACY
+        super().save(*args, **kwargs)
+
 
 class AppTestExecution(models.Model):
     """APP测试执行记录"""
@@ -578,15 +658,22 @@ class AppTestExecution(models.Model):
         (ExecutionResult.PASSED, '通过'),
         (ExecutionResult.FAILED, '失败'),
         (ExecutionResult.SKIPPED, '跳过'),
+        (ExecutionResult.UNVERIFIED, '未验证'),
     ]
     
     test_case = models.ForeignKey(
-        AppTestCase, 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True, 
-        related_name='executions', 
-        verbose_name='测试用例'
+        AppTestCase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='executions',
+        verbose_name='测试用例',
+    )
+    engine = models.CharField(
+        max_length=20,
+        choices=[(ExecutionEngine.LEGACY, 'Legacy'), (ExecutionEngine.APPIUM, 'Appium')],
+        default=None,
+        verbose_name='执行引擎快照',
     )
     test_suite = models.ForeignKey(
         AppTestSuite,
@@ -612,9 +699,17 @@ class AppTestExecution(models.Model):
         related_name='app_test_executions', 
         verbose_name='执行用户'
     )
+    dataset = models.ForeignKey(
+        AppDataSet, on_delete=models.PROTECT, null=True, blank=True,
+        related_name='executions', verbose_name='数据集版本',
+    )
+    dataset_row_index = models.PositiveIntegerField(null=True, blank=True, verbose_name='数据集行号')
     device_lease_generation = models.PositiveBigIntegerField(
         null=True, blank=True, verbose_name='设备租约世代'
     )
+    stop_requested = models.BooleanField(default=False, verbose_name='是否请求停止')
+    release_device_lease_on_stop = models.BooleanField(default=False, verbose_name='停止时释放执行租约')
+    device_action_pending = models.BooleanField(default=False, verbose_name='设备动作待安全恢复')
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
@@ -661,8 +756,19 @@ class AppTestExecution(models.Model):
             models.Index(fields=['-created_at']),
         ]
     
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            if self.test_case_id:
+                case_engine = AppTestCase.objects.filter(pk=self.test_case_id).values_list(
+                    'engine', flat=True,
+                ).first()
+                self.engine = case_engine or ExecutionEngine.LEGACY
+            elif self.engine is None:
+                self.engine = ExecutionEngine.LEGACY
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.test_case.name} - {self.get_status_display()}"
+        return f"{self.test_case.name if self.test_case_id else 'APP execution'} - {self.get_status_display()}"
     
     @property
     def case_name(self):

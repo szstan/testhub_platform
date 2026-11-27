@@ -7,12 +7,14 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.settings import api_settings
 from rest_framework.filters import SearchFilter
+from django.db import transaction
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from django.http import FileResponse, Http404, HttpResponse
 from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
 from django.views.decorators.csrf import csrf_exempt
+from apps.quality_intelligence.services.redaction import redact_text
 import logging
 import os
 
@@ -20,6 +22,8 @@ from ..models import AppTestExecution
 from ..access import scope_executions
 from ..serializers import AppTestExecutionSerializer
 from ..tasks import send_execution_update
+from ..app_flow_diagnostic_models import AppFlowFailure
+from ..app_flow_diagnostics import resolve_flow_failure_screenshot, serialize_flow_failure
 from apps.app_automation.views.test_case_views import AppPagination
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,35 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
         return Response({'detail': '请通过测试用例执行入口创建执行记录'},
                         status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
+    def retrieve(self, request, *args, **kwargs):
+        execution = self.get_object()
+        data = dict(self.get_serializer(execution).data)
+        failure = serialize_flow_failure(execution)
+        data['case_revision'] = (
+            execution.test_case.updated_at.isoformat() if execution.test_case_id else ''
+        )
+        data['flow_failure'] = failure
+        data['error_classification'] = failure['classification'] if failure else ''
+        data['execution_state'] = (
+            'device_recovery_pending' if execution.device_action_pending else
+            'stopping' if execution.status == 'running' and execution.stop_requested else
+            execution.status
+        )
+        if failure and failure['has_screenshot']:
+            data['flow_failure']['screenshot_url'] = self.reverse_action(
+                'flow-failure-evidence', args=[execution.pk], request=request,
+            )
+        return Response(data)
+
+    @action(detail=True, methods=['get'], url_path='flow-failure-evidence')
+    def flow_failure_evidence(self, request, pk=None):
+        execution = self.get_object()
+        failure = AppFlowFailure.objects.filter(execution_id=execution.pk).first()
+        screenshot = resolve_flow_failure_screenshot(failure)
+        if screenshot is None:
+            raise Http404('失败证据不存在')
+        return FileResponse(open(screenshot, 'rb'), content_type='image/png')
+
     @action(detail=False, methods=['get'])
     def ws_status(self, request):
         """检查 WebSocket 是否可用"""
@@ -85,45 +118,94 @@ class AppTestExecutionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def stop(self, request, pk=None):
-        """停止执行"""
+        """Request cooperative stop without freeing a device under active I/O."""
         execution = self.get_object()
-        
-        if execution.status not in ['pending', 'running']:
-            return Response({
-                'success': False,
-                'message': '只能停止待执行或执行中的任务'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
         try:
-            # 停止 Celery 任务
-            if execution.task_id:
-                from celery import current_app
-                current_app.control.revoke(execution.task_id, terminate=True, signal='SIGTERM')
-                logger.info(f"Celery任务已终止: task_id={execution.task_id}")
-            
-            execution.status = 'stopped'
-            execution.finished_at = timezone.now()
-            if execution.started_at:
-                execution.duration = (execution.finished_at - execution.started_at).total_seconds()
-            execution.save()
-            send_execution_update(
-                execution.id,
-                status='stopped',
-                progress=execution.progress,
-                message='任务已停止',
-                report_path=execution.report_path,
-                finished_at=execution.finished_at
-            )
-            
+            with transaction.atomic():
+                if execution.device_id:
+                    from ..models import AppDevice
+                    AppDevice.objects.select_for_update().filter(pk=execution.device_id).first()
+                current = AppTestExecution.objects.select_for_update().get(pk=execution.pk)
+                if current.status not in ['pending', 'running']:
+                    return Response({
+                        'success': False,
+                        'message': '只能停止待执行或执行中的任务'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                rows = AppTestExecution.objects.select_for_update().filter(
+                    pk=current.pk,
+                    status__in=['pending', 'running'],
+                )
+                if current.task_id:
+                    rows = AppTestExecution.objects.select_for_update().filter(
+                        task_id=current.task_id,
+                        device_id=current.device_id,
+                        user_id=current.user_id,
+                        status__in=['pending', 'running'],
+                    )
+                active_rows = list(rows.order_by('pk'))
+                running_rows = [item for item in active_rows if item.status == 'running']
+                pending_rows = [item for item in active_rows if item.status == 'pending']
+                now = timezone.now()
+
+                for item in pending_rows:
+                    item.status = 'stopped'
+                    item.finished_at = now
+                    item.save(update_fields=['status', 'finished_at', 'updated_at'])
+                for item in running_rows:
+                    item.stop_requested = True
+                    item.save(update_fields=['stop_requested', 'updated_at'])
+
+                if (
+                    not running_rows
+                    and current.release_device_lease_on_stop
+                    and current.device_id
+                    and current.user_id
+                ):
+                    from ..execution_admission import release_device_if_idle
+                    release_device_if_idle(
+                        current.device_id,
+                        current.user,
+                        current.device_lease_generation,
+                    )
+
+            if current.task_id:
+                try:
+                    from celery import current_app
+                    current_app.control.revoke(current.task_id, terminate=False)
+                    logger.info('Celery执行已撤销/请求协作停止: task_id=%s', current.task_id)
+                except Exception as exc:
+                    # The database cancellation is authoritative even if the broker is unavailable.
+                    logger.warning('撤销队列任务失败: %s', redact_text(str(exc), max_length=500))
+
+            for item in pending_rows:
+                send_execution_update(
+                    item.pk,
+                    status='stopped',
+                    progress=item.progress,
+                    message='任务已停止',
+                    report_path=item.report_path,
+                    finished_at=item.finished_at,
+                )
+            for item in running_rows:
+                send_execution_update(
+                    item.pk,
+                    status='running',
+                    progress=item.progress,
+                    message='正在停止当前步骤',
+                    report_path=item.report_path,
+                )
+
             return Response({
                 'success': True,
-                'message': '任务已停止'
+                'message': '停止请求已提交' if running_rows else '任务已停止',
+                'stopping': bool(running_rows),
             })
         except Exception as e:
-            logger.error(f"停止任务失败: {str(e)}")
+            logger.error('停止任务失败: %s', redact_text(str(e), max_length=500))
             return Response({
                 'success': False,
-                'message': f'停止任务失败: {str(e)}'
+                'message': '停止任务失败，请稍后重试'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 

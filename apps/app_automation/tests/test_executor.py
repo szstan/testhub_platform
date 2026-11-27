@@ -118,13 +118,14 @@ def test_preflight_fails_before_starting_without_worker_dependencies(tmp_path):
     which.assert_called_once_with('adb')
 
 
-def test_run_tests_propagates_allure_report_failure(tmp_path):
+def test_run_tests_returns_process_completion_when_allure_generation_fails(tmp_path):
     executor = AppTestExecutor(base_path=str(tmp_path))
     results_dir = tmp_path / 'allure-results'
     results_dir.mkdir()
     process = Mock()
     process.returncode = 0
     process.wait.return_value = 0
+    fence = Mock()
 
     with (
         patch.object(
@@ -136,7 +137,6 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
             },
         ),
         patch.object(executor, '_get_allure_results_dir', return_value=str(results_dir)),
-        patch.object(executor, '_get_log_file_path', return_value=str(tmp_path / 'run.log')),
         patch.object(
             executor,
             '_parse_allure_results',
@@ -151,24 +151,54 @@ def test_run_tests_propagates_allure_report_failure(tmp_path):
         patch.object(executor, '_generate_allure_report', return_value=None),
         patch.object(subprocess, 'Popen', return_value=process),
     ):
-        with pytest.raises(AppTestWorkerError, match='Allure report generation failed'):
-            executor.run_tests(1, 'device', 'package')
+        result = executor.run_tests(1, 'device', 'package', before_device_io=fence)
+
+    assert result['success'] is False
+    assert result['exit_code'] == 0
+    assert result['pytest_process_started'] is True
+    assert result['pytest_process_completed'] is True
+    assert result['device_io_admitted'] is True
+    assert result['test_results']['passed'] == 1
+    assert result['error'] == 'Allure report generation failed after pytest completed'
+    fence.assert_called_once_with()
 
 
-def test_run_tests_streams_all_output_and_returns_only_a_bounded_tail(tmp_path):
+def test_run_tests_reports_marker_admitted_when_pytest_spawn_fails(tmp_path):
+    executor = AppTestExecutor(base_path=str(tmp_path))
+    fence = Mock()
+
+    with (
+        patch.object(executor, '_preflight_worker', return_value={
+            'adb_path': str(tmp_path / 'adb'),
+            'allure_path': str(ALLURE_COMMAND),
+        }),
+        patch.object(
+            executor,
+            '_get_allure_results_dir',
+            return_value=str(tmp_path / 'allure-results'),
+        ),
+        patch.object(subprocess, 'Popen', side_effect=OSError('spawn failed')),
+    ):
+        result = executor.run_tests(1, 'device', 'package', before_device_io=fence)
+
+    assert result['success'] is False
+    assert result['device_io_admitted'] is True
+    assert result['pytest_process_started'] is False
+    assert result['pytest_process_completed'] is False
+    fence.assert_called_once_with()
+
+
+def test_run_tests_suppresses_untrusted_worker_output(tmp_path):
     executor = AppTestExecutor(base_path=str(tmp_path))
     results_dir = tmp_path / 'allure-results'
     results_dir.mkdir()
-    log_path = tmp_path / 'pytest.log'
     process = Mock()
     process.returncode = 0
     process.wait.return_value = 0
 
     def spawn(*_args, **kwargs):
-        assert kwargs['stdout'] is not subprocess.PIPE
-        for index in range(1000):
-            kwargs['stdout'].write(f'pytest-line-{index}\n')
-        kwargs['stdout'].flush()
+        assert kwargs['stdout'] is subprocess.DEVNULL
+        assert kwargs['stderr'] is subprocess.DEVNULL
         return process
 
     with (
@@ -177,7 +207,6 @@ def test_run_tests_streams_all_output_and_returns_only_a_bounded_tail(tmp_path):
             'allure_path': str(ALLURE_COMMAND),
         }),
         patch.object(executor, '_get_allure_results_dir', return_value=str(results_dir)),
-        patch.object(executor, '_get_log_file_path', return_value=str(log_path)),
         patch.object(executor, '_parse_allure_results', return_value={'total': 0}),
         patch.object(executor, '_generate_allure_report', return_value='report'),
         patch('apps.app_automation.executors.test_executor.subprocess.Popen', side_effect=spawn) as popen,
@@ -185,10 +214,8 @@ def test_run_tests_streams_all_output_and_returns_only_a_bounded_tail(tmp_path):
         result = executor.run_tests(1, 'device', 'package')
 
     assert result['success'] is True
-    assert len(result['output'].splitlines()) == 50
-    assert result['output'].splitlines()[-2] == 'pytest-line-999'
-    assert 'pytest-line-0' in log_path.read_text(encoding='utf-8')
-    assert 'pytest-line-999' in log_path.read_text(encoding='utf-8')
+    assert 'output' not in result
+    assert not list(tmp_path.glob('*.log'))
     popen.assert_called_once()
     process.communicate.assert_not_called()
 

@@ -7,6 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.http import FileResponse
 from django.conf import settings
+from django.db import connection, transaction
 from pathlib import Path
 from .test_case_views import AppPagination
 import hashlib
@@ -17,6 +18,7 @@ import logging
 
 from ..models import AppElement
 from ..access import scope_project
+from ..element_reference_service import reference_summary_for_ids, validate_element_ids
 from ..serializers import AppElementSerializer
 
 logger = logging.getLogger(__name__)
@@ -47,33 +49,80 @@ class AppElementViewSet(viewsets.ModelViewSet):
             return None
         return candidate
 
-    def perform_destroy(self, instance):
-        """
-        删除元素时同时删除物理文件
-        """
-        # 如果是图片类型，删除物理文件
-        if instance.element_type == 'image' and instance.config:
-            image_path = instance.config.get('image_path')
-            if image_path:
-                try:
-                    # 构造完整文件路径
-                    template_base = self.get_template_base_path()
-                    file_path = self._safe_template_file_path(image_path)
-                    if file_path is None:
-                        raise ValueError('非法图片路径')
-                    
-                    # 删除文件
-                    if file_path.exists():
-                        file_path.unlink()
-                        logger.info(f"删除图片文件: {file_path}")
-                    else:
-                        logger.warning(f"图片文件不存在: {file_path}")
-                except Exception as e:
-                    logger.error(f"删除图片文件失败: {str(e)}")
-                    # 继续删除数据库记录，即使文件删除失败
-        
-        # 删除数据库记录
-        instance.delete()
+    def _add_reference_summaries(self, serialized, elements):
+        summaries = reference_summary_for_ids(elements, self.request.user)
+        for element, row in zip(elements, serialized):
+            summary = summaries[element.pk]
+            row['reference_count'] = summary['reference_count']
+            row['reference_count_unknown'] = summary['reference_count_unknown']
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        elements = list(page if page is not None else queryset)
+        serializer = self.get_serializer(elements, many=True)
+        data = serializer.data
+        self._add_reference_summaries(data, elements)
+        if page is not None:
+            return self.get_paginated_response(data)
+        return Response(data)
+
+    def _archive_elements(self, request, element_ids):
+        with transaction.atomic():
+            visible_ids = set(scope_project(
+                AppElement.objects.filter(pk__in=element_ids, is_active=True),
+                request.user,
+                'project',
+            ).values_list('pk', flat=True))
+            if len(visible_ids) != len(element_ids):
+                return Response(
+                    {'detail': '元素不存在'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            elements = list(
+                AppElement.objects.select_for_update()
+                .filter(pk__in=element_ids, is_active=True)
+                .order_by('pk')
+            )
+            if len(elements) != len(element_ids):
+                return Response(
+                    {'detail': '元素不存在'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            summaries = reference_summary_for_ids(elements, request.user)
+            if any(summaries[element.pk]['is_referenced'] for element in elements):
+                return Response({
+                    'code': status.HTTP_409_CONFLICT,
+                    'msg': '元素仍被保存的用例或组件引用，无法归档',
+                    'detail': '请先移除相关引用后再归档',
+                    'success': False,
+                }, status=status.HTTP_409_CONFLICT)
+
+            AppElement.objects.filter(pk__in=element_ids, is_active=True).update(is_active=False)
+
+        return Response({
+            'code': 0,
+            'msg': '归档成功',
+            'success': True,
+            'data': {'archived_count': len(element_ids)},
+        })
+
+    def destroy(self, request, *args, **kwargs):
+        element = self.get_object()
+        return self._archive_elements(request, [element.pk])
+
+    @action(detail=False, methods=['post'], url_path='bulk-archive')
+    def bulk_archive(self, request):
+        element_ids = validate_element_ids(request.data.get('ids'))
+        if element_ids is None:
+            return Response({
+                'code': status.HTTP_400_BAD_REQUEST,
+                'msg': '元素 ID 列表无效',
+                'success': False,
+            }, status=status.HTTP_400_BAD_REQUEST)
+        return self._archive_elements(request, element_ids)
     
     def get_queryset(self):
         """
@@ -88,24 +137,23 @@ class AppElementViewSet(viewsets.ModelViewSet):
         search = self.request.query_params.get('search', '').strip()
         if search:
             from django.db.models import Q
-            from django.db import connection
             import json
-            
+
             if 'mysql' in connection.vendor:
-                # MySQL: 使用 JSON_CONTAINS 查询
-                search_json = json.dumps(search)  # "登录" → '"登录"'
-                
-                # 不使用表名前缀，让 Django 自动处理
+                # Keep MySQL JSON_CONTAINS semantics: tags match whole JSON values.
+                search_json = json.dumps(search)
                 queryset = queryset.extra(
                     where=["name LIKE %s OR JSON_CONTAINS(tags, %s)"],
                     params=[f'%{search}%', search_json]
                 )
-            else:
-                # PostgreSQL: 使用 @> 运算符
+            elif connection.vendor == 'postgresql':
                 queryset = queryset.filter(
-                    Q(name__icontains=search) | 
+                    Q(name__icontains=search) |
                     Q(tags__contains=[search])
                 )
+            else:
+                # SQLite has no JSON array containment lookup; retain name search.
+                queryset = queryset.filter(name__icontains=search)
         
         return queryset
     

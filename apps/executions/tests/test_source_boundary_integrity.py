@@ -5,7 +5,8 @@ import pytest
 from rest_framework.test import APIClient
 
 from apps.api_testing.models import ApiCollection, ApiProject, ApiRequest, TestSuite as ApiTestSuite
-from apps.app_automation.models import AppProject, AppTestCase, AppTestSuite
+from apps.app_automation.device_pool import acquire_device
+from apps.app_automation.models import AppDevice, AppProject, AppTestCase, AppTestSuite
 from apps.executions.adapters import (
     ApiExecutorAdapter,
     AppExecutorAdapter,
@@ -286,12 +287,13 @@ def test_app_approval_capabilities_and_lease_require_privileged_changes(boundary
     worker = execute_app_source
     app_binding.refresh_from_db()
     assert app_binding.metadata['approved'] is True
-    device = SimpleNamespace(pk=71, lease_generation=3)
+    device = AppDevice.objects.create(device_id='source-boundary-device', status='available')
+    device, lease_token = acquire_device(actor)
     execution = SimpleNamespace(
         pk=72, result='passed', status='completed', refresh_from_db=lambda: None
     )
     with (
-        patch('apps.app_automation.device_pool.acquire_device', return_value=(device, 'test-lease')) as acquire,
+        patch('apps.app_automation.device_pool.acquire_device', return_value=(device, lease_token)) as acquire,
         patch('apps.app_automation.device_pool.release_device') as release,
         patch('apps.app_automation.models.AppTestExecution.objects.create', return_value=execution),
         patch('apps.app_automation.tasks.execute_app_test_task.run') as app_runner,
@@ -303,7 +305,7 @@ def test_app_approval_capabilities_and_lease_require_privileged_changes(boundary
         actor, capabilities={'platform': 'android'}, lease_seconds=120
     )
     app_runner.assert_called_once()
-    release.assert_called_once_with(device.pk, actor, 'test-lease')
+    release.assert_called_once_with(device.pk, actor, lease_token)
 
 
 def test_app_approval_cannot_be_smuggled_through_non_app_metadata(boundary):

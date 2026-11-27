@@ -4,3 +4,7 @@ airtest==1.4.3
 easyocr==1.7.2
 opencv-contrib-python==4.6.0.66
 numpy==1.26.4
+# Appium automation client and its browser protocol dependencies. Web workers use requirements-prod.txt.
+Appium-Python-Client==6.0.0
+selenium==4.32.0
+websocket-client==1.8.0

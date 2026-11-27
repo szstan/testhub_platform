@@ -4,6 +4,12 @@ APP自动化测试常量定义
 """
 
 
+class ExecutionEngine:
+    """Persisted APP scene engine identifiers."""
+    LEGACY = 'legacy'
+    APPIUM = 'appium'
+
+
 class DeviceStatus:
     """设备状态"""
     AVAILABLE = 'available'
@@ -30,6 +36,7 @@ class ExecutionResult:
     PASSED = 'passed'
     FAILED = 'failed'
     SKIPPED = 'skipped'
+    UNVERIFIED = 'unverified'
 
 
 class ElementType:
@@ -37,3 +44,8 @@ class ElementType:
     IMAGE = 'image'      # 图片元素
     POS = 'pos'          # 坐标元素
     REGION = 'region'    # 区域元素
+    NATIVE = 'native'    # Android native locator
+
+
+ANDROID_PACKAGE_NAME_PATTERN = r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+'
+NATIVE_ELEMENT_STRATEGIES = ('id', 'accessibility_id')

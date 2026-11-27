@@ -9,7 +9,9 @@ class AppAutomationConfig(AppConfig):
     
     def ready(self):
         """应用启动时执行"""
+        import apps.app_automation.app_flow_diagnostic_models  # noqa
         try:
             import apps.app_automation.tasks  # noqa
+            import apps.app_automation.appium_tasks  # noqa
         except ImportError:
             pass

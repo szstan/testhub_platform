@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate an installed Linux runtime without network access or mutation."""
+"""Validate an installed Linux runtime and optional local Appium readiness."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
@@ -30,6 +32,7 @@ PROFILES = {
             "channels_redis",
             "rest_framework",
             "airtest.core.api",
+            "appium.webdriver",
             "allure",
             "allure_pytest",
             "cv2",
@@ -71,6 +74,17 @@ def parse_args() -> argparse.Namespace:
         "--allure",
         type=Path,
         help="Allure executable; defaults to <repo-root>/allure/bin/allure",
+    )
+    parser.add_argument(
+        "--appium-url",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="Check an automation worker's loopback Appium /status without opening a device session",
+    )
+    parser.add_argument(
+        "--appium-version",
+        help="Require the reported Appium Server version for every --appium-url",
     )
     parser.add_argument(
         "--json",
@@ -231,8 +245,47 @@ def validate_executable(name: str, path: Path | None, default: Path | None = Non
     return result
 
 
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def validate_appium(url: str, expected_version: str | None = None) -> dict[str, Any]:
+    try:
+        endpoint = urlsplit(url)
+        if (
+            endpoint.scheme != "http" or endpoint.hostname not in {"127.0.0.1", "::1"}
+            or not endpoint.port or endpoint.username is not None or endpoint.password is not None
+            or endpoint.query or endpoint.fragment or endpoint.path not in {"", "/"}
+        ):
+            raise ValueError
+    except ValueError:
+        return {"ok": False, "error": "expected an HTTP loopback base URL with an explicit port"}
+
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(f"http://{endpoint.netloc}/status", timeout=3) as response:
+            body = response.read(65_537)
+        if len(body) > 65_536:
+            raise ValueError
+        value = json.loads(body)["value"]
+        if not isinstance(value, dict) or value.get("ready") is not True:
+            return {"ok": False, "error": "Appium Server reports that it is not ready"}
+        build = value.get("build")
+        version = build.get("version") if isinstance(build, dict) else None
+        if expected_version is not None and version != expected_version:
+            return {"ok": False, "error": "Appium Server version does not match the release"}
+    except (KeyError, ValueError, OSError, TypeError):
+        return {"ok": False, "error": "could not read the Appium /status response"}
+    return {"ok": True}
+
+
 def main() -> int:
     args = parse_args()
+    if args.appium_url and args.profile != "automation":
+        raise SystemExit("--appium-url requires the automation profile")
+    if args.appium_version and not args.appium_url:
+        raise SystemExit("--appium-version requires --appium-url")
     profile = PROFILES[args.profile]
     result: dict[str, Any] = {
         "schema_version": 1,
@@ -253,7 +306,9 @@ def main() -> int:
                 args.repo_root.expanduser().resolve() / "allure" / "bin" / "allure",
             ),
         }
-    checks = [result["platform"], result["pip_check"], result["imports"]]
+    if args.appium_url:
+        result["appium"] = [validate_appium(url, args.appium_version) for url in args.appium_url]
+    checks = [result["platform"], result["pip_check"], result["imports"], *result.get("appium", [])]
     if args.mirror:
         checks.append(result["mirror"])
     if args.profile == "automation":
@@ -272,6 +327,8 @@ def main() -> int:
         if args.profile == "automation":
             for name, check in result["executables"].items():
                 print(f"{name}={'passed' if check['ok'] else 'failed'}")
+        for index, check in enumerate(result.get("appium", []), start=1):
+            print(f"appium[{index}]={'passed' if check['ok'] else check['error']}")
         print(f"runtime_validation={'passed' if result['ok'] else 'failed'}")
     return 0 if result["ok"] else 1
 

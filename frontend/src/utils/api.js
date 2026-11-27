@@ -53,7 +53,7 @@ api.interceptors.response.use(
         return api(originalRequest)
       }
       userStore.clearSession({ notify: true })
-    } else if (error.response?.status >= 500) {
+    } else if (error.response?.status >= 500 && !originalRequest?.suppressServerErrorToast) {
       ElMessage.error('服务器错误，请稍后重试')
     }
     // Auth endpoint failures go directly to their caller, without logout or reload.

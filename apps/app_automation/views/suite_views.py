@@ -7,11 +7,19 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db import transaction
+from apps.quality_intelligence.services.redaction import redact_text
 import logging
 import re
 
 from ..models import AppTestSuite, AppTestSuiteCase, AppTestCase, AppDevice, AppTestExecution
-from ..device_pool import DeviceLeaseError, validate_device_lease
+from ..device_pool import DeviceLeaseError
+from ..execution_admission import DeviceExecutionBusy
+from ..execution_dispatch import (
+    enqueue_app_task,
+    execution_user_matches,
+    new_execution_dispatch_id,
+    prepare_execution_device,
+)
 from ..access import scope_project, scope_test_cases
 from .test_case_views import AppPagination
 from ..serializers import (
@@ -20,6 +28,7 @@ from ..serializers import (
     AppTestSuiteUpdateSerializer,
     AppTestSuiteCaseSerializer,
     AppTestExecutionSerializer,
+    AppDeviceSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,95 +178,131 @@ class AppTestSuiteViewSet(viewsets.ModelViewSet):
     def run(self, request, pk=None):
         """执行测试套件（顺序执行所有用例）"""
         suite = self.get_object()
+        if not execution_user_matches(request.user, request.data.get('expected_user_id')):
+            return Response({'success': False, 'message': '登录用户已变化，请重新操作'},
+                            status=status.HTTP_403_FORBIDDEN)
         device_id = request.data.get('device_id')
         package_name = request.data.get('package_name') or ''
-        lease_token = request.data.get('lease_token') or ''
+        auto_lock = request.data.get('auto_lock', False)
 
+        if not isinstance(auto_lock, bool):
+            return Response({'success': False, 'message': 'auto_lock 必须为布尔值'},
+                            status=status.HTTP_400_BAD_REQUEST)
         if not device_id:
             return Response({'success': False, 'message': '请选择执行设备'},
                             status=status.HTTP_400_BAD_REQUEST)
-        if package_name and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', str(package_name)):
-            return Response({'success': False, 'message': '非法 Android package name'}, status=status.HTTP_400_BAD_REQUEST)
+        if package_name and not re.fullmatch(
+            r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+', str(package_name)
+        ):
+            return Response({'success': False, 'message': '非法 Android package name'},
+                            status=status.HTTP_400_BAD_REQUEST)
 
-        suite_cases = suite.suite_cases.select_related('test_case').all()
-        if suite_cases.filter(test_case__project_id__isnull=False).exclude(
-            test_case__project_id=suite.project_id
-        ).exists():
+        suite_cases = list(
+            suite.suite_cases.select_related('test_case', 'test_case__app_package').all()
+        )
+        if not suite_cases:
+            return Response({'success': False, 'message': '该套件未包含任何测试用例'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        case_ids = [item.test_case_id for item in suite_cases]
+        accessible_ids = set(scope_test_cases(
+            AppTestCase.objects.filter(pk__in=case_ids), request.user
+        ).values_list('pk', flat=True))
+        if any(case_id not in accessible_ids for case_id in case_ids):
+            return Response({'success': False, 'message': '测试套件包含无权使用的测试用例'},
+                            status=status.HTTP_403_FORBIDDEN)
+        if any(
+            item.test_case.project_id is not None
+            and item.test_case.project_id != suite.project_id
+            for item in suite_cases
+        ):
             return Response(
                 {'success': False, 'message': '测试套件包含其他项目的测试用例'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        if not suite_cases.exists():
-            return Response(
-                {'success': False, 'message': '该套件未包含任何测试用例'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        executions = []
+        acquired_lease = False
         try:
             with transaction.atomic():
                 device = AppDevice.objects.select_for_update().get(device_id=device_id)
-                try:
-                    validate_device_lease(device.id, request.user, lease_token)
-                except DeviceLeaseError as exc:
-                    return Response({'success': False, 'message': str(exc)}, status=status.HTTP_403_FORBIDDEN)
-
-                lease_generation = device.lease_generation
+                device, lease_generation, acquired_lease = prepare_execution_device(
+                    device,
+                    request.user,
+                    lease_token=request.data.get('lease_token') or '',
+                    auto_lock=auto_lock,
+                )
+                dispatch_id = new_execution_dispatch_id()
                 executions = [
                     AppTestExecution.objects.create(
-                        test_case=sc.test_case,
+                        test_case=item.test_case,
                         test_suite=suite,
                         device=device,
                         user=request.user,
                         status='pending',
+                        task_id=dispatch_id,
                         device_lease_generation=lease_generation,
+                        release_device_lease_on_stop=acquired_lease,
                     )
-                    for sc in suite_cases
+                    for item in suite_cases
                 ]
                 suite.execution_status = 'running'
                 suite.save(update_fields=['execution_status'])
-
-            from ..tasks import execute_app_suite_task
-            execution_ids = [e.id for e in executions]
-            try:
-                task = execute_app_suite_task.delay(
-                    suite_id=suite.id,
-                    execution_ids=execution_ids,
-                    package_name=package_name,
-                    lease_generation=lease_generation,
-                )
-            except Exception:
-                AppTestExecution.objects.filter(id__in=execution_ids).update(
-                    status='error', error_message='无法提交 Celery 执行任务'
-                )
-                suite.execution_status = 'error'
-                suite.save(update_fields=['execution_status'])
-                raise
-
-            executions[0].task_id = task.id
-            executions[0].save(update_fields=['task_id'])
-
-            logger.info(f"测试套件已提交执行: suite={suite.name}, "
-                        f"cases={len(executions)}, task_id={task.id}")
-            return Response({
-                'success': True,
-                'message': f'测试套件已提交执行，共 {len(executions)} 个用例',
-                'data': {
-                    'suite_id': suite.id,
-                    'task_id': task.id,
-                    'execution_ids': execution_ids,
-                    'test_case_count': len(executions),
-                }
-            })
         except AppDevice.DoesNotExist:
             return Response({'success': False, 'message': '设备不存在'},
                             status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"执行套件失败: {str(e)}", exc_info=True)
-            suite.execution_status = 'failed'
-            suite.save(update_fields=['execution_status'])
-            return Response({'success': False, 'message': f'执行失败: {str(e)}'},
+        except DeviceExecutionBusy as exc:
+            return Response({'success': False, 'message': str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        except PermissionError as exc:
+            return Response({'success': False, 'message': str(exc)},
+                            status=status.HTTP_403_FORBIDDEN)
+        except DeviceLeaseError as exc:
+            return Response({'success': False, 'message': str(exc)},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        from ..tasks import execute_app_suite_task, settle_undispatched_app_executions
+        execution_ids = [execution.pk for execution in executions]
+        try:
+            enqueue_app_task(
+                execute_app_suite_task,
+                dispatch_id=dispatch_id,
+                kwargs={
+                    'suite_id': suite.pk,
+                    'execution_ids': execution_ids,
+                    'package_name': package_name,
+                    'lease_generation': lease_generation,
+                    'release_device_lease': acquired_lease,
+                    'dispatch_id': dispatch_id,
+                },
+            )
+        except Exception as exc:
+            message = '无法提交执行任务，请检查任务队列'
+            settle_undispatched_app_executions(
+                execution_ids,
+                message,
+                suite_id=suite.pk,
+                device_id=device.pk,
+                lease_owner=request.user if acquired_lease else None,
+                lease_generation=lease_generation,
+                release_device_lease=acquired_lease,
+            )
+            logger.error('执行套件派发失败: %s', redact_text(str(exc), max_length=500))
+            return Response({'success': False, 'message': message},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        device.refresh_from_db()
+        logger.info('测试套件已提交执行: suite=%s cases=%s task_id=%s',
+                    suite.name, len(executions), dispatch_id)
+        return Response({
+            'success': True,
+            'message': f'测试套件已提交执行，共 {len(executions)} 个用例',
+            'data': {
+                'suite_id': suite.pk,
+                'task_id': dispatch_id,
+                'execution_ids': execution_ids,
+                'test_case_count': len(executions),
+            },
+            'device': AppDeviceSerializer(device).data,
+        })
 
     @action(detail=True, methods=['get'])
     def executions(self, request, pk=None):

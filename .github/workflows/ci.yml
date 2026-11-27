@@ -254,7 +254,7 @@ jobs:
         run: |
           python scripts/validate_linux_runtime.py --profile automation --repo-root "$PWD"
           python -m pip check
-          python -c "import airtest.core.api, allure, allure_pytest; print('APP Python dependencies: OK')"
+          python -c "import airtest.core.api, appium.webdriver, allure, allure_pytest; print('APP Python dependencies: OK')"
           export APP_ADB_PATH="$(command -v adb)"
           test -n "$APP_ADB_PATH"
           test -x "$APP_ADB_PATH"
@@ -274,7 +274,26 @@ jobs:
           SECRET_KEY: ci-only-not-for-production
           DEBUG: 'True'
           ALLOWED_HOSTS: 127.0.0.1,localhost
-        run: python -m pytest -q apps/app_automation/tests/test_security_boundaries.py apps/app_automation/tests/test_execution_views.py apps/app_automation/tests/test_executor.py apps/app_automation/tests/test_websocket_events.py
+        run: |
+          python -m pytest -q \
+            apps/app_automation/tests/test_security_boundaries.py \
+            apps/app_automation/tests/test_execution_views.py \
+            apps/app_automation/tests/test_executor.py \
+            apps/app_automation/tests/test_websocket_events.py \
+            apps/app_automation/tests/test_manual_execution_lease.py \
+            apps/app_automation/tests/test_execution_admission.py \
+            apps/app_automation/tests/test_execution_stop_recovery.py \
+            apps/app_automation/tests/test_region_interactions.py \
+            apps/app_automation/tests/test_result_truth.py \
+            apps/app_automation/tests/test_element_archival.py \
+            apps/app_automation/tests/test_appium_data_contract.py \
+            apps/app_automation/tests/test_appium_flow_adapter.py \
+            apps/app_automation/tests/test_appium_sessions_integration.py \
+            apps/app_automation/tests/test_appium_batch_reservation.py \
+            apps/app_automation/tests/test_appium_interactive_expiry.py \
+            apps/app_automation/tests/test_appium_visual_stop_and_ocr.py \
+            apps/app_automation/tests/test_appium_configuration_and_device_history.py \
+            apps/app_automation/tests/test_app_flow_diagnostics.py
 
       - name: Run APP UI Flow safety gate
         env:
@@ -340,10 +359,14 @@ jobs:
           python-version: '3.12'
 
       - name: Run release integrity regressions with frontend dependencies
+      - name: Test APP automation authoring and execution
+        working-directory: ${{ github.workspace }}
+        run: node --test --test-concurrency=1 frontend/tests/app-*.test.mjs
+
         working-directory: ${{ github.workspace }}
         run: |
           python -m pip install pytest==8.4.1
-          python -m pytest -q -c /dev/null scripts/tests/test_release_integrity.py
+          python -m pytest -q -c /dev/null scripts/tests/test_release_integrity.py scripts/tests/test_appium_runtime.py
 
       - name: Validate release packaging and staging checks
         working-directory: ${{ github.workspace }}

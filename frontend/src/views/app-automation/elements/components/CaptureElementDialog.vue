@@ -53,20 +53,34 @@
         <el-form :model="formData" ref="formRef" label-width="110px" size="small">
           <!-- 设备选择和截图 -->
           <el-form-item :label="$t('appAutomation.element.capture.selectDevice')">
-            <el-select v-model="selectedDevice" :placeholder="$t('appAutomation.element.capture.selectDevicePlaceholder')" style="width: 100%" :loading="devicesLoading">
+            <el-select
+              v-model="selectedDevice"
+              :placeholder="$t('appAutomation.element.capture.selectDevicePlaceholder')"
+              :disabled="capturing || lockingDevice || submitting"
+              style="width: 100%"
+              :loading="devicesLoading"
+            >
               <el-option
                 v-for="device in devices"
                 :key="device.id"
-                :label="device.device_id"
+                :label="`${device.name || device.device_id} · ${t(`appAutomation.element.capture.deviceStates.${getDeviceCaptureState(device)}`)}`"
                 :value="device.id"
               />
             </el-select>
           </el-form-item>
 
           <el-form-item>
-            <el-button type="primary" :loading="capturing" :disabled="!selectedDevice" @click="captureScreen">
+            <el-button
+              v-if="deviceCaptureState === 'available'"
+              :loading="lockingDevice"
+              @click="lockSelectedDevice"
+            >{{ $t('appAutomation.device.lock') }}</el-button>
+            <el-button type="primary" :loading="capturing" :disabled="deviceCaptureState !== 'ready' || lockingDevice" @click="captureScreen">
               {{ $t('appAutomation.element.capture.captureFromDevice') }}
             </el-button>
+            <router-link v-if="['recovery', 'busy', 'offline'].includes(deviceCaptureState)" to="/app-automation/devices">
+              {{ $t('appAutomation.element.capture.openDeviceManagement') }}
+            </router-link>
           </el-form-item>
 
           <!-- Region和Pos值（根据元素类型显示） -->
@@ -87,7 +101,7 @@
 
           <!-- 所属项目 -->
           <el-form-item :label="$t('appAutomation.element.capture.project')">
-            <el-select v-model="formData.project" :placeholder="$t('appAutomation.common.selectProject')" clearable filterable style="width: 100%">
+            <el-select v-model="formData.project" :disabled="defaultProject != null" :placeholder="$t('appAutomation.common.selectProject')" clearable filterable style="width: 100%">
               <el-option v-for="p in projectList" :key="p.id" :label="p.name" :value="p.id" />
             </el-select>
           </el-form-item>
@@ -114,6 +128,13 @@
           <!-- 图片类型特有配置 -->
           <template v-if="formData.element_type === 'image'">
             <el-divider content-position="left">{{ $t('appAutomation.element.capture.imageConfig') }}</el-divider>
+            <el-form-item v-if="capturedImage" :label="$t('appAutomation.element.capture.imagePreview')">
+              <div class="image-crop-preview">
+                <el-checkbox v-model="saveFullImage">{{ $t('appAutomation.element.capture.saveFullImage') }}</el-checkbox>
+                <img v-if="imagePreview" :src="imagePreview" :alt="$t('appAutomation.element.capture.imagePreview')" />
+                <p v-else>{{ $t('appAutomation.element.capture.dragToSelectTip') }}</p>
+              </div>
+            </el-form-item>
 
             <!-- 图片分类 -->
             <el-form-item :label="$t('appAutomation.element.capture.imageCategory')" required>
@@ -239,21 +260,30 @@ interface ProjectItem {
 }
 import { FolderOpened, Plus, Delete } from '@element-plus/icons-vue'
 import {
-  getDeviceList,
   captureDeviceScreenshot,
+  lockDevice,
   uploadAppElementImage,
   createAppElement,
   getAppImageCategories,
   createAppImageCategory,
   deleteAppImageCategory
 } from '@/api/app-automation'
+import { getAllAppDevices } from '@/api/app-device-options'
+import { useUserStore } from '@/stores/user'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
+const userStore = useUserStore()
+const currentUserId = () => userStore.user?.id ?? userStore.user?.pk ?? null
+const sessionGeneration = () => userStore.getSessionGeneration?.()
+let dialogVersion = 0
+const requestIsCurrent = (version, userId, generation) =>
+  dialogVersion === version && currentUserId() === userId && sessionGeneration() === generation
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
-  projectList: { type: Array as PropType<ProjectItem[]>, default: () => [] }
+  projectList: { type: Array as PropType<ProjectItem[]>, default: () => [] },
+  defaultProject: { type: [Number, String], default: null }
 })
 
 const emit = defineEmits(['update:modelValue', 'success'])
@@ -274,7 +304,22 @@ const devices = ref([])
 const devicesLoading = ref(false)
 const selectedDevice = ref(null)
 const capturing = ref(false)
+const lockingDevice = ref(false)
 const capturedImage = ref('')
+const saveFullImage = ref(false)
+const selectedDeviceRecord = computed(() => devices.value.find(device => device.id === selectedDevice.value))
+
+const getDeviceCaptureState = device => {
+  if (!device) return ''
+  if (device.has_pending_action || device.maintenance_mode || device.health_status === 'unhealthy') return 'recovery'
+  if (device.status === 'offline') return 'offline'
+  const ownerId = device.locked_by_id ?? device.locked_by?.id ?? device.locked_by
+  if (ownerId == null && ['online', 'available'].includes(device.status)) return 'available'
+  if (device.status === 'locked' && ownerId != null && currentUserId() != null
+      && String(ownerId) === String(currentUserId()) && !device.lease_requires_token) return 'ready'
+  return 'busy'
+}
+const deviceCaptureState = computed(() => getDeviceCaptureState(selectedDeviceRecord.value))
 
 // 截图选区
 const selection = ref(null)
@@ -298,12 +343,12 @@ const formData = reactive({
   config: {
     image_threshold: 0.7,
     rgb: false,
-    x: 0,
-    y: 0,
-    x1: 0,
-    y1: 0,
-    x2: 0,
-    y2: 0,
+    x: null,
+    y: null,
+    x1: null,
+    y1: null,
+    x2: null,
+    y2: null,
     image_path: '',
     file_hash: ''
   }
@@ -316,18 +361,34 @@ const newCategoryName = ref('')
 const creatingCategory = ref(false)
 
 // 计算属性
-const regionValue = computed(() => {
-  if (formData.config.x1 && formData.config.y1 && formData.config.x2 && formData.config.y2) {
-    return `${formData.config.x1},${formData.config.y1},${formData.config.x2},${formData.config.y2}`
-  }
-  return ''
+const hasPosition = computed(() => Number.isFinite(formData.config.x) && Number.isFinite(formData.config.y))
+const hasRegion = computed(() => {
+  const { x1, y1, x2, y2 } = formData.config
+  return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
 })
+const regionValue = computed(() => {
+  if (!hasRegion.value) return ''
+  const { x1, y1, x2, y2 } = formData.config
+  return `${x1},${y1},${x2},${y2}`
+})
+const posValue = computed(() => hasPosition.value ? `${formData.config.x},${formData.config.y}` : '')
 
-const posValue = computed(() => {
-  if (formData.config.x && formData.config.y) {
-    return `${formData.config.x},${formData.config.y}`
+const imagePreview = computed(() => {
+  if (formData.element_type !== 'image' || !capturedImage.value || !imageSize.value.width) return ''
+  if (saveFullImage.value) return capturedImage.value
+  if (selecting.value || !selection.value || !hasRegion.value || !imageRef.value) return ''
+  const { x1, y1, x2, y2 } = formData.config
+  try {
+    const canvas = document.createElement('canvas')
+    canvas.width = x2 - x1
+    canvas.height = y2 - y1
+    const context = canvas.getContext('2d')
+    if (!context) return ''
+    context.drawImage(imageRef.value, x1, y1, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height)
+    return canvas.toDataURL('image/png')
+  } catch {
+    return ''
   }
-  return ''
 })
 
 const selectionStyle = computed(() => {
@@ -360,56 +421,96 @@ const imageSavePath = computed(() => {
 
 // 是否可以保存
 const canSave = computed(() => {
-  if (!formData.name) return false
+  if (!formData.name.trim()) return false
   if (formData.element_type === 'image') {
-    return capturedImage.value && templateFileName.value && formData.image_category
+    return Boolean(imagePreview.value && templateFileName.value && formData.image_category)
   } else if (formData.element_type === 'pos') {
-    return formData.config.x && formData.config.y
+    return hasPosition.value
   } else if (formData.element_type === 'region') {
-    return formData.config.x1 && formData.config.y1 && formData.config.x2 && formData.config.y2
+    return hasRegion.value && !selecting.value
   }
   return false
 })
 
 // 加载设备列表
 const loadDevices = async () => {
+  const version = dialogVersion
+  const userId = currentUserId()
+  const generation = sessionGeneration()
+  const isCurrent = () => requestIsCurrent(version, userId, generation)
   devicesLoading.value = true
   try {
-    const { data } = await getDeviceList()
-    devices.value = data.results || []
-  } catch (error) {
-    console.error('加载设备列表失败:', error)
-    ElMessage.error(t('appAutomation.element.capture.messages.loadDevicesFailed'))
+    const rows = await getAllAppDevices()
+    if (isCurrent()) devices.value = rows
+  } catch {
+    if (isCurrent()) ElMessage.error(t('appAutomation.element.capture.messages.loadDevicesFailed'))
   } finally {
-    devicesLoading.value = false
+    if (isCurrent()) devicesLoading.value = false
   }
 }
 
 // 从设备截图
-const captureScreen = async () => {
-  if (!selectedDevice.value) {
-    ElMessage.warning(t('appAutomation.element.capture.messages.selectDeviceRequired'))
-    return
+const getScreenshotErrorMessage = (data, fallback) => {
+  const backendMessage = [data?.msg, data?.message, data?.detail]
+    .find(value => typeof value === 'string' && value.trim())
+  const safeMessage = typeof backendMessage === 'string' ? backendMessage.trim().slice(0, 500) : ''
+  return safeMessage || fallback
+}
+
+const lockSelectedDevice = async () => {
+  if (deviceCaptureState.value !== 'available' || lockingDevice.value) return
+  const deviceId = selectedDevice.value
+  const version = dialogVersion
+  const userId = currentUserId()
+  const generation = sessionGeneration()
+  const isCurrent = () => requestIsCurrent(version, userId, generation)
+  lockingDevice.value = true
+  try {
+    const { data } = await lockDevice(deviceId)
+    if (!isCurrent()) return
+    if (data?.success) await loadDevices()
+    else ElMessage.error(getScreenshotErrorMessage(data, t('appAutomation.device.messages.lockFailed')))
+  } catch (error) {
+    if (isCurrent()) ElMessage.error(getScreenshotErrorMessage(error.response?.data, t('appAutomation.device.messages.lockFailed')))
+  } finally {
+    if (isCurrent()) lockingDevice.value = false
   }
+}
+
+const captureScreen = async () => {
+  if (deviceCaptureState.value !== 'ready' || capturing.value) return
+  const version = dialogVersion
+  const userId = currentUserId()
+  const generation = sessionGeneration()
+  const deviceId = selectedDevice.value
+  const isCurrent = () => requestIsCurrent(version, userId, generation) && selectedDevice.value === deviceId
 
   capturing.value = true
   try {
-    const { data } = await captureDeviceScreenshot(selectedDevice.value)
+    const { data } = await captureDeviceScreenshot(deviceId)
+    if (!isCurrent()) return
 
     if (data.success && data.data) {
+      clearCapturedFrame()
       capturedImage.value = data.data.content || data.content || ''
       if (!capturedImage.value) {
-        throw new Error(t('appAutomation.element.capture.messages.emptyScreenshot'))
+        ElMessage.error(t('appAutomation.element.capture.messages.emptyScreenshot'))
+        return
       }
       ElMessage.success(t('appAutomation.element.capture.messages.captureSuccess'))
     } else {
-      ElMessage.error(data.message || t('appAutomation.element.capture.messages.captureFailed'))
+      ElMessage.error(getScreenshotErrorMessage(
+        data,
+        t('appAutomation.element.capture.messages.captureFailed')
+      ))
     }
   } catch (error) {
-    console.error('截图失败:', error)
-    ElMessage.error(t('appAutomation.element.capture.messages.captureFailed'))
+    if (isCurrent()) ElMessage.error(getScreenshotErrorMessage(
+      error.response?.data,
+      t('appAutomation.element.capture.messages.captureFailed')
+    ))
   } finally {
-    capturing.value = false
+    if (isCurrent()) capturing.value = false
   }
 }
 
@@ -459,7 +560,7 @@ const updateSelectionValues = () => {
 
 // 鼠标事件处理
 const handleMouseDown = (e) => {
-  if (!capturedImage.value || !imageWrapper.value) return
+  if (!capturedImage.value || !imageWrapper.value || submitting.value) return
   const rect = getImageRect()
   if (!rect) return
   const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width))
@@ -506,7 +607,7 @@ const handleMouseUp = () => {
           formData.config.x = Math.round(selection.value.x1 * scaleX)
           formData.config.y = Math.round(selection.value.y1 * scaleY)
         }
-        selection.value = null
+        clearSelection()
       } else {
         updateSelectionValues()
       }
@@ -559,15 +660,27 @@ const clearSelection = () => {
   action.value = null
   resizeHandle.value = null
   moveOffset.value = null
-  formData.config.x1 = 0
-  formData.config.y1 = 0
-  formData.config.x2 = 0
-  formData.config.y2 = 0
+  formData.config.x1 = null
+  formData.config.y1 = null
+  formData.config.x2 = null
+  formData.config.y2 = null
+}
+
+const clearCapturedFrame = () => {
+  clearSelection()
+  selecting.value = false
+  startPoint.value = null
+  formData.config.x = null
+  formData.config.y = null
+  imageSize.value = { width: 0, height: 0 }
+  capturedImage.value = ''
+  saveFullImage.value = false
 }
 
 // 提交表单
 const handleSubmit = async () => {
-  if (!formData.name) {
+  if (submitting.value) return
+  if (!formData.name.trim()) {
     ElMessage.warning(t('appAutomation.element.capture.messages.elementNameRequired'))
     return
   }
@@ -585,58 +698,39 @@ const handleSubmit = async () => {
       ElMessage.warning(t('appAutomation.element.capture.messages.imageCategoryRequired'))
       return
     }
+    if (!imagePreview.value) {
+      ElMessage.warning(t('appAutomation.element.capture.dragToSelectTip'))
+      return
+    }
   } else if (formData.element_type === 'pos') {
-    if (!formData.config.x || !formData.config.y) {
+    if (!hasPosition.value) {
       ElMessage.warning(t('appAutomation.element.capture.messages.coordinateRequired'))
       return
     }
   } else if (formData.element_type === 'region') {
-    if (!formData.config.x1 || !formData.config.y1 || !formData.config.x2 || !formData.config.y2) {
+    if (!hasRegion.value || selecting.value) {
       ElMessage.warning(t('appAutomation.element.capture.messages.regionRequired'))
       return
     }
   }
 
   submitting.value = true
+  const version = dialogVersion
+  const userId = currentUserId()
+  const generation = sessionGeneration()
+  const isCurrent = () => requestIsCurrent(version, userId, generation)
+  const submitData = {
+    name: formData.name.trim(),
+    element_type: formData.element_type,
+    project: formData.project ?? null,
+    tags: [...formData.tags],
+    config: { ...formData.config, image_category: formData.image_category || 'common' },
+  }
 
   try {
-    if (formData.element_type === 'image' && capturedImage.value) {
-      let imageBlob
-
-      // 裁剪图片
-      if (selection.value && imageRef.value) {
-        const img = imageRef.value
-        const sel = selection.value
-        const scaleX = imageSize.value.width / img.clientWidth
-        const scaleY = imageSize.value.height / img.clientHeight
-        
-        // 计算裁剪区域
-        const x1 = Math.min(sel.x1, sel.x2)
-        const y1 = Math.min(sel.y1, sel.y2)
-        const x2 = Math.max(sel.x1, sel.x2)
-        const y2 = Math.max(sel.y1, sel.y2)
-        const width = x2 - x1
-        const height = y2 - y1
-        
-        // 转换为实际图片坐标
-        const cropX = Math.round(x1 * scaleX)
-        const cropY = Math.round(y1 * scaleY)
-        const cropWidth = Math.round(width * scaleX)
-        const cropHeight = Math.round(height * scaleY)
-
-        const canvas = document.createElement('canvas')
-        canvas.width = cropWidth
-        canvas.height = cropHeight
-        const ctx = canvas.getContext('2d')
-
-        if (ctx) {
-          ctx.drawImage(img, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight)
-          imageBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'))
-        }
-      } else {
-        const base64Data = capturedImage.value.split(',')[1]
-        imageBlob = base64ToBlob(base64Data, 'image/png')
-      }
+    if (submitData.element_type === 'image') {
+      const base64Data = imagePreview.value.split(',')[1]
+      const imageBlob = base64Data ? base64ToBlob(base64Data) : null
 
       if (!imageBlob) {
         ElMessage.error(t('appAutomation.element.capture.messages.imageProcessFailed'))
@@ -649,12 +743,13 @@ const handleSubmit = async () => {
       try {
         const { data: uploadData } = await uploadAppElementImage(
           file,
-          formData.image_category || 'common'
+          submitData.config.image_category
         )
+        if (!isCurrent()) return
 
         if (uploadData.success) {
-          formData.config.image_path = uploadData.data.image_path
-          formData.config.file_hash = uploadData.data.file_hash
+          submitData.config.image_path = uploadData.data.image_path
+          submitData.config.file_hash = uploadData.data.file_hash
           ElMessage.success(t('appAutomation.element.capture.messages.imageUploaded', { path: uploadData.data.image_path }))
         } else {
           // 显示详细的错误信息
@@ -684,7 +779,7 @@ const handleSubmit = async () => {
           return
         }
       } catch (uploadError) {
-        console.error('图片上传异常:', uploadError)
+        if (!isCurrent()) return
         let errorMessage = t('appAutomation.element.capture.messages.uploadImageFailed')
 
         if (uploadError.response?.data) {
@@ -704,25 +799,13 @@ const handleSubmit = async () => {
       }
     }
 
-    // 准备提交数据
-    const submitData = {
-      name: formData.name,
-      element_type: formData.element_type,
-      project: formData.project || null,
-      tags: formData.tags,
-      config: {
-        ...formData.config,
-        image_category: formData.image_category || 'common'
-      }
-    }
-
-    // DRF ModelViewSet 的 create 方法直接返回序列化数据，没有 success 字段
-    await createAppElement(submitData)
+    const { data } = await createAppElement(submitData)
+    if (!isCurrent()) return
     ElMessage.success(t('appAutomation.common.createSuccess'))
-    emit('success')
+    emit('success', data)
     handleClose()
   } catch (error) {
-    console.error('创建失败:', error)
+    if (!isCurrent()) return
 
     // 显示详细的错误信息
     let errorMessage = t('appAutomation.element.capture.messages.createFailed')
@@ -754,7 +837,7 @@ const handleSubmit = async () => {
       showClose: true
     })
   } finally {
-    submitting.value = false
+    if (isCurrent()) submitting.value = false
   }
 }
 
@@ -769,7 +852,15 @@ const base64ToBlob = (base64, type = 'image/png') => {
 }
 
 const handleClose = () => {
+  ++dialogVersion
   emit('update:modelValue', false)
+  capturing.value = false
+  lockingDevice.value = false
+  devicesLoading.value = false
+  submitting.value = false
+  selectedDevice.value = null
+  devices.value = []
+  clearCapturedFrame()
   Object.assign(formData, {
     name: '',
     element_type: 'image',
@@ -779,20 +870,17 @@ const handleClose = () => {
     config: {
       image_threshold: 0.7,
       rgb: false,
-      x: 0,
-      y: 0,
-      x1: 0,
-      y1: 0,
-      x2: 0,
-      y2: 0,
+      x: null,
+      y: null,
+      x1: null,
+      y1: null,
+      x2: null,
+      y2: null,
       image_path: '',
       file_hash: ''
     }
   })
   templateFileName.value = ''
-  capturedImage.value = ''
-  selection.value = null
-  action.value = null
 }
 
 // 加载图片分类列表
@@ -880,8 +968,13 @@ const handleDeleteCategory = async (categoryName) => {
   }
 }
 
+watch(selectedDevice, clearCapturedFrame)
+watch(() => [currentUserId(), sessionGeneration()], () => {
+  if (props.modelValue) handleClose()
+})
 watch(() => props.modelValue, (val) => {
   if (val) {
+    formData.project = props.defaultProject ?? null
     loadDevices()
     loadImageCategories()
   }
@@ -889,6 +982,13 @@ watch(() => props.modelValue, (val) => {
 </script>
 
 <style scoped>
+.image-crop-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 120px;
+  object-fit: contain;
+}
+
 .capture-container {
   display: flex;
   gap: 20px;

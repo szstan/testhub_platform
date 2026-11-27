@@ -6,12 +6,13 @@ import { runInNewContext } from 'node:vm'
 import { build } from 'esbuild'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import * as vue from 'vue'
+import * as elementLinks from '../../src/utils/app-automation-element-links.mjs'
 
 const frontend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 
 // Compile the real SFC script, replacing only imports that would perform IO or
 // require a mounted application. Vue refs, computed values and watchers are real.
-export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
+export async function loadSfcSetup(relativePath, imports = {}, globals = {}, setupProps = {}) {
   const filename = resolve(frontend, relativePath)
   const source = await readFile(filename, 'utf8')
   const { descriptor, errors } = parse(source, { filename })
@@ -19,22 +20,55 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
   const script = compileScript(descriptor, { id: relativePath })
   const mounted = []
   const beforeUnmount = []
+  const unmounted = []
   const messages = []
   const mocks = {
     vue: {
       ...vue,
       onMounted: callback => mounted.push(callback),
       onBeforeUnmount: callback => beforeUnmount.push(callback),
+      onUnmounted: callback => unmounted.push(callback),
     },
-    'vue-i18n': { useI18n: () => ({ t: key => key }) },
+    'vue-i18n': { useI18n: () => ({ t: (key, params) => params?.message ? `${key}: ${params.message}` : key }) },
     'element-plus': {
       ElMessage: Object.fromEntries(['error', 'warning', 'success'].map(type => [type, text => messages.push({ type, text })])),
-      ElMessageBox: { confirm: async () => true },
+      ElMessageBox: { confirm: globals.confirm || (async () => true) },
     },
+    '@/api/app-scene-data': {
+      getSceneDatasets: async () => ({ data: [] }),
+      getAllSceneDatasets: async () => [],
+      uploadSceneDataset: async () => ({ data: {} }),
+      getProjectComponents: async () => ({ data: [] }),
+      getAllProjectComponents: async () => [],
+      createProjectComponent: async () => ({ data: {} }),
+      executeSceneDataset: async () => ({ data: { success: true, data: { execution_ids: [] } } }),
+    },
+    // Component tests mock IO at the aggregate device-list boundary. The real
+    // pagination helper has its own multi-page and error regressions.
+    '@/api/app-device-options': {
+      getAllAppDevices: async (params = {}) => {
+        const api = imports['@/api/app-automation'] || imports['@/api/app-automation.js']
+        const response = await api?.getDeviceList?.({ ...params, ordering: 'id', page: 1, page_size: 100 })
+        const body = response?.data?.data ?? response?.data ?? response
+        return Array.isArray(body) ? body : body?.results || []
+      },
+    },
+    '@/utils/app-automation-element-links.mjs': elementLinks,
+    '../components/SceneDataPanel.vue': { default: {} },
+    '../components/NativeElementInspector.vue': { default: {} },
     ...imports,
+    '@/api/app-automation': {
+      getPackageList: async () => ({ data: { results: [] } }),
+      ...imports['@/api/app-automation'],
+    },
   }
   const bundle = await build({
-    stdin: { contents: script.content, resolveDir: dirname(filename), sourcefile: filename, loader: 'js' },
+    stdin: {
+      contents: script.content,
+      resolveDir: dirname(filename),
+      sourcefile: filename,
+      loader: descriptor.scriptSetup?.lang === 'ts' || descriptor.script?.lang === 'ts' ? 'ts' : 'js',
+    },
     bundle: true,
     write: false,
     platform: 'node',
@@ -61,16 +95,20 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}) {
   }, { filename })
   const scope = vue.effectScope()
   const component = module.exports.default
+  const events = []
   const state = typeof component.setup === 'function'
-    ? scope.run(() => component.setup({}, { expose() {} }))
+    ? scope.run(() => component.setup(setupProps, { expose() {}, emit: (...args) => events.push(args) }))
     : null
   return {
     component,
     state,
+    events,
+    props: setupProps,
     messages,
     mount: () => Promise.all(mounted.map(callback => callback())),
     dispose() {
       beforeUnmount.forEach(callback => callback())
+      unmounted.forEach(callback => callback())
       scope.stop()
     },
   }

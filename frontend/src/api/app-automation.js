@@ -73,6 +73,13 @@ export function getDeviceList(params) {
   })
 }
 
+export function getAppDevice(id) {
+  return request({
+    url: `/app-automation/devices/${id}/`,
+    method: 'get'
+  })
+}
+
 /**
  * 获取设备截图
  */
@@ -80,7 +87,8 @@ export function captureDeviceScreenshot(id) {
   return request({
     url: `/app-automation/devices/${id}/screenshot/`,
     method: 'post',
-    timeout: 15000 // 截图可能需要较长时间
+    timeout: 15000, // 截图可能需要较长时间
+    suppressServerErrorToast: true
   })
 }
 
@@ -122,6 +130,90 @@ export function unlockDevice(id) {
   return request({
     url: `/app-automation/devices/${id}/unlock/`,
     method: 'post'
+  })
+}
+
+/** Acquire a short-lived, token-fenced lease for an explicitly started recorder. */
+export function acquireRecorderLease(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/recorder-lease/`,
+    method: 'post',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Release only the recorder lease represented by the supplied token. */
+export function releaseRecorderLease(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/recorder-lease/`,
+    method: 'delete',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Start a short-lived Appium inspection session for a recorder lease. */
+export function startAppiumSession(deviceId, data) {
+  return request({
+    url: `/app-automation/devices/${deviceId}/appium/sessions/`,
+    method: 'post',
+    data,
+    timeout: 15000,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Submit one idempotent read or interaction operation to an Appium session. */
+export function runAppiumSessionOperation(sessionId, data) {
+  return request({
+    url: `/app-automation/appium/sessions/${sessionId}/operations/`,
+    method: 'post',
+    data,
+    timeout: 15000,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Close an Appium session; callers must retain the device lease until confirmed. */
+export function closeAppiumSession(sessionId, data) {
+  return request({
+    url: `/app-automation/appium/sessions/${sessionId}/close/`,
+    method: 'post',
+    data,
+    timeout: 15000,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Poll one Appium operation by its server-issued id. */
+export function getAppiumOperation(operationId) {
+  return request({
+    url: `/app-automation/appium/operations/${operationId}/`,
+    method: 'get',
+    timeout: 15000,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Renew the current user's device lock while the recorder remains open. */
+export function heartbeatDevice(id, data = {}) {
+  return request({
+    url: `/app-automation/devices/${id}/heartbeat/`,
+    method: 'post',
+    data,
+    suppressServerErrorToast: true
+  })
+}
+
+/** Send one allowlisted interaction after explicit recorder activation. */
+export function recordDeviceInteraction(id, data) {
+  return request({
+    url: `/app-automation/devices/${id}/record-interaction/`,
+    method: 'post',
+    data,
+    timeout: 15000,
+    suppressServerErrorToast: true
   })
 }
 
@@ -353,6 +445,14 @@ export function deleteTestCase(id) {
 export function executeTestCase(id, data) {
   return request({
     url: `/app-automation/test-cases/${id}/execute/`,
+    method: 'post',
+    data
+  })
+}
+
+export function batchExecuteTestCases(data) {
+  return request({
+    url: '/app-automation/test-cases/batch-execute/',
     method: 'post',
     data
   })

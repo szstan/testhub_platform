@@ -59,9 +59,15 @@ class AirtestBase:
                 settings.MEDIA_ROOT, 'app-automation', 'screenshots', username or 'unknown'
             )
         
-        # 确保截图目录存在
-        os.makedirs(self.screenshots_dir, exist_ok=True)
-        logger.info(f"初始化AirtestBase实例，设备ID: {self.device_id}，截图目录: {self.screenshots_dir}")
+        try:
+            os.makedirs(self.screenshots_dir, exist_ok=True)
+        except Exception as exc:
+            logger.error(
+                "Airtest screenshot directory initialization failed (error_type=%s)",
+                type(exc).__name__,
+            )
+            raise RuntimeError("无法初始化截图目录，请检查存储配置") from None
+        logger.info("初始化AirtestBase实例")
     
     def setup_airtest(self, config: Optional[dict] = None) -> bool:
         """
@@ -85,7 +91,7 @@ class AirtestBase:
         for attempt in range(retry_count):
             try:
                 if self.device_id:
-                    logger.info(f"尝试连接到设备: {self.device_id} (尝试 {attempt+1}/{retry_count})")
+                    logger.info(f"尝试连接 Android 设备 (尝试 {attempt+1}/{retry_count})")
                     success = self._init_device_with_timeout(
                         platform='Android',
                         uuid=self.device_id,
@@ -111,7 +117,9 @@ class AirtestBase:
                 return True
                 
             except Exception as e:
-                logger.error(f"设置Airtest环境时出错: {str(e)}", exc_info=True)
+                logger.error(
+                    "Airtest initialization failed (error_type=%s)", type(e).__name__
+                )
                 
                 if attempt < retry_count - 1:
                     logger.info(f"{retry_interval}秒后重试连接...")
@@ -150,8 +158,8 @@ class AirtestBase:
                 logger.info(f"线程中 init_device() 调用完成")
                 result_queue.put(True)
             except Exception as e:
-                logger.error(f"线程中 init_device() 调用异常: {type(e).__name__}: {e}", exc_info=True)
-                exception_queue.put(e)
+                logger.error("Airtest device initialization failed (error_type=%s)", type(e).__name__)
+                exception_queue.put(True)
         
         thread = threading.Thread(target=call_init_device, daemon=True)
         thread.start()
@@ -162,7 +170,9 @@ class AirtestBase:
             return False
         
         if not exception_queue.empty():
-            raise exception_queue.get()
+            raise RuntimeError(
+                "Airtest device initialization failed; check ADB and device connectivity"
+            ) from None
         
         if not result_queue.empty():
             logger.info(f"init_device() 调用完成，设备已连接")
@@ -178,7 +188,7 @@ class AirtestBase:
             self.is_connected = False
             logger.info("Airtest环境已清理")
         except Exception as e:
-            logger.error(f"清理Airtest环境时出错: {str(e)}", exc_info=True)
+            logger.error("Airtest teardown failed (error_type=%s)", type(e).__name__)
     
     def _disconnect_device(self) -> None:
         """断开与设备的连接"""
@@ -190,7 +200,7 @@ class AirtestBase:
         except NoDeviceError:
             logger.info("没有设备连接，无需断开")
         except Exception as e:
-            logger.error(f"断开设备连接时出错: {str(e)}", exc_info=True)
+            logger.error("Airtest device disconnect failed (error_type=%s)", type(e).__name__)
     
     def is_device_connected(self) -> bool:
         """
@@ -225,10 +235,10 @@ class AirtestBase:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(self.screenshots_dir, f'{name}_{timestamp}.png')
             snapshot(filename=screenshot_path)
-            logger.info(f"截图已保存: {screenshot_path}")
+            logger.info("Screenshot saved")
             return screenshot_path
         except Exception as e:
-            logger.error(f"截图失败: {str(e)}", exc_info=True)
+            logger.error("Screenshot failed (error_type=%s)", type(e).__name__)
             return ""
     
     def _validate_package_name(self, package_name: str) -> str:
@@ -256,7 +266,7 @@ class AirtestBase:
         
         for attempt in range(retry_count):
             try:
-                logger.info(f"尝试启动应用: {package_name} (尝试 {attempt+1}/{retry_count})")
+                logger.info(f"尝试启动应用 (尝试 {attempt+1}/{retry_count})")
                 start_app(package_name)
                 
                 # 等待应用启动
@@ -264,22 +274,22 @@ class AirtestBase:
                 
                 # 验证应用是否真正启动成功
                 if self.is_app_running(package_name):
-                    logger.info(f"成功启动应用: {package_name}")
+                    logger.info("应用已启动")
                     return True
                 else:
-                    logger.warning(f"应用 {package_name} 启动后未检测到运行状态")
+                    logger.warning("应用启动后未检测到运行状态")
                 
                 if attempt < retry_count - 1:
                     logger.info(f"{retry_interval}秒后重试启动应用...")
                     time.sleep(retry_interval)
                     
             except Exception as e:
-                logger.error(f"启动应用失败: {str(e)}", exc_info=True)
+                logger.error("App launch failed (error_type=%s)", type(e).__name__)
                 if attempt < retry_count - 1:
                     logger.info(f"{retry_interval}秒后重试启动应用...")
                     time.sleep(retry_interval)
         
-        logger.error(f"经过 {retry_count} 次尝试后，启动应用 {package_name} 失败")
+        logger.error(f"经过 {retry_count} 次尝试后，启动应用失败")
         return False
     
     def close_app(self, package_name: str) -> bool:
@@ -298,12 +308,12 @@ class AirtestBase:
             return True
         
         try:
-            logger.info(f"尝试关闭应用: {package_name}")
+            logger.info("正在关闭应用")
             stop_app(package_name)
-            logger.info(f"成功关闭应用: {package_name}")
+            logger.info("应用已关闭")
             return True
         except Exception as e:
-            logger.error(f"关闭应用失败: {str(e)}", exc_info=True)
+            logger.error("App stop failed (error_type=%s)", type(e).__name__)
             return False
     
     def is_app_installed(self, package_name: str) -> bool:
@@ -324,10 +334,10 @@ class AirtestBase:
         try:
             result = G.DEVICE.shell(f"pm list packages | grep {package_name}")
             installed = package_name in result
-            logger.info(f"应用 {package_name} {'已安装' if installed else '未安装'}")
+            logger.info(f"应用安装状态检查完成: {'已安装' if installed else '未安装'}")
             return installed
         except Exception as e:
-            logger.error(f"检查应用安装状态时出错: {str(e)}", exc_info=True)
+            logger.error("App installation check failed (error_type=%s)", type(e).__name__)
             return False
     
     def is_app_running(self, package_name: str) -> bool:
@@ -356,13 +366,13 @@ class AirtestBase:
                 try:
                     result = G.DEVICE.shell(method)
                     if result.strip():
-                        logger.info(f"应用 {package_name} 正在运行")
+                        logger.info("应用正在运行")
                         return True
                 except Exception:
                     continue
             
-            logger.info(f"应用 {package_name} 未运行")
+            logger.info("应用未运行")
             return False
         except Exception as e:
-            logger.error(f"检查应用运行状态时出错: {str(e)}", exc_info=True)
+            logger.error("App running-state check failed (error_type=%s)", type(e).__name__)
             return False

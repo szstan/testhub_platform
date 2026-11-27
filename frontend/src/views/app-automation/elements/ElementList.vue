@@ -16,6 +16,7 @@
               <el-radio-button value="image">{{ $t('appAutomation.element.types.image') }}</el-radio-button>
               <el-radio-button value="pos">{{ $t('appAutomation.element.types.pos') }}</el-radio-button>
               <el-radio-button value="region">{{ $t('appAutomation.element.types.region') }}</el-radio-button>
+              <el-radio-button value="native">{{ $t('appAutomation.element.types.native') }}</el-radio-button>
             </el-radio-group>
 
             <!-- 搜索 -->
@@ -48,6 +49,9 @@
             <el-button type="success" @click="showCaptureDialog">
               <el-icon><Camera /></el-icon>
               {{ $t('appAutomation.element.createFromDevice') }}
+            </el-button>
+            <el-button type="primary" @click="showNativeInspector">
+              {{ $t('appAutomation.nativeInspector.title') }}
             </el-button>
             <el-button type="primary" @click="showCreateDialog">
               <el-icon><Plus /></el-icon>
@@ -107,7 +111,6 @@
         <!-- 预览 -->
         <el-table-column :label="$t('appAutomation.element.preview')" width="200" align="center">
           <template #default="{ row }">
-            <!-- 图片类型 -->
             <div v-if="row.element_type === 'image'" class="preview-image">
               <el-image
                 :src="getImageUrl(row)"
@@ -117,16 +120,12 @@
                 preview-teleported
               />
             </div>
-            
-            <!-- 坐标类型 -->
             <div v-else-if="row.element_type === 'pos'" class="preview-pos">
               <el-space :size="4">
                 <el-tag type="primary" size="small">X: {{ row.config?.x }}</el-tag>
                 <el-tag type="primary" size="small">Y: {{ row.config?.y }}</el-tag>
               </el-space>
             </div>
-            
-            <!-- 区域类型 -->
             <div v-else-if="row.element_type === 'region'" class="preview-region">
               <el-space direction="vertical" :size="4">
                 <el-space :size="4">
@@ -139,10 +138,22 @@
                 </el-space>
               </el-space>
             </div>
+            <div v-else-if="row.element_type === 'native'" class="preview-native">
+              <code>{{ row.config?.strategy }}: {{ row.config?.value }}</code>
+              <small v-if="row.config?.container">{{ row.config.container.strategy }}: {{ row.config.container.value }}</small>
+            </div>
           </template>
         </el-table-column>
-        
+
         <el-table-column prop="usage_count" :label="$t('appAutomation.element.usageCount')" width="100" sortable />
+        <el-table-column :label="$t('appAutomation.element.referenceCount')" width="125" align="center">
+          <template #default="{ row }">
+            <el-tooltip v-if="row.reference_count_unknown" :content="$t('appAutomation.element.dynamicReferenceHint')" placement="top">
+              <span>{{ formatReferenceCount(row) }} <el-icon><InfoFilled /></el-icon></span>
+            </el-tooltip>
+            <span v-else>{{ row.reference_count ?? 0 }}</span>
+          </template>
+        </el-table-column>
 
         <el-table-column prop="created_at" :label="$t('appAutomation.common.createTime')" width="180">
           <template #default="{ row }">
@@ -150,7 +161,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column :label="$t('appAutomation.common.operation')" width="280" fixed="right">
+        <el-table-column :label="$t('appAutomation.common.operation')" width="310" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" @click="handleEdit(row)">
               {{ $t('appAutomation.common.edit') }}
@@ -158,8 +169,8 @@
             <el-button size="small" @click="handleDuplicate(row)">
               {{ $t('appAutomation.element.copy') }}
             </el-button>
-            <el-button size="small" type="danger" @click="handleDelete(row)">
-              {{ $t('appAutomation.common.delete') }}
+            <el-button size="small" type="warning" @click="handleArchive(row)">
+              {{ $t('appAutomation.element.archive') }}
             </el-button>
           </template>
         </el-table-column>
@@ -169,8 +180,8 @@
       <div v-if="selectedElements.length > 0" class="batch-actions">
         <el-space>
           <span>{{ $t('appAutomation.element.selectedCount', { count: selectedElements.length }) }}</span>
-          <el-button type="danger" size="small" @click="handleBatchDelete">
-            {{ $t('appAutomation.common.batchDelete') }}
+          <el-button type="warning" size="small" @click="handleBatchArchive">
+            {{ $t('appAutomation.element.batchArchive') }}
           </el-button>
         </el-space>
       </div>
@@ -203,6 +214,24 @@
       @success="handleCreateSuccess"
     />
 
+    <!-- Appium-native element authoring and verification -->
+    <el-dialog
+      v-model="nativeInspectorVisible"
+      :title="$t('appAutomation.nativeInspector.title')"
+      width="94vw"
+      top="3vh"
+      destroy-on-close
+    >
+      <NativeElementInspector
+        v-if="nativeInspectorVisible"
+        :key="`${nativeInspectorProjectId || 'new'}:${nativeEditElement?.id || 'create'}`"
+        :project-id="nativeInspectorProjectId"
+        :project-options="projectList"
+        :initial-element="nativeEditElement"
+        @saved="handleCreateSuccess"
+      />
+    </el-dialog>
+
     <!-- 查看详情对话框 -->
     <el-dialog
       v-model="detailDialogVisible"
@@ -225,6 +254,12 @@
           <pre style="margin: 0; padding: 10px; background: #f5f7fa; border-radius: 4px;">{{ JSON.stringify(viewingElement.config, null, 2) }}</pre>
         </el-descriptions-item>
         <el-descriptions-item :label="$t('appAutomation.element.usageCount')">{{ viewingElement.usage_count || 0 }}</el-descriptions-item>
+        <el-descriptions-item :label="$t('appAutomation.element.referenceCount')">
+          <el-tooltip v-if="viewingElement.reference_count_unknown" :content="$t('appAutomation.element.dynamicReferenceHint')" placement="top">
+            <span>{{ formatReferenceCount(viewingElement) }} <el-icon><InfoFilled /></el-icon></span>
+          </el-tooltip>
+          <span v-else>{{ formatReferenceCount(viewingElement) }}</span>
+        </el-descriptions-item>
         <el-descriptions-item :label="$t('appAutomation.common.createTime')">{{ formatDateTime(viewingElement.created_at) }}</el-descriptions-item>
       </el-descriptions>
     </el-dialog>
@@ -240,11 +275,13 @@ import {
   deleteAppElement as apiDeleteAppElement,
   getAppProjects
 } from '@/api/app-automation'
-import { Search, Plus, Camera } from '@element-plus/icons-vue'
+import request from '@/utils/api'
+import { Search, Plus, Camera, InfoFilled } from '@element-plus/icons-vue'
 import { formatDateTime } from '@/utils/app-automation-helpers'
 import { useI18n } from 'vue-i18n'
 import CaptureElementDialog from './components/CaptureElementDialog.vue'
 import ManualElementDialog from './components/ManualElementDialog.vue'
+import NativeElementInspector from '../components/NativeElementInspector.vue'
 
 const { t } = useI18n()
 
@@ -265,6 +302,9 @@ const total = ref(0)
 // 对话框
 const dialogVisible = ref(false)
 const captureDialogVisible = ref(false)
+const nativeInspectorVisible = ref(false)
+const nativeInspectorProjectId = ref(null)
+const nativeEditElement = ref(null)
 const detailDialogVisible = ref(false)
 const editElement = ref(null)
 const viewingElement = ref(null)
@@ -310,12 +350,24 @@ const showCaptureDialog = () => {
   captureDialogVisible.value = true
 }
 
+const showNativeInspector = () => {
+  nativeEditElement.value = null
+  nativeInspectorProjectId.value = projectFilter.value || null
+  nativeInspectorVisible.value = true
+}
+
 const handleView = (element) => {
   viewingElement.value = element
   detailDialogVisible.value = true
 }
 
 const handleEdit = (element) => {
+  if (element.element_type === 'native') {
+    nativeEditElement.value = element
+    nativeInspectorProjectId.value = typeof element.project === 'object' ? element.project?.id : element.project
+    nativeInspectorVisible.value = true
+    return
+  }
   editElement.value = element
   dialogVisible.value = true
 }
@@ -391,11 +443,11 @@ const handleSelectionChange = (selection) => {
   selectedElements.value = selection
 }
 
-const handleBatchDelete = async () => {
+const handleBatchArchive = async () => {
   try {
     await ElMessageBox.confirm(
-      t('appAutomation.element.messages.batchDeleteConfirm', { count: selectedElements.value.length }),
-      t('appAutomation.element.messages.batchDeleteTitle'),
+      t('appAutomation.element.messages.batchArchiveConfirm', { count: selectedElements.value.length }),
+      t('appAutomation.element.messages.archiveTitle'),
       {
         confirmButtonText: t('appAutomation.common.confirm'),
         cancelButtonText: t('appAutomation.common.cancel'),
@@ -403,26 +455,34 @@ const handleBatchDelete = async () => {
       }
     )
 
-    for (const element of selectedElements.value) {
-      await apiDeleteAppElement(element.id)
-    }
+    await request({
+      url: '/app-automation/elements/bulk-archive/',
+      method: 'post',
+      data: { ids: selectedElements.value.map(element => element.id) }
+    })
 
-    ElMessage.success(t('appAutomation.element.messages.batchDeleteSuccess'))
+    ElMessage.success(t('appAutomation.element.messages.batchArchiveSuccess'))
     selectedElements.value = []
     loadElements()
   } catch (error) {
     if (error !== 'cancel') {
-      console.error('批量删除失败:', error)
-      ElMessage.error(t('appAutomation.element.messages.batchDeleteFailed'))
+      console.error('批量归档失败:', error)
+      ElMessage.error(getArchiveErrorMessage(error))
     }
   }
 }
 
-const handleDelete = async (element) => {
+const getArchiveErrorMessage = (error) => {
+  if (error.response?.status === 409) return t('appAutomation.element.messages.archiveBlocked')
+  const data = error.response?.data
+  return data?.msg || (typeof data?.detail === 'string' ? data.detail : '') || error.message || t('appAutomation.element.messages.archiveFailed')
+}
+
+const handleArchive = async (element) => {
   try {
     await ElMessageBox.confirm(
-      t('appAutomation.element.messages.deleteConfirm', { name: element.name }),
-      t('appAutomation.common.confirmDelete'),
+      t('appAutomation.element.messages.archiveConfirm', { name: element.name }),
+      t('appAutomation.element.messages.archiveTitle'),
       {
         confirmButtonText: t('appAutomation.common.confirm'),
         cancelButtonText: t('appAutomation.common.cancel'),
@@ -431,17 +491,21 @@ const handleDelete = async (element) => {
     )
 
     await apiDeleteAppElement(element.id)
-    ElMessage.success(t('appAutomation.common.deleteSuccess'))
+    ElMessage.success(t('appAutomation.element.messages.archiveSuccess'))
     loadElements()
   } catch (error) {
     if (error !== 'cancel') {
-      console.error('删除失败:', error)
-      ElMessage.error(t('appAutomation.common.deleteFailed'))
+      console.error('归档失败:', error)
+      ElMessage.error(getArchiveErrorMessage(error))
     }
   }
 }
 
-// 获取图片URL
+const formatReferenceCount = (element) => {
+  const count = element?.reference_count ?? 0
+  return element?.reference_count_unknown ? `${count}+` : count
+}
+
 const getImageUrl = (element) => {
   if (!element?.id) return ''
   // 使用 updated_at 作为版本号，确保图片更新后能刷新
@@ -453,7 +517,8 @@ const getTypeColor = (type) => {
   const colorMap = {
     'image': 'primary',
     'pos': 'success',
-    'region': 'warning'
+    'region': 'warning',
+    'native': 'success'
   }
   return colorMap[type] || 'info'
 }
@@ -462,7 +527,8 @@ const getTypeName = (type) => {
   const nameKey = {
     'image': 'image',
     'pos': 'pos',
-    'region': 'region'
+    'region': 'region',
+    'native': 'native'
   }[type]
   return nameKey ? t(`appAutomation.element.types.${nameKey}`) : type
 }
@@ -502,9 +568,18 @@ onMounted(() => {
   }
   
   .preview-pos,
-  .preview-region {
+  .preview-region,
+  .preview-native {
     display: flex;
     justify-content: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .preview-native {
+    flex-direction: column;
+    align-items: center;
   }
   
   .batch-actions {

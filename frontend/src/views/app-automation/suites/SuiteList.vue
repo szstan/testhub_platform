@@ -32,13 +32,14 @@
                 filterable
                 style="width: 100%"
                 :loading="devicesLoading"
+                :disabled="executionSubmitting"
               >
                 <el-option
                   v-for="device in availableDevices"
                   :key="device.id"
-                  :label="`${device.name || device.device_id} (${device.device_id})`"
-                  :value="device.device_id"
-                  :disabled="device.status !== 'available' && device.status !== 'online'"
+                  :label="`${device.name || device.device_id} (${device.device_id})` + (device.lease_requires_token ? ` - ${$t('appAutomation.device.messages.executionTokenLeaseBadge')}` : '')"
+                  :value="device.id"
+                  :disabled="!canSelectAppExecutionDevice(device, userStore.user?.id)"
                 />
               </el-select>
             </el-form-item>
@@ -51,6 +52,7 @@
                 clearable
                 filterable
                 style="width: 100%"
+                :disabled="executionSubmitting"
               >
                 <el-option
                   v-for="pkg in appPackages"
@@ -77,6 +79,14 @@
             </el-form-item>
           </el-col>
         </el-row>
+        <el-alert
+          v-if="selectedExecutionDevice?.lease_requires_token"
+          class="device-lease-warning"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="$t('appAutomation.device.messages.executionTokenLeaseUnavailable')"
+        />
       </el-form>
     </el-card>
 
@@ -130,7 +140,7 @@
       </el-table-column>
       <el-table-column :label="$t('appAutomation.common.operation')" width="220" fixed="right">
         <template #default="{ row }">
-          <el-button link type="success" size="small" @click="runSuite(row)">
+          <el-button link type="success" size="small" :disabled="executionSubmitting" @click="runSuite(row)">
             {{ $t('appAutomation.common.execute') }}
           </el-button>
           <el-button link type="primary" size="small" @click="showEditDialog(row)">
@@ -299,20 +309,33 @@ import {
   updateSuiteTestCaseOrder,
   runTestSuite,
   getTestSuiteExecutions,
+  getExecutionDetail,
   getTestCaseList,
-  getDeviceList,
   getPackageList,
   getAppProjects,
+  getAppDevice,
 } from '@/api/app-automation'
-import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime, getAppReportUrl } from '@/utils/app-automation-helpers'
+import { getAllAppDevices } from '@/api/app-device-options'
+import { getExecutionStatusType, getExecutionStatusText, getDisplayStatus, formatDateTime } from '@/utils/app-automation-helpers'
+import { openAppExecutionReport } from '@/utils/app-automation-report.mjs'
+import {
+  canSelectAppExecutionDevice,
+  getAppExecutionErrorMessage,
+  normalizeAppDevice,
+  normalizeAppDeviceList,
+  prepareAppDeviceForExecution,
+} from '@/utils/app-automation-device-execution.mjs'
+import { useUserStore } from '@/stores/user'
 
 const { t } = useI18n()
+const userStore = useUserStore()
 
 // ===== 响应式数据 =====
 const loading = ref(false)
 const devicesLoading = ref(false)
 const saving = ref(false)
 const historyLoading = ref(false)
+const executionSubmitting = ref(false)
 const searchQuery = ref('')
 const projectFilter = ref(null)
 const projectList = ref([])
@@ -326,6 +349,9 @@ const runConfig = ref({
   deviceId: null,
   packageName: null
 })
+const selectedExecutionDevice = computed(() =>
+  availableDevices.value.find(device => String(device.id) === String(runConfig.value.deviceId))
+)
 
 // 对话框
 const dialogVisible = ref(false)
@@ -366,7 +392,7 @@ const loadSuites = async () => {
     const data = res.data
     suites.value = data.results || data || []
   } catch (error) {
-    console.error('加载套件列表失败:', error)
+    console.error('加载套件列表失败')
     suites.value = []
   } finally {
     loading.value = false
@@ -376,18 +402,43 @@ const loadSuites = async () => {
 const loadDevices = async () => {
   devicesLoading.value = true
   try {
-    const res = await getDeviceList({ page_size: 100 })
-    const data = res.data
-    if (data.success !== undefined) {
-      availableDevices.value = data.data?.results || data.data || []
-    } else {
-      availableDevices.value = data.results || data || []
-    }
-  } catch (error) {
-    console.error('加载设备失败:', error)
+    availableDevices.value = normalizeAppDeviceList(await getAllAppDevices())
+  } catch {
     availableDevices.value = []
   } finally {
     devicesLoading.value = false
+  }
+}
+
+const refreshExecutionDevice = async deviceId => {
+  const res = await getAppDevice(deviceId)
+  return normalizeAppDevice(res.data)
+}
+
+const updateExecutionDevice = device => {
+  if (!device?.id) return
+  const index = availableDevices.value.findIndex(item => String(item.id) === String(device.id))
+  if (index >= 0) availableDevices.value[index] = device
+  else availableDevices.value.push(device)
+}
+
+const captureExecutionIdentity = () => ({
+  userId: userStore.user?.id,
+  sessionGeneration: typeof userStore.getSessionGeneration === 'function'
+    ? userStore.getSessionGeneration()
+    : undefined,
+})
+
+const isExecutionIdentityCurrent = identity =>
+  String(userStore.user?.id) === String(identity.userId) &&
+  (identity.sessionGeneration === undefined || (
+    typeof userStore.getSessionGeneration === 'function' &&
+    userStore.getSessionGeneration() === identity.sessionGeneration
+  ))
+
+const verifyExecutionUser = identity => {
+  if (!isExecutionIdentityCurrent(identity)) {
+    throw new Error(t('appAutomation.device.messages.executionUserChanged'))
   }
 }
 
@@ -460,7 +511,7 @@ const showEditDialog = async (suite) => {
         app_package_name: sc.test_case.app_package_name || ''
       }))
   } catch (error) {
-    console.error('加载套件用例失败:', error)
+    console.error('加载套件用例失败')
     selectedCases.value = []
   }
 }
@@ -564,42 +615,73 @@ const filterAvailableCases = () => {
 
 // ===== 执行套件 =====
 const runSuite = async (suite) => {
-  if (!runConfig.value.deviceId) {
+  if (executionSubmitting.value) return
+  const selectedDeviceId = runConfig.value.deviceId
+  const selectedSuiteId = suite.id
+  const selectedSuiteName = suite.name
+  const selectedSuiteCaseCount = suite.test_case_count
+  const executionIdentity = captureExecutionIdentity()
+  const executionUserId = executionIdentity.userId
+  const packageName = runConfig.value.packageName
+  if (!selectedDeviceId) {
     ElMessage.warning(t('appAutomation.suite.messages.selectDeviceFirst'))
     return
   }
 
-  if (suite.test_case_count === 0) {
+  if (selectedSuiteCaseCount === 0) {
     ElMessage.warning(t('appAutomation.suite.messages.noCases'))
     return
   }
 
+  executionSubmitting.value = true
   try {
     await ElMessageBox.confirm(
-      t('appAutomation.suite.messages.confirmRun', { name: suite.name, count: suite.test_case_count }),
+      t('appAutomation.suite.messages.confirmRun', { name: selectedSuiteName, count: selectedSuiteCaseCount }),
       t('appAutomation.suite.messages.confirmRunTitle'),
       { confirmButtonText: t('appAutomation.common.execute'), cancelButtonText: t('appAutomation.common.cancel'), type: 'info' }
     )
+    verifyExecutionUser(executionIdentity)
 
-    const params = { device_id: runConfig.value.deviceId }
-    if (runConfig.value.packageName) {
-      params.package_name = runConfig.value.packageName
+    const device = await prepareAppDeviceForExecution({
+      selectedId: selectedDeviceId,
+      userId: executionUserId,
+      sessionGeneration: executionIdentity.sessionGeneration,
+      getCurrentUserId: () => userStore.user?.id,
+      getCurrentSessionGeneration: () => userStore.getSessionGeneration?.(),
+      getDevice: refreshExecutionDevice,
+      onDeviceRefreshed: updateExecutionDevice,
+      t,
+    })
+    verifyExecutionUser(executionIdentity)
+    const params = {
+      device_id: device.device_id,
+      auto_lock: true,
+      expected_user_id: executionUserId,
     }
+    if (packageName) params.package_name = packageName
 
-    const res = await runTestSuite(suite.id, params)
-    const data = res.data
+    const res = await runTestSuite(selectedSuiteId, params)
+    verifyExecutionUser(executionIdentity)
+    const data = res.data || {}
 
     if (data.success) {
+      updateExecutionDevice(data.device)
       ElMessage.success(data.message || t('appAutomation.suite.messages.submitted'))
-      // 延迟刷新
-      setTimeout(() => loadSuites(), 2000)
+      setTimeout(() => {
+        if (isExecutionIdentityCurrent(executionIdentity)) loadSuites()
+      }, 2000)
     } else {
       ElMessage.error(data.message || t('appAutomation.suite.messages.executeFailed'))
     }
   } catch (error) {
     if (error !== 'cancel') {
-      ElMessage.error(t('appAutomation.suite.messages.executeFailed') + ': ' + (error.response?.data?.message || error.message || t('appAutomation.suite.messages.unknownError')))
+      const message = isExecutionIdentityCurrent(executionIdentity)
+        ? getAppExecutionErrorMessage(error, t('appAutomation.suite.messages.unknownError'))
+        : t('appAutomation.device.messages.executionUserChanged')
+      ElMessage.error(t('appAutomation.suite.messages.executeFailed') + ': ' + message)
     }
+  } finally {
+    executionSubmitting.value = false
   }
 }
 
@@ -619,17 +701,12 @@ const showSuiteExecutions = async (suite) => {
   }
 }
 
-const viewReport = (execution) => {
-  if (!execution.report_path) {
-    ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
-    return
+const viewReport = async (execution) => {
+  const result = await openAppExecutionReport(execution?.id, { fetchExecution: getExecutionDetail })
+  if (!result.opened) {
+    const key = result.reason === 'blocked' ? 'reportPopupBlocked' : result.reason === 'failed' ? 'reportOpenFailed' : 'reportUnavailable'
+    ElMessage.warning(t(`appAutomation.common.${key}`))
   }
-  const reportUrl = getAppReportUrl(execution)
-  if (!reportUrl) {
-    ElMessage.info(t('appAutomation.suite.messages.reportPathNotFound'))
-    return
-  }
-  window.open(reportUrl, '_blank', 'noopener,noreferrer')
 }
 
 // ===== 工具方法 =====
@@ -643,6 +720,7 @@ const getSuiteDisplayStatus = (row) => {
   if (result === 'passed') return { type: 'success', text: t('appAutomation.status.passed') }
   if (result === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
   if (result === 'skipped') return { type: 'warning', text: t('appAutomation.status.skipped') }
+  if (result === 'unverified') return { type: 'warning', text: t('appAutomation.status.unverified') }
   // 向后兼容旧值
   if (status === 'success') return { type: 'success', text: t('appAutomation.status.passed') }
   if (status === 'failed') return { type: 'danger', text: t('appAutomation.status.failed') }
@@ -651,7 +729,8 @@ const getSuiteDisplayStatus = (row) => {
 
 const getProgressStatus = (row) => {
   if (row.status === 'completed') {
-    return row.result === 'failed' ? 'exception' : 'success'
+    if (row.result === 'failed') return 'exception'
+    return row.result === 'passed' ? 'success' : undefined
   }
   if (row.status === 'error') return 'exception'
   return undefined

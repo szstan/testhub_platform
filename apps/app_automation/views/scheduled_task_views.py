@@ -10,11 +10,12 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from django.db import transaction
+from apps.quality_intelligence.services.redaction import redact_text
 
 from .test_case_views import AppPagination
 from ..models import (
     AppScheduledTask, AppNotificationLog,
-    AppTestSuite, AppTestCase, AppDevice,
+    AppTestSuite, AppTestCase, AppDevice, AppTestExecution,
 )
 from ..device_pool import (
     DeviceLeaseError,
@@ -22,7 +23,10 @@ from ..device_pool import (
     is_device_lease_active,
     release_device_execution_lease,
     validate_device_lease,
+    assert_device_execution_lease,
 )
+from ..execution_admission import DeviceExecutionBusy, assert_device_execution_idle
+from ..execution_dispatch import enqueue_app_task, new_execution_dispatch_id
 from ..access import scope_project, scheduled_task_relation_errors
 from ..serializers import (
     AppScheduledTaskSerializer,
@@ -132,109 +136,110 @@ class AppScheduledTaskViewSet(viewsets.ModelViewSet):
                 lease_generation = device.lease_generation
                 release_device_lease = True
 
-            if task.task_type == 'TEST_SUITE':
-                suite_cases = task.test_suite.suite_cases.select_related('test_case').all()
-                if not suite_cases.exists():
-                    if release_device_lease:
-                        release_device_execution_lease(device.pk, request.user, lease_generation)
-                    return Response(
-                        {'success': False, 'message': '测试套件没有用例'},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-            task.last_run_time = timezone.now()
-            task.total_runs += 1
-            task.next_run_time = task.calculate_next_run()
-            task.save()
+            suite_cases = list(task.test_suite.suite_cases.select_related('test_case').all()) if task.task_type == 'TEST_SUITE' else []
+            if task.task_type == 'TEST_SUITE' and not suite_cases:
+                if release_device_lease:
+                    release_device_execution_lease(device.pk, request.user, lease_generation)
+                return Response(
+                    {'success': False, 'message': '测试套件没有用例'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             package_name = task.app_package.package_name if task.app_package else ''
-
-            if task.task_type == 'TEST_SUITE':
-                from ..models import AppTestExecution
-                from ..tasks import execute_app_suite_task
-
-                executions = []
-                for sc in suite_cases:
-                    executions.append(AppTestExecution.objects.create(
+            dispatch_id = new_execution_dispatch_id()
+            with transaction.atomic():
+                device = AppDevice.objects.select_for_update().get(pk=device.pk)
+                assert_device_execution_lease(device.pk, request.user, lease_generation)
+                assert_device_execution_idle(device.pk)
+                task.last_run_time = timezone.now()
+                task.total_runs += 1
+                task.next_run_time = task.calculate_next_run()
+                task.save()
+                if task.task_type == 'TEST_SUITE':
+                    executions = [AppTestExecution.objects.create(
                         test_case=sc.test_case,
                         test_suite=task.test_suite,
                         device=device,
                         user=request.user,
                         status='pending',
+                        task_id=dispatch_id,
                         device_lease_generation=lease_generation,
-                    ))
+                        release_device_lease_on_stop=release_device_lease,
+                    ) for sc in suite_cases]
+                    task.test_suite.execution_status = 'running'
+                    task.test_suite.save(update_fields=['execution_status'])
+                else:
+                    executions = [AppTestExecution.objects.create(
+                        test_case=task.test_case,
+                        device=device,
+                        user=request.user,
+                        status='pending',
+                        task_id=dispatch_id,
+                        device_lease_generation=lease_generation,
+                        release_device_lease_on_stop=release_device_lease,
+                    )]
 
-                task.test_suite.execution_status = 'running'
-                task.test_suite.save(update_fields=['execution_status'])
-
-                celery_task = execute_app_suite_task.delay(
-                    suite_id=task.test_suite.id,
-                    execution_ids=[e.id for e in executions],
-                    package_name=package_name,
-                    scheduled_task_id=task.id,
-                    lease_generation=lease_generation,
-                    device_id=device.pk,
-                    device_lease_owner_id=request.user.pk,
-                    release_device_lease=release_device_lease,
+            from ..tasks import execute_app_suite_task, execute_app_test_task, settle_undispatched_app_executions
+            if task.task_type == 'TEST_SUITE':
+                enqueue_app_task(
+                    execute_app_suite_task,
+                    dispatch_id=dispatch_id,
+                    kwargs={
+                        'suite_id': task.test_suite_id,
+                        'execution_ids': [item.pk for item in executions],
+                        'package_name': package_name,
+                        'scheduled_task_id': task.pk,
+                        'lease_generation': lease_generation,
+                        'device_id': device.pk,
+                        'device_lease_owner_id': request.user.pk,
+                        'release_device_lease': release_device_lease,
+                        'dispatch_id': dispatch_id,
+                    },
                 )
                 return Response({
                     'success': True,
                     'message': f'测试套件开始执行，共 {len(executions)} 个用例',
-                    'data': {'task_id': celery_task.id, 'test_case_count': len(executions)},
+                    'data': {'task_id': dispatch_id, 'test_case_count': len(executions)},
                 })
 
-            if task.task_type == 'TEST_CASE':
-                from ..models import AppTestExecution
-                from ..tasks import execute_app_test_task
-
-                execution = AppTestExecution.objects.create(
-                    test_case=task.test_case,
-                    device=device,
-                    user=request.user,
-                    status='pending',
-                    device_lease_generation=lease_generation,
-                )
-                executions.append(execution)
-                celery_task = execute_app_test_task.delay(
-                    execution.id,
-                    package_name=package_name,
-                    scheduled_task_id=task.id,
-                    lease_generation=lease_generation,
-                    release_device_lease=release_device_lease,
-                )
-                execution.task_id = celery_task.id
-                execution.save(update_fields=['task_id'])
-                return Response({
-                    'success': True,
-                    'message': '测试用例开始执行',
-                    'data': {'task_id': celery_task.id},
-                })
-
-            return Response(
-                {'success': False, 'message': '不支持的任务类型'},
-                status=status.HTTP_400_BAD_REQUEST,
+            enqueue_app_task(
+                execute_app_test_task,
+                dispatch_id=dispatch_id,
+                args=(executions[0].pk,),
+                kwargs={
+                    'package_name': package_name,
+                    'scheduled_task_id': task.pk,
+                    'lease_generation': lease_generation,
+                    'release_device_lease': release_device_lease,
+                },
             )
+            return Response({
+                'success': True,
+                'message': '测试用例开始执行',
+                'data': {'task_id': dispatch_id},
+            })
+        except DeviceExecutionBusy as exc:
+            return Response({'success': False, 'message': str(exc)}, status=status.HTTP_409_CONFLICT)
         except Exception as e:
-            failure = f'执行失败: {str(e)}'
+            failure = '无法提交执行任务，请检查任务队列'
             try:
                 from ..tasks import settle_undispatched_app_executions
                 settle_undispatched_app_executions(
                     [item.pk for item in executions],
                     failure,
                     suite_id=suite_id,
+                    device_id=device.pk if locals().get('device') else None,
+                    lease_owner=request.user if locals().get('release_device_lease') else None,
+                    lease_generation=locals().get('lease_generation'),
+                    release_device_lease=bool(locals().get('release_device_lease')),
                 )
             except Exception:  # noqa: BLE001 - retain the broker failure response
                 logger.exception('settling manually scheduled APP executions failed')
-            if locals().get('release_device_lease') and locals().get('lease_generation') is not None:
-                try:
-                    release_device_execution_lease(device.pk, request.user, lease_generation)
-                except Exception:
-                    logger.exception('释放未成功派发的 APP 设备租约失败')
             task.failed_runs += 1
             task.error_message = failure[:4000]
             task.last_result = {'status': 'failed', 'error': failure[:4000]}
             task.save(update_fields=['failed_runs', 'error_message', 'last_result', 'updated_at'])
-            logger.error(f'执行定时任务失败: {str(e)}', exc_info=True)
+            logger.error('执行定时任务失败: %s', redact_text(str(e), max_length=500))
             return Response(
                 {'success': False, 'message': failure},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,

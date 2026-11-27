@@ -2,7 +2,7 @@
 """从同目录下的 ui-component-pack.yaml 加载组件包"""
 import os
 import yaml
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from apps.app_automation.models import AppComponent
 
@@ -14,7 +14,7 @@ class Command(BaseCommand):
         parser.add_argument(
             '--overwrite',
             action='store_true',
-            help='覆盖已存在的组件'
+            help='更新已存在的内置组件，不删除未在包中声明的组件'
         )
 
     def handle(self, *args, **options):
@@ -32,11 +32,24 @@ class Command(BaseCommand):
         with open(yaml_path, 'r', encoding='utf-8') as f:
             manifest = yaml.safe_load(f)
         
-        if not manifest or 'components' not in manifest:
-            self.stdout.write(self.style.ERROR('❌ 组件包格式错误'))
-            return
-        
+        if not isinstance(manifest, dict) or not isinstance(manifest.get('components'), list):
+            raise CommandError('component pack must be a YAML object with a components list')
+
         components = manifest['components']
+        seen_types = set()
+        for index, item in enumerate(components):
+            if not isinstance(item, dict):
+                raise CommandError(f'component at index {index} must be a YAML object')
+            component_type = item.get('type')
+            if not isinstance(component_type, str) or not component_type.strip() or component_type != component_type.strip():
+                raise CommandError(f'component at index {index} must have a non-empty trimmed type')
+            if component_type in seen_types:
+                raise CommandError(f'duplicate component type in pack: {component_type}')
+            seen_types.add(component_type)
+            for key in ('schema', 'default_config'):
+                if key in item and item[key] is not None and not isinstance(item[key], dict):
+                    raise CommandError(f'component {component_type} {key} must be a YAML object')
+
         overwrite = options['overwrite']
         
         self.stdout.write(self.style.SUCCESS(f'📦 组件包信息:'))
@@ -49,21 +62,10 @@ class Command(BaseCommand):
         created_count = 0
         updated_count = 0
         skipped_count = 0
-        errors = []
-        
-        deleted_count = 0
         
         with transaction.atomic():
-            # 收集 YAML 中定义的所有 type
-            yaml_types = set()
-            
             for item in components:
-                component_type = item.get('type')
-                if not component_type:
-                    errors.append(f'组件缺少 type: {item.get("name", "unknown")}')
-                    continue
-                
-                yaml_types.add(component_type)
+                component_type = item['type']
                 
                 defaults = {
                     'name': item.get('name') or component_type,
@@ -95,14 +97,6 @@ class Command(BaseCommand):
                     updated_count += 1
                     self.stdout.write(self.style.WARNING(f'♻️  更新组件: {obj.name} ({obj.type})'))
             
-            # 清理数据库中存在但 YAML 中已删除的组件
-            if overwrite and yaml_types:
-                stale = AppComponent.objects.exclude(type__in=yaml_types)
-                for obj in stale:
-                    self.stdout.write(self.style.ERROR(f'🗑️  删除组件: {obj.name} ({obj.type}) - YAML 中已移除'))
-                deleted_count = stale.count()
-                stale.delete()
-        
         # 统计
         self.stdout.write('')
         self.stdout.write('=' * 60)
@@ -110,14 +104,7 @@ class Command(BaseCommand):
         self.stdout.write(f'   新建: {created_count} 个')
         self.stdout.write(f'   更新: {updated_count} 个')
         self.stdout.write(f'   跳过: {skipped_count} 个')
-        if deleted_count:
-            self.stdout.write(f'   清理: {deleted_count} 个')
         self.stdout.write(f'   总计: {AppComponent.objects.filter(enabled=True).count()} 个启用的组件')
-        
-        if errors:
-            self.stdout.write(self.style.ERROR(f'   错误: {len(errors)} 个'))
-            for error in errors:
-                self.stdout.write(self.style.ERROR(f'      - {error}'))
         
         self.stdout.write('=' * 60)
         self.stdout.write('')

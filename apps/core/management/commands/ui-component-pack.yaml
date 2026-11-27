@@ -1,5 +1,5 @@
 name: ui-component-pack
-version: 2026.02.02
+version: 2026.11.23
 description: 导出的组件包
 author: ''
 components:
@@ -68,6 +68,10 @@ components:
         type: string
       send_enter:
         type: boolean
+      clear_first:
+        type: boolean
+      sensitive:
+        type: boolean
       selector:
         type: string
       image_scope:
@@ -79,6 +83,8 @@ components:
   default_config:
     value: ''
     send_enter: false
+    clear_first: false
+    sensitive: false
     selector: ''
     image_scope: common
     selector_type: image
@@ -137,10 +143,15 @@ components:
     properties:
       duration:
         type: number
+      start:
+        type: string
+      end:
+        type: string
       selector:
         type: string
       direction:
         type: string
+        enum: [up, down, left, right]
       image_scope:
         type: string
       selector_type:
@@ -148,6 +159,9 @@ components:
   default_config:
     selector: ''
     direction: up
+    duration: 0.5
+    start: ''
+    end: ''
     image_scope: common
     selector_type: pos
   enabled: true
@@ -676,3 +690,179 @@ components:
     finally_steps: []
   enabled: true
   sort_order: 170
+- type: clear_input
+  name: 清空输入框
+  category: action
+  description: 可选择目标输入框；未指定时清空当前焦点
+  schema:
+    required: []
+    properties:
+      selector_type: {type: string, enum: [image, pos, region, resource_id, text, content_desc, class]}
+      selector: {type: string}
+      image_scope: {type: string}
+      image_threshold: {type: number}
+      timeout: {type: number}
+  default_config: {selector_type: image, selector: '', image_scope: common, image_threshold: 0.7, timeout: 5}
+  enabled: true
+  sort_order: 22
+- type: key_event
+  name: 系统按键
+  category: device
+  description: 发送受支持的 Android 系统按键
+  schema:
+    required: [key]
+    properties:
+      key: {type: string, enum: [BACK, HOME, ENTER, TAB, DELETE, ESCAPE, APP_SWITCH, VOLUME_UP, VOLUME_DOWN]}
+  default_config: {key: BACK}
+  enabled: true
+  sort_order: 10
+- type: hide_keyboard
+  name: 收起键盘
+  category: device
+  description: 键盘显示时收起键盘，不在未显示时触发返回
+  schema: {required: [], properties: {}}
+  default_config: {}
+  enabled: true
+  sort_order: 20
+- type: app_start
+  name: 启动应用
+  category: device
+  description: 启动指定应用；留空使用当前执行配置的包名
+  schema:
+    required: []
+    properties:
+      package_name: {type: string}
+  default_config: {package_name: ''}
+  enabled: true
+  sort_order: 30
+- type: app_stop
+  name: 关闭应用
+  category: device
+  description: 停止指定应用；留空使用当前执行配置的包名
+  schema:
+    required: []
+    properties:
+      package_name: {type: string}
+  default_config: {package_name: ''}
+  enabled: true
+  sort_order: 40
+- type: app_restart
+  name: 重启应用
+  category: device
+  description: 先关闭再启动指定应用，不清除应用数据
+  schema:
+    required: []
+    properties:
+      package_name: {type: string}
+  default_config: {package_name: ''}
+  enabled: true
+  sort_order: 50
+- type: handle_permission
+  name: 处理系统权限弹窗
+  category: device
+  description: 按指定选择处理 Android 系统权限弹窗
+  schema:
+    required: [choice]
+    properties:
+      choice: {type: string, enum: [allow, deny, while_in_use]}
+      optional: {type: boolean}
+      timeout: {type: number}
+  default_config: {choice: allow, optional: true, timeout: 5}
+  enabled: true
+  sort_order: 60
+- type: wait_element
+  name: 等待元素出现或消失
+  category: control
+  description: 在限定时间内等待图片或原生控件出现或消失
+  schema:
+    required: [selector_type, selector, state]
+    properties:
+      selector_type: {type: string, enum: [image, resource_id, text, content_desc, class]}
+      selector: {type: string}
+      selector_match: {type: string, enum: [exact, contains]}
+      image_scope: {type: string}
+      image_threshold: {type: number}
+      state: {type: string, enum: [visible, hidden]}
+      timeout: {type: number}
+      interval: {type: number}
+  default_config: {selector_type: image, selector: '', selector_match: exact, image_scope: common, image_threshold: 0.7, state: visible, timeout: 10, interval: 0.5}
+  enabled: true
+  sort_order: 45
+- type: assert_element
+  name: 断言元素状态
+  category: assert
+  description: 验证元素可见性或原生控件启用、选中和勾选状态
+  schema:
+    required: [selector_type, selector, state]
+    properties:
+      selector_type: {type: string, enum: [image, resource_id, text, content_desc, class]}
+      selector: {type: string}
+      selector_match: {type: string, enum: [exact, contains]}
+      image_scope: {type: string}
+      image_threshold: {type: number}
+      state: {type: string, enum: [visible, hidden, enabled, disabled, checked, unchecked, selected, unselected]}
+      timeout: {type: number}
+      interval: {type: number}
+  default_config: {selector_type: image, selector: '', selector_match: exact, image_scope: common, image_threshold: 0.7, state: visible, timeout: 5, interval: 0.5}
+  enabled: true
+  sort_order: 60
+- type: assert_text
+  name: 断言元素文字
+  category: assert
+  description: 验证原生控件文字或指定区域的 OCR 文本
+  schema:
+    required: [selector_type, selector, expected, match_mode]
+    properties:
+      selector_type: {type: string, enum: [resource_id, text, content_desc, class, region]}
+      selector: {type: string}
+      selector_match: {type: string, enum: [exact, contains]}
+      expected: {type: string}
+      match_mode: {type: string, enum: [exact, contains, regex]}
+      timeout: {type: number}
+      interval: {type: number}
+  default_config: {selector_type: resource_id, selector: '', selector_match: exact, expected: '', match_mode: contains, timeout: 5, interval: 0.5}
+  enabled: true
+  sort_order: 70
+- type: assert_value
+  name: 断言变量值
+  category: assert
+  description: 比较变量或表达式的值
+  schema:
+    required: [left, operator]
+    properties:
+      left: {type: string}
+      operator: {type: string, enum: ['==', '!=', '>', '>=', '<', '<=', contains, regex, truthy, falsy]}
+      right: {type: string}
+  default_config: {left: '', operator: '==', right: ''}
+  enabled: true
+  sort_order: 80
+- type: assert_response
+  name: 断言接口响应
+  category: assert
+  description: 按路径比较上一次或指定接口响应中的值
+  schema:
+    required: [source, path, operator]
+    properties:
+      source: {type: string}
+      path: {type: string}
+      operator: {type: string, enum: ['==', '!=', '>', '>=', '<', '<=', contains, regex, truthy, falsy]}
+      expected: {type: string}
+  default_config: {source: outputs.last, path: status_code, operator: '==', expected: '200'}
+  enabled: true
+  sort_order: 90
+- type: extract_text
+  name: 提取元素文字
+  category: utility
+  description: 将原生控件或 OCR 区域文字保存为变量，不输出敏感内容到日志
+  schema:
+    required: [selector_type, selector, name]
+    properties:
+      selector_type: {type: string, enum: [resource_id, text, content_desc, class, region]}
+      selector: {type: string}
+      selector_match: {type: string, enum: [exact, contains]}
+      name: {type: string}
+      scope: {type: string, enum: [local, global]}
+      timeout: {type: number}
+  default_config: {selector_type: resource_id, selector: '', selector_match: exact, name: '', scope: local, timeout: 5}
+  enabled: true
+  sort_order: 35

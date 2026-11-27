@@ -59,10 +59,10 @@ python scripts/validate_linux_runtime.py --profile web --repo-root "$PWD" --mirr
 以下清单只用于独立自动化执行环境，当前 Web/Daphne 服务不安装、不启动这些能力：
 
 - `requirements-ui-optional.txt`：Playwright、Selenium、webdriver-manager、browser-use 及其固定版本的 cdp-use、bubus 运行时依赖。
-- `requirements-app-optional.txt`：Airtest、EasyOCR、OpenCV、NumPy（loguru、Pillow 已由 `requirements-prod.txt` 提供）。
+- `requirements-app-optional.txt` 包含 Airtest、EasyOCR、OpenCV、NumPy 和 Appium Python 客户端。`requirements-prod.txt` 提供 loguru 和 Pillow。
 - `requirements-report-optional.txt`：Allure pytest 插件及 Python 运行时；仓库内 `allure/bin/allure` 提供报告命令。
 
-Selenium 仅作为显式兼容引擎保留。生产环境默认 `UI_SELENIUM_COMPATIBILITY=False`，新 UI 项目使用 Playwright；只有完成 legacy Selenium 项目评估并经过管理员配置，才设置为 `True`。APP 自动化仍使用独立 Airtest worker。
+生产环境默认 `UI_SELENIUM_COMPATIBILITY=False`，新增 Web UI 项目使用 Playwright。Selenium 兼容项目使用独立的 Web UI worker。Android APP 的 Appium 服务、设备实例、队列和版本见 [Appium 自动化主机部署](APPIUM_DEPLOYMENT.md)。
 
 
 ```bash

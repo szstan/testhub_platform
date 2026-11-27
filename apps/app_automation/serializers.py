@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 from typing import Optional
+import math
+import re
 
 from rest_framework import serializers
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 from django.core.signing import TimestampSigner
+from .runtime_config import validate_base_url
+from .constants import (
+    ANDROID_PACKAGE_NAME_PATTERN,
+    ElementType,
+    ExecutionEngine,
+    NATIVE_ELEMENT_STRATEGIES,
+)
 from .access import (
     accessible_projects,
     scope_test_cases,
@@ -27,6 +37,125 @@ from .models import (
     AppScheduledTask,
     AppNotificationLog,
 )
+from .scene_component_runtime import (
+    SceneComponentError,
+    validate_legacy_component_configuration,
+    validate_legacy_component_references,
+    validate_project_component_references,
+)
+
+
+_SECRET_ALIAS_RE = re.compile(r'secret://[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
+_VARIABLE_REFERENCE_RE = re.compile(
+    r'(?:\{\{\s*[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\}\}'
+    r'|\$\{\s*[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*\s*\})\Z'
+)
+_NESTED_SCENE_STEP_FIELDS = ('steps', 'then_steps', 'else_steps', 'try_steps', 'catch_steps', 'finally_steps')
+_MAX_SCENE_STEP_DEPTH = 16
+
+
+def _is_empty_sensitive_value(value):
+    return (
+        value is None
+        or (isinstance(value, str) and not value.strip())
+        or (isinstance(value, (list, dict)) and not value)
+    )
+
+
+def _validate_sensitive_variables(variables):
+    if not isinstance(variables, list):
+        return
+    for variable in variables:
+        if not isinstance(variable, dict) or variable.get('sensitive') is not True:
+            continue
+        value = variable.get('value')
+        if _is_empty_sensitive_value(value):
+            continue
+        if not isinstance(value, str) or not _SECRET_ALIAS_RE.fullmatch(value):
+            raise serializers.ValidationError('敏感变量只能留空或使用 secret:// 别名')
+
+
+def _is_exact_scene_variable_reference(value):
+    if not isinstance(value, str) or not _VARIABLE_REFERENCE_RE.fullmatch(value):
+        return False
+    expression = value[2:-2] if value.startswith('{{') else value[2:-1]
+    root = expression.strip().split('.', 1)[0].split('[', 1)[0].strip()
+    return root != 'params'
+
+
+def _validate_sensitive_flow(ui_flow):
+    if isinstance(ui_flow, dict):
+        if 'steps' not in ui_flow:
+            return
+        ui_flow = ui_flow['steps']
+        if not isinstance(ui_flow, list):
+            raise serializers.ValidationError('ui_flow.steps 必须是步骤列表')
+    elif not isinstance(ui_flow, list):
+        return
+
+    def visit(steps, depth):
+        if depth > _MAX_SCENE_STEP_DEPTH:
+            raise serializers.ValidationError('敏感输入配置嵌套过深')
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            config = step.get('config')
+            containers = [step]
+            if isinstance(config, dict):
+                containers.append(config)
+            action = step.get('type')
+            if (
+                isinstance(action, str)
+                and action.lower() in {'input', 'text'}
+                and any(container.get('sensitive') is True for container in containers)
+            ):
+                for container in containers:
+                    for key in ('value', 'text'):
+                        value = container.get(key)
+                        if _is_empty_sensitive_value(value):
+                            continue
+                        if not _is_exact_scene_variable_reference(value):
+                            raise serializers.ValidationError('敏感输入只能留空或使用变量引用')
+
+            for container in containers:
+                for field in _NESTED_SCENE_STEP_FIELDS:
+                    nested = container.get(field)
+                    if isinstance(nested, list):
+                        visit(nested, depth + 1)
+
+    visit(ui_flow, 0)
+
+
+def _validate_native_element_config(config):
+    if not isinstance(config, dict):
+        raise serializers.ValidationError('原生元素配置必须是 JSON 对象')
+    if not {'package_name', 'strategy', 'value'} <= set(config) or set(config) - {
+        'package_name', 'strategy', 'value', 'container',
+    }:
+        raise serializers.ValidationError('原生元素配置仅支持 package_name、strategy、value 和 container')
+    package_name = config.get('package_name')
+    if (
+        not isinstance(package_name, str)
+        or not re.fullmatch(ANDROID_PACKAGE_NAME_PATTERN, package_name)
+    ):
+        raise serializers.ValidationError('原生元素必须包含有效的 Android package_name')
+    if config.get('strategy') not in NATIVE_ELEMENT_STRATEGIES:
+        raise serializers.ValidationError('原生元素 strategy 必须为 id 或 accessibility_id')
+    if not isinstance(config.get('value'), str) or not config['value'].strip() or len(config['value']) > 512:
+        raise serializers.ValidationError('原生元素 value 必须是 1 到 512 个字符')
+
+    if 'container' in config:
+        container = config['container']
+        if (
+            not isinstance(container, dict)
+            or set(container) != {'strategy', 'value'}
+            or container.get('strategy') not in NATIVE_ELEMENT_STRATEGIES
+            or not isinstance(container.get('value'), str)
+            or not container['value'].strip()
+            or len(container['value']) > 512
+        ):
+            raise serializers.ValidationError('container 必须仅包含有效的 strategy 和 value')
+    return config
 
 
 # ========== 项目管理序列化器 ==========
@@ -60,7 +189,7 @@ class AppProjectCreateSerializer(serializers.ModelSerializer):
     """APP项目创建序列化器"""
     class Meta:
         model = AppProject
-        fields = ('name', 'description', 'status', 'start_date', 'end_date', 'members')
+        fields = ('name', 'description', 'status', 'start_date', 'end_date', 'members', 'appium_enabled')
         extra_kwargs = {
             'members': {'required': False},
         }
@@ -70,7 +199,7 @@ class AppProjectUpdateSerializer(serializers.ModelSerializer):
     """APP项目更新序列化器"""
     class Meta:
         model = AppProject
-        fields = ('name', 'description', 'status', 'start_date', 'end_date', 'members')
+        fields = ('name', 'description', 'status', 'start_date', 'end_date', 'members', 'appium_enabled')
 
 
 # ========== 配置序列化器 ==========
@@ -84,27 +213,76 @@ class AppTestConfigSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class AppDeviceListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        devices = data.all() if hasattr(data, 'all') else data
+        if hasattr(devices, 'annotate'):
+            pending_executions = AppTestExecution.objects.filter(
+                device_id=OuterRef('pk'),
+                device_action_pending=True,
+            )
+            devices = devices.annotate(
+                _has_pending_execution=Exists(pending_executions)
+            )
+            return super().to_representation(devices)
+
+        devices = list(devices)
+        if not devices:
+            return []
+        pending_device_ids = set(AppTestExecution.objects.filter(
+            device_id__in=[device.pk for device in devices],
+            device_action_pending=True,
+        ).values_list('device_id', flat=True))
+        self.child._pending_action_device_ids = pending_device_ids
+        try:
+            return super().to_representation(devices)
+        finally:
+            del self.child._pending_action_device_ids
+
+
 class AppDeviceSerializer(serializers.ModelSerializer):
     """APP设备序列化器"""
     locked_by_name = serializers.SerializerMethodField()
+    lease_requires_token = serializers.SerializerMethodField()
+    has_pending_action = serializers.SerializerMethodField()
     
     class Meta:
         model = AppDevice
         fields = [
             'id', 'device_id', 'name', 'status', 'android_version', 'connection_type',
-            'ip_address', 'port', 'locked_by', 'locked_by_name', 'locked_at',
+            'ip_address', 'port', 'locked_by', 'locked_by_name', 'lease_requires_token', 'locked_at',
             'max_allocation_time', 'lease_acquired_at', 'lease_expires_at',
             'last_heartbeat_at', 'capabilities', 'health_status', 'maintenance_mode',
-            'last_seen_at', 'device_specs', 'description', 'location',
+            'has_pending_action', 'last_seen_at', 'device_specs', 'description', 'location',
             'created_at', 'updated_at',
         ]
         read_only_fields = (
             'id', 'locked_by', 'locked_by_name', 'locked_at', 'lease_acquired_at',
             'lease_expires_at', 'last_heartbeat_at', 'last_seen_at', 'created_at', 'updated_at',
         )
+        list_serializer_class = AppDeviceListSerializer
     
     def get_locked_by_name(self, obj) -> Optional[str]:
         return obj.locked_by.username if obj.locked_by else None
+
+    def get_lease_requires_token(self, obj) -> bool:
+        return bool(obj.lease_token_hash)
+
+    def get_has_pending_action(self, obj) -> bool:
+        pending_execution = getattr(obj, '_has_pending_execution', None)
+        if pending_execution is not None:
+            return bool(obj.device_action_pending or pending_execution)
+
+        pending_device_ids = getattr(self, '_pending_action_device_ids', None)
+        if pending_device_ids is not None:
+            return bool(obj.device_action_pending or obj.pk in pending_device_ids)
+
+        if obj.device_action_pending:
+            return True
+        return AppTestExecution.objects.filter(
+            device_id=obj.pk,
+            device_action_pending=True,
+        ).exists()
 
 
 class AppElementSerializer(serializers.ModelSerializer):
@@ -119,6 +297,8 @@ class AppElementSerializer(serializers.ModelSerializer):
         read_only_fields = ('created_at', 'updated_at', 'usage_count', 'last_used_at')
     
     def validate_project(self, value):
+        if value is None:
+            return None
         request = self.context.get('request')
         user = getattr(request, 'user', None)
         if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
@@ -173,8 +353,24 @@ class AppElementSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     f'区域元素缺少必需字段: {", ".join(missing_fields)}'
                 )
-        
+
+        elif element_type == ElementType.NATIVE:
+            _validate_native_element_config(value)
+
         return value
+
+    def validate(self, attrs):
+        element_type = attrs.get('element_type', getattr(self.instance, 'element_type', None))
+        if element_type == ElementType.NATIVE:
+            project = attrs.get('project', getattr(self.instance, 'project', None))
+            if project is None:
+                raise serializers.ValidationError({'project': '原生元素必须绑定到 APP 项目'})
+            config = attrs.get('config', getattr(self.instance, 'config', {}))
+            try:
+                _validate_native_element_config(config)
+            except serializers.ValidationError as exc:
+                raise serializers.ValidationError({'config': exc.detail}) from None
+        return attrs
     
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -204,11 +400,111 @@ class AppTestCaseSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
+    def validate_variables(self, value):
+        _validate_sensitive_variables(value)
+        return value
+
+    def validate_ui_flow(self, value):
+        _validate_sensitive_flow(value)
+        try:
+            validate_legacy_component_references(value)
+        except SceneComponentError:
+            raise serializers.ValidationError('旧版组件配置无效或包含不安全的敏感值') from None
+        return value
+
+    def validate(self, attrs):
+        flow_was_supplied = 'ui_flow' in attrs
+        project_was_supplied = 'project' in attrs
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        engine = attrs.get('engine', getattr(self.instance, 'engine', None))
+        if engine is None:
+            engine = (
+                ExecutionEngine.APPIUM
+                if project is not None and project.appium_enabled
+                else ExecutionEngine.LEGACY
+            )
+            attrs['engine'] = engine
+        if engine == ExecutionEngine.APPIUM and (
+            project is None or not project.appium_enabled
+        ):
+            raise serializers.ValidationError({
+                'engine': '只有启用 Appium 的 APP 项目才能使用 Appium 引擎'
+            })
+
+        if not flow_was_supplied and not project_was_supplied:
+            return attrs
+
+        flow = attrs.get('ui_flow', getattr(self.instance, 'ui_flow', None))
+        if isinstance(flow, dict):
+            flow_steps = flow.get('steps', [])
+        elif isinstance(flow, list):
+            flow_steps = flow
+        else:
+            flow_steps = []
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        try:
+            validate_project_component_references(flow_steps, project, user)
+        except SceneComponentError:
+            raise serializers.ValidationError({'ui_flow': '项目组件配置无效或无权访问'}) from None
+        return attrs
+
     def validate_project(self, value):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
         if user is not None and not accessible_projects(user).filter(pk=value.pk).exists():
             raise serializers.ValidationError('无权使用该 APP 项目')
+        return value
+
+    def validate_runtime_config(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('runtime_config 必须是 JSON 对象')
+        supported = {'base_url', 'retry_times', 'retry_interval', 'ocr_languages', 'ocr_use_gpu', 'stop_on_error'}
+        if set(value) - supported:
+            raise serializers.ValidationError('runtime_config 包含不支持的配置项')
+
+        if 'base_url' in value:
+            try:
+                validate_base_url(value['base_url'])
+            except ValueError as exc:
+                raise serializers.ValidationError(str(exc)) from None
+
+        retry_times = value.get('retry_times')
+        if retry_times is not None and (
+            isinstance(retry_times, bool)
+            or not isinstance(retry_times, int)
+            or not 0 <= retry_times <= 10
+        ):
+            raise serializers.ValidationError('retry_times 必须是 0 到 10 之间的整数')
+
+        retry_interval = value.get('retry_interval')
+        if retry_interval is not None and (
+            isinstance(retry_interval, bool)
+            or not isinstance(retry_interval, (int, float))
+            or retry_interval < 0
+            or retry_interval > 10
+            or not math.isfinite(retry_interval)
+        ):
+            raise serializers.ValidationError('retry_interval 必须是 0 到 10 之间的有限数值')
+
+        languages = value.get('ocr_languages')
+        if languages is not None and (
+            not isinstance(languages, list)
+            or not languages
+            or len(languages) > 2
+            or any(not isinstance(language, str) or language not in ('en', 'ch_sim') for language in languages)
+            or len(set(languages)) != len(languages)
+        ):
+            raise serializers.ValidationError('ocr_languages 仅支持不重复的 en / ch_sim 列表')
+
+        use_gpu = value.get('ocr_use_gpu')
+        if use_gpu is not None and not isinstance(use_gpu, bool):
+            raise serializers.ValidationError('ocr_use_gpu 必须是布尔值')
+
+        stop_on_error = value.get('stop_on_error')
+        if stop_on_error is not None and not isinstance(stop_on_error, bool):
+            raise serializers.ValidationError('stop_on_error 必须是布尔值')
+
         return value
 
     def get_created_by_name(self, obj) -> Optional[str]:
@@ -250,7 +546,10 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AppTestExecution
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at', 'started_at', 'finished_at', 'duration')
+        read_only_fields = (
+            'created_at', 'updated_at', 'started_at', 'finished_at', 'duration',
+            'stop_requested', 'release_device_lease_on_stop', 'engine',
+        )
 
 
 class AppComponentSerializer(serializers.ModelSerializer):
@@ -269,6 +568,18 @@ class AppCustomComponentSerializer(serializers.ModelSerializer):
         model = AppCustomComponent
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
+    def validate(self, attrs):
+        schema = attrs.get('schema', getattr(self.instance, 'schema', {}))
+        defaults = attrs.get('default_config', getattr(self.instance, 'default_config', {}))
+        steps = attrs.get('steps', getattr(self.instance, 'steps', []))
+        try:
+            validate_legacy_component_configuration(
+                schema, defaults, steps, {},
+            )
+        except SceneComponentError:
+            raise serializers.ValidationError('全局组件定义包含无效或不安全的敏感配置') from None
+        return attrs
 
 
 class AppComponentPackageSerializer(serializers.ModelSerializer):
