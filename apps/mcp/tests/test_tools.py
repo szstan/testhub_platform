@@ -237,6 +237,33 @@ class GetUiExecutionToolTest(ToolBase):
         self.assertEqual(result['steps'], [])
         self.assertEqual(result['raw_logs'], '纯文本历史日志')
 
+    def test_internal_exception_returns_public_diagnostics(self):
+        from apps.ui_automation.execution_summary import INTERNAL_CASE_EXECUTION_ERROR
+
+        execution = self._create_execution(status='error', logs=(
+            'Legacy execution error\nTraceback (most recent call last):\ninternal code location'
+        ))
+        result = mcp_tools.get_ui_execution(self.ctx, execution_id=execution.id)
+        self.assertEqual(result['raw_logs'], INTERNAL_CASE_EXECUTION_ERROR)
+        self.assertEqual(result['error_message'], INTERNAL_CASE_EXECUTION_ERROR)
+
+    def test_legacy_selenium_stack_is_redacted_without_dropping_steps(self):
+        from apps.ui_automation.execution_summary import INTERNAL_CASE_EXECUTION_ERROR
+
+        steps = [
+            {'step_number': 1, 'success': True, 'description': 'Page opened'},
+            {'step_number': 2, 'success': False, 'error': 'Driver error\nStacktrace:\nfixture frame'},
+        ]
+        execution = self._create_execution(
+            status='failed', logs=json.dumps(steps),
+            screenshots=[{'url': 'data:image/png;base64,AAAA', 'step_number': 2, 'description': steps[1]['error']}],
+        )
+        result = mcp_tools.get_ui_execution(self.ctx, execution_id=execution.id)
+        self.assertEqual(result['steps'], [steps[0], dict(steps[1], error=INTERNAL_CASE_EXECUTION_ERROR)])
+        self.assertEqual(result['screenshots'], [{'step_number': 2, 'description': INTERNAL_CASE_EXECUTION_ERROR}])
+        self.assertNotIn('raw_logs', result)
+        self.assertEqual(result['error_message'], INTERNAL_CASE_EXECUTION_ERROR)
+
     def test_permission_denied_for_foreign_project(self):
         from apps.ui_automation.models import UiProject
         foreign = UiProject.objects.create(

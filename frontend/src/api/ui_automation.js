@@ -1,10 +1,19 @@
 import request from '@/utils/api'
 
 // 仪表盘相关API
-export function getDashboardStats() {
+export function getDashboardStats(params) {
   return request({
     url: '/ui-automation/dashboard/stats/',
-    method: 'get'
+    method: 'get',
+    params
+  })
+}
+
+export function getDashboardRecentExecutions(params) {
+  return request({
+    url: '/ui-automation/dashboard/recent-executions/',
+    method: 'get',
+    params
   })
 }
 
@@ -631,6 +640,14 @@ export function getTestCaseExecutions(params) {
     url: '/ui-automation/test-case-executions/',
     method: 'get',
     params
+  })
+}
+
+// 获取测试用例执行详情
+export function getTestCaseExecutionDetail(id) {
+  return request({
+    url: `/ui-automation/test-case-executions/${id}/`,
+    method: 'get'
   })
 }
 

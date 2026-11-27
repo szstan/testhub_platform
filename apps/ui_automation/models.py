@@ -1,9 +1,50 @@
-from django.db import models
+from django.db import models, router
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 import json
 
+from .execution_summary import FAILURE_STATUSES, build_failure_summary, normalize_execution_status
+
 User = get_user_model()
+
+
+class ExecutionFailureSummaryModel(models.Model):
+    failure_summary = models.JSONField(default=dict, blank=True, null=True, editable=False)
+    failure_payload_field = 'execution_logs'
+
+    class Meta:
+        abstract = True
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        payload_field = self.failure_payload_field
+        summary_inputs = {'status', 'error_message', payload_field}
+        if update_fields is not None:
+            update_fields = set(update_fields)
+
+        if update_fields is None or summary_inputs & update_fields:
+            status = self.status
+            stored = {}
+            if update_fields is not None and not self._state.adding:
+                database = using or router.db_for_write(type(self), instance=self)
+                previous = type(self)._base_manager.using(database).filter(pk=self.pk)
+                if 'status' not in update_fields:
+                    status = previous.values_list('status', flat=True).first() or status
+                if normalize_execution_status(status) in FAILURE_STATUSES:
+                    # A partial save must not summarize evidence omitted from that save.
+                    missing = {payload_field, 'error_message'} - update_fields
+                    if missing:
+                        stored = previous.values(*sorted(missing)).first() or {}
+
+            self.failure_summary = {}
+            if normalize_execution_status(status) in FAILURE_STATUSES:
+                message = stored['error_message'] if 'error_message' in stored else self.error_message
+                payload = stored[payload_field] if payload_field in stored else getattr(self, payload_field)
+                self.failure_summary = build_failure_summary(
+                    status, message, payload, suite=payload_field == 'result_data',
+                )
+            if update_fields is not None:
+                update_fields.add('failure_summary')
+        super().save(force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields)
 
 
 class UiProject(models.Model):
@@ -461,8 +502,9 @@ class TestSuiteTestCase(models.Model):
         return f'{self.test_suite.name} - {self.test_case.name}'
 
 
-class TestExecution(models.Model):
+class TestExecution(ExecutionFailureSummaryModel):
     """测试执行记录模型"""
+    failure_payload_field = 'result_data'
     STATUS_CHOICES = [
         ('PENDING', '待执行'),
         ('RUNNING', '运行中'),
@@ -651,7 +693,7 @@ class TestCaseStep(models.Model):
         return f"{self.test_case.name} - 步骤{self.step_number}"
 
 
-class TestCaseExecution(models.Model):
+class TestCaseExecution(ExecutionFailureSummaryModel):
     """测试用例执行记录模型"""
     STATUS_CHOICES = [
         ('pending', '待执行'),

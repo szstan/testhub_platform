@@ -2,12 +2,30 @@
   <div class="page-container">
     <div class="page-header">
       <h1 class="page-title">{{ $t('uiAutomation.execution.title') }}</h1>
-      <el-select v-model="projectId" :placeholder="$t('uiAutomation.common.selectProject')" style="width: 200px; margin-right: 15px" @change="onProjectChange">
+      <el-select
+        v-model="projectId"
+        :aria-label="$t('uiAutomation.common.selectProject')"
+        :placeholder="$t('uiAutomation.common.selectProject')"
+        :disabled="projectsLoading"
+        style="width: 200px"
+      >
         <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
       </el-select>
     </div>
 
-    <div class="card-container">
+    <div v-if="projectsLoading" class="card-container" role="status">{{ $t('uiAutomation.dashboard.loading') }}</div>
+    <div v-else-if="projectsError" class="card-container" role="alert">
+      <p>{{ $t('uiAutomation.project.messages.loadFailed') }}</p>
+      <el-button @click="reloadProjects">{{ $t('uiAutomation.workbenchExecution.retry') }}</el-button>
+    </div>
+    <div v-else-if="!projectId" class="card-container">
+      <el-empty :description="$t(invalidProject ? 'uiAutomation.workbenchExecution.invalidProject' : projects.length ? 'uiAutomation.common.selectProject' : 'uiAutomation.workbenchExecution.noProjects')">
+        <RouterLink v-if="!projects.length" :to="{ name: 'UiProjects', query: { setup: 'project' } }">
+          {{ $t('uiAutomation.project.newProject') }}
+        </RouterLink>
+      </el-empty>
+    </div>
+    <div v-else class="card-container">
       <div class="filter-bar">
         <el-form :inline="true" :model="queryParams" class="demo-form-inline">
           <el-form-item :label="$t('uiAutomation.common.search')">
@@ -53,14 +71,18 @@
         </el-form>
       </div>
 
-      <el-table :data="executions" v-loading="loading" style="width: 100%" @selection-change="handleSelectionChange">
+      <div v-if="listError" role="alert" class="list-error">
+        <p>{{ $t('uiAutomation.execution.messages.loadFailed') }}</p>
+        <el-button size="small" @click="loadExecutions">{{ $t('uiAutomation.workbenchExecution.retry') }}</el-button>
+      </div>
+      <el-table v-else :data="executions" v-loading="loading" style="width: 100%" @selection-change="handleSelectionChange">
         <el-table-column type="selection" width="55" align="center" />
         <el-table-column prop="id" label="ID" width="80" align="center" />
         <el-table-column prop="test_case_name" :label="$t('uiAutomation.execution.caseName')" min-width="200">
           <template #default="{ row }">
-            <el-link @click="viewExecutionDetail(row)" type="primary">
+            <RouterLink class="execution-link" :to="detailLocation(row.id)">
               {{ row.test_case_name }}
-            </el-link>
+            </RouterLink>
           </template>
         </el-table-column>
         <el-table-column :label="$t('uiAutomation.execution.relatedObject')" width="100" align="center">
@@ -107,10 +129,9 @@
         </el-table-column>
         <el-table-column :label="$t('uiAutomation.common.operation')" width="150" fixed="right" align="center">
           <template #default="{ row }">
-            <el-button size="small" type="primary" link @click="viewExecutionDetail(row)">
-              <el-icon><View /></el-icon>
+            <RouterLink class="execution-link" :to="detailLocation(row.id)">
               {{ $t('uiAutomation.common.details') }}
-            </el-button>
+            </RouterLink>
             <el-button
               v-if="row.status === 'failed' || row.status === 'error'"
               size="small"
@@ -132,7 +153,7 @@
         </el-table-column>
       </el-table>
 
-      <div class="pagination-container">
+      <div v-if="!listError" class="pagination-container">
         <el-pagination
           v-model:current-page="pagination.currentPage"
           v-model:page-size="pagination.pageSize"
@@ -146,8 +167,18 @@
     </div>
 
     <!-- 执行详情对话框 -->
-    <el-dialog v-model="showDetailDialog" :title="$t('uiAutomation.execution.executionDetail')" width="900px">
-      <div v-if="currentExecution" class="execution-detail">
+    <el-dialog :model-value="showDetailDialog" @update:model-value="onDetailVisibility" :title="$t('uiAutomation.execution.executionDetail')" width="min(900px, calc(100vw - 32px))">
+      <div v-if="projectsLoading || detailState === 'loading'" role="status">
+        {{ $t('uiAutomation.dashboard.loading') }}
+      </div>
+      <div v-else-if="projectsError || detailState === 'error'" role="alert">
+        <p>{{ $t('uiAutomation.workbenchExecution.detailError') }}</p>
+        <el-button @click="projectsError ? reloadProjects() : loadExecutionDetail()">
+          {{ $t('uiAutomation.workbenchExecution.retry') }}
+        </el-button>
+      </div>
+      <el-empty v-else-if="!currentExecution" :description="$t('uiAutomation.workbenchExecution.detailUnavailable')" />
+      <div v-else class="execution-detail">
         <!-- 基本信息 -->
         <el-descriptions :column="2" border>
           <el-descriptions-item :label="$t('uiAutomation.execution.caseName')">{{ currentExecution.test_case_name }}</el-descriptions-item>
@@ -161,13 +192,30 @@
           <el-descriptions-item :label="$t('uiAutomation.execution.duration')" :span="2">{{ formatDuration(currentExecution.execution_time) }}</el-descriptions-item>
         </el-descriptions>
 
+        <section v-if="failure" class="failure-summary" :aria-label="$t('uiAutomation.workbenchExecution.failureTitle')">
+          <h3>{{ failure.stepNumber ? $t('uiAutomation.workbenchExecution.failedStep', { step: failure.stepNumber }) : $t('uiAutomation.workbenchExecution.failureTitle') }}</h3>
+          <p>{{ failure.message || $t('uiAutomation.execution.noError') }}</p>
+          <figure v-if="failure.screenshotIndex >= 0 && !failedImages.has(failure.screenshotIndex)">
+            <img
+              :src="currentExecution.screenshots[failure.screenshotIndex].url"
+              :alt="currentExecution.screenshots[failure.screenshotIndex].description || $t('uiAutomation.execution.screenshot')"
+              class="failure-screenshot"
+              @error="failedImages.add(failure.screenshotIndex)"
+            />
+          </figure>
+          <p v-else class="muted-text">{{ $t(failure.screenshotIndex >= 0 ? 'uiAutomation.execution.imageLoadFailed' : 'uiAutomation.execution.noScreenshots') }}</p>
+        </section>
+        <el-button v-else-if="['pending', 'running'].includes(currentExecution.status)" class="status-refresh" @click="loadExecutionDetail">
+          {{ $t('uiAutomation.workbenchExecution.refreshStatus') }}
+        </el-button>
+
         <!-- 执行结果选项卡 -->
         <el-tabs v-model="activeTab" class="execution-tabs" style="margin-top: 20px;">
           <!-- 执行日志 - 所有状态都显示 -->
           <el-tab-pane :label="$t('uiAutomation.execution.executionLogs')" name="logs">
             <div class="logs-container">
-              <div v-if="currentExecution.execution_logs">
-                <div v-for="(step, index) in parseExecutionLogs(currentExecution.execution_logs)" :key="index" class="log-item">
+              <div v-if="executionLog.steps.length">
+                <div v-for="(step, index) in executionLog.steps" :key="index" class="log-item">
                   <div class="log-header">
                     <el-tag :type="step.success ? 'success' : 'danger'" size="small">
                       {{ $t('uiAutomation.execution.step') }} {{ step.step_number }}
@@ -181,6 +229,7 @@
                   </div>
                 </div>
               </div>
+              <pre v-else-if="executionLog.text" class="plain-log">{{ executionLog.text }}</pre>
               <el-empty v-else :description="$t('uiAutomation.execution.noLogs')" />
             </div>
           </el-tab-pane>
@@ -190,21 +239,20 @@
             <div class="screenshots-container">
               <div v-if="currentExecution.screenshots && currentExecution.screenshots.length > 0">
                 <div v-for="(screenshot, index) in currentExecution.screenshots" :key="index" class="screenshot-item">
-                  <h5>{{ screenshot.description || `${$t('uiAutomation.execution.screenshot')} ${index + 1}` }}</h5>
-                  <!-- 检查截图URL是否有效 -->
-                  <div v-if="screenshot.url" class="screenshot-wrapper">
+                  <h5>{{ screenshot?.description || `${$t('uiAutomation.execution.screenshot')} ${index + 1}` }}</h5>
+                  <div v-if="screenshot?.url && !failedImages.has(index)" class="screenshot-wrapper">
                     <img
                       :src="screenshot.url"
-                      :alt="screenshot.description"
+                      :alt="screenshot.description || $t('uiAutomation.execution.screenshot')"
                       class="screenshot-img"
-                      @error="handleImageError($event, screenshot)"
+                      @error="failedImages.add(index)"
                     />
                   </div>
                   <div v-else class="screenshot-error">
                     <el-icon><WarningFilled /></el-icon>
-                    <span>{{ $t('uiAutomation.execution.screenshotFailed') }}{{ screenshot.error || $t('uiAutomation.execution.unknownReason') }}</span>
+                    <span>{{ failedImages.has(index) ? $t('uiAutomation.execution.imageLoadFailed') : screenshot?.error || $t('uiAutomation.execution.noScreenshots') }}</span>
                   </div>
-                  <p class="screenshot-time">{{ formatDateTime(screenshot.timestamp) }}</p>
+                  <p class="screenshot-time">{{ formatDateTime(screenshot?.timestamp) }}</p>
                 </div>
               </div>
               <el-empty v-else :description="$t('uiAutomation.execution.noScreenshots')" />
@@ -225,12 +273,15 @@
         </el-tabs>
       </div>
       <template #footer>
-        <el-button @click="showDetailDialog = false">{{ $t('uiAutomation.common.close') }}</el-button>
+        <el-button v-if="failure" :disabled="rerunning" @click="showRerunDialog(currentExecution)">
+          {{ $t('uiAutomation.common.rerun') }}
+        </el-button>
+        <el-button @click="onDetailVisibility(false)">{{ $t('uiAutomation.common.close') }}</el-button>
       </template>
     </el-dialog>
 
     <!-- 重跑测试用例对话框 -->
-    <el-dialog v-model="showRerunDialogVisible" :title="$t('uiAutomation.execution.rerunTitle')" width="500px">
+    <el-dialog v-model="showRerunDialogVisible" :title="$t('uiAutomation.execution.rerunTitle')" width="min(500px, calc(100vw - 32px))" append-to-body>
       <el-form :model="rerunFormData" label-width="100px">
         <el-form-item :label="$t('uiAutomation.execution.testEngine')">
           <el-radio-group v-model="rerunFormData.engine">
@@ -262,26 +313,33 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { computed, onScopeDispose, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search, View, WarningFilled, Refresh } from '@element-plus/icons-vue'
+import { Search, WarningFilled, Refresh } from '@element-plus/icons-vue'
 import { useI18n } from 'vue-i18n'
+import { useUiProjectContext } from '@/composables/useUiProjectContext'
+import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
+import { caseExecutionFailure, readCaseExecutionLog } from '@/utils/ui-case-execution.mjs'
 import {
   getTestCaseExecutions,
-  getUiProjects,
+  getTestCaseExecutionDetail,
   deleteTestCaseExecution,
   batchDeleteTestCaseExecutions,
   runTestCase
 } from '@/api/ui_automation'
 
 const { t } = useI18n()
-
-// 项目和执行数据
-const projects = ref([])
-const projectId = ref('')
+const route = useRoute()
+const router = useRouter()
+const { projects, projectId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
 const executions = ref([])
 const loading = ref(false)
+const listError = ref(false)
 const total = ref(0)
+let listRequest = 0
+let detailRequest = 0
+let projectGeneration = 0
 const pagination = reactive({
   currentPage: 1,
   pageSize: 20
@@ -289,17 +347,21 @@ const pagination = reactive({
 
 // 搜索和筛选
 const queryParams = reactive({
-  project: undefined,
   search: '',
   status: '',
   browser: ''
 })
 const selectedIds = ref([])
 
-// 详情对话框相关
-const showDetailDialog = ref(false)
+const executionQuery = computed(() => route.query.executionId)
+const showDetailDialog = computed(() => route.name === 'UiExecutions' && executionQuery.value !== undefined)
+const detailState = ref('idle')
 const activeTab = ref('logs')
 const currentExecution = ref(null)
+const failedImages = ref(new Set())
+const executionLog = computed(() => readCaseExecutionLog(currentExecution.value?.execution_logs))
+const failure = computed(() => caseExecutionFailure(currentExecution.value, executionLog.value))
+const detailLocation = id => uiExecutionLocation('UiExecutions', projectId.value, id)
 
 // 重跑对话框相关
 const showRerunDialogVisible = ref(false)
@@ -324,24 +386,6 @@ const formatDateTime = (dateString) => {
     minute: '2-digit',
     second: '2-digit'
   })
-}
-
-// 处理图片加载错误
-const handleImageError = (event, screenshot) => {
-  console.error('Screenshot load failed:', screenshot)
-  const img = event.target
-  img.style.display = 'none'
-  // Show error message after image
-  const errorDiv = img.parentElement.querySelector('.img-load-error')
-  if (!errorDiv) {
-    const div = document.createElement('div')
-    div.className = 'img-load-error'
-    div.innerHTML = `
-      <i class="el-icon-warning"></i>
-      <span>${t('uiAutomation.execution.imageLoadFailed')}</span>
-    `
-    img.parentElement.appendChild(div)
-  }
 }
 
 // 格式化持续时间（execution_time单位是秒）
@@ -422,63 +466,68 @@ const getActionText = (actionType) => {
   return actionMap[actionType] || actionType
 }
 
-// 解析执行日志
-const parseExecutionLogs = (logs) => {
-  if (!logs) return []
+async function loadExecutions() {
+  const request = ++listRequest
+  const project = projectId.value
+  loading.value = Boolean(project)
+  listError.value = false
+  if (!project) return
   try {
-    return typeof logs === 'string' ? JSON.parse(logs) : logs
-  } catch (e) {
-    console.error('解析执行日志失败:', e)
-    return []
-  }
-}
-
-// 加载项目列表
-const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error(t('uiAutomation.project.messages.loadFailed'))
-    console.error('获取项目列表失败:', error)
-  }
-}
-
-// 加载执行列表
-const loadExecutions = async () => {
-  loading.value = true
-  try {
-    const params = {
+    const { data } = await getTestCaseExecutions({
       page: pagination.currentPage,
       page_size: pagination.pageSize,
-      ...queryParams
-    }
-
-    // 添加项目筛选
-    if (projectId.value) {
-      params.project = projectId.value
-    } else {
-      params.project = undefined // Ensure project is undefined if not selected
-    }
-
-    const response = await getTestCaseExecutions(params)
-    executions.value = response.data.results || response.data
-    total.value = response.data.count || executions.value.length
-  } catch (error) {
-    ElMessage.error(t('uiAutomation.execution.messages.loadFailed'))
-    console.error('获取执行列表失败:', error)
+      ...queryParams,
+      project,
+    })
+    if (request !== listRequest || projectId.value !== project) return
+    const rows = Array.isArray(data) ? data : data?.results
+    if (!Array.isArray(rows)) throw new Error('Invalid UI execution list')
+    executions.value = rows
+    total.value = data.count ?? rows.length
+  } catch {
+    if (request === listRequest && projectId.value === project) listError.value = true
   } finally {
-    loading.value = false
+    if (request === listRequest) loading.value = false
   }
 }
 
-// 项目变更处理
-const onProjectChange = () => {
-  queryParams.search = ''
-  queryParams.status = ''
-  queryParams.browser = ''
-  pagination.currentPage = 1
-  loadExecutions()
+async function loadExecutionDetail() {
+  const request = ++detailRequest
+  const project = projectId.value
+  const id = normalizeUiId(executionQuery.value)
+  currentExecution.value = null
+  detailState.value = 'idle'
+  failedImages.value = new Set()
+  activeTab.value = 'logs'
+  if (!showDetailDialog.value || !project || !id) return
+  detailState.value = 'loading'
+  try {
+    const { data } = await getTestCaseExecutionDetail(id)
+    if (request !== detailRequest || projectId.value !== project) return
+    if (normalizeUiId(data?.project) === project && normalizeUiId(data?.id) === id) {
+      currentExecution.value = data
+    }
+    detailState.value = 'idle'
+  } catch (error) {
+    if (request !== detailRequest || projectId.value !== project) return
+    detailState.value = [403, 404].includes(error.response?.status) ? 'idle' : 'error'
+  }
+}
+
+function onDetailVisibility(visible) {
+  if (visible || !showDetailDialog.value) return
+  const query = { ...route.query }
+  delete query.executionId
+  void router.replace({ name: 'UiExecutions', query, hash: route.hash })
+}
+
+function resetProjectScope() {
+  projectGeneration += 1
+  executions.value = []
+  total.value = 0
+  selectedIds.value = []
+  showRerunDialogVisible.value = false
+  resetQuery()
 }
 
 // 搜索处理
@@ -533,15 +582,16 @@ const handleDelete = (row) => {
 
 // 批量删除执行记录
 const handleBatchDelete = () => {
-  if (selectedIds.value.length === 0) return
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
 
-  ElMessageBox.confirm(t('uiAutomation.execution.messages.batchDeleteConfirm', { count: selectedIds.value.length }), t('uiAutomation.messages.confirm.tip'), {
+  ElMessageBox.confirm(t('uiAutomation.execution.messages.batchDeleteConfirm', { count: ids.length }), t('uiAutomation.messages.confirm.tip'), {
     confirmButtonText: t('uiAutomation.common.confirm'),
     cancelButtonText: t('uiAutomation.common.cancel'),
     type: 'warning'
   }).then(async () => {
     try {
-      await batchDeleteTestCaseExecutions(selectedIds.value)
+      await batchDeleteTestCaseExecutions(ids)
       ElMessage.success(t('uiAutomation.execution.messages.batchDeleteSuccess'))
       selectedIds.value = []
       loadExecutions()
@@ -552,15 +602,9 @@ const handleBatchDelete = () => {
   })
 }
 
-// 查看执行详情
-const viewExecutionDetail = (execution) => {
-  currentExecution.value = execution
-  activeTab.value = 'logs'
-  showDetailDialog.value = true
-}
-
 // 显示重跑对话框
 const showRerunDialog = (execution) => {
+  if (rerunning.value || !execution || normalizeUiId(execution.project) !== projectId.value) return
   rerunFormData.testCaseId = execution.test_case
   rerunFormData.engine = execution.engine || 'playwright'
   rerunFormData.browser = execution.browser || 'chrome'
@@ -575,48 +619,47 @@ const handleRerun = async () => {
     return
   }
 
+  if (rerunning.value || !projectId.value) return
+  const project = projectId.value
+  const generation = projectGeneration
+  const isCurrent = () => generation === projectGeneration && projectId.value === project && route.name === 'UiExecutions'
   rerunning.value = true
+  let result
   try {
     const response = await runTestCase(rerunFormData.testCaseId, {
+      project_id: project,
       engine: rerunFormData.engine,
       browser: rerunFormData.browser,
       headless: rerunFormData.headless
     })
-
-    // 无论成功失败，都关闭弹框并刷新列表
-    showRerunDialogVisible.value = false
-
-    // 延迟一下再刷新，确保后端已经保存完成
-    setTimeout(async () => {
-      await loadExecutions()
-    }, 500)
-
-    // 根据返回结果显示消息
-    if (response.data.success) {
+    result = response.data
+    if (!isCurrent()) return
+    if (result.success) {
       ElMessage.success(t('uiAutomation.execution.messages.rerunSuccess'))
     } else {
-      ElMessage.warning(t('uiAutomation.execution.messages.rerunCompleteWithFailure') + ': ' + (response.data.errors?.[0]?.message || t('uiAutomation.execution.messages.viewDetails')))
+      ElMessage.warning(t('uiAutomation.execution.messages.rerunCompleteWithFailure') + ': ' + (result.errors?.[0]?.message || t('uiAutomation.execution.messages.viewDetails')))
     }
   } catch (error) {
-    showRerunDialogVisible.value = false
-    ElMessage.error(t('uiAutomation.execution.messages.rerunFailed') + ': ' + (error.response?.data?.message || error.message || t('uiAutomation.messages.error.unknown')))
-    console.error('重跑失败:', error)
-    // 即使失败也刷新列表，因为可能已经创建了执行记录
-    setTimeout(async () => {
-      await loadExecutions()
-    }, 500)
+    result = error.response?.data
+    if (!isCurrent()) return
+    ElMessage.error(t('uiAutomation.execution.messages.rerunFailed') + ': ' + (result?.message || error.message || t('uiAutomation.messages.error.unknown')))
   } finally {
     rerunning.value = false
+    if (isCurrent()) {
+      showRerunDialogVisible.value = false
+      void loadExecutions()
+      const id = normalizeUiId(result?.execution_id)
+      if (id) void router.push(detailLocation(id))
+    }
   }
 }
 
-// 组件挂载时加载数据
-onMounted(async () => {
-  await loadProjects()
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
-  }
-  await loadExecutions()
+watch(projectId, resetProjectScope, { immediate: true })
+watch([projectId, executionQuery], loadExecutionDetail, { immediate: true })
+onScopeDispose(() => {
+  listRequest += 1
+  detailRequest += 1
+  projectGeneration += 1
 })
 </script>
 
@@ -630,6 +673,8 @@ onMounted(async () => {
 
 .page-header {
   display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 20px;
@@ -659,6 +704,48 @@ onMounted(async () => {
   margin-top: 20px;
   display: flex;
   justify-content: flex-end;
+}
+
+.execution-link {
+  color: var(--el-color-primary);
+  margin-inline-end: 8px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.list-error,
+.failure-summary {
+  border: 1px solid var(--el-color-danger-light-7);
+  border-radius: 6px;
+  padding: 12px 16px;
+  background: var(--el-color-danger-light-9);
+}
+
+.failure-summary,
+.status-refresh {
+  margin-top: 16px;
+}
+
+.failure-summary h3,
+.failure-summary figure {
+  margin: 0;
+}
+
+.failure-summary p,
+.plain-log {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.failure-screenshot {
+  display: block;
+  max-width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+}
+
+.muted-text {
+  color: var(--el-text-color-secondary);
 }
 
 .execution-detail {

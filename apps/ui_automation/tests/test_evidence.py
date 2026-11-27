@@ -201,6 +201,7 @@ def test_view_screenshot_producer_persists_evidence_projection(monkeypatch):
 
     reference = execution.screenshots[0]['evidence_reference']
     assert response.status_code == 200
+    assert response.data['execution_id'] == execution.id
     assert reference['sha256'] == hashlib.sha256(payload).hexdigest()
     assert reference['size_bytes'] == len(payload)
     assert reference['mime_type'] == 'image/png'

@@ -3,17 +3,27 @@
     <div class="page-header">
       <h1 class="page-title">{{ t('uiAutomation.testCase.title') }}</h1>
       <div class="header-actions">
-        <el-select v-model="projectId" :placeholder="t('uiAutomation.project.selectProject')" style="width: 200px; margin-right: 15px" @change="onProjectChange">
+        <el-select v-model="projectId" :aria-label="t('uiAutomation.project.selectProject')" :placeholder="t('uiAutomation.project.selectProject')" :disabled="projectsLoading" style="width: 200px">
           <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
         </el-select>
-        <el-button type="primary" @click="showCreateDialog = true">
+        <el-button type="primary" :disabled="!projectId" @click="openCreateCase">
           <el-icon><Plus /></el-icon>
           {{ t('uiAutomation.testCase.newTestCase') }}
         </el-button>
       </div>
     </div>
 
-    <div class="main-content">
+    <p v-if="projectsLoading" class="case-page-state" role="status">{{ t('uiAutomation.dashboard.loading') }}</p>
+    <div v-else-if="projectsError" class="case-page-state" role="alert">
+      <p>{{ t('uiAutomation.project.messages.loadFailed') }}</p>
+      <el-button @click="reloadProjects">{{ t('uiAutomation.workbenchExecution.retry') }}</el-button>
+    </div>
+    <el-empty v-else-if="!projectId" :description="t(invalidProject ? 'uiAutomation.workbenchExecution.invalidProject' : projects.length ? 'uiAutomation.common.selectProject' : 'uiAutomation.workbenchExecution.noProjects')">
+      <RouterLink v-if="!projects.length" :to="{ name: 'UiProjects', query: { setup: 'project' } }" class="el-button el-button--primary">
+        {{ t('uiAutomation.project.newProject') }}
+      </RouterLink>
+    </el-empty>
+    <div v-else class="main-content">
       <!-- 左侧：测试用例列表 -->
       <div class="left-panel">
         <div class="panel-header">
@@ -31,7 +41,15 @@
           </el-input>
         </div>
 
-        <div class="test-case-list">
+        <div class="test-case-list" :aria-busy="casesLoading">
+          <p v-if="casesLoading" class="case-page-state" role="status">{{ t('uiAutomation.dashboard.loading') }}</p>
+          <div v-else-if="casesError" class="case-page-state" role="alert">
+            <p>{{ t('uiAutomation.workbenchOnboarding.casesError') }}</p>
+            <el-button @click="loadTestCases">{{ t('uiAutomation.workbenchExecution.retry') }}</el-button>
+          </div>
+          <el-empty v-else-if="!filteredTestCases.length" :description="t(testCases.length ? 'uiAutomation.workbenchOnboarding.noMatches' : 'uiAutomation.workbenchOnboarding.noCases')">
+            <el-button v-if="!testCases.length" type="primary" @click="openCreateCase">{{ t('uiAutomation.testCase.newTestCase') }}</el-button>
+          </el-empty>
           <div
             v-for="testCase in filteredTestCases"
             :key="testCase.id"
@@ -41,13 +59,12 @@
           >
             <div class="case-header">
               <div class="case-info">
-                <h4 class="case-name">{{ testCase.name }}</h4>
+                <h4 class="case-name">
+                  <button type="button" :aria-pressed="selectedTestCase?.id === testCase.id" @click.stop="selectTestCase(testCase)">{{ testCase.name }}</button>
+                </h4>
                 <p class="case-description">{{ testCase.description || t('uiAutomation.testCase.noDescription') }}</p>
               </div>
               <div class="case-actions">
-                <el-button size="small" text @click.stop="runTestCase(testCase)">
-                  <el-icon><CaretRight /></el-icon>
-                </el-button>
                 <el-button size="small" text @click.stop="editTestCase(testCase)">
                   <el-icon><Edit /></el-icon>
                 </el-button>
@@ -78,44 +95,42 @@
                 <el-icon><Plus /></el-icon>
                 {{ t('uiAutomation.testCase.addStep') }}
               </el-button>
-              <el-button size="small" type="primary" @click="saveTestCase">
+              <el-button size="small" type="primary" @click="saveTestCase" :loading="savingSteps" :disabled="isRunning">
                 <el-icon><Check /></el-icon>
                 {{ t('uiAutomation.testCase.saveTestCase') }}
               </el-button>
-              <el-select v-model="selectedEngine" :placeholder="t('uiAutomation.testCase.selectEngine')" size="small" style="width: 130px; margin-right: 10px">
+              <el-select v-model="selectedEngine" :aria-label="t('uiAutomation.testCase.selectEngine')" size="small" style="width: 130px">
                 <el-option label="Playwright" value="playwright" />
                 <el-option label="Selenium" value="selenium" />
               </el-select>
-              <el-select v-model="selectedBrowser" :placeholder="t('uiAutomation.testCase.selectBrowser')" size="small" style="width: 120px; margin-right: 10px">
+              <el-select v-model="selectedBrowser" :aria-label="t('uiAutomation.testCase.selectBrowser')" size="small" style="width: 120px">
                 <el-option label="Chrome" value="chrome" />
                 <el-option label="Firefox" value="firefox" />
                 <el-option label="Safari" value="safari" />
                 <el-option label="Edge" value="edge" />
               </el-select>
-              <el-select v-model="headlessMode" :placeholder="t('uiAutomation.testCase.runModeLabel')" size="small" style="width: 110px; margin-right: 10px">
+              <el-select v-model="headlessMode" :aria-label="t('uiAutomation.testCase.runModeLabel')" size="small" style="width: 110px">
                 <el-option :label="t('uiAutomation.testCase.headedMode')" :value="false" />
                 <el-option :label="t('uiAutomation.testCase.headlessMode')" :value="true" />
               </el-select>
-              <el-button size="small" type="success" @click="runTestCase(selectedTestCase)" :loading="isRunning">
+              <el-button size="small" type="success" @click="runTestCase(selectedTestCase)" :loading="isRunning" :disabled="!canRunSelectedCase">
                 <el-icon v-if="!isRunning"><CaretRight /></el-icon>
                 {{ isRunning ? t('uiAutomation.testCase.running') : t('uiAutomation.testCase.runLabel') }}
               </el-button>
               <el-button size="small" v-if="executionResult" @click="toggleView">
-                <el-icon><component :is="showSteps ? 'View' : 'Edit'" /></el-icon>
+                <el-icon><component :is="showSteps ? View : Edit" /></el-icon>
                 {{ showSteps ? t('uiAutomation.testCase.viewResult') : t('uiAutomation.testCase.editSteps') }}
-              </el-button>
-              <el-button
-                size="small"
-                v-if="executionResult && !showSteps"
-                type="success"
-                @click="runTestCase(selectedTestCase)"
-                :loading="isRunning"
-              >
-                <el-icon v-if="!isRunning"><Refresh /></el-icon>
-                {{ t('uiAutomation.testCase.rerun') }}
               </el-button>
             </div>
           </div>
+          <p v-if="!selectedTestCase.steps?.length" class="case-guide">
+            {{ t('uiAutomation.workbenchOnboarding.addSteps') }}
+            <RouterLink :to="{ name: 'UiElementsEnhanced', query: { project: String(projectId), caseId: String(selectedTestCase.id) } }">
+              {{ t('uiAutomation.dashboard.elementManagement') }}
+            </RouterLink>
+          </p>
+          <p v-else-if="hasUnsavedSteps" class="case-guide">{{ t('uiAutomation.workbenchOnboarding.saveSteps') }}</p>
+          <p v-if="isRunning" class="case-guide" role="status">{{ t('uiAutomation.testCase.running') }}</p>
 
           <!-- 测试步骤编辑 -->
           <div class="steps-container" v-show="showSteps">
@@ -290,7 +305,13 @@
               <el-tag :type="executionResult.success ? 'success' : 'danger'">
                 {{ executionResult.success ? t('uiAutomation.testCase.executionSuccess') : t('uiAutomation.testCase.executionFailed') }}
               </el-tag>
+              <RouterLink v-if="executionResult.executionId" :to="uiExecutionLocation('UiExecutions', projectId, executionResult.executionId)">
+                {{ t('uiAutomation.workbenchOnboarding.viewThisExecution') }}
+              </RouterLink>
             </div>
+            <p v-if="executionResult.preflight" class="case-guide" role="alert">
+              {{ t('uiAutomation.workbenchOnboarding.preflight') }}
+            </p>
             <div class="result-content">
               <el-tabs v-model="resultActiveTab">
                 <el-tab-pane :label="t('uiAutomation.testCase.executionLogs')" name="logs">
@@ -310,7 +331,8 @@
                         </div>
                       </div>
                     </div>
-                    <el-empty :description="t('uiAutomation.testCase.noLogs')" />
+                    <pre v-else-if="plainExecutionLog" class="plain-case-log">{{ plainExecutionLog }}</pre>
+                    <el-empty v-else :description="t('uiAutomation.testCase.noLogs')" />
                   </div>
                 </el-tab-pane>
                 <el-tab-pane :label="t('uiAutomation.testCase.failedScreenshots')" name="screenshots" v-if="executionResult.screenshots && executionResult.screenshots.length > 0">
@@ -404,7 +426,8 @@
       v-model="showCreateDialog"
       :title="editingTestCase ? t('uiAutomation.testCase.editTestCase') : t('uiAutomation.testCase.createTestCase')"
       :close-on-click-modal="false"
-      width="500px"
+      width="min(500px, calc(100vw - 32px))"
+      @closed="closeCaseForm"
     >
       <el-form :model="testCaseForm" label-width="100px">
         <el-form-item :label="t('uiAutomation.testCase.caseName')" required>
@@ -429,7 +452,7 @@
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="showCreateDialog = false">{{ t('uiAutomation.common.cancel') }}</el-button>
-          <el-button type="primary" @click="saveTestCaseForm">{{ t('uiAutomation.common.confirm') }}</el-button>
+          <el-button type="primary" :loading="savingForm" @click="saveTestCaseForm">{{ t('uiAutomation.common.confirm') }}</el-button>
         </span>
       </template>
     </el-dialog>
@@ -501,19 +524,19 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onScopeDispose, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Search, Plus, Edit, Delete, Check, CaretRight, ArrowUp, ArrowDown, Rank, Picture, Warning, View, ZoomIn, Refresh, WarningFilled, MagicStick
+  Search, Plus, Edit, Delete, Check, CaretRight, ArrowUp, ArrowDown, Rank, Picture, Warning, View, ZoomIn, WarningFilled, MagicStick
 } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import DataFactorySelector from '@/components/DataFactorySelector.vue'
 import { useI18n } from 'vue-i18n'
-
-const { t } = useI18n()
-
+import { useUiProjectContext } from '@/composables/useUiProjectContext'
+import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
+import { readCaseExecutionLog } from '@/utils/ui-case-execution.mjs'
 import {
-  getUiProjects,
   getElements,
   createTestCase,
   updateTestCase,
@@ -525,9 +548,18 @@ import {
 } from '@/api/ui_automation'
 import { getVariableFunctions } from '@/api/data-factory'
 
-// 响应式数据
-const projects = ref([])
-const projectId = ref('')
+const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const { projects, projectId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
+const casesLoading = ref(false)
+const casesError = ref(false)
+const savingForm = ref(false)
+const savingSteps = ref(false)
+let projectGeneration = 0
+let caseListRequest = 0
+let caseMutationVersion = 0
+let caseMutationLog = []
 const testCases = ref([])
 const selectedTestCase = ref(null)
 const currentSteps = ref([])
@@ -541,7 +573,7 @@ const allStepsExpanded = ref(false)
 const showSteps = ref(true)
 const showScreenshotPreview = ref(false)
 const currentScreenshot = ref(null)
-const isRunning = ref(false)
+const runningRuns = reactive(new Map())
 const selectedEngine = ref('playwright')  // 默认使用Playwright
 const selectedBrowser = ref('chrome')  // 默认使用Chrome
 const headlessMode = ref(false)  // 默认使用有头模式
@@ -572,70 +604,157 @@ const filteredTestCases = computed(() => {
   )
 })
 
-// 解析执行日志
-const parsedExecutionLogs = computed(() => {
-  if (!executionResult.value || !executionResult.value.logs) return []
-  try {
-    return typeof executionResult.value.logs === 'string'
-      ? JSON.parse(executionResult.value.logs)
-      : executionResult.value.logs
-  } catch (e) {
-    console.error('解析执行日志失败:', e)
-    return []
-  }
-})
+const savedStepKeys = ref('[]')
+const stepFields = ['action_type', 'element_id', 'input_value', 'wait_time', 'assert_type', 'assert_value', 'description']
+const serializeSteps = steps => JSON.stringify(steps.map(step => stepFields.map(key => step[key])))
+const hasUnsavedSteps = computed(() => serializeSteps(currentSteps.value) !== savedStepKeys.value)
+const runKey = (project, caseId) => JSON.stringify([String(project), normalizeUiId(caseId)])
+const isRunning = computed(() => Boolean(
+  selectedTestCase.value && runningRuns.has(runKey(projectId.value, selectedTestCase.value.id))
+))
+const canRunSelectedCase = computed(() => Boolean(selectedTestCase.value?.steps?.length && !hasUnsavedSteps.value && !savingSteps.value && !isRunning.value))
+const executionLog = computed(() => readCaseExecutionLog(executionResult.value?.logs))
+const parsedExecutionLogs = computed(() => executionLog.value.steps)
+const plainExecutionLog = computed(() => executionLog.value.text)
 
-// 方法定义
-const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error('获取项目列表失败')
-    console.error('获取项目列表失败:', error)
+const isProjectCurrent = (project, generation) => projectId.value === project && projectGeneration === generation
+
+const recordCaseMutation = (project, generation, testCase, action = 'update') => {
+  if (!casesLoading.value || !isProjectCurrent(project, generation)) return
+  caseMutationLog.push({ version: ++caseMutationVersion, project, generation, testCase, action })
+}
+
+const reconcileCaseMutations = (items, project, generation, requestMutationVersion) => {
+  const mutations = caseMutationLog.filter(mutation =>
+    mutation.project === project && mutation.generation === generation && mutation.version > requestMutationVersion
+  )
+  for (const mutation of mutations) {
+    const index = items.findIndex(item => normalizeUiId(item.id) === normalizeUiId(mutation.testCase.id))
+    if (mutation.action === 'delete') {
+      if (index >= 0) items.splice(index, 1)
+    } else if (index >= 0) {
+      items[index] = { ...items[index], ...mutation.testCase }
+    } else if (mutation.action === 'create') {
+      items.unshift(mutation.testCase)
+    }
   }
+  caseMutationLog = caseMutationLog.filter(mutation => mutation.project !== project || mutation.generation !== generation)
+  return items
 }
 
 const loadTestCases = async () => {
-  if (!projectId.value) {
-    testCases.value = []
-    return
-  }
-
+  const project = projectId.value
+  if (!project) return
+  const generation = projectGeneration
+  const request = ++caseListRequest
+  const requestMutationVersion = caseMutationVersion
+  const isCurrent = () => isProjectCurrent(project, generation) && request === caseListRequest
+  const maxAttempts = 3
+  casesLoading.value = true
+  casesError.value = false
   try {
-    const response = await getTestCases({ project: projectId.value })
-    testCases.value = response.data.results || response.data
-  } catch (error) {
-    console.error('获取测试用例失败:', error)
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const attemptMutationVersion = caseMutationVersion
+      const pageItems = []
+      const seenIds = new Set()
+      let expectedCount
+      let countChanged = false
+      let duplicateIds = false
+      let invalidPage = false
+      let pageCount = 0
+
+      for (let page = 1; ; page += 1) {
+        let response
+        try {
+          response = await getTestCases({ project, page })
+        } catch (error) {
+          if (!isCurrent()) return
+          if (page === 1 || error.response?.status !== 404) throw error
+          // DRF returns an invalid-page 404 when deletions remove the requested page.
+          invalidPage = true
+          break
+        }
+        if (!isCurrent()) return
+        const { data } = response
+        const rows = Array.isArray(data) ? data : data?.results
+        const hasNext = Boolean(data?.next)
+        if (!Array.isArray(rows) || (hasNext && !rows.length)) throw new Error('Invalid UI case list')
+        if (Number.isInteger(data?.count) && data.count >= 0) {
+          if (expectedCount === undefined) expectedCount = data.count
+          else if (expectedCount !== data.count) countChanged = true
+        }
+        for (const row of rows) {
+          const id = normalizeUiId(row.id)
+          if (id && seenIds.has(id)) duplicateIds = true
+          if (id) seenIds.add(id)
+        }
+        pageItems.push(...rows)
+        pageCount += 1
+        if (!hasNext) break
+      }
+
+      const structuralMutationObserved = caseMutationLog.some(mutation =>
+        mutation.project === project && mutation.generation === generation &&
+        mutation.version > attemptMutationVersion && ['create', 'delete'].includes(mutation.action)
+      )
+      const inconsistentWalk = pageCount > 1 && (
+        countChanged || duplicateIds || (expectedCount !== undefined && pageItems.length !== expectedCount)
+      )
+      if (invalidPage || (pageCount > 1 && (structuralMutationObserved || inconsistentWalk))) continue
+
+      testCases.value = reconcileCaseMutations(pageItems, project, generation, requestMutationVersion)
+      return
+    }
+    throw new Error('UI case list changed during pagination')
+  } catch {
+    if (isCurrent()) casesError.value = true
+  } finally {
+    if (isCurrent()) {
+      casesLoading.value = false
+      caseMutationLog = []
+    }
   }
 }
 
-const loadElements = async () => {
-  if (!projectId.value) {
-    availableElements.value = []
-    return
-  }
-
+const loadElements = async (project, generation) => {
   try {
-    const response = await getElements({ project: projectId.value })
-    availableElements.value = response.data.results || response.data
-  } catch (error) {
-    console.error('获取元素列表失败:', error)
+    const { data } = await getElements({ project })
+    if (isProjectCurrent(project, generation)) availableElements.value = data.results || data
+  } catch {
+    if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.workbenchOnboarding.elementsError'))
   }
 }
 
-const onProjectChange = async () => {
+const onProjectChange = project => {
+  const generation = ++projectGeneration
+  caseMutationVersion = 0
+  caseMutationLog = []
   selectedTestCase.value = null
+  testCases.value = []
+  availableElements.value = []
   currentSteps.value = []
+  searchKeyword.value = ''
   executionResult.value = null
-
-  await Promise.all([
-    loadTestCases(),
-    loadElements()
-  ])
+  showCreateDialog.value = false
+  showScreenshotPreview.value = false
+  showSteps.value = true
+  casesLoading.value = false
+  casesError.value = false
+  if (!project) return
+  void loadTestCases()
+  void loadElements(project, generation)
 }
 
-const selectTestCase = (testCase) => {
+const selectTestCase = (testCase, explicit = true) => {
+  if (explicit) {
+    const project = normalizeUiId(projectId.value)
+    const caseId = normalizeUiId(route.query.caseId)
+    const key = `${project}:${caseId}`
+    if (route.name === 'UiTestCases' && project && caseId && consumedCaseSelection !== key) {
+      cancelledCaseSelection = key
+    }
+  }
+
   // 如果点击的是同一个用例，不做任何处理
   if (selectedTestCase.value && selectedTestCase.value.id === testCase.id) {
     return
@@ -652,9 +771,10 @@ const selectTestCase = (testCase) => {
   } else {
     currentSteps.value = []
   }
-  // 只有在切换到不同用例时才清空执行结果
+  savedStepKeys.value = serializeSteps(currentSteps.value)
   executionResult.value = null
   showSteps.value = true
+  allStepsExpanded.value = false
 }
 
 const addStep = () => {
@@ -723,86 +843,71 @@ const expandAllSteps = () => {
 }
 
 const saveTestCase = async () => {
-  if (!selectedTestCase.value) return
-
+  if (!selectedTestCase.value || !projectId.value || savingSteps.value || isRunning.value) return
+  const testCase = selectedTestCase.value
+  const project = projectId.value
+  const generation = projectGeneration
+  const steps = currentSteps.value.map(step => ({ ...step }))
+  const savedKeys = serializeSteps(steps)
+  savingSteps.value = true
   try {
-    const updateData = {
-      ...selectedTestCase.value,
-      steps: currentSteps.value
+    const { data } = await updateTestCase(testCase.id, { steps })
+    if (!isProjectCurrent(project, generation)) return
+    const updated = { ...testCase, ...data, steps: data?.steps || steps }
+    testCases.value = testCases.value.map(item => item.id === testCase.id ? updated : item)
+    recordCaseMutation(project, generation, updated)
+    if (selectedTestCase.value?.id === testCase.id) {
+      selectedTestCase.value = updated
+      savedStepKeys.value = savedKeys
     }
-
-    await updateTestCase(selectedTestCase.value.id, updateData)
     ElMessage.success(t('uiAutomation.testCase.save.success'))
-
-    // 更新本地数据
-    const index = testCases.value.findIndex(tc => tc.id === selectedTestCase.value.id)
-    if (index !== -1) {
-      testCases.value[index] = { ...updateData }
-      selectedTestCase.value = { ...updateData }
-    }
-  } catch (error) {
-      console.error('保存测试用例失败:', error)
-      ElMessage.error(t('uiAutomation.testCase.save.failed'))
-    }
+  } catch {
+    if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.testCase.save.failed'))
+  } finally {
+    savingSteps.value = false
+  }
 }
 
-const runTestCase = async (testCase) => {
-  isRunning.value = true
+const runTestCase = async testCase => {
+  const project = projectId.value
+  const generation = projectGeneration
+  const key = runKey(project, testCase?.id)
+  if (!project || testCase?.id !== selectedTestCase.value?.id || !canRunSelectedCase.value || runningRuns.has(key)) return
+  const runOwner = Symbol('test-case-run')
+  const isCurrent = () => isProjectCurrent(project, generation) &&
+    selectedTestCase.value?.id === testCase.id && runningRuns.get(key) === runOwner
+  runningRuns.set(key, runOwner)
+  executionResult.value = null
   try {
-    const modeText = headlessMode.value ? t('uiAutomation.testCase.runMode.headless') : t('uiAutomation.testCase.runMode.headed')
-    ElMessage.info(t('uiAutomation.testCase.run.start', { engine: selectedEngine.value.toUpperCase(), browser: selectedBrowser.value.toUpperCase(), mode: modeText }))
-
-    const response = await runTestCaseApi(testCase.id, {
-      project_id: projectId.value,
+    const { data } = await runTestCaseApi(testCase.id, {
+      project_id: project,
       engine: selectedEngine.value,
       browser: selectedBrowser.value,
       headless: headlessMode.value
     })
-
-    executionResult.value = response.data
-    resultActiveTab.value = 'logs'
-    showSteps.value = false  // 自动切换到结果视图
-
-    if (response.data.success) {
-      ElMessage.success(t('uiAutomation.testCase.run.success'))
-    } else {
-      ElMessage.error(t('uiAutomation.testCase.run.failed'))
-      // 如果有截图，自动切换到截图标签页
-      if (response.data.screenshots && response.data.screenshots.length > 0) {
-        resultActiveTab.value = 'screenshots'
-      }
-    }
+    if (!isCurrent()) return
+    setExecutionResult(data)
   } catch (error) {
-    console.error('执行测试用例失败:', error)
-
-    // 即使出错也要设置执行结果,显示错误信息
-    const errorMessage = error.response?.data?.message || error.message || '执行失败'
-    const errorLogs = error.response?.data?.logs || `测试用例执行出错\n\n错误信息: ${errorMessage}`
-
-    // 格式化错误信息为统一的对象格式
-    const errors = error.response?.data?.errors || [{
-      message: errorMessage,
-      details: error.stack || '',
-      step_number: null,
-      action_type: '',
-      element: '',
-      description: ''
-    }]
-
-    executionResult.value = {
+    if (!isCurrent()) return
+    const data = error.response?.data || {}
+    const message = data.message || data.error || data.detail || error.message || t('uiAutomation.testCase.executionFailed')
+    setExecutionResult({
+      ...data,
       success: false,
-      logs: errorLogs,
-      screenshots: error.response?.data?.screenshots || [],
-      execution_time: 0,
-      errors: errors
-    }
-    resultActiveTab.value = 'logs'
-    showSteps.value = false  // 切换到结果视图显示错误
-
-    ElMessage.error(t('uiAutomation.testCase.run.failedWithMessage', { message: errorMessage }))
+      logs: data.logs || message,
+      errors: data.errors?.length ? data.errors : [{ message }],
+    })
   } finally {
-    isRunning.value = false
+    if (runningRuns.get(key) === runOwner) runningRuns.delete(key)
   }
+}
+
+function setExecutionResult(data) {
+  const executionId = normalizeUiId(data.execution_id)
+  const preflight = !data.success && (!executionId || data.errors?.some(item => item.step_number === 0))
+  executionResult.value = { ...data, executionId, preflight }
+  resultActiveTab.value = preflight && data.errors?.length ? 'errors' : 'logs'
+  showSteps.value = false
 }
 
 const toggleView = () => {
@@ -818,6 +923,8 @@ const editTestCase = (testCase) => {
 }
 
 const deleteTestCase = async (testCase) => {
+  const project = projectId.value
+  const generation = projectGeneration
   try {
     await ElMessageBox.confirm(
       t('uiAutomation.testCase.delete.confirm', { name: testCase.name }),
@@ -829,7 +936,10 @@ const deleteTestCase = async (testCase) => {
       }
     )
 
+    if (!isProjectCurrent(project, generation)) return
     await deleteTestCaseApi(testCase.id)
+    if (!isProjectCurrent(project, generation)) return
+    recordCaseMutation(project, generation, { id: testCase.id }, 'delete')
     ElMessage.success(t('uiAutomation.testCase.delete.success'))
 
     // 从列表中移除
@@ -845,7 +955,7 @@ const deleteTestCase = async (testCase) => {
       executionResult.value = null
     }
   } catch (error) {
-    if (error !== 'cancel') {
+    if (error !== 'cancel' && isProjectCurrent(project, generation)) {
       console.error('删除测试用例失败:', error)
       ElMessage.error('删除失败')
     }
@@ -853,6 +963,8 @@ const deleteTestCase = async (testCase) => {
 }
 
 const copyTestCase = async (testCase) => {
+  const project = projectId.value
+  const generation = projectGeneration
   try {
     await ElMessageBox.confirm(
       t('uiAutomation.testCase.copy.confirm', { name: testCase.name }),
@@ -864,7 +976,10 @@ const copyTestCase = async (testCase) => {
       }
     )
 
+    if (!isProjectCurrent(project, generation)) return
     const response = await copyTestCaseApi(testCase.id)
+    if (!isProjectCurrent(project, generation)) return
+    recordCaseMutation(project, generation, response.data, 'create')
     ElMessage.success(t('uiAutomation.testCase.copy.success'))
 
     // 找到原用例的位置
@@ -877,7 +992,7 @@ const copyTestCase = async (testCase) => {
       testCases.value.push(response.data)
     }
   } catch (error) {
-    if (error !== 'cancel') {
+    if (error !== 'cancel' && isProjectCurrent(project, generation)) {
       console.error('复制测试用例失败:', error)
       ElMessage.error('复制失败')
     }
@@ -1064,43 +1179,39 @@ const insertVariable = (variable) => {
 }
 
 const saveTestCaseForm = async () => {
+  if (!projectId.value || savingForm.value) return
   if (!testCaseForm.name.trim()) {
     ElMessage.warning(t('uiAutomation.testCase.form.nameRequired'))
     return
   }
 
+  const project = projectId.value
+  const generation = projectGeneration
+  const editing = editingTestCase.value
+  const data = { ...testCaseForm, name: testCaseForm.name.trim(), project }
+  savingForm.value = true
   try {
-    const data = {
-      name: testCaseForm.name,
-      description: testCaseForm.description,
-      priority: testCaseForm.priority,
-      project: projectId.value,
-      steps: []
-    }
-
-    if (editingTestCase.value) {
-      // 编辑现有用例
-      await updateTestCase(editingTestCase.value.id, data)
+    const response = editing ? await updateTestCase(editing.id, data) : await createTestCase(data)
+    if (!isProjectCurrent(project, generation)) return
+    if (editing) {
+      const existing = testCases.value.find(item => item.id === editing.id) || editing
+      const updated = { ...existing, ...response.data }
+      testCases.value = testCases.value.map(item => item.id === editing.id ? updated : item)
+      recordCaseMutation(project, generation, updated)
+      if (selectedTestCase.value?.id === editing.id) selectedTestCase.value = { ...selectedTestCase.value, ...response.data }
       ElMessage.success(t('uiAutomation.testCase.update.success'))
-
-      // 更新本地数据
-      const index = testCases.value.findIndex(tc => tc.id === editingTestCase.value.id)
-      if (index !== -1) {
-        testCases.value[index] = { ...testCases.value[index], ...data }
-      }
     } else {
-      // 创建新用例
-      const response = await createTestCase(data)
+      testCases.value = [response.data, ...testCases.value.filter(item => item.id !== response.data.id)]
+      recordCaseMutation(project, generation, response.data, 'create')
+      searchKeyword.value = ''
+      selectTestCase(response.data)
       ElMessage.success(t('uiAutomation.testCase.create.success'))
-      testCases.value.push(response.data)
     }
-
     showCreateDialog.value = false
-    editingTestCase.value = null
-    resetForm()
-  } catch (error) {
-    console.error('保存测试用例失败:', error)
-    ElMessage.error(t('uiAutomation.testCase.save.failed'))
+  } catch {
+    if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.testCase.save.failed'))
+  } finally {
+    savingForm.value = false
   }
 }
 
@@ -1108,6 +1219,20 @@ const resetForm = () => {
   testCaseForm.name = ''
   testCaseForm.description = ''
   testCaseForm.priority = 'medium'
+}
+
+const closeCaseForm = () => {
+  if (!showCreateDialog.value) {
+    editingTestCase.value = null
+    resetForm()
+  }
+}
+
+const openCreateCase = () => {
+  if (!projectId.value || savingForm.value) return
+  editingTestCase.value = null
+  resetForm()
+  showCreateDialog.value = true
 }
 
 // 辅助方法
@@ -1194,19 +1319,44 @@ const previewScreenshot = (screenshot) => {
   showScreenshotPreview.value = true
 }
 
-// 组件挂载
-onMounted(async () => {
-  console.log('TestCaseManager onMounted 开始执行...')
-  await loadProjects()
-  console.log('loadProjects 完成，准备加载变量函数...')
-  await loadVariableFunctions()
-  console.log('loadVariableFunctions 完成')
-
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
-    await onProjectChange()
+watch(projectId, onProjectChange, { immediate: true })
+let consumedCaseSelection = ''
+let cancelledCaseSelection = ''
+let lastCaseSelection = normalizeUiId(route.query.caseId)
+let lastCaseRoute = route.name
+let lastCaseProject = normalizeUiId(projectId.value)
+const restoreCaseSelection = () => {
+  const caseId = normalizeUiId(route.query.caseId)
+  const project = normalizeUiId(projectId.value)
+  if (route.name !== lastCaseRoute || caseId !== lastCaseSelection || project !== lastCaseProject) {
+    consumedCaseSelection = ''
+    cancelledCaseSelection = ''
+    lastCaseRoute = route.name
+    lastCaseSelection = caseId
+    lastCaseProject = project
   }
-})
+  if (route.name !== 'UiTestCases') return
+  if (!project || !caseId) return
+
+  const key = `${project}:${caseId}`
+  if (consumedCaseSelection === key || cancelledCaseSelection === key) return
+  const match = testCases.value.find(item => normalizeUiId(item.id) === caseId)
+  if (!match) return
+
+  consumedCaseSelection = key
+  selectTestCase(match, false)
+}
+watch([projectId, testCases, () => route.name, () => route.query.caseId], restoreCaseSelection)
+watch([projectId, () => route.query.setup], ([project, setup]) => {
+  if (route.name !== 'UiTestCases' || !project || setup !== 'case') return
+  openCreateCase()
+  const query = { ...route.query, project: String(project) }
+  delete query.setup
+  void router.replace({ name: 'UiTestCases', query, hash: route.hash })
+}, { immediate: true })
+
+onMounted(loadVariableFunctions)
+onScopeDispose(() => { projectGeneration += 1 })
 </script>
 
 <style scoped>
@@ -1232,7 +1382,9 @@ onMounted(async () => {
 
 .header-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  gap: 10px;
 }
 
 .main-content {
@@ -1303,6 +1455,17 @@ onMounted(async () => {
   font-weight: 600;
 }
 
+.case-name button {
+  padding: 0;
+  color: var(--el-color-primary);
+  text-align: start;
+  font: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
 .case-description {
   margin: 0;
   color: #666;
@@ -1359,7 +1522,50 @@ onMounted(async () => {
 
 .detail-actions {
   display: flex;
-  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+.case-page-state {
+  padding: 16px;
+}
+
+.case-guide {
+  padding: 10px 12px;
+  margin: 0 0 12px;
+  border-radius: 4px;
+  color: var(--el-text-color-regular);
+  background: var(--el-color-primary-light-9);
+}
+
+.plain-case-log {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 850px) {
+  .test-case-manager {
+    height: auto;
+    min-height: 0;
+  }
+
+  .page-header,
+  .main-content,
+  .detail-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .left-panel {
+    width: auto;
+    max-height: 320px;
+  }
 }
 
 .steps-container {

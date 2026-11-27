@@ -244,15 +244,18 @@
 
 <script setup>
 import { ref, reactive, computed, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { User, Lock, Phone, Document, MagicStick, Connection, TrendCharts, ArrowDown } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
 import { useAppStore } from '@/stores/app'
 import api from '@/utils/api'
+import { uiWorkbenchReturnLocation } from '@/utils/ui-project-context.mjs'
 
+const route = useRoute()
 const router = useRouter()
+const finishLogin = () => router.replace(uiWorkbenchReturnLocation(route.query.uiPage, route.query) || '/home')
 const userStore = useUserStore()
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -409,7 +412,7 @@ const handleLogin = async () => {
             verify_code_token: form.verify_code_token
           })
           ElMessage.success(t('auth.loginSuccess'))
-          await router.replace('/home')
+          await finishLogin()
         } catch (error) {
           ElMessage.error(error.response?.data?.error || t('auth.loginFailed'))
           refreshCaptcha()
@@ -428,7 +431,7 @@ const handleLogin = async () => {
       try {
         await userStore.login(form)
         ElMessage.success(t('auth.loginSuccess'))
-        await router.replace('/home')
+        await finishLogin()
       } catch (error) {
         ElMessage.error(error.response?.data?.error || t('auth.loginFailed'))
       } finally {

@@ -10,6 +10,7 @@ from django.http import FileResponse, HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
+from django.db.models.functions import Lower, Trim
 from django.utils import timezone
 from apps.core.http_transport import guarded_post
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
@@ -51,6 +52,12 @@ from .serializers import (
 )
 from .operation_logger import log_operation
 from .evidence import from_file, project_screenshots
+from .execution_summary import (
+    EXECUTION_STACKTRACE_MARKERS, EXECUTION_STATUSES, EXECUTION_STORAGE_STATUSES,
+    FAILURE_STATUSES, GENERIC_FAILURE_MESSAGE, INTERNAL_CASE_EXECUTION_ERROR,
+    INTERNAL_SUITE_EXECUTION_ERROR, build_failure_summary, contains_execution_stacktrace,
+    execution_status_filter_values, normalize_execution_status,
+)
 from .access import accessible_projects, is_ui_admin, selenium_compatibility_enabled
 
 logger = logging.getLogger(__name__)
@@ -849,18 +856,47 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                     'message': 'Playwright 浏览器未就绪，请先安装后再执行测试套件'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-        # 更新套件执行状态为运行中
-        test_suite.execution_status = 'running'
-        test_suite.save()
-
-        # 记录运行操作
-        log_operation('run', 'suite', test_suite.id, test_suite.name, request.user)
-
-        # 在后台线程中执行测试
+        # Create the executor dependencies before persisting the run record.
         import threading
-        import traceback
         from .test_executor import TestExecutor
 
+        # Persist the aggregate before dispatch so every run has a stable, independent ID.
+        execution = TestExecution.objects.create(
+            project=test_suite.project,
+            test_suite=test_suite,
+            status='RUNNING',
+            total_cases=test_case_count,
+            started_at=timezone.now(),
+            executed_by=request.user,
+            engine=engine,
+            browser=browser,
+            headless=headless,
+        )
+
+        def mark_dispatch_failed():
+            logger.exception('套件执行失败 suite_id=%s execution_id=%s', test_suite.pk, execution.pk)
+            message = INTERNAL_SUITE_EXECUTION_ERROR
+            now = timezone.now()
+            TestExecution.objects.filter(pk=execution.pk).update(
+                status='FAILED', finished_at=now, error_message=message,
+                failure_summary=build_failure_summary('FAILED', message),
+            )
+            TestSuite.objects.filter(pk=test_suite.pk).update(execution_status='failed')
+
+        try:
+            test_suite.execution_status = 'running'
+            test_suite.save(update_fields=['execution_status', 'updated_at'])
+        except Exception:
+            try:
+                mark_dispatch_failed()
+            except Exception:
+                logger.exception('[测试套件] 无法保存启动失败状态 execution_id=%s', execution.pk)
+            return Response({
+                'error': INTERNAL_SUITE_EXECUTION_ERROR,
+                'execution_id': execution.pk,
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # 在后台线程中执行测试
         def run_test():
             try:
                 print(f"[测试套件] 开始执行: {test_suite.name} (ID: {test_suite.id})")
@@ -871,36 +907,50 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                     engine=engine,
                     browser=browser,
                     headless=headless,
-                    executed_by=request.user
+                    executed_by=request.user,
+                    execution=execution,
                 )
                 executor.run()
 
                 print(f"[测试套件] 执行完成: {test_suite.name}")
-            except Exception as e:
-                print(f"[测试套件] 执行异常: {test_suite.name}")
-                print(f"[测试套件] 错误: {str(e)}")
-                traceback.print_exc()
-
-                # 更新套件状态为失败
+            except Exception:
                 try:
-                    test_suite.execution_status = 'failed'
-                    test_suite.save()
-                    print(f"[测试套件] 已更新状态为失败")
-                except Exception as save_error:
-                    print(f"[测试套件] 更新状态失败: {save_error}")
+                    mark_dispatch_failed()
+                except Exception:
+                    logger.exception('[测试套件] 无法保存执行失败状态 execution_id=%s', execution.pk)
 
         # 启动后台线程执行测试
-        thread = threading.Thread(target=run_test, daemon=False)
-        thread.start()
+        try:
+            log_operation('run', 'suite', test_suite.id, test_suite.name, request.user)
+            thread = threading.Thread(target=run_test, daemon=False)
+            thread.start()
+        except Exception:
+            try:
+                mark_dispatch_failed()
+            except Exception:
+                logger.exception('[测试套件] 无法保存启动失败状态 execution_id=%s', execution.pk)
+            return Response({
+                'error': INTERNAL_SUITE_EXECUTION_ERROR,
+                'execution_id': execution.pk,
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({
             'message': '测试套件开始执行',
             'suite_id': test_suite.id,
+            'execution_id': execution.pk,
             'test_case_count': test_case_count,
             'engine': engine,
             'browser': browser,
             'headless': headless
         }, status=status.HTTP_200_OK)
+
+
+def _execution_stacktrace_filter(*fields):
+    condition = models.Q()
+    for field in fields:
+        for marker in EXECUTION_STACKTRACE_MARKERS:
+            condition |= models.Q(**{f'{field}__contains': marker})
+    return condition
 
 
 class TestExecutionViewSet(viewsets.ModelViewSet):
@@ -909,7 +959,7 @@ class TestExecutionViewSet(viewsets.ModelViewSet):
 
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['project', 'test_suite', 'test_script', 'status', 'environment', 'executed_by']
-    search_fields = ['error_message']
+    search_fields = ['visible_error_message']
     ordering = ['-created_at']
     pagination_class = StandardPagination
 
@@ -919,7 +969,14 @@ class TestExecutionViewSet(viewsets.ModelViewSet):
         project_scope = accessible_projects(user)
         return TestExecution.objects.filter(
             project__in=project_scope
-        ).select_related('project', 'test_suite', 'test_script', 'executed_by')
+        ).select_related('project', 'test_suite', 'test_script', 'executed_by').alias(visible_error_message=models.Case(
+            models.When(
+                _execution_stacktrace_filter('error_message'),
+                then=models.Value(INTERNAL_SUITE_EXECUTION_ERROR),
+            ),
+            default=models.F('error_message'),
+            output_field=models.TextField(),
+        ))
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -956,7 +1013,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'updated_at', 'name', 'priority', 'status']
-    ordering = ['-created_at']
+    ordering = ['-created_at', '-pk']
     filterset_fields = ['project', 'status', 'priority', 'created_by']
 
     def get_queryset(self):
@@ -1306,6 +1363,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
     def run(self, request, pk=None):
         """运行单个测试用例 - 支持选择Playwright或Selenium执行引擎"""
         test_case = self.get_object()
+        execution = None
 
         try:
             # 获取执行引擎选择，默认使用playwright
@@ -1348,6 +1406,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                     return Response({
                         'success': False,
+                        'execution_id': execution.id,
                         'logs': execution.execution_logs,
                         'screenshots': [],
                         'execution_time': 0,
@@ -1382,6 +1441,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                     return Response({
                         'success': False,
+                        'execution_id': execution.id,
                         'logs': execution.execution_logs,
                         'screenshots': [],
                         'execution_time': 0,
@@ -1449,6 +1509,27 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             detailed_errors = []
             execution_result = {'status': 'passed', 'error_message': None}
 
+            def record_step_exception(number, total, action_type, action_text, element, description):
+                logger.exception('执行用例步骤异常 execution_id=%s step=%s', execution.id, number)
+                message = f'步骤 {number}/{total} 执行异常'
+                execution_logs.append(message)
+                step_results.append({
+                    'step_number': number, 'action_type': action_type, 'description': description or '',
+                    'success': False, 'error': INTERNAL_CASE_EXECUTION_ERROR,
+                })
+                execution_result.update(status='failed', error_message=f'{message}。{INTERNAL_CASE_EXECUTION_ERROR}')
+                detailed_errors.append({
+                    'step_number': number, 'action_type': action_text, 'element': element,
+                    'message': message, 'details': INTERNAL_CASE_EXECUTION_ERROR, 'description': description or '',
+                })
+
+            def run_case_worker(worker):
+                try:
+                    worker()
+                except Exception:
+                    logger.exception('用例执行线程异常 execution_id=%s', execution.id)
+                    execution_result.update(status='error', error_message=INTERNAL_CASE_EXECUTION_ERROR)
+
             # 根据引擎类型选择执行方式
             if engine_type == 'selenium':
                 # Selenium同步执行
@@ -1469,22 +1550,18 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             execution_logs.append(
                                 f"✓ {browser_type.capitalize()} 浏览器启动成功 (Selenium, {mode_text})")
                             execution_logs.append("")
-                        except Exception as browser_error:
-                            # 浏览器启动失败
-                            execution_logs.append(f"✗ {browser_type.capitalize()} 浏览器启动失败")
-                            execution_logs.append(f"  错误: {str(browser_error)}")
-                            execution_logs.append("")
-                            execution_result['status'] = 'failed'
-                            execution_result[
-                                'error_message'] = f"{browser_type.capitalize()} 浏览器启动失败: {str(browser_error)}"
-
-                            # 添加详细错误信息
+                        except Exception:
+                            logger.exception('Selenium 浏览器启动异常 execution_id=%s browser=%s', execution.id, browser_type)
+                            message = f'{browser_type.capitalize()} 浏览器启动失败'
+                            hint = '请检查执行服务上的浏览器和驱动版本及配置。'
+                            execution_logs.append(message)
+                            execution_result.update(status='failed', error_message=f'{message}。{hint}')
                             detailed_errors.append({
-                                'step_number': None,
+                                'step_number': 0,
                                 'action_type': '浏览器启动',
                                 'element': '',
-                                'message': f"{browser_type.capitalize()} 浏览器启动失败",
-                                'details': str(browser_error),
+                                'message': message,
+                                'details': hint,
                                 'description': '执行前浏览器启动检查'
                             })
 
@@ -1533,6 +1610,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                                 try:
                                     success, step_log, screenshot_base64 = engine.execute_step(step, element_data or {})
+                                    if not success and contains_execution_stacktrace(step_log):
+                                        logger.error('Selenium 步骤失败 execution_id=%s step=%s\n%s', execution.id, i, step_log)
+                                        step_log = INTERNAL_CASE_EXECUTION_ERROR
                                     execution_logs.append(f"  {step_log}")
                                     execution_logs.append("")
 
@@ -1585,40 +1665,16 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                                             # 移除 loaded 和 error 字段，让前端自行处理
                                         })
 
-                                except Exception as e:
-                                    execution_logs.append(f"  ✗ 步骤执行异常: {str(e)}")
-                                    import traceback
-                                    tb_str = traceback.format_exc()
-                                    execution_logs.append(f"  [调试] 异常堆栈:\n{tb_str}")
-
-                                    # 记录步骤执行结果（异常情况）
-                                    step_results.append({
-                                        'step_number': i,
-                                        'action_type': action_type,
-                                        'description': description or '',
-                                        'success': False,
-                                        'error': str(e)
-                                    })
-
-                                    execution_result['status'] = 'failed'
-                                    execution_result['error_message'] = f"步骤 {i} 执行异常: {str(e)}"
-
-                                    element_info = element_data['name'] if element_data else "未知元素"
-                                    detailed_errors.append({
-                                        'step_number': i,
-                                        'action_type': action_type_text,
-                                        'element': element_info,
-                                        'message': f"步骤 {i}/{step_count} 执行异常",
-                                        'details': f"异常: {str(e)}\n\n堆栈跟踪:\n{tb_str}",
-                                        'description': description or ''
-                                    })
+                                except Exception:
+                                    record_step_exception(i, step_count, action_type, action_type_text,
+                                                          element_data['name'] if element_data else '', description)
 
                                     try:
                                         screenshot_base64 = engine.capture_screenshot()
                                         if screenshot_base64:
                                             screenshots.append({
                                                 'url': screenshot_base64,
-                                                'description': f'步骤 {i} 异常截图: {str(e)}',
+                                                'description': f'步骤 {i} 异常截图',
                                                 'step_number': i,
                                                 'timestamp': timezone.now().isoformat()
                                                 # 移除 loaded 和 error 字段，让前端自行处理
@@ -1642,7 +1698,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                 # 在独立线程中运行Selenium测试
                 import threading
-                test_thread = threading.Thread(target=run_test_selenium)
+                test_thread = threading.Thread(target=lambda: run_case_worker(run_test_selenium))
                 test_thread.start()
                 test_thread.join()
 
@@ -1786,35 +1842,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                                         execution_logs.append(f"  [调试] 步骤 {i} 成功完成,准备执行下一步...")
 
-                                    except Exception as e:
-                                        execution_logs.append(f"  ✗ 步骤执行异常: {str(e)}")
-                                        execution_logs.append(f"  [调试] 异常详情: {repr(e)}")
-                                        import traceback
-                                        tb_str = traceback.format_exc()
-                                        execution_logs.append(f"  [调试] 异常堆栈:\n{tb_str}")
-
-                                        # 记录步骤执行结果（异常情况）
-                                        step_results.append({
-                                            'step_number': i,
-                                            'action_type': action_type,
-                                            'description': description or '',
-                                            'success': False,
-                                            'error': str(e)
-                                        })
-
-                                        execution_result['status'] = 'failed'
-                                        execution_result['error_message'] = f"步骤 {i} 执行异常: {str(e)}"
-
-                                        # 添加详细错误信息
-                                        element_info = element_data['name'] if element_data else "未知元素"
-                                        detailed_errors.append({
-                                            'step_number': i,
-                                            'action_type': action_type_text,
-                                            'element': element_info,
-                                            'message': f"步骤 {i}/{step_count} 执行异常",
-                                            'details': f"异常: {str(e)}\n\n堆栈跟踪:\n{tb_str}",
-                                            'description': description or ''
-                                        })
+                                    except Exception:
+                                        record_step_exception(i, step_count, action_type, action_type_text,
+                                                              element_data['name'] if element_data else '', description)
 
                                         # 捕获异常截图
                                         try:
@@ -1822,7 +1852,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                                             if screenshot_base64:
                                                 screenshots.append({
                                                     'url': screenshot_base64,
-                                                    'description': f'步骤 {i} 异常截图: {str(e)}',
+                                                    'description': f'步骤 {i} 异常截图',
                                                     'step_number': i,
                                                     'timestamp': timezone.now().isoformat()
                                                     # 移除 loaded 和 error 字段，让前端自行处理
@@ -1858,7 +1888,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                 # 在独立线程中运行Playwright测试
                 import threading
-                test_thread = threading.Thread(target=run_test_in_thread)
+                test_thread = threading.Thread(target=lambda: run_case_worker(run_test_in_thread))
                 test_thread.start()
                 test_thread.join()  # 等待测试完成
 
@@ -1920,23 +1950,38 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
             return Response({
                 'success': execution.status == 'passed',
+                'execution_id': execution.id,
                 'logs': execution.execution_logs,
                 'screenshots': screenshots,
                 'execution_time': execution.execution_time,
                 'errors': errors
             })
 
-        except Exception as e:
-            logger.error(f"执行测试用例失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response({
+        except Exception:
+            logger.exception(
+                '运行用例时出现内部错误 case_id=%s execution_id=%s',
+                test_case.id, execution.id if execution is not None else None,
+            )
+            response_data = {
                 'success': False,
-                'logs': f"执行失败: {str(e)}\n\n{traceback.format_exc()}",
+                'logs': INTERNAL_CASE_EXECUTION_ERROR,
                 'screenshots': [],
                 'execution_time': 0,
-                'errors': [{'message': str(e), 'stack': traceback.format_exc()}]
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                'errors': [{'message': INTERNAL_CASE_EXECUTION_ERROR}],
+            }
+            if execution is not None:
+                response_data['execution_id'] = execution.id
+                try:
+                    execution.status = 'error'
+                    execution.error_message = INTERNAL_CASE_EXECUTION_ERROR
+                    execution.execution_logs = INTERNAL_CASE_EXECUTION_ERROR
+                    execution.finished_at = timezone.now()
+                    execution.save(update_fields=[
+                        'status', 'error_message', 'execution_logs', 'finished_at'
+                    ])
+                except Exception:
+                    logger.exception('保存用例执行失败状态失败 execution_id=%s', execution.id)
+            return Response(response_data, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
     def batch_run(self, request):
@@ -2000,7 +2045,7 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
     serializer_class = TestCaseExecutionSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['test_case__name', 'error_message']
+    search_fields = ['test_case__name', 'visible_error_message']
     ordering_fields = ['created_at', 'started_at', 'finished_at', 'status']
     ordering = ['-created_at']
     filterset_fields = ['project', 'test_suite', 'test_case', 'status', 'execution_source']
@@ -2014,7 +2059,14 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
             project__in=project_scope
         ).select_related(
             'test_case', 'project', 'test_suite', 'created_by'
-        )
+        ).alias(visible_error_message=models.Case(
+            models.When(
+                _execution_stacktrace_filter('execution_logs', 'error_message'),
+                then=models.Value(INTERNAL_CASE_EXECUTION_ERROR),
+            ),
+            default=models.F('error_message'),
+            output_field=models.TextField(),
+        ))
 
     def perform_destroy(self, instance):
         # 记录操作
@@ -4015,41 +4067,136 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+def _filter_dashboard_execution_status(executions, status_filter):
+    if not status_filter:
+        return executions
+    executions = executions.alias(storage_status=Lower(Trim('status')))
+    accepted = models.Q(storage_status__in=execution_status_filter_values(status_filter))
+    if status_filter in FAILURE_STATUSES:
+        # Unknown stored statuses are shown as errors by the response projection.
+        accepted |= ~models.Q(storage_status__in=EXECUTION_STORAGE_STATUSES)
+    return executions.filter(accepted)
+
+
+def _recover_recent_failure_summaries(executions, rows, payload_field):
+    ids = [pk for _, pk, _, status, _, summary in rows if not summary and normalize_execution_status(status) in FAILURE_STATUSES]
+    if not ids:
+        return {}
+
+    # Old workers completing during the upgrade may leave these few rows without a summary.
+    candidates = executions.filter(pk__in=ids)
+    missing = candidates.filter(models.Q(failure_summary__isnull=True) | models.Q(failure_summary={}))
+    recovered = {}
+    pending = set(ids)
+    for pk, raw_status, error, payload in missing.values_list('pk', 'status', 'error_message', payload_field):
+        summary = build_failure_summary(raw_status, error, payload, suite=payload_field == 'result_data')
+        if summary and missing.filter(pk=pk, status=raw_status).update(failure_summary=summary):
+            recovered[pk, raw_status] = summary
+            pending.discard(pk)
+
+    if pending:
+        # A concurrent writer may have filled a row before our read or won the conditional update.
+        for pk, raw_status, summary in candidates.filter(pk__in=pending).values_list('pk', 'status', 'failure_summary'):
+            if summary:
+                recovered[pk, raw_status] = summary
+    return recovered
+
+
 class UiDashboardViewSet(viewsets.ViewSet):
     """UI自动化仪表盘视图集"""
     permission_classes = [IsAuthenticated]
 
+    def _project_scope(self, request):
+        project_scope = accessible_projects(request.user)
+        project_id = request.query_params.get('project')
+        if project_id in (None, ''):
+            return project_scope, None
+        try:
+            project = project_scope.filter(pk=project_id).first()
+        except (TypeError, ValueError):
+            project = None
+        if project is None:
+            return None, Response({'error': '项目不存在或无权访问'}, status=status.HTTP_404_NOT_FOUND)
+        return project_scope.filter(pk=project.pk), None
+
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """获取仪表盘统计数据"""
-        user = request.user
+        project_scope, error_response = self._project_scope(request)
+        if error_response is not None:
+            return error_response
+        project_ids = project_scope.values_list('id', flat=True)
 
-        # 获取用户可访问的项目ID列表
-        accessible_project_scope = accessible_projects(request.user)
-        project_ids = accessible_project_scope.values_list('id', flat=True)
-
-        # 统计数据
-        project_count = accessible_project_scope.count()
-
-        # 测试用例数量
+        project_count = project_scope.count()
         test_case_count = TestCase.objects.filter(project_id__in=project_ids).count()
-
-        # 测试套件数量（包含用例总数）
-        suite_count = TestSuite.objects.filter(project_id__in=project_ids).count()
+        suite_entity_count = TestSuite.objects.filter(project_id__in=project_ids).count()
 
         from .models import TestSuiteTestCase
         suite_test_case_count = TestSuiteTestCase.objects.filter(
             test_suite__project_id__in=project_ids
         ).count()
 
-        # 测试执行数量（传统+新版）
         execution_count = TestExecution.objects.filter(project_id__in=project_ids).count()
         test_case_execution_count = TestCaseExecution.objects.filter(project_id__in=project_ids).count()
-        total_execution_count = execution_count + test_case_execution_count
-
         return Response({
             'project_count': project_count,
             'test_case_count': test_case_count,
             'suite_count': suite_test_case_count,
-            'execution_count': total_execution_count
+            'suite_entity_count': suite_entity_count,
+            'execution_count': execution_count + test_case_execution_count,
         })
+
+    @action(detail=False, methods=['get'], url_path='recent-executions')
+    def recent_executions(self, request):
+        """Return a small, project-scoped mix of recent suite and standalone case runs."""
+        project_scope, error_response = self._project_scope(request)
+        if error_response is not None:
+            return error_response
+
+        status_filter = (request.query_params.get('status') or '').strip().lower()
+        if status_filter and status_filter not in EXECUTION_STATUSES:
+            return Response({'error': '不支持的执行状态'}, status=status.HTTP_400_BAD_REQUEST)
+
+        suite_executions = TestExecution.objects.filter(
+            project__in=project_scope,
+            test_suite__isnull=False,
+        )
+        case_executions = TestCaseExecution.objects.filter(
+            project__in=project_scope,
+            test_suite__isnull=True,
+        ).exclude(execution_source__iexact='suite')
+        sources = (
+            ('suite', suite_executions, 'test_suite__name', 'result_data'),
+            ('case', case_executions, 'test_case__name', 'execution_logs'),
+        )
+        candidates = []
+        for kind, executions, name_field, _ in sources:
+            matching = _filter_dashboard_execution_status(executions, status_filter)
+            rows = matching.order_by('-created_at', '-pk').values_list(
+                'pk', 'status', 'created_at', name_field, 'failure_summary',
+            )[:5]
+            candidates.extend((created_at, pk, kind, status, name, summary) for pk, status, created_at, name, summary in rows)
+
+        candidates.sort(key=lambda row: row[:3], reverse=True)
+        candidates = candidates[:5]
+        recovered = {
+            kind: _recover_recent_failure_summaries(executions, [row for row in candidates if row[2] == kind], payload_field)
+            for kind, executions, _, payload_field in sources
+        }
+        results = []
+        for created_at, pk, kind, raw_status, name, summary in candidates:
+            normalized_status = normalize_execution_status(raw_status)
+            failure = {}
+            if normalized_status in FAILURE_STATUSES:
+                failure = summary or recovered[kind].get((pk, raw_status), {})
+            results.append({
+                'id': pk,
+                'kind': kind,
+                'name': name or f'{kind.title()} #{pk}',
+                'status': normalized_status,
+                'created_at': created_at.isoformat(),
+                'failure_message': failure.get('message') or (GENERIC_FAILURE_MESSAGE if normalized_status in FAILURE_STATUSES else ''),
+                'failed_step_number': failure.get('step_number'),
+            })
+
+        return Response({'results': results})

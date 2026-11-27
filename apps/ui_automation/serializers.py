@@ -12,6 +12,8 @@ from django.contrib.auth import get_user_model
 from django.conf import settings
 from .access import project_accessible, is_ui_admin, selenium_compatibility_enabled
 
+from .execution_summary import INTERNAL_SUITE_EXECUTION_ERROR, public_case_diagnostics, public_execution_evidence, public_suite_error
+
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 
 
@@ -65,7 +67,7 @@ class UiProjectSerializer(serializers.ModelSerializer):
 class UiProjectCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = UiProject
-        fields = ('name', 'description', 'status', 'base_url', 'start_date', 'end_date', 'owner', 'members')
+        fields = ('id', 'name', 'description', 'status', 'base_url', 'start_date', 'end_date', 'owner', 'members')
 
     def validate_base_url(self, value):
         try:
@@ -355,11 +357,17 @@ class TestExecutionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TestExecution
-        fields = '__all__'
+        exclude = ('failure_summary',)
         read_only_fields = (
             'created_at', 'started_at', 'finished_at', 'duration',
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases'
         )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['error_message'] = public_suite_error(data['error_message'])
+        data['result_data'] = public_execution_evidence(data['result_data'], INTERNAL_SUITE_EXECUTION_ERROR)
+        return data
 
     def validate(self, attrs):
         project_id = attrs.pop('project_id', None)
@@ -925,7 +933,13 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
             'created_by', 'created_by_name', 'created_at'
         ]
         read_only_fields = ['created_by']
-    
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['execution_logs'], data['error_message'] = public_case_diagnostics(data['execution_logs'], data['error_message'])
+        data['screenshots'] = public_execution_evidence(data['screenshots'])
+        return data
+
     def validate(self, attrs):
         project = _ensure_project_access(self, attrs.get('project', getattr(self.instance, 'project', None)))
         test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))

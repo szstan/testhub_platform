@@ -2,14 +2,27 @@
   <div class="page-container">
     <div class="page-header">
       <h1 class="page-title">{{ $t('uiAutomation.suite.title') }}</h1>
-      <el-select v-model="projectId" :placeholder="$t('uiAutomation.common.selectProject')" style="width: 200px; margin-right: 15px" @change="onProjectChange">
+      <el-select v-model="projectId" :aria-label="$t('uiAutomation.common.selectProject')" :placeholder="$t('uiAutomation.common.selectProject')" :loading="projectsLoading" :disabled="projectsLoading" style="width: 200px; margin-right: 15px">
         <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
       </el-select>
-      <el-button type="primary" @click="handleNewSuite">
+      <el-button type="primary" :disabled="!projectId" @click="handleNewSuite">
         <el-icon><Plus /></el-icon>
         {{ $t('uiAutomation.suite.newSuite') }}
       </el-button>
     </div>
+
+    <el-alert
+      v-if="invalidProject || projectsError"
+      :title="invalidProject ? t('uiAutomation.workbenchResults.projectUnavailable') : t('uiAutomation.workbenchResults.projectLoadFailed')"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="project-alert"
+    >
+      <el-button link type="primary" :loading="projectsLoading" @click="reloadProjects">
+        {{ t('uiAutomation.workbenchResults.reloadProjects') }}
+      </el-button>
+    </el-alert>
 
     <div class="card-container">
       <div class="filter-bar">
@@ -69,7 +82,7 @@
               <el-icon><Edit /></el-icon>
               {{ $t('uiAutomation.common.edit') }}
             </el-button>
-            <el-button size="small" type="success" @click="runSuite(row)">
+            <el-button size="small" type="success" @click="runSuite(row)" :loading="isSuiteSubmitting(row.id)" :disabled="isSuiteSubmitting(row.id)">
               <el-icon><RefreshRight /></el-icon>
               {{ $t('uiAutomation.common.run') }}
             </el-button>
@@ -243,7 +256,7 @@
       </el-form>
       <template #footer>
         <span class="dialog-footer">
-          <el-button @click="showRunDialog = false">{{ $t('uiAutomation.common.cancel') }}</el-button>
+          <el-button :disabled="running" @click="showRunDialog = false">{{ $t('uiAutomation.common.cancel') }}</el-button>
           <el-button
             type="primary"
             @click="confirmRunSuite"
@@ -258,14 +271,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Plus, Search, Edit, Delete, RefreshRight, Collection,
+  Plus, Search, Edit, Delete, RefreshRight,
   ArrowRight, Top, Bottom
 } from '@element-plus/icons-vue'
 import {
-  getUiProjects,
   getTestSuites,
   createTestSuite,
   updateTestSuite,
@@ -274,20 +286,31 @@ import {
   getTestSuiteTestCases,
   addTestCaseToTestSuite,
   removeTestCaseFromTestSuite,
-  updateTestCaseOrder,
   runTestSuite
 } from '@/api/ui_automation'
+import { useRouter } from 'vue-router'
+import { useUiProjectContext } from '@/composables/useUiProjectContext'
+import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
+const router = useRouter()
+const {
+  projects,
+  projectId,
+  projectsLoading,
+  projectsError,
+  invalidProject,
+  reloadProjects
+} = useUiProjectContext()
 
 // 响应式数据
-const projects = ref([])
-const projectId = ref('')
 const suites = ref([])
 const loading = ref(false)
 const searchText = ref('')
 const total = ref(0)
+let projectScopeVersion = 0
+let suiteRequestVersion = 0
 const pagination = reactive({
   currentPage: 1,
   pageSize: 20
@@ -300,6 +323,7 @@ const isEditing = ref(false)
 const currentSuiteId = ref(null)
 const saving = ref(false)
 const running = ref(false)
+const submittingSuiteIds = ref(new Set())
 
 // 表单数据
 const createForm = reactive({
@@ -325,6 +349,17 @@ const runConfig = reactive({
 })
 const currentRunningSuite = ref(null)
 
+const isPositiveId = (value) => Boolean(normalizeUiId(value))
+
+const responseList = (response) => {
+  const body = response?.data?.data ?? response?.data
+  if (Array.isArray(body)) return body
+  if (Array.isArray(body?.results)) return body.results
+  return null
+}
+
+const isSuiteSubmitting = (id) => submittingSuiteIds.value.has(String(id))
+
 // 计算属性 - 过滤后的可用测试用例
 const filteredAvailableTestCases = computed(() => {
   if (!testCaseSearchText.value) {
@@ -336,69 +371,78 @@ const filteredAvailableTestCases = computed(() => {
   )
 })
 
-// 加载项目列表
-const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    console.error('获取项目列表失败:', error)
-    ElMessage.error(t('uiAutomation.project.messages.loadFailed'))
-  }
-}
-
 // 加载测试套件列表
 const loadSuites = async () => {
-  if (!projectId.value) {
+  const requestedProjectId = projectId.value
+  const scopeVersion = projectScopeVersion
+  const requestVersion = ++suiteRequestVersion
+  if (!isPositiveId(requestedProjectId)) {
     suites.value = []
     total.value = 0
+    loading.value = false
     return
   }
 
   loading.value = true
   try {
     const response = await getTestSuites({
-      project: projectId.value,
+      project: requestedProjectId,
       page: pagination.currentPage,
       page_size: pagination.pageSize,
       search: searchText.value
     })
+    const resultList = responseList(response)
+    if (scopeVersion !== projectScopeVersion || requestVersion !== suiteRequestVersion || String(projectId.value) !== String(requestedProjectId)) return
+    if (!resultList) throw new Error('Invalid suite list response')
 
-    if (response.data.results) {
-      suites.value = response.data.results
-      total.value = response.data.count || 0
-    } else {
-      suites.value = response.data
-      total.value = response.data.length
-    }
+    const scopedSuites = resultList.filter(suite => {
+      if (!suite || typeof suite !== 'object' || !isPositiveId(suite.id)) return false
+      if (suite.project === undefined || suite.project === null) return true
+      const returnedProjectId = typeof suite.project === 'object' ? suite.project.id : suite.project
+      return String(returnedProjectId) === String(requestedProjectId)
+    })
+    suites.value = scopedSuites
+    const count = response?.data?.count
+    total.value = Number.isSafeInteger(Number(count)) && Number(count) >= 0 ? Number(count) : scopedSuites.length
   } catch (error) {
-    console.error('获取测试套件列表失败:', error)
-    ElMessage.error(t('uiAutomation.suite.messages.loadFailed'))
+    if (scopeVersion === projectScopeVersion && requestVersion === suiteRequestVersion) {
+      console.error('获取测试套件列表失败:', error)
+      ElMessage.error(t('uiAutomation.suite.messages.loadFailed'))
+    }
   } finally {
-    loading.value = false
+    if (scopeVersion === projectScopeVersion && requestVersion === suiteRequestVersion) loading.value = false
   }
 }
 
 // 加载可用测试用例
 const loadAvailableTestCases = async () => {
-  if (!projectId.value) return
+  const requestedProjectId = projectId.value
+  const scopeVersion = projectScopeVersion
+  if (!isPositiveId(requestedProjectId)) {
+    availableTestCases.value = []
+    return
+  }
 
   try {
     const response = await getTestCases({
-      project: projectId.value,
-      page_size: 1000  // 加载所有用例
+      project: requestedProjectId,
+      page_size: 1000
     })
-    availableTestCases.value = response.data.results || response.data
+    const resultList = responseList(response)
+    if (scopeVersion !== projectScopeVersion || String(projectId.value) !== String(requestedProjectId)) return
+    if (!resultList) throw new Error('Invalid test case list response')
+    availableTestCases.value = resultList.filter(testCase => {
+      if (!testCase || !isPositiveId(testCase.id)) return false
+      if (testCase.project === undefined || testCase.project === null) return true
+      const returnedProjectId = typeof testCase.project === 'object' ? testCase.project.id : testCase.project
+      return String(returnedProjectId) === String(requestedProjectId)
+    })
   } catch (error) {
-    console.error('获取测试用例列表失败:', error)
-    ElMessage.error(t('uiAutomation.suite.messages.loadCasesFailed'))
+    if (scopeVersion === projectScopeVersion && String(projectId.value) === String(requestedProjectId)) {
+      console.error('获取测试用例列表失败:', error)
+      ElMessage.error(t('uiAutomation.suite.messages.loadCasesFailed'))
+    }
   }
-}
-
-// 项目切换
-const onProjectChange = async () => {
-  pagination.currentPage = 1
-  await loadSuites()
 }
 
 // 搜索处理
@@ -482,6 +526,7 @@ const handleCreate = async () => {
 
 // 编辑套件
 const editSuite = async (id) => {
+  const scopeVersion = projectScopeVersion
   try {
     // 加载套件详情
     const suites_data = suites.value.find(s => s.id === id)
@@ -494,10 +539,16 @@ const editSuite = async (id) => {
 
     // 加载已选测试用例
     const response = await getTestSuiteTestCases(id)
-    selectedTestCases.value = response.data.map(item => item.test_case).sort((a, b) => a.order - b.order)
+    const caseList = response?.data?.data ?? response?.data
+    if (scopeVersion !== projectScopeVersion || !Array.isArray(caseList)) return
+    selectedTestCases.value = caseList
+      .filter(item => item?.test_case && isPositiveId(item.test_case.id))
+      .map(item => item.test_case)
+      .sort((a, b) => a.order - b.order)
 
     // 加载可用测试用例
     await loadAvailableTestCases()
+    if (scopeVersion !== projectScopeVersion) return
 
     showCreateDialog.value = true
   } catch (error) {
@@ -528,11 +579,15 @@ const deleteSuite = async (id) => {
 
 // 运行套件
 const runSuite = (suite) => {
-  // 检查是否包含测试用例
+  if (!isPositiveId(projectId.value)) {
+    ElMessage.warning(t('uiAutomation.suite.messages.selectProject'))
+    return
+  }
   if (!suite.test_case_count || suite.test_case_count === 0) {
     ElMessage.warning(t('uiAutomation.suite.messages.noCases'))
     return
   }
+  if (isSuiteSubmitting(suite.id)) return
 
   currentRunningSuite.value = suite
   showRunDialog.value = true
@@ -540,73 +595,51 @@ const runSuite = (suite) => {
 
 // 确认运行套件
 const confirmRunSuite = async () => {
+  const suite = currentRunningSuite.value
+  if (!suite || !isPositiveId(suite.id) || !isPositiveId(projectId.value)) return
+  if (running.value || isSuiteSubmitting(suite.id)) return
+
+  const requestedProjectId = String(projectId.value)
+  const scopeVersion = projectScopeVersion
+  submittingSuiteIds.value.add(String(suite.id))
   running.value = true
   try {
-    const requestData = {
+    const response = await runTestSuite(suite.id, {
       use_ai: false,
       engine: runConfig.engine,
       browser: runConfig.browser,
       headless: runConfig.headless
+    })
+    const body = response?.data?.data ?? response?.data
+    const executionId = body?.execution_id
+    if (!isPositiveId(executionId)) {
+      throw new Error(t('uiAutomation.workbenchResults.executionUnavailable'))
     }
-
-    const response = await runTestSuite(currentRunningSuite.value.id, requestData)
+    if (scopeVersion !== projectScopeVersion || String(projectId.value) !== requestedProjectId) return
 
     ElMessage.success(t('uiAutomation.suite.messages.startSuccess'))
     showRunDialog.value = false
-
-    // 立即刷新一次以显示"运行中"状态
-    await loadSuites()
-
-    // 开始轮询检查执行状态
-    pollSuiteStatus(currentRunningSuite.value.id)
+    currentRunningSuite.value = null
+    await router.push(uiExecutionLocation('UiReports', requestedProjectId, executionId))
   } catch (error) {
-    console.error('执行测试套件失败:', error)
-    // 如果后端返回了错误消息，显示具体错误
-    const errorMsg = error.response?.data?.error || t('uiAutomation.suite.messages.executeFailed')
-    ElMessage.error(errorMsg)
+    if (scopeVersion === projectScopeVersion && String(projectId.value) === requestedProjectId) {
+      console.error('执行测试套件失败:', error)
+      const backendMessage = error.response?.data?.error || error.response?.data?.detail
+      const errorMessage = error.message === t('uiAutomation.workbenchResults.executionUnavailable')
+        ? error.message
+        : backendMessage || t('uiAutomation.suite.messages.executeFailed')
+      ElMessage.error(errorMessage)
+      const executionId = error.response?.data?.execution_id
+      if (isPositiveId(executionId)) {
+        showRunDialog.value = false
+        currentRunningSuite.value = null
+        await router.push(uiExecutionLocation('UiReports', requestedProjectId, executionId))
+      }
+    }
   } finally {
+    submittingSuiteIds.value.delete(String(suite.id))
     running.value = false
   }
-}
-
-// 轮询检查套件执行状态
-const pollSuiteStatus = (suiteId) => {
-  let pollCount = 0
-  const maxPolls = 120 // 最多轮询2分钟（每秒一次）
-
-  const pollInterval = setInterval(async () => {
-    pollCount++
-
-    try {
-      // 重新加载套件列表
-      await loadSuites()
-
-      // 查找当前套件的状态
-      const currentSuite = suites.value.find(s => s.id === suiteId)
-
-      if (currentSuite && currentSuite.execution_status !== 'running') {
-        // 执行完成，停止轮询
-        clearInterval(pollInterval)
-
-        // 根据状态显示消息
-        if (currentSuite.execution_status === 'passed') {
-          ElMessage.success(`${t('uiAutomation.suite.messages.executionComplete')}: ${t('uiAutomation.suite.messages.allPassed')} (${currentSuite.passed_count}/${currentSuite.passed_count + currentSuite.failed_count})`)
-        } else if (currentSuite.execution_status === 'failed') {
-          ElMessage.warning(`${t('uiAutomation.suite.messages.executionComplete')}: ${t('uiAutomation.suite.messages.partialFailed')} (${t('uiAutomation.suite.messages.passed')}: ${currentSuite.passed_count}, ${t('uiAutomation.status.failed')}: ${currentSuite.failed_count})`)
-        }
-      }
-
-      // 超过最大轮询次数，停止轮询
-      if (pollCount >= maxPolls) {
-        clearInterval(pollInterval)
-        ElMessage.info(t('uiAutomation.suite.messages.longExecution'))
-      }
-    } catch (error) {
-      console.error('轮询套件状态失败:', error)
-      // 发生错误时停止轮询
-      clearInterval(pollInterval)
-    }
-  }, 3000) // 每3秒轮询一次
 }
 
 // 测试用例管理方法
@@ -738,28 +771,34 @@ const getCaseStatusText = (status) => {
   return statusKey ? t(`uiAutomation.status.${statusKey}`) : t('uiAutomation.status.unknown')
 }
 
-// 监听新增套件按钮
-const originalShowCreateDialog = showCreateDialog
-onMounted(async () => {
-  await loadProjects()
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
-    await loadSuites()
-  }
-})
+// 项目范围变化时丢弃旧响应并清理页面状态
+watch(projectId, (nextProjectId) => {
+  projectScopeVersion += 1
+  suiteRequestVersion += 1
+  pagination.currentPage = 1
+  suites.value = []
+  total.value = 0
+  availableTestCases.value = []
+  selectedTestCases.value = []
+  loading.value = false
+  showCreateDialog.value = false
+  showRunDialog.value = false
+  currentRunningSuite.value = null
+  if (isPositiveId(nextProjectId)) loadSuites()
+}, { immediate: true })
 
-// 监听对话框打开事件
-const openCreateDialog = async () => {
-  if (!isEditing.value) {
-    await loadAvailableTestCases()
-  }
-}
+onBeforeUnmount(() => {
+  projectScopeVersion += 1
+  suiteRequestVersion += 1
+})
 
 // 修改新增套件按钮点击事件
 const handleNewSuite = async () => {
+  if (!projectId.value) return
+  const scope = projectScopeVersion
   resetForm()
   await loadAvailableTestCases()
-  showCreateDialog.value = true
+  if (scope === projectScopeVersion) showCreateDialog.value = true
 }
 </script>
 
@@ -783,6 +822,10 @@ const handleNewSuite = async () => {
 .page-title {
   margin: 0;
   font-size: 24px;
+}
+
+.project-alert {
+  margin: 0 0 16px;
 }
 
 .card-container {

@@ -324,6 +324,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: npm --prefix frontend run test:interface-management-pagination
 
+      - name: Test UI automation workbench
+        working-directory: ${{ github.workspace }}
+        run: npm --prefix frontend run test:ui-workbench
+
       - name: Lint frontend
         run: npm run lint
 

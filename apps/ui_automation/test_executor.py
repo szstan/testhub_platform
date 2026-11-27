@@ -2,6 +2,7 @@
 UI自动化测试执行服务
 支持 Playwright 和 Selenium 测试引擎
 """
+import logging
 import time
 import json
 from datetime import datetime
@@ -14,6 +15,7 @@ from apps.core.network import (
     guard_playwright_route_sync,
     validate_outbound_url,
 )
+from apps.core.scheduler import ScheduleClaimLost
 from playwright.sync_api import sync_playwright
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -30,20 +32,24 @@ from .models import (
 )
 from .variable_resolver import resolve_variables
 from .evidence import project_screenshots
+from .execution_summary import INTERNAL_SUITE_EXECUTION_ERROR
+
+
+logger = logging.getLogger(__name__)
 
 
 class TestExecutor:
     """测试执行器基类"""
 
     def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None,
-                 cancel_check=None):
+                 cancel_check=None, execution=None):
         self.test_suite = test_suite
         self.engine = engine
         self.browser = browser
         self.headless = headless
         self.executed_by = executed_by
         self.cancel_check = cancel_check
-        self.execution = None
+        self.execution = execution
         self.test_cases = []
         self.results = []
         self._case_executions = {}
@@ -51,6 +57,21 @@ class TestExecutor:
     def _check_cancelled(self):
         if self.cancel_check is not None:
             self.cancel_check()
+
+    def _selenium_startup_error_message(self):
+        browser = str(self.browser or '').lower()
+        if browser == 'safari':
+            return (
+                'Safari 浏览器启动失败。请确认执行服务运行于 macOS，执行 sudo safaridriver --enable，'
+                '并在 Safari 的“开发”菜单中启用“允许远程自动化”。'
+            )
+        browser_name = {'chrome': 'Chrome', 'firefox': 'Firefox', 'edge': 'Edge'}.get(
+            browser, browser.capitalize() or '指定的'
+        )
+        return (
+            f'{browser_name} 浏览器启动失败。请检查执行服务上的浏览器是否已安装，'
+            '并确认 Selenium WebDriver 与浏览器版本兼容且驱动配置正确。'
+        )
 
     def _finish_case_execution(self, case_execution, *, status, error_message='', logs=None):
         case_execution.status = status
@@ -96,6 +117,8 @@ class TestExecutor:
 
     def create_execution_record(self):
         """创建测试执行记录"""
+        if self.execution is not None:
+            return self.execution
         self.execution = TestExecution.objects.create(
             project=self.test_suite.project,
             test_suite=self.test_suite,
@@ -181,19 +204,13 @@ class TestExecutor:
 
             print(f"[TestExecutor] 执行完成")
 
-        except Exception as e:
-            print(f"[TestExecutor] 测试执行失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            passed, failed, skipped = self._settle_unfinished_case_executions(str(e))
+        except Exception as error:
+            logger.exception('套件执行异常 suite_id=%s', getattr(self.test_suite, 'pk', None))
+            message = str(error) if isinstance(error, ScheduleClaimLost) else INTERNAL_SUITE_EXECUTION_ERROR
+            passed, failed, skipped = self._settle_unfinished_case_executions(message)
             if self.execution:
-                print(f"[TestExecutor] 更新执行结果为失败...")
                 self.update_execution_result(
-                    status='FAILED',
-                    passed=passed,
-                    failed=failed,
-                    skipped=skipped,
-                    error_msg=f"执行失败: {str(e)}\n\n{traceback.format_exc()}"
+                    status='FAILED', passed=passed, failed=failed, skipped=skipped, error_msg=message,
                 )
             else:
                 self.test_suite.passed_count = passed
@@ -1473,8 +1490,15 @@ class TestExecutor:
                 driver = self.create_selenium_driver()
                 self._selenium_driver = driver
                 print(f"✓ 浏览器已启动（将复用于所有用例）\n")
-            except Exception as e:
-                print(f"✗ 浏览器启动失败: {str(e)}")
+            except ScheduleClaimLost:
+                raise
+            except Exception:
+                logger.exception(
+                    'Selenium 套件浏览器启动失败 suite_id=%s browser=%s',
+                    getattr(self.test_suite, 'pk', None), self.browser,
+                )
+                startup_error = self._selenium_startup_error_message()
+                print(f"✗ 浏览器启动失败: {startup_error}")
                 # 标记所有用例为失败
                 for case_data in test_cases_data:
                     self.results.append({
@@ -1482,7 +1506,7 @@ class TestExecutor:
                         'test_case_name': case_data['name'],
                         'status': 'failed',
                         'steps': [],
-                        'error': f"浏览器启动失败: {str(e)}",
+                        'error': startup_error,
                         'start_time': datetime.now().isoformat(),
                         'end_time': datetime.now().isoformat(),
                         'screenshots': []
@@ -1524,14 +1548,21 @@ class TestExecutor:
                     driver = self.create_selenium_driver()
                     self._selenium_driver = driver
                     print(f"✓ Safari 浏览器已启动")
-                except Exception as e:
-                    print(f"✗ Safari 浏览器启动失败: {str(e)}")
+                except ScheduleClaimLost:
+                    raise
+                except Exception:
+                    logger.exception(
+                        'Safari 套件浏览器启动失败 suite_id=%s browser=%s case_id=%s',
+                        getattr(self.test_suite, 'pk', None), self.browser, case_data['id'],
+                    )
+                    startup_error = self._selenium_startup_error_message()
+                    print(f"✗ Safari 浏览器启动失败: {startup_error}")
                     self.results.append({
                         'test_case_id': case_data['id'],
                         'test_case_name': case_data['name'],
                         'status': 'failed',
                         'steps': [],
-                        'error': f"浏览器启动失败: {str(e)}",
+                        'error': startup_error,
                         'start_time': datetime.now().isoformat(),
                         'end_time': datetime.now().isoformat(),
                         'screenshots': []
@@ -1542,7 +1573,7 @@ class TestExecutor:
                     case_execution.finished_at = timezone.now()
                     case_execution.execution_time = (
                                 case_execution.finished_at - case_execution.started_at).total_seconds()
-                    case_execution.error_message = f"浏览器启动失败: {str(e)}"
+                    case_execution.error_message = startup_error
                     case_execution.save()
                     continue
 

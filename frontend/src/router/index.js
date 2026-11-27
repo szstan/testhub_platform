@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { trackPageView } from '@/utils/tracker'
 import api from '@/utils/api'
+import { uiWorkbenchReturnLocation } from '@/utils/ui-project-context.mjs'
 
 // Keep the shell and initial auth/home views eager; feature pages are lazy-loaded.
 const Login = () => import('@/views/auth/Login.vue')
@@ -802,9 +803,10 @@ router.beforeEach(async (to, _from, next) => {
     if (to.meta.featureFlag === 'quality-intelligence' && !QUALITY_INTELLIGENCE_ENABLED) {
         next('/home')
     } else if (to.meta.requiresAuth && !userStore.isAuthenticated) {
-        next('/login')
+        const workbench = uiWorkbenchReturnLocation(to.name, to.query)
+        next(workbench ? { name: 'Login', query: { uiPage: workbench.name, ...workbench.query } } : '/login')
     } else if (to.meta.requiresGuest && userStore.isAuthenticated) {
-        next('/home')
+        next(to.name === 'Login' ? uiWorkbenchReturnLocation(to.query.uiPage, to.query) || '/home' : '/home')
     } else if (to.meta.requiresAdmin && !userStore.isAdmin) {
         next({ name: 'Home', query: { forbidden: 'generation-config' } })
     } else {

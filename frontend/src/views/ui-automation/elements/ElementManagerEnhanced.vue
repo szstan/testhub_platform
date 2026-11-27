@@ -1,10 +1,18 @@
 <template>
   <div class="element-manager">
+      <div v-if="returnToCase" class="element-setup-guide">
+        <p>{{ $t('uiAutomation.workbenchOnboarding.elementGuide') }}</p>
+        <RouterLink :to="returnToCase">{{ $t('uiAutomation.workbenchOnboarding.returnToCase') }}</RouterLink>
+      </div>
+      <p v-if="projectsLoading" class="element-setup-guide" role="status">{{ $t('uiAutomation.dashboard.loading') }}</p>
+      <el-alert v-else-if="projectsError || invalidProject" :title="$t(projectsError ? 'uiAutomation.project.messages.loadFailed' : 'uiAutomation.workbenchExecution.invalidProject')" type="warning" :closable="false">
+        <el-button v-if="projectsError" link @click="reloadProjects">{{ $t('uiAutomation.workbenchExecution.retry') }}</el-button>
+      </el-alert>
     <div class="element-layout">
       <!-- 左侧页面树 -->
       <div class="sidebar">
         <div class="sidebar-header">
-          <el-select v-model="selectedProject" :placeholder="$t('common.selectProject')" @change="onProjectChange">
+          <el-select v-model="selectedProject" :placeholder="$t('common.selectProject')" :aria-label="$t('uiAutomation.common.selectProject')" :disabled="projectsLoading">
             <el-option
               v-for="project in projects"
               :key="project.id"
@@ -13,10 +21,10 @@
             />
           </el-select>
           <div class="header-actions">
-            <el-button type="primary" size="small" @click="showCreatePageDialog = true" :title="$t('uiAutomation.element.createPage')">
+            <el-button type="primary" size="small" :disabled="!selectedProject" @click="showCreatePageDialog = true" :aria-label="$t('uiAutomation.element.createPage')" :title="$t('uiAutomation.element.createPage')">
               <el-icon><Folder /></el-icon>
             </el-button>
-            <el-button type="success" size="small" @click="createEmptyElement" :title="$t('uiAutomation.element.addElement')">
+            <el-button type="success" size="small" :disabled="!selectedProject" @click="createEmptyElement" :aria-label="$t('uiAutomation.element.addElement')" :title="$t('uiAutomation.element.addElement')">
               <el-icon><Plus /></el-icon>
             </el-button>
           </div>
@@ -273,14 +281,15 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRoute } from 'vue-router'
+import { useUiProjectContext } from '@/composables/useUiProjectContext'
+import { normalizeUiId } from '@/utils/ui-project-context.mjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Plus, FolderAdd, Document, Search, Edit, Delete,
   Folder, Document as DocumentIcon, Operation, DocumentCopy, ArrowDown
 } from '@element-plus/icons-vue'
 import {
-  getUiProjects,
-  getElements,
   createElement,
   getElementDetail,
   updateElement,
@@ -301,9 +310,16 @@ const { t } = useI18n()
 let hideMenuTimeout = null
 let activeHideMenu = null
 
-// 响应式数据
-const projects = ref([])
-const selectedProject = ref('')
+const route = useRoute()
+const { projects, projectId: selectedProject, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
+const returnToCase = computed(() => {
+  const caseId = normalizeUiId(route.query.caseId)
+  if (!caseId || !selectedProject.value) return null
+  return { name: 'UiTestCases', query: { project: String(selectedProject.value), caseId: String(caseId) } }
+})
+let projectScope = 0
+let treeRequest = 0
+let pagesRequest = 0
 const pages = ref([])
 const locatorStrategies = ref([])
 const treeData = ref([])
@@ -478,45 +494,18 @@ const exposeToWindow = () => {
   }
 }
 
-// 组件挂载
-onMounted(async () => {
-  console.log('=== 组件挂载开始 ===')
-
-  await loadProjects()
-  await loadLocatorStrategies()
-
-  console.log('项目数量:', projects.value.length)
-  console.log('定位策略:', locatorStrategies.value.length)
-
-  if (projects.value.length > 0) {
-    console.log('设置初始项目为:', projects.value[0].id)
-    selectedProject.value = projects.value[0].id
-    await onProjectChange()
-    console.log('onProjectChange完成')
-  }
-
-  // 暴露调试信息
+onMounted(() => {
+  void loadLocatorStrategies()
   exposeToWindow()
-
-  console.log('=== 组件挂载完成 ===')
 })
 
 onBeforeUnmount(() => {
+  projectScope += 1
   if (hideMenuTimeout) clearTimeout(hideMenuTimeout)
   if (activeHideMenu) document.removeEventListener('click', activeHideMenu)
   hideMenuTimeout = null
   activeHideMenu = null
 })
-
-// 加载项目列表
-const loadProjects = async () => {
-  try {
-    const response = await getUiProjects()
-    projects.value = response.data?.results || response.data || []
-  } catch (error) {
-    console.error('获取项目列表失败:', error)
-  }
-}
 
 // 提供控制台调试帮助函数
 const debugTree = () => {
@@ -570,51 +559,37 @@ const loadLocatorStrategies = async () => {
 
 // 加载页面（分组）
 const loadPages = async () => {
-  if (!selectedProject.value) return
-
+  const project = selectedProject.value
+  const scope = projectScope
+  const request = ++pagesRequest
+  if (!project) return
   try {
-    const response = await getElementGroups({ project: selectedProject.value })
-    pages.value = response.data?.results || response.data || []
+    const response = await getElementGroups({ project })
+    if (scope === projectScope && request === pagesRequest && project === selectedProject.value) {
+      pages.value = response.data?.results || response.data || []
+    }
   } catch (error) {
     console.error('获取页面失败:', error)
   }
 }
 
-// 加载页面树结构
-const loadPageTree = async () => {
-  if (!selectedProject.value) return
-
-  try {
-    const response = await getElementGroupTree({ project: selectedProject.value })
-    // 构建完整的树形结构
-    const buildTree = (groups) => {
-      return groups.map(group => ({
-        ...group,
-        type: 'page',
-        children: group.children ? buildTree(group.children) : []
-      }))
-    }
-
-    treeData.value = buildTree(response.data || [])
-  } catch (error) {
-    console.error('获取页面树失败:', error)
-    treeData.value = []
-  }
-}
-
 // 加载元素树
 const loadElementTree = async () => {
-  if (!selectedProject.value) {
+  const project = selectedProject.value
+  const scope = projectScope
+  const request = ++treeRequest
+  const isCurrent = () => scope === projectScope && request === treeRequest && project === selectedProject.value
+  if (!project) {
     treeData.value = []
     return
   }
 
   try {
-    // 并行加载页面树和元素
     const [pageTreeResponse, elementsResponse] = await Promise.all([
-      getElementGroupTree({ project: selectedProject.value }),
-      getElementTree({ project: selectedProject.value })
+      getElementGroupTree({ project }),
+      getElementTree({ project })
     ])
+    if (!isCurrent()) return
 
     // 构建完整的树形结构
     const buildTree = (groups) => {
@@ -716,38 +691,27 @@ const loadElementTree = async () => {
       })))
     }
   } catch (error) {
-    console.error('获取元素树失败:', error)
-    treeData.value = []
+    if (isCurrent()) {
+      console.error('获取元素树失败:', error)
+      treeData.value = []
+    }
   }
 }
 
-// 项目切换
-const onProjectChange = async () => {
+watch(selectedProject, async project => {
+  const scope = ++projectScope
   selectedElement.value = null
+  treeData.value = []
+  pages.value = []
+  expandedKeys.value = []
   suggestions.value = []
-
-  console.log('=== 项目切换调试 ===')
-  console.log('当前项目ID:', selectedProject.value)
-
-  await Promise.all([
-    loadPages(),
-    loadElementTree()
-  ])
-
-  console.log('项目切换完成，检查treeData:', treeData.value)
-  console.log('treeData长度:', treeData.value.length)
-  if (treeData.value.length > 0) {
-    console.log('第一页信息:', {
-      id: treeData.value[0].id,
-      name: treeData.value[0].name,
-      type: treeData.value[0].type,
-      children: treeData.value[0].children?.length || 0
-    })
-  }
-
-  // 项目切换时强制刷新树
-  treeKey.value += 1
-}
+  showCreatePageDialog.value = false
+  showEditPageDialog.value = false
+  showContextMenu.value = false
+  if (!project) return
+  await Promise.all([loadPages(), loadElementTree()])
+  if (scope === projectScope && selectedProject.value === project) treeKey.value += 1
+}, { immediate: true })
 
 // 创建空元素
 const createEmptyElement = () => {
@@ -843,8 +807,10 @@ const createPage = async () => {
 // 节点点击
 const onNodeClick = async (data) => {
   if (data.type === 'element') {
+    const scope = projectScope
     try {
       const response = await getElementDetail(data.id)
+      if (scope !== projectScope) return
       selectedElement.value = response.data
 
       // 强制刷新表单，确保下拉框正确显示
@@ -1343,6 +1309,20 @@ const updatePage = async () => {
   height: 100vh;
   display: flex;
   flex-direction: column;
+}
+
+.element-setup-guide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 14px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-text-color-regular);
+}
+
+.element-setup-guide p {
+  margin: 0;
 }
 
 .element-layout {

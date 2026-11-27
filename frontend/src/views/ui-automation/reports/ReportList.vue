@@ -3,7 +3,7 @@
     <div class="header">
       <h3>{{ $t('uiAutomation.report.title') }}</h3>
       <div class="actions">
-        <el-select v-model="selectedProject" :placeholder="$t('uiAutomation.common.selectProject')" style="width: 200px; margin-right: 15px" @change="onProjectChange">
+        <el-select v-model="projectId" :aria-label="$t('uiAutomation.common.selectProject')" :placeholder="$t('uiAutomation.common.selectProject')" :loading="projectsLoading" :disabled="projectsLoading" style="width: 200px; margin-right: 15px">
           <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
         </el-select>
         <el-button type="primary" @click="refreshReports">
@@ -13,8 +13,48 @@
       </div>
     </div>
 
-    <div class="content">
-      <el-table :data="reports" v-loading="loading" style="width: 100%">
+    <el-alert
+      v-if="invalidProject || projectsError"
+      :title="invalidProject ? t('uiAutomation.workbenchResults.projectUnavailable') : t('uiAutomation.workbenchResults.projectLoadFailed')"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="project-alert"
+    >
+      <el-button link type="primary" :loading="projectsLoading" @click="reloadProjects">
+        {{ t('uiAutomation.workbenchResults.reloadProjects') }}
+      </el-button>
+    </el-alert>
+
+    <div v-if="hasExecutionLink" class="execution-link-state">
+      <el-alert v-if="exactDetailState === 'loading'" :title="t('uiAutomation.workbenchResults.loadingExecution')" type="info" show-icon :closable="false" />
+      <el-alert v-else-if="exactDetailState === 'invalid'" :title="t('uiAutomation.workbenchResults.invalidExecutionLink')" type="warning" show-icon :closable="false">
+        <el-button link type="primary" @click="returnToReportList">{{ t('uiAutomation.workbenchResults.backToReports') }}</el-button>
+      </el-alert>
+      <el-alert v-else-if="exactDetailState === 'notFound'" :title="t('uiAutomation.workbenchResults.executionNotFound')" type="warning" show-icon :closable="false">
+        <el-button link type="primary" @click="returnToReportList">{{ t('uiAutomation.workbenchResults.backToReports') }}</el-button>
+      </el-alert>
+      <el-alert v-else-if="exactDetailState === 'error'" :title="t('uiAutomation.workbenchResults.executionLoadFailed')" type="error" show-icon :closable="false">
+        <el-button link type="primary" @click="retryExactReport">{{ t('uiAutomation.workbenchResults.retry') }}</el-button>
+      </el-alert>
+      <el-alert v-else-if="exactDetailState === 'ready'" :title="t('uiAutomation.workbenchResults.runStatus', { id: currentReport?.id, status: getStatusText(currentReport?.status) })" :type="getStatusType(currentReport?.status)" show-icon :closable="false">
+        <div class="execution-link-actions">
+          <span v-if="trackingState === 'polling'">{{ t('uiAutomation.workbenchResults.trackingActive') }}</span>
+          <span v-else-if="trackingState === 'paused'">{{ t('uiAutomation.workbenchResults.trackingPaused') }}</span>
+          <span v-else-if="trackingState === 'timeout'">{{ t('uiAutomation.workbenchResults.trackingTimedOut') }}</span>
+          <el-button link type="primary" @click="openCurrentReport">{{ t('uiAutomation.workbenchResults.openReport') }}</el-button>
+          <el-button v-if="trackingState === 'paused' || trackingState === 'timeout'" link type="primary" @click="resumeTracking">
+            {{ t('uiAutomation.workbenchResults.resumeTracking') }}
+          </el-button>
+        </div>
+      </el-alert>
+    </div>
+
+    <div v-if="projectId" class="content">
+      <el-alert v-if="listError" :title="t('uiAutomation.report.messages.loadFailed')" type="error" :closable="false" show-icon>
+        <el-button link @click="loadReports">{{ t('uiAutomation.workbenchResults.retry') }}</el-button>
+      </el-alert>
+      <el-table v-else :data="reports" v-loading="loading" style="width: 100%">
         <el-table-column prop="id" label="ID" width="80" />
         <el-table-column prop="test_suite_name" :label="$t('uiAutomation.report.testSuite')" min-width="200" />
         <el-table-column prop="status" :label="$t('uiAutomation.common.status')" width="120">
@@ -91,15 +131,22 @@
         />
       </div>
     </div>
+    <el-empty v-else-if="!projectsLoading && !projectsError && !invalidProject && !hasExecutionLink" :description="$t(projects.length ? 'uiAutomation.common.selectProject' : 'uiAutomation.workbenchExecution.noProjects')" />
 
     <!-- 报告详情对话框 -->
     <el-dialog
       v-model="showDetailDialog"
       :title="$t('uiAutomation.report.reportDetail')"
-      width="80%"
+      width="min(1100px, calc(100vw - 32px))"
       :close-on-click-modal="false"
     >
       <div v-if="currentReport" class="report-detail">
+        <div v-if="trackingState !== 'idle'" class="tracking-notice">
+          <p role="status">{{ t(`uiAutomation.workbenchResults.${trackingLabel}`) }}</p>
+          <el-button v-if="isRunActive(currentReport.status) && trackingState !== 'polling'" link type="primary" @click="resumeTracking">
+            {{ t('uiAutomation.workbenchResults.resumeTracking') }}
+          </el-button>
+        </div>
         <el-descriptions :column="2" border>
           <el-descriptions-item :label="$t('uiAutomation.report.reportId')">{{ currentReport.id }}</el-descriptions-item>
           <el-descriptions-item :label="$t('uiAutomation.report.testSuite')">{{ currentReport.test_suite_name }}</el-descriptions-item>
@@ -116,6 +163,32 @@
           <el-descriptions-item :label="$t('uiAutomation.report.startTime')">{{ formatDate(currentReport.started_at) }}</el-descriptions-item>
           <el-descriptions-item :label="$t('uiAutomation.report.endTime')">{{ formatDate(currentReport.finished_at) }}</el-descriptions-item>
         </el-descriptions>
+
+        <div v-if="failureSummary" class="failure-summary">
+          <h4>{{ $t('uiAutomation.workbenchResults.failureSummary') }}</h4>
+          <el-descriptions :column="2" border>
+            <el-descriptions-item v-if="failureSummary.caseName" :label="$t('uiAutomation.workbenchResults.failedCase')">
+              {{ failureSummary.caseName }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="failureSummary.stage" :label="$t('uiAutomation.workbenchResults.failureStage')">
+              {{ failureSummary.stage }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="failureSummary.step" :label="$t('uiAutomation.workbenchResults.firstFailedStep')">
+              <span v-if="normalizeUiId(failureSummary.step.step_number)">{{ $t('uiAutomation.workbenchExecution.failedStep', { step: failureSummary.step.step_number }) }} · </span>
+              {{ failureSummary.step.description || getActionText(failureSummary.step.action_type) }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="failureSummary.error" :label="$t('uiAutomation.report.errorInfo')" :span="2">
+              <pre class="failure-error">{{ failureSummary.error }}</pre>
+            </el-descriptions-item>
+          </el-descriptions>
+          <div v-if="failureSummary.screenshotUrl && !failedScreenshot" class="failure-screenshot">
+            <img :src="failureSummary.screenshotUrl" :alt="$t('uiAutomation.workbenchResults.failureScreenshot')" @error="failedScreenshot = true" />
+          </div>
+          <p v-else>{{ $t(failedScreenshot ? 'uiAutomation.execution.imageLoadFailed' : 'uiAutomation.execution.noScreenshots') }}</p>
+          <el-button v-if="failureSummary.caseData" link type="primary" @click="viewCaseDetail(failureSummary.caseData)">
+            {{ $t('uiAutomation.workbenchResults.openFailedCase') }}
+          </el-button>
+        </div>
 
         <div class="statistics-section">
           <h4>{{ $t('uiAutomation.report.testStatistics') }}</h4>
@@ -211,8 +284,9 @@
     <el-dialog
       v-model="showCaseDetailDialog"
       :title="`${$t('uiAutomation.report.caseDetail')} - ${currentCase?.test_case_name || ''}`"
-      width="900px"
+      width="min(900px, calc(100vw - 32px))"
       :close-on-click-modal="false"
+      append-to-body
     >
       <div v-if="currentCase" class="case-detail">
         <!-- 用例执行成功 - 只显示执行日志 -->
@@ -291,139 +365,417 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Document, Delete, WarningFilled } from '@element-plus/icons-vue'
-import {
-  getUiProjects,
-  getTestExecutions,
-  deleteTestExecution
-} from '@/api/ui_automation'
+import { getTestExecutions, getTestExecutionDetail, deleteTestExecution } from '@/api/ui_automation'
+import { useUiProjectContext } from '@/composables/useUiProjectContext'
+import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
 
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const {
+  projects,
+  projectId,
+  projectsLoading,
+  projectsError,
+  invalidProject,
+  reloadProjects
+} = useUiProjectContext()
 
 const reports = ref([])
-const projects = ref([])
-const selectedProject = ref('')
 const loading = ref(false)
+const listError = ref(false)
 const total = ref(0)
-const pagination = reactive({
-  currentPage: 1,
-  pageSize: 20
-})
-
-// 详情对话框
+const pagination = reactive({ currentPage: 1, pageSize: 20 })
 const showDetailDialog = ref(false)
 const currentReport = ref(null)
-
-// 用例详情对话框
 const showCaseDetailDialog = ref(false)
 const currentCase = ref(null)
 const activeTab = ref('logs')
+const exactDetailState = ref('idle')
+const trackingState = ref('idle')
+const hasExecutionLink = computed(() => route.name === 'UiReports' && route.query.executionId !== undefined)
+const failureSummary = computed(() => buildFailureSummary(currentReport.value))
+const failedScreenshot = ref(false)
+const trackingLabel = computed(() => ({ polling: 'trackingActive', paused: 'trackingPaused', timeout: 'trackingTimedOut' }[trackingState.value]))
 
-// 加载项目列表
-const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    console.error('Failed to load projects:', error)
-    ElMessage.error(t('uiAutomation.report.messages.loadProjectsFailed'))
+let scopeVersion = 0
+let listRequestVersion = 0
+let exactRequestVersion = 0
+let pollGeneration = 0
+let pollTimer = null
+const pollIntervalMs = 3000
+const maxPolls = 40
+const maxConfirmedReports = 100
+let confirmedReportRevision = 0
+const confirmedReports = new Map()
+
+const isPositiveId = value => Boolean(normalizeUiId(value))
+
+const responseBody = (response) => response?.data?.data ?? response?.data ?? response
+const responseList = (response) => {
+  const body = responseBody(response)
+  if (Array.isArray(body)) return body
+  if (Array.isArray(body?.results)) return body.results
+  return null
+}
+const normalizeProjectId = (value) => value && typeof value === 'object' ? value.id : value
+const isRunActive = status => ['PENDING', 'RUNNING'].includes(status)
+const isUnavailable = error => [403, 404].includes(error.response?.status)
+const reportProgress = report => ({ PENDING: 0, RUNNING: 1, SUCCESS: 2, FAILED: 2, ABORTED: 2 }[report?.status] ?? -1)
+const reportKey = (project, id) => JSON.stringify([normalizeUiId(project), normalizeUiId(id)])
+
+const rememberConfirmedReport = (record, scopedProjectId) => {
+  const projectKey = normalizeUiId(scopedProjectId)
+  const reportId = normalizeUiId(record?.id)
+  if (!projectKey || !reportId || normalizeUiId(normalizeProjectId(record?.project)) !== projectKey) return
+  const key = reportKey(projectKey, reportId)
+  confirmedReports.delete(key)
+  confirmedReports.set(key, { report: { ...record }, revision: ++confirmedReportRevision })
+  // Keep only recent snapshots while this project is open.
+  if (confirmedReports.size > maxConfirmedReports) {
+    confirmedReports.delete(confirmedReports.keys().next().value)
   }
 }
 
-// 加载报告列表
+const mergeReportIntoRows = (rows, record, scopedProjectId, preferRecord = false) => {
+  const projectKey = normalizeUiId(scopedProjectId)
+  const reportId = normalizeUiId(record?.id)
+  if (!projectKey || !reportId || String(projectId.value) !== String(scopedProjectId)) return rows
+  if (normalizeUiId(normalizeProjectId(record?.project)) !== projectKey) return rows
+
+  return rows.map(row => {
+    if (normalizeUiId(row?.id) !== reportId) return row
+    const rowProject = normalizeUiId(normalizeProjectId(row.project))
+    if (rowProject && rowProject !== projectKey) return row
+    const rowProgress = reportProgress(row)
+    const recordProgress = reportProgress(record)
+    if (rowProgress > recordProgress) return row
+    if (recordProgress > rowProgress) return { ...row, ...record }
+
+    const bothTerminal = rowProgress === 2 && recordProgress === 2
+    const sameStatus = String(row.status).toUpperCase() === String(record.status).toUpperCase()
+    if (bothTerminal && !sameStatus) return preferRecord ? { ...row, ...record } : row
+    if (bothTerminal && !preferRecord) {
+      const merged = { ...record, ...row }
+      if (row.result_data == null && record.result_data != null) merged.result_data = record.result_data
+      if (row.error_message == null && record.error_message != null) merged.error_message = record.error_message
+      return merged
+    }
+    return preferRecord ? { ...row, ...record } : { ...record, ...row }
+  })
+}
+
+const applyExactReport = (record, scopedProjectId) => {
+  const previous = currentReport.value
+  const confirmed = confirmedReports.get(reportKey(scopedProjectId, record.id))?.report
+  if (normalizeUiId(previous?.id) === normalizeUiId(record.id) && reportProgress(previous) > reportProgress(record)) {
+    record = previous
+  }
+  if (confirmed && reportProgress(confirmed) > reportProgress(record)) record = confirmed
+  rememberConfirmedReport(record, scopedProjectId)
+  reports.value = mergeReportIntoRows(reports.value, record, scopedProjectId, true)
+  adoptAdvancedListReport(record, reports.value, scopedProjectId)
+}
+
+const adoptAdvancedListReport = (record, rows, scopedProjectId) => {
+  const reportId = normalizeUiId(record.id)
+  const row = rows.find(item => normalizeUiId(item.id) === reportId)
+  if (reportProgress(row) > reportProgress(record)) {
+    currentReport.value = { ...record, ...row }
+    rememberConfirmedReport(currentReport.value, scopedProjectId)
+  } else {
+    currentReport.value = record
+  }
+}
+
+const mergeCurrentExactReport = (rows, scopedProjectId, requestConfirmedRevision) => {
+  const projectKey = normalizeUiId(scopedProjectId)
+  const merged = rows.map(row => {
+    const key = reportKey(projectKey, row.id)
+    const entry = confirmedReports.get(key)
+    if (!entry) return row
+
+    const isStaleSnapshot = entry.revision > requestConfirmedRevision
+    const reconciled = mergeReportIntoRows([row], entry.report, scopedProjectId, isStaleSnapshot)[0]
+    const rowProgress = reportProgress(row)
+    const confirmedProgress = reportProgress(entry.report)
+    if (rowProgress > confirmedProgress || (!isStaleSnapshot && rowProgress === confirmedProgress)) {
+      rememberConfirmedReport(reconciled, scopedProjectId)
+    }
+    return reconciled
+  })
+
+  const executionId = route.name === 'UiReports' ? normalizeUiId(route.query.executionId) : ''
+  const current = currentReport.value
+  if (executionId && normalizeUiId(current?.id) === executionId && normalizeUiId(normalizeProjectId(current.project)) === projectKey) {
+    const entry = confirmedReports.get(reportKey(projectKey, executionId))
+    if (entry) {
+      currentReport.value = entry.report
+      if (isRunActive(current.status) && !isRunActive(entry.report.status)) stopTracking()
+    }
+  }
+  return merged
+}
+
+const stopTracking = () => {
+  pollGeneration += 1
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = null
+  trackingState.value = 'idle'
+}
+
+const clearExactReport = () => {
+  stopTracking()
+  exactRequestVersion += 1
+  exactDetailState.value = 'idle'
+  currentReport.value = null
+  showDetailDialog.value = false
+  showCaseDetailDialog.value = false
+}
+
 const loadReports = async () => {
+  const requestedProjectId = projectId.value
+  const currentScope = scopeVersion
+  const requestVersion = ++listRequestVersion
+  const requestConfirmedRevision = confirmedReportRevision
+  if (!isPositiveId(requestedProjectId)) {
+    reports.value = []
+    total.value = 0
+    loading.value = false
+    return
+  }
+
   loading.value = true
+  listError.value = false
   try {
-    const params = {
+    const response = await getTestExecutions({
+      project: requestedProjectId,
       page: pagination.currentPage,
       page_size: pagination.pageSize
-    }
+    })
+    const resultList = responseList(response)
+    if (currentScope !== scopeVersion || requestVersion !== listRequestVersion || String(projectId.value) !== String(requestedProjectId)) return
+    if (!resultList) throw new Error('Invalid execution list response')
 
-    if (selectedProject.value) {
-      params.project = selectedProject.value
-    }
-
-    const response = await getTestExecutions(params)
-
-    if (response.data.results) {
-      reports.value = response.data.results
-      total.value = response.data.count || 0
-    } else {
-      reports.value = response.data
-      total.value = response.data.length
-    }
-  } catch (error) {
-    console.error('Failed to load test reports:', error)
-    ElMessage.error(t('uiAutomation.report.messages.loadFailed'))
+    const scopedReports = resultList.filter(report => {
+      if (!report || typeof report !== 'object' || !isPositiveId(report.id)) return false
+      if (report.project === undefined || report.project === null) return true
+      return String(normalizeProjectId(report.project)) === String(requestedProjectId)
+    })
+    reports.value = mergeCurrentExactReport(scopedReports, requestedProjectId, requestConfirmedRevision)
+    const body = responseBody(response)
+    const count = body?.count
+    total.value = Number.isSafeInteger(Number(count)) && Number(count) >= 0 ? Number(count) : reports.value.length
+  } catch {
+    if (currentScope === scopeVersion && requestVersion === listRequestVersion) listError.value = true
   } finally {
-    loading.value = false
+    if (currentScope === scopeVersion && requestVersion === listRequestVersion) loading.value = false
   }
 }
 
-// 项目切换
-const onProjectChange = async () => {
-  pagination.currentPage = 1
-  await loadReports()
+const loadExactReport = async ({ preserveDialog = false, preserveKnown = false } = {}) => {
+  const requestedExecutionId = normalizeUiId(route.query.executionId)
+  const activeProjectId = projectId.value
+  const currentScope = scopeVersion
+  const requestVersion = ++exactRequestVersion
+  stopTracking()
+
+  if (!isPositiveId(activeProjectId)) return
+  if (!requestedExecutionId) {
+    exactDetailState.value = 'invalid'
+    currentReport.value = null
+    showDetailDialog.value = false
+    return
+  }
+
+  exactDetailState.value = 'loading'
+  if (!preserveKnown) currentReport.value = null
+  if (!preserveDialog) showDetailDialog.value = false
+  try {
+    const response = await getTestExecutionDetail(requestedExecutionId)
+    const record = responseBody(response)
+    const returnedProjectId = normalizeUiId(normalizeProjectId(record?.project))
+    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId) return
+    if (normalizeUiId(record?.id) !== requestedExecutionId || returnedProjectId !== activeProjectId) {
+      exactDetailState.value = 'notFound'
+      currentReport.value = null
+      showDetailDialog.value = false
+      return
+    }
+
+    exactDetailState.value = 'ready'
+    applyExactReport(record, activeProjectId)
+    if (!preserveDialog || showDetailDialog.value) showDetailDialog.value = true
+    if (isRunActive(currentReport.value.status)) startTracking()
+  } catch (error) {
+    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId) return
+    if (isUnavailable(error)) {
+      clearExactReport()
+      exactDetailState.value = 'notFound'
+    } else if (preserveKnown && currentReport.value) {
+      exactDetailState.value = 'ready'
+      trackingState.value = isRunActive(currentReport.value.status) ? 'paused' : 'idle'
+    } else {
+      exactDetailState.value = 'error'
+      currentReport.value = null
+      showDetailDialog.value = false
+    }
+  }
 }
 
-// 刷新报告
+const startTracking = (immediate = false) => {
+  stopTracking()
+  const record = currentReport.value
+  if (!record || !isRunActive(record.status)) return
+
+  const currentPollGeneration = ++pollGeneration
+  const currentScope = scopeVersion
+  const executionId = String(record.id)
+  const requestedProjectId = String(projectId.value)
+  const isCurrentPoll = () => currentPollGeneration === pollGeneration &&
+    currentScope === scopeVersion &&
+    String(projectId.value) === requestedProjectId &&
+    route.name === 'UiReports' &&
+    normalizeUiId(route.query.executionId) === normalizeUiId(executionId)
+  let attempts = 0
+  trackingState.value = 'polling'
+
+  const poll = async () => {
+    if (!isCurrentPoll()) return
+    try {
+      const response = await getTestExecutionDetail(executionId)
+      const updated = responseBody(response)
+      const returnedProjectId = normalizeProjectId(updated?.project)
+      if (!isCurrentPoll()) return
+      if (!updated || normalizeUiId(updated.id) !== normalizeUiId(executionId) || !isPositiveId(returnedProjectId) || String(returnedProjectId) !== requestedProjectId) {
+        stopTracking()
+        exactDetailState.value = 'notFound'
+        currentReport.value = null
+        showDetailDialog.value = false
+        return
+      }
+
+      exactDetailState.value = 'ready'
+      applyExactReport(updated, requestedProjectId)
+      attempts += 1
+      if (!isRunActive(currentReport.value.status)) {
+        trackingState.value = 'idle'
+        pollTimer = null
+        return
+      }
+      if (attempts >= maxPolls) {
+        trackingState.value = 'timeout'
+        pollTimer = null
+        return
+      }
+      pollTimer = setTimeout(poll, pollIntervalMs)
+    } catch (error) {
+      if (!isCurrentPoll()) return
+      if (isUnavailable(error)) {
+        clearExactReport()
+        exactDetailState.value = 'notFound'
+      } else {
+        trackingState.value = 'paused'
+        pollTimer = null
+      }
+    }
+  }
+
+  if (immediate) poll()
+  else pollTimer = setTimeout(poll, pollIntervalMs)
+}
+
+const retryExactReport = () => loadExactReport()
+const resumeTracking = () => startTracking(true)
+const openCurrentReport = () => {
+  if (currentReport.value) showDetailDialog.value = true
+}
+
+const returnToReportList = async () => {
+  const query = { ...route.query }
+  delete query.executionId
+  await router.replace({ name: 'UiReports', query })
+}
+
 const refreshReports = async () => {
-  await loadReports()
+  const exactId = route.query.executionId
+  await Promise.all([
+    loadReports(),
+    exactId ? loadExactReport({ preserveDialog: true, preserveKnown: true }) : Promise.resolve()
+  ])
   ElMessage.success(t('uiAutomation.report.messages.refreshed'))
 }
 
-// 分页处理
 const handleSizeChange = async () => {
   pagination.currentPage = 1
   await loadReports()
 }
+const handleCurrentChange = async () => loadReports()
 
-const handleCurrentChange = async () => {
-  await loadReports()
+const viewReportDetail = async (report) => {
+  if (!isPositiveId(projectId.value) || !isPositiveId(report?.id)) return
+  if (report.project !== undefined && report.project !== null && String(normalizeProjectId(report.project)) !== String(projectId.value)) return
+  await router.push(uiExecutionLocation('UiReports', projectId.value, report.id))
 }
 
-// 查看报告详情
-const viewReportDetail = (report) => {
-  currentReport.value = report
-  showDetailDialog.value = true
-}
-
-// 获取用例执行列表
 const getCaseExecutionList = (report) => {
-  if (!report || !report.result_data || !report.result_data.test_cases) {
-    return []
-  }
-  return report.result_data.test_cases
+  const testCases = report?.result_data?.test_cases
+  return Array.isArray(testCases) ? testCases.filter(testCase => testCase && typeof testCase === 'object') : []
 }
 
-// 查看用例详情
+const firstText = (...values) => {
+  const value = values.find(candidate => typeof candidate === 'string' && candidate.trim())
+  return value ? value.trim() : ''
+}
+
+const buildFailureSummary = (report) => {
+  if (!['FAILED', 'ABORTED'].includes(report?.status)) return null
+  const testCases = getCaseExecutionList(report)
+  const isFailure = item => item && (item.success === false || ['failed', 'error'].includes(String(item.status).toLowerCase()))
+  const failedCase = testCases.find(isFailure) || report.result_data?.failed_case || null
+  const steps = Array.isArray(failedCase?.steps) ? failedCase.steps : []
+  const failedStep = steps.find(isFailure)
+  const resultData = report.result_data || {}
+  const stage = firstText(failedCase?.failure_stage, failedCase?.failed_stage, failedCase?.stage, failedStep?.stage, resultData.failure_stage, report.failure_stage)
+  const error = firstText(failedCase?.error, failedCase?.error_message, failedStep?.error, resultData.error_message, report.error_message)
+  const screenshots = Array.isArray(failedCase?.screenshots) ? failedCase.screenshots : []
+  const getScreenshotUrl = item => typeof item === 'string' ? item : firstText(item?.url, item?.image_url, item?.src, item?.data)
+  const matched = failedStep?.step_number && screenshots.find(item => item?.step_number === failedStep.step_number && getScreenshotUrl(item))
+  const screenshotUrl = getScreenshotUrl(matched) || screenshots.map(getScreenshotUrl).find(Boolean) || getScreenshotUrl(failedCase?.screenshot || failedCase?.screenshot_url)
+  const caseName = firstText(failedCase?.test_case_name, failedCase?.name, resultData.failed_case_name, report.failed_case_name)
+  if (!failedCase && !failedStep && !stage && !error && !screenshotUrl) return null
+  return { caseData: failedCase, caseName, stage, step: failedStep, error, screenshotUrl }
+}
+
 const viewCaseDetail = (caseData) => {
+  if (!caseData || typeof caseData !== 'object') return
   currentCase.value = caseData
   activeTab.value = 'logs'
   showCaseDetailDialog.value = true
 }
 
-// 获取操作类型文本
 const getActionText = (actionType) => {
   const actionMap = {
-    'click': t('uiAutomation.actionTypes.click'),
-    'fill': t('uiAutomation.actionTypes.fill'),
-    'getText': t('uiAutomation.actionTypes.getText'),
-    'waitFor': t('uiAutomation.actionTypes.waitFor'),
-    'hover': t('uiAutomation.actionTypes.hover'),
-    'scroll': t('uiAutomation.actionTypes.scroll'),
-    'screenshot': t('uiAutomation.actionTypes.screenshot'),
-    'assert': t('uiAutomation.actionTypes.assert'),
-    'wait': t('uiAutomation.actionTypes.wait')
+    click: t('uiAutomation.actionTypes.click'),
+    fill: t('uiAutomation.actionTypes.fill'),
+    getText: t('uiAutomation.actionTypes.getText'),
+    waitFor: t('uiAutomation.actionTypes.waitFor'),
+    hover: t('uiAutomation.actionTypes.hover'),
+    scroll: t('uiAutomation.actionTypes.scroll'),
+    screenshot: t('uiAutomation.actionTypes.screenshot'),
+    assert: t('uiAutomation.actionTypes.assert'),
+    wait: t('uiAutomation.actionTypes.wait')
   }
-  return actionMap[actionType] || actionType
+  return actionMap[actionType] || actionType || t('uiAutomation.status.unknown')
 }
 
-// 删除报告
 const deleteReport = async (report) => {
+  const currentScope = scopeVersion
   try {
     await ElMessageBox.confirm(
       t('uiAutomation.report.messages.deleteConfirm', { name: report.test_suite_name }),
@@ -434,84 +786,82 @@ const deleteReport = async (report) => {
         type: 'warning'
       }
     )
+    if (currentScope !== scopeVersion || !isPositiveId(report?.id)) return
 
     await deleteTestExecution(report.id)
+    if (currentScope !== scopeVersion) return
+    confirmedReports.delete(reportKey(projectId.value, report.id))
     ElMessage.success(t('uiAutomation.report.messages.deleteSuccess'))
+    if (String(route.query.executionId) === String(report.id)) await returnToReportList()
     await loadReports()
   } catch (error) {
-    if (error !== 'cancel') {
+    if (error !== 'cancel' && currentScope === scopeVersion) {
       console.error('Failed to delete report:', error)
       ElMessage.error(t('uiAutomation.report.messages.deleteFailed'))
     }
   }
 }
 
-// 辅助方法
 const getStatusType = (status) => {
-  const typeMap = {
-    'PENDING': 'info',
-    'RUNNING': 'warning',
-    'SUCCESS': 'success',
-    'FAILED': 'danger',
-    'ABORTED': 'info'
-  }
-  return typeMap[status] || 'info'
+  const typeMap = { PENDING: 'info', RUNNING: 'warning', SUCCESS: 'success', FAILED: 'danger', ABORTED: 'info' }
+  return typeMap[String(status || '').toUpperCase()] || 'info'
 }
 
 const getStatusText = (status) => {
   const textMap = {
-    'PENDING': t('uiAutomation.report.statusPending'),
-    'RUNNING': t('uiAutomation.report.statusRunning'),
-    'SUCCESS': t('uiAutomation.report.statusSuccess'),
-    'FAILED': t('uiAutomation.report.statusFailed'),
-    'ABORTED': t('uiAutomation.report.statusAborted')
+    PENDING: t('uiAutomation.report.statusPending'),
+    RUNNING: t('uiAutomation.report.statusRunning'),
+    SUCCESS: t('uiAutomation.report.statusSuccess'),
+    FAILED: t('uiAutomation.report.statusFailed'),
+    ABORTED: t('uiAutomation.report.statusAborted')
   }
-  return textMap[status] || status
+  return textMap[String(status || '').toUpperCase()] || status || t('uiAutomation.status.unknown')
 }
 
-const getEngineText = (engine) => {
-  const engineMap = {
-    'playwright': 'Playwright',
-    'selenium': 'Selenium'
-  }
-  return engineMap[engine] || engine || 'Playwright'
-}
-
-const getBrowserText = (browser) => {
-  const browserMap = {
-    'chrome': 'Chrome',
-    'firefox': 'Firefox',
-    'safari': 'Safari',
-    'edge': 'Edge'
-  }
-  return browserMap[browser] || browser || 'Chrome'
-}
-
+const getEngineText = (engine) => ({ playwright: 'Playwright', selenium: 'Selenium' }[engine] || engine || 'Playwright')
+const getBrowserText = (browser) => ({ chrome: 'Chrome', firefox: 'Firefox', safari: 'Safari', edge: 'Edge' }[browser] || browser || 'Chrome')
 const getProgressColor = (percentage) => {
-  if (percentage >= 80) return '#67c23a'
-  if (percentage >= 60) return '#e6a23c'
+  const value = Number(percentage) || 0
+  if (value >= 80) return '#67c23a'
+  if (value >= 60) return '#e6a23c'
   return '#f56c6c'
 }
-
-const formatDate = (dateString) => {
-  if (!dateString) return '-'
-  return new Date(dateString).toLocaleString()
-}
-
+const formatDate = (dateString) => dateString ? new Date(dateString).toLocaleString() : '-'
 const formatDuration = (seconds) => {
-  if (!seconds) return `0${t('uiAutomation.report.seconds')}`
-  if (seconds < 60) return `${seconds.toFixed(1)}${t('uiAutomation.report.seconds')}`
-  const minutes = Math.floor(seconds / 60)
-  const secs = (seconds % 60).toFixed(0)
-  return `${minutes}${t('uiAutomation.report.minutes')}${secs}${t('uiAutomation.report.seconds')}`
+  const value = Number(seconds) || 0
+  if (value < 60) return `${value.toFixed(1)}${t('uiAutomation.report.seconds')}`
+  const minutes = Math.floor(value / 60)
+  const remainder = (value % 60).toFixed(0)
+  return `${minutes}${t('uiAutomation.report.minutes')}${remainder}${t('uiAutomation.report.seconds')}`
 }
 
-onMounted(async () => {
-  await loadProjects()
-  if (projects.value.length > 0) {
-    selectedProject.value = projects.value[0].id
-  }
-  await loadReports()
+watch(() => failureSummary.value?.screenshotUrl, () => { failedScreenshot.value = false })
+
+watch(projectId, nextProject => {
+  scopeVersion += 1
+  listRequestVersion += 1
+  confirmedReports.clear()
+  pagination.currentPage = 1
+  reports.value = []
+  total.value = 0
+  loading.value = false
+  listError.value = false
+  if (nextProject) void loadReports()
+}, { immediate: true })
+
+watch([projectId, hasExecutionLink, () => route.query.executionId, projectsLoading, invalidProject], ([project, hasLink]) => {
+  clearExactReport()
+  if (!hasLink) return
+  if (project) void loadExactReport()
+  else if (invalidProject.value || (!projectsLoading.value && !projectsError.value)) exactDetailState.value = 'invalid'
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  scopeVersion += 1
+  listRequestVersion += 1
+  exactRequestVersion += 1
+  confirmedReports.clear()
+  stopTracking()
 })
 </script>
 
@@ -545,6 +895,37 @@ onMounted(async () => {
   }
 }
 
+.execution-link-state {
+  margin: 0 0 16px;
+
+  .execution-link-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+}
+
+.tracking-notice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  color: var(--el-text-color-regular);
+  background: var(--el-color-info-light-9);
+  border-radius: 4px;
+
+  p {
+    margin: 0;
+  }
+}
+
+.project-alert {
+  margin: 0 0 16px;
+}
+
 .content {
   flex: 1;
   overflow: auto;
@@ -561,6 +942,41 @@ onMounted(async () => {
 
 // 报告详情样式
 .report-detail {
+  .failure-summary {
+    margin: 24px 0 8px;
+    padding: 16px;
+    border: 1px solid #f3b8b8;
+    border-left: 4px solid #f56c6c;
+    background: #fff8f8;
+
+    h4 {
+      margin: 0 0 14px;
+      color: #303133;
+    }
+
+    .failure-error {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .failure-screenshot {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+      margin-top: 14px;
+
+      img {
+        display: block;
+        max-width: min(100%, 720px);
+        max-height: 420px;
+        object-fit: contain;
+        border: 1px solid #dcdfe6;
+      }
+    }
+  }
+
   .statistics-section {
     margin-top: 30px;
 

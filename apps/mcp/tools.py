@@ -560,6 +560,7 @@ def get_ui_execution(ctx: Context, execution_id: int) -> dict:
     """
 
     def run(user):
+        from apps.ui_automation.execution_summary import public_case_diagnostics, public_execution_evidence
         from apps.ui_automation.models import TestCaseExecution
         execution = TestCaseExecution.objects.filter(
             id=execution_id, project__in=act.accessible_ui_projects(user)
@@ -571,7 +572,7 @@ def get_ui_execution(ctx: Context, execution_id: int) -> dict:
         # 历史文本日志或异常数据降级为 raw_logs 返回
         steps = []
         raw_logs = ''
-        logs = execution.execution_logs or ''
+        logs, error_message = public_case_diagnostics(execution.execution_logs, execution.error_message)
         if logs:
             try:
                 parsed = json.loads(logs)
@@ -590,16 +591,16 @@ def get_ui_execution(ctx: Context, execution_id: int) -> dict:
             'engine': execution.engine,
             'browser': execution.browser,
             'headless': execution.headless,
-            'error_message': execution.error_message or '',
+            'error_message': error_message or '',
             'steps': steps,
             'execution_time': execution.execution_time,
             'started_at': execution.started_at,
             'finished_at': execution.finished_at,
             # 截图只返回元数据，base64 原图体积过大不适合 MCP 通道传输
-            'screenshots': [
+            'screenshots': public_execution_evidence([
                 {k: v for k, v in shot.items() if k != 'url'}
                 for shot in (execution.screenshots or []) if isinstance(shot, dict)
-            ],
+            ]),
         }
         if raw_logs:
             result['raw_logs'] = raw_logs[:2000]

@@ -83,7 +83,7 @@
     </div>
     
     <!-- 创建项目对话框 -->
-    <el-dialog v-model="showCreateDialog" :title="$t('uiAutomation.project.createProject')" width="500px" :close-on-click-modal="false">
+    <el-dialog v-model="showCreateDialog" :title="$t('uiAutomation.project.createProject')" width="min(500px, calc(100vw - 32px))" :close-on-click-modal="false">
       <el-form ref="createFormRef" :model="createForm" :rules="formRules" label-width="80px">
         <el-form-item :label="$t('uiAutomation.project.projectName')" prop="name">
           <el-input v-model="createForm.name" :placeholder="$t('uiAutomation.project.rules.nameRequired')" />
@@ -124,7 +124,7 @@
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="showCreateDialog = false">{{ $t('uiAutomation.common.cancel') }}</el-button>
-          <el-button type="primary" @click="handleCreate">{{ $t('uiAutomation.common.confirm') }}</el-button>
+          <el-button type="primary" :loading="creatingProject" @click="handleCreate">{{ $t('uiAutomation.common.confirm') }}</el-button>
         </span>
       </template>
     </el-dialog>
@@ -208,13 +208,19 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { normalizeUiId } from '@/utils/ui-project-context.mjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search, View, Edit, Delete } from '@element-plus/icons-vue'
 import { getUiProjects, createUiProject, updateUiProject, deleteUiProject } from '@/api/ui_automation'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const creatingProject = ref(false)
+const guidedCreation = computed(() => route.query.setup === 'project')
 
 // 项目数据
 const projects = ref([])
@@ -438,9 +444,18 @@ const formatDateToISO = (date) => {
 
 // 处理创建项目
 const handleCreate = async () => {
-  const validate = await createFormRef.value.validate()
-  if (!validate) return
-  
+  if (creatingProject.value) return
+  creatingProject.value = true
+  try {
+    const validate = await createFormRef.value.validate()
+    if (!validate) return
+    await createProject()
+  } finally {
+    creatingProject.value = false
+  }
+}
+
+const createProject = async () => {
   try {
     const userStore = useUserStore()
     // 确保用户信息已加载
@@ -464,8 +479,13 @@ const handleCreate = async () => {
       end_date: formatDateToISO(createForm.end_date)
     }
     
-    await createUiProject(projectData)
+    const response = await createUiProject(projectData)
+    const projectId = normalizeUiId(response?.data?.id)
+    const continueSetup = guidedCreation.value && route.name === 'UiProjects'
     ElMessage.success(t('uiAutomation.project.messages.createSuccess'))
+    if (continueSetup && projectId) {
+      await router.replace({ name: 'UiTestCases', query: { project: String(projectId), setup: 'case' } })
+    }
     showCreateDialog.value = false
     
     // 重置表单
@@ -475,7 +495,7 @@ const handleCreate = async () => {
     createForm.status = 'IN_PROGRESS'
     urlProtocol.value = 'https://'
     
-    loadProjects()
+    if (!(continueSetup && projectId)) loadProjects()
   } catch (error) {
     ElMessage.error(error.response?.data?.base_url?.[0] || error.response?.data?.detail || '项目创建失败')
     console.error('创建项目失败:', error)
@@ -512,6 +532,17 @@ const handleEdit = async () => {
     console.error('更新项目失败:', error)
   }
 }
+
+watch(guidedCreation, guided => {
+  if (guided && route.name === 'UiProjects') showCreateDialog.value = true
+}, { immediate: true })
+
+watch(showCreateDialog, open => {
+  if (open || !guidedCreation.value || route.name !== 'UiProjects') return
+  const query = { ...route.query }
+  delete query.setup
+  void router.replace({ name: 'UiProjects', query, hash: route.hash })
+})
 
 // 组件挂载时加载数据
 onMounted(() => {

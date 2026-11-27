@@ -11,6 +11,10 @@ import version from './version.js'
 import requirementModule from './requirement.js'
 import apiTestingModule from './api-testing.js'
 import uiAutomationModule from './ui-automation.js'
+import workbenchDashboard from './ui-workbench-dashboard.js'
+import workbenchExecution from './ui-workbench-execution.js'
+import workbenchOnboarding from './ui-workbench-onboarding.js'
+import workbenchResults from './ui-workbench-results.js'
 import appAutomationModule from './app-automation.js'
 import configurationModule from './configuration.js'
 import assistantModule from './assistant.js'
@@ -63,7 +67,7 @@ export default {
   apiTesting: apiTestingModule,
 
   // UI自动化测试模块
-  uiAutomation: uiAutomationModule,
+  uiAutomation: { ...uiAutomationModule, workbenchDashboard, workbenchExecution, workbenchOnboarding, workbenchResults },
 
   // APP自动化测试模块
   appAutomation: appAutomationModule,
