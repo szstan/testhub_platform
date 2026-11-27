@@ -111,18 +111,20 @@
 
       <!-- ---------- 执行日志 ---------- -->
       <el-col :span="14">
-        <el-card shadow="never" class="log-card">
-          <template #header>
-            <div class="card-head">
-              <span>{{ t('performanceTesting.monitor.logTitle') }}</span>
-              <el-button link :icon="Refresh" @click="fetchLog">
-                {{ t('performanceTesting.common.refresh') }}
-              </el-button>
-            </div>
-          </template>
-          <pre v-if="runLog" ref="logRef" class="log-pre">{{ runLog }}</pre>
-          <el-empty v-else :description="t('performanceTesting.monitor.logEmpty')" :image-size="60" />
-        </el-card>
+        <section id="execution-log" ref="logPanel" aria-labelledby="execution-log-title" tabindex="-1">
+          <el-card shadow="never" class="log-card">
+            <template #header>
+              <div class="card-head">
+                <span id="execution-log-title">{{ t('performanceTesting.monitor.logTitle') }}</span>
+                <el-button link :icon="Refresh" @click="fetchLog">
+                  {{ t('performanceTesting.common.refresh') }}
+                </el-button>
+              </div>
+            </template>
+            <pre v-if="runLog" ref="logRef" class="log-pre">{{ runLog }}</pre>
+            <el-empty v-else :description="t('performanceTesting.monitor.logEmpty')" :image-size="60" />
+          </el-card>
+        </section>
       </el-col>
     </el-row>
 
@@ -186,6 +188,7 @@ const abortNotice = ref('')
 const slaThresholds = ref({})
 const chartRef = ref(null)
 const logRef = ref(null)
+const logPanel = ref(null)
 
 // 'ws' | 'polling' | 'closed'
 const channel = ref('polling')
@@ -300,6 +303,17 @@ async function fetchExecution() {
   return res.data
 }
 
+async function replayHistory() {
+  try {
+    const { data } = await getPerfRealtime(executionId, -1)
+    if (unmounted) return
+    const samples = data.samples || []
+    samples.forEach(pushSample)
+  } catch {
+    if (!unmounted) ElMessage.warning(t('performanceTesting.monitor.historyLoadFailed'))
+  }
+}
+
 async function fetchSlaThresholds(scenarioId) {
   if (!scenarioId) return
   try {
@@ -337,7 +351,7 @@ function pushSample(sample) {
   if (sample.ts_offset != null) lastTs = Math.max(lastTs, sample.ts_offset)
   latest.value = { ...latest.value, ...sample }
   chartRef.value?.push(sample)
-  if (plannedDuration.value > 0 && sample.ts_offset != null) {
+  if (isActive.value && plannedDuration.value > 0 && sample.ts_offset != null) {
     progress.value = Math.min(100, (sample.ts_offset / plannedDuration.value) * 100)
   }
 }
@@ -532,19 +546,20 @@ onMounted(async () => {
   loading.value = true
   try {
     const data = await fetchExecution()
+    if (unmounted) return
     if (!ACTIVE_STATUSES.includes(data.status)) {
-      // 已结束：只做一次历史回放，不建实时通道
+      // 已结束：日志独立于历史曲线和接口统计加载，不建实时通道。
       finished = true
       channel.value = 'closed'
-      const { data: replay } = await getPerfRealtime(executionId, -1)
-      ;(replay.samples || []).forEach(pushSample)
       progress.value = 100
-      await Promise.all([fetchLog(), fetchRequestStats()])
+      void replayHistory()
+      void fetchRequestStats()
+      await fetchLog()
       return
     }
     // 先把已有采样点补齐，避免中途进来只看到后半段曲线
-    const { data: history } = await getPerfRealtime(executionId, -1)
-    ;(history.samples || []).forEach(pushSample)
+    await replayHistory()
+    if (unmounted) return
     fetchSlaThresholds(data.scenario)
 
     let wsOk = false
@@ -561,6 +576,11 @@ onMounted(async () => {
     logTimer = setInterval(fetchLog, 8000)
   } finally {
     loading.value = false
+    if (route.hash === '#execution-log') {
+      await nextTick()
+      logPanel.value?.scrollIntoView({ block: 'start' })
+      logPanel.value?.focus({ preventScroll: true })
+    }
   }
 })
 
@@ -629,6 +649,7 @@ onBeforeUnmount(() => {
 .card-head { display: flex; align-items: center; justify-content: space-between; }
 .card-tip { font-size: 12px; color: #c0c4cc; font-weight: 400; }
 
+#execution-log { scroll-margin-top: 16px; }
 .sla-card, .log-card { height: 320px; :deep(.el-card__body) { padding: 8px 12px; overflow: auto; height: 250px; } }
 .ok { color: #52c41a; }
 .bad { color: #f5222d; }

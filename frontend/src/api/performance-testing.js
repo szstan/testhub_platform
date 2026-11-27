@@ -127,8 +127,8 @@ export function createPerfComparisonReport(data) {
 export function deletePerfComparisonReport(id) {
   return request({ url: `/perf-testing/comparison-reports/${id}/`, method: 'delete' })
 }
-export function getPerfDashboard(params) {
-  return request({ url: '/perf-testing/executions/dashboard/', method: 'get', params })
+export function getPerfDashboard(params, signal) {
+  return request({ url: '/perf-testing/executions/dashboard/', method: 'get', params, signal })
 }
 export function reapStalePerfExecutions() {
   return request({ url: '/perf-testing/executions/reap-stale/', method: 'post' })

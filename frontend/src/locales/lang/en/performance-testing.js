@@ -141,23 +141,33 @@ export default {
 
   // ---------- Dashboard ----------
   dashboard: {
-    title: 'Performance Testing - Dashboard',
-    subtitle: 'Execution overview and trends',
+    title: 'Performance Testing Dashboard',
+    dateRange: 'Date range',
+    timeZone: 'Time zone {zone}',
     range7: 'Last 7 days',
     range30: 'Last 30 days',
     range90: 'Last 90 days',
     scenarioTotal: 'Scenarios',
+    scenarioScope: 'All scenarios in the selected projects',
     executionTotal: 'Executions',
     slaPassRate: 'SLA pass rate',
+    slaCoverage: '{evaluated} of {total} ended runs evaluated',
     avgTps: 'Average TPS',
-    runningNow: 'Running now',
+    tpsScope: 'Completed runs with TPS data',
+    runningNow: 'In progress now',
+    activeScope: 'Includes queued, preparing and stopping runs',
     trendTitle: 'Execution trend',
     trendEmpty: 'No executions in the selected range',
     slaDistTitle: 'SLA result distribution',
+    slaEmpty: 'No ended runs in the selected range',
     slowestTitle: 'Top 5 slowest APIs (P95)',
-    slowestEmpty: 'No per-request statistics yet',
+    slowestSource: 'Latest ended run with request statistics',
+    slowestEmpty: 'No request statistics in the selected range',
+    p95WithUnit: 'P95 (ms)',
     recentTitle: 'Recent executions',
-    viewAll: 'View all'
+    viewAll: 'View all executions',
+    projectsFailed: 'Could not load projects. Refresh to retry.',
+    loadFailed: 'Could not load the dashboard'
   },
 
   // ---------- Projects ----------
@@ -418,6 +428,7 @@ export default {
     peak: 'Peak',
     chartTitle: 'Live chart',
     chartTip: 'Only the latest 300 samples are kept',
+    historyLoadFailed: 'Could not load historical samples',
     stepDetailTitle: 'Per-step live stats',
     logTitle: 'Execution log',
     logEmpty: 'No log output yet',

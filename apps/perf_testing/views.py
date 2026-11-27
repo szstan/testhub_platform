@@ -10,13 +10,16 @@ import csv
 import io
 import json
 import logging
+import math
 import os
 import shutil
-from datetime import timedelta
+from collections import Counter
+from datetime import datetime, time, timedelta
 
 from django.conf import settings
 from django.db import models as db_models
 from django.db import transaction
+from django.db.models.functions import TruncDate
 from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -906,32 +909,133 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
 
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
-        """压测总览：近 30 天概况 + 当前运行中列表。"""
-        since = timezone.now() - timedelta(days=30)
-        qs = scope_by_project(
-            PerfExecution.objects.filter(created_at__gte=since), request.user, 'project')
+        """压测总览：按应用时区统计日历区间，并单独返回当前活跃执行。"""
+        raw_days = request.query_params.get('days', '30')
+        if raw_days not in {'7', '30', '90'}:
+            return Response(
+                {'error': 'days 只支持 7、30 或 90'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        days = int(raw_days)
         project_id = request.query_params.get('project')
+        project_ids = accessible_projects(request.user).order_by().values('pk')
+
+        now = timezone.now()
+        current_tz = timezone.get_current_timezone()
+        today = timezone.localtime(now, current_tz).date()
+        first_day = today - timedelta(days=days - 1)
+        window_start = timezone.make_aware(
+            datetime.combine(first_day, time.min), current_tz)
+
+        executions = PerfExecution.objects.filter(
+            project_id__in=project_ids,
+            created_at__gte=window_start,
+            created_at__lte=now,
+        )
+        scenarios = PerfScenario.objects.filter(project_id__in=project_ids)
         if project_id:
-            qs = qs.filter(project_id=project_id)
+            executions = executions.filter(project_id=project_id)
+            scenarios = scenarios.filter(project_id=project_id)
 
-        finished = qs.filter(status__in=PerfExecution.FINAL_STATUSES)
-        evaluated = finished.exclude(sla_result='NOT_EVALUATED')
-        passed = evaluated.filter(sla_result='PASSED').count()
+        status_counts = {
+            row['status']: row['count']
+            for row in executions.values('status').annotate(count=db_models.Count('pk'))
+        }
+        terminal = executions.filter(status__in=PerfExecution.FINAL_STATUSES)
+        sla_counts = {'PASSED': 0, 'FAILED': 0, 'NOT_EVALUATED': 0}
+        for row in terminal.values('sla_result').annotate(count=db_models.Count('pk')):
+            if row['sla_result'] in sla_counts:
+                sla_counts[row['sla_result']] = row['count']
 
-        running = scope_by_project(
-            PerfExecution.objects.filter(status__in=PerfExecution.ACTIVE_STATUSES),
-            request.user, 'project').select_related('scenario')
+        evaluated_sla_count = sla_counts['PASSED'] + sla_counts['FAILED']
+        sla_pass_rate = (
+            round(sla_counts['PASSED'] / evaluated_sla_count * 100, 1)
+            if evaluated_sla_count else None
+        )
+
+        tps_count = 0
+        avg_tps_value = 0.0
+        completed_summaries = executions.filter(status='COMPLETED').order_by().values_list(
+            'summary', flat=True)
+        for summary in completed_summaries.iterator(chunk_size=200):
+            tps = summary.get('tps') if isinstance(summary, dict) else None
+            if isinstance(tps, (int, float)) and not isinstance(tps, bool):
+                try:
+                    value = float(tps)
+                except (OverflowError, TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value >= 0:
+                    tps_count += 1
+                    avg_tps_value += (value - avg_tps_value) / tps_count
+        avg_tps = round(avg_tps_value, 2) if tps_count else None
+
+        daily_counts = {
+            row['local_date']: row['count']
+            for row in executions.order_by().annotate(
+                local_date=TruncDate('created_at', tzinfo=current_tz)
+            ).values('local_date').annotate(count=db_models.Count('pk'))
+        }
+        if None in daily_counts:
+            # MySQL returns NULL for named timezone conversions without timezone data.
+            timestamps = executions.order_by().values_list('created_at', flat=True)
+            daily_counts = Counter(
+                timezone.localdate(created_at, current_tz)
+                for created_at in timestamps.iterator(chunk_size=2000)
+            )
+        calendar_dates = (first_day + timedelta(days=offset) for offset in range(days))
+        daily_executions = [
+            {'date': day.isoformat(), 'count': daily_counts.get(day, 0)}
+            for day in calendar_dates
+        ]
+
+        running = PerfExecution.objects.filter(
+            project_id__in=project_ids,
+            status__in=PerfExecution.ACTIVE_STATUSES,
+        )
         if project_id:
             running = running.filter(project_id=project_id)
+        running = running.select_related(
+            'scenario', 'project', 'executed_by', 'scheduled_task'
+        ).order_by('-created_at', '-pk')
 
-        recent = qs.order_by('-created_at')[:10]
+        recent = executions.select_related(
+            'scenario', 'project', 'executed_by', 'scheduled_task'
+        ).order_by('-created_at', '-pk')[:10]
+
+        slow_execution = terminal.filter(
+            pk__in=PerfRequestStat.objects.filter(p95_rt__gt=0).values('execution_id')
+        ).select_related('scenario').order_by('-created_at', '-pk').first()
+        slowest = None
+        if slow_execution:
+            slow_items = list(
+                PerfRequestStat.objects.filter(
+                    execution=slow_execution, p95_rt__gt=0
+                ).order_by('-p95_rt', 'step_name', 'method', 'pk').values(
+                    'step_name', 'p95_rt', 'method'
+                )[:5]
+            )
+            slowest = {
+                'execution': {
+                    'id': slow_execution.id,
+                    'execution_no': slow_execution.execution_no,
+                    'scenario_name': slow_execution.scenario.name,
+                    'created_at': slow_execution.created_at,
+                },
+                'items': slow_items,
+            }
+
         return Response({
-            'total_executions': qs.count(),
-            'completed': finished.filter(status='COMPLETED').count(),
-            'failed': finished.filter(status__in=['FAILED', 'TIMEOUT']).count(),
+            'total_executions': sum(status_counts.values()),
+            'completed': status_counts.get('COMPLETED', 0),
+            'failed': status_counts.get('FAILED', 0) + status_counts.get('TIMEOUT', 0),
             'running_count': running.count(),
-            'sla_pass_rate': round(passed / evaluated.count() * 100, 1)
-            if evaluated.count() else 0,
+            'sla_pass_rate': sla_pass_rate,
+            'sla_counts': sla_counts,
+            'total_scenarios': scenarios.count(),
+            'avg_tps': avg_tps,
+            'time_zone': timezone.get_current_timezone_name(),
+            'daily_executions': daily_executions,
+            'slowest': slowest,
             'running': PerfExecutionListSerializer(running, many=True).data,
             'recent': PerfExecutionListSerializer(recent, many=True).data,
         })

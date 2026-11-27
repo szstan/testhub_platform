@@ -37,6 +37,17 @@
       </div>
     </div>
 
+    <div v-if="execution.error_message || ['FAILED', 'TIMEOUT', 'STOPPED'].includes(execution.status)" class="report-diagnostics">
+      <el-alert
+        v-if="execution.error_message"
+        :title="execution.error_message"
+        type="error"
+        :closable="false"
+        show-icon
+      />
+      <router-link :to="runLogRoute">{{ t('performanceTesting.monitor.logTitle') }}</router-link>
+    </div>
+
     <el-tabs v-model="activeTab" class="report-tabs" @tab-change="onTabChange">
       <!-- ================= 概览 ================= -->
       <el-tab-pane :label="t('performanceTesting.report.tabOverview')" name="overview">
@@ -399,13 +410,14 @@ const router = useRouter()
 const { t } = useI18n()
 
 const executionId = Number(route.params.id)
+const runLogRoute = { name: 'PerfExecutionMonitor', params: { id: executionId }, hash: '#execution-log' }
 const loading = ref(false)
 const regenerating = ref(false)
 const activeTab = ref('overview')
 
 const execution = reactive({
   execution_no: '', scenario_name: '', status: '', sla_result: '', summary: {},
-  sla_detail: [], load_snapshot: {}, steps_snapshot: [], report_url: '',
+  sla_detail: [], load_snapshot: {}, steps_snapshot: [], report_url: '', error_message: '',
   has_raw_detail: false, executed_by: null,
   verdict: 'NOT_EVALUATED', verdict_details: []
 })
@@ -754,7 +766,7 @@ async function loadAll() {
     } catch (e) {
       baseline.value = { has_baseline: false }
     }
-    if (!execution.report_url && !['PENDING', 'PREPARING', 'RUNNING', 'STOPPING'].includes(execution.status)) {
+    if (!execution.report_url && !execution.error_message && !['PENDING', 'PREPARING', 'RUNNING', 'STOPPING'].includes(execution.status)) {
       ElMessage.info(t('performanceTesting.report.notReady'))
     }
   } catch (e) {
@@ -904,6 +916,16 @@ onBeforeUnmount(() => {
   .head-right { display: flex; gap: 8px; }
   .exec-no { font-weight: 600; color: #303133; font-family: Menlo, Consolas, monospace; }
   .scenario-name { color: #909399; font-size: 13px; }
+}
+
+.report-diagnostics {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  margin-bottom: 12px;
+
+  a { color: var(--el-color-primary); }
+  :deep(.el-alert__title) { white-space: pre-wrap; overflow-wrap: anywhere; }
 }
 
 .report-tabs {
