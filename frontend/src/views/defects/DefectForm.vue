@@ -8,8 +8,12 @@
       </el-button>
     </div>
 
+    <el-alert v-if="detailLoadFailed" class="detail-error" title="加载缺陷详情失败" type="error" :closable="false" show-icon>
+      <el-button type="primary" link @click="loadDefect">重试</el-button>
+    </el-alert>
+
     <div class="card-container">
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
+      <el-form ref="formRef" :model="form" :rules="rules" :disabled="!canSave || submitting" label-width="110px">
         <el-row :gutter="16">
           <el-col :xs="24" :md="16">
             <el-form-item label="缺陷标题" prop="title">
@@ -160,17 +164,17 @@
           </div>
         </el-form-item>
 
-        <div class="form-actions">
-          <el-button @click="router.back()">取消</el-button>
-          <el-button type="primary" :loading="submitting" @click="submitForm">保存</el-button>
-        </div>
       </el-form>
+      <div class="form-actions">
+        <el-button @click="router.back()">取消</el-button>
+        <el-button type="primary" :loading="submitting" :disabled="!canSave" @click="submitForm">保存</el-button>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Back, Upload } from '@element-plus/icons-vue'
@@ -191,6 +195,10 @@ const projects = ref([])
 const versions = ref([])
 const users = ref([])
 const isEdit = computed(() => Boolean(route.params.id))
+const openedDefect = ref(null)
+const detailLoadFailed = ref(false)
+const canSave = computed(() => !isEdit.value || openedDefect.value?.id === route.params.id)
+let detailRequest = 0
 
 const pendingFiles = ref([])
 const existingAttachments = ref([])
@@ -200,7 +208,7 @@ const allowedAttachmentExtensions = ['.txt', '.log', '.pdf', '.png', '.jpg', '.j
 
 const nullableFields = ['project_id', 'version_id', 'assignee_id', 'due_at']
 
-const form = reactive({
+const defaultForm = {
   title: '',
   description: '',
   reproduce_steps: '',
@@ -215,7 +223,8 @@ const form = reactive({
   source: 'manual',
   assignee_id: '',
   due_at: ''
-})
+}
+const form = reactive({ ...defaultForm })
 
 const rules = {
   title: [{ required: true, message: '请输入缺陷标题', trigger: 'blur' }],
@@ -238,16 +247,14 @@ const fetchProjects = async () => {
 }
 
 const fetchVersions = async (projectId = form.project_id) => {
-  if (!projectId) {
-    versions.value = []
-    return
-  }
+  versions.value = []
+  if (!projectId) return
 
   try {
     const response = await api.get(`/versions/projects/${projectId}/versions/`)
-    versions.value = normalizeList(response.data)
-  } catch (error) {
-    versions.value = []
+    if (projectId === form.project_id) versions.value = normalizeList(response.data)
+  } catch {
+    if (projectId === form.project_id) versions.value = []
   }
 }
 
@@ -266,11 +273,21 @@ const handleProjectChange = async () => {
 }
 
 const loadDefect = async () => {
-  if (!isEdit.value) return
+  const defectId = route.params.id
+  const request = ++detailRequest
+  openedDefect.value = null
+  detailLoadFailed.value = false
+  existingAttachments.value = []
+  pendingFiles.value = []
+  versions.value = []
+  Object.assign(form, defaultForm)
+  if (!defectId) return
 
   try {
-    const response = await getDefect(route.params.id)
-    const data = response.data || {}
+    const { data } = await getDefect(defectId)
+    if (request !== detailRequest || defectId !== route.params.id) return
+    if (String(data?.id) !== String(defectId)) throw new Error('Invalid defect detail response')
+
     form.title = data.title || ''
     form.description = data.description || ''
     form.reproduce_steps = data.reproduce_steps || ''
@@ -286,9 +303,10 @@ const loadDefect = async () => {
     form.assignee_id = data.assignee?.id || ''
     form.due_at = data.due_at || ''
     existingAttachments.value = data.attachments || []
-    await fetchVersions(data.project?.id || '')
-  } catch (error) {
-    ElMessage.error('加载缺陷详情失败')
+    openedDefect.value = { id: defectId, values: buildPayload() }
+    await fetchVersions()
+  } catch {
+    if (request === detailRequest && defectId === route.params.id) detailLoadFailed.value = true
   }
 }
 
@@ -296,7 +314,7 @@ const buildPayload = () => {
   const payload = { ...form }
 
   nullableFields.forEach((field) => {
-    if (payload[field] === '') {
+    if (payload[field] === '' || payload[field] === undefined) {
       payload[field] = null
     }
   })
@@ -396,25 +414,41 @@ const extractErrorMessage = (errorData) => {
 }
 
 const submitForm = async () => {
-  if (!formRef.value) return
+  if (!formRef.value || !canSave.value || submitting.value) return
 
+  const defectId = route.params.id
+  submitting.value = true
   try {
-    await formRef.value.validate()
-    submitting.value = true
     const payload = buildPayload()
+    let savedId = defectId
 
-    if (isEdit.value) {
-      await updateDefect(route.params.id, payload)
-      ElMessage.success('缺陷已更新')
-      await uploadPendingAttachments(route.params.id)
-      router.push(`/defects/${route.params.id}`)
+    if (defectId) {
+      const openedValues = openedDefect.value.values
+      const changes = Object.fromEntries(
+        Object.entries(payload).filter(([field, value]) => value !== openedValues[field])
+      )
+      if ('project_id' in changes) {
+        // A move replaces the version selection along with the project.
+        changes.version_id = payload.version_id
+      }
+      if (Object.keys(changes).length) {
+        await formRef.value.validate()
+        if (route.params.id !== defectId) return
+        await updateDefect(defectId, changes)
+        if (route.params.id !== defectId) return
+        openedDefect.value = { id: defectId, values: payload }
+        ElMessage.success('缺陷已更新')
+      }
     } else {
+      await formRef.value.validate()
+      if (route.params.id !== defectId) return
       const response = await createDefect(payload)
-      const defectId = response.data?.id
+      savedId = response.data?.id
       ElMessage.success('缺陷已创建')
-      await uploadPendingAttachments(defectId)
-      router.push(`/defects/${defectId || 'list'}`)
     }
+
+    await uploadPendingAttachments(savedId)
+    if (route.params.id === defectId) router.push(`/defects/${savedId || 'list'}`)
   } catch (error) {
     if (error?.response) {
       const message = extractErrorMessage(error.response.data) || '保存缺陷失败'
@@ -425,13 +459,15 @@ const submitForm = async () => {
   }
 }
 
-onMounted(async () => {
-  await Promise.all([fetchProjects(), fetchUsers()])
-  await loadDefect()
-})
+watch(() => route.params.id, loadDefect)
+onMounted(() => Promise.all([fetchProjects(), fetchUsers(), loadDefect()]))
 </script>
 
 <style lang="scss" scoped>
+.detail-error {
+  margin-bottom: 16px;
+}
+
 .full-width {
   width: 100%;
 }

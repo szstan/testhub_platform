@@ -27,7 +27,7 @@ class TestCaseSimpleSerializer(serializers.ModelSerializer):
 
 
 class DefectTransitionSerializer(serializers.ModelSerializer):
-    operator = UserSimpleSerializer(read_only=True)
+    operator = UserSimpleSerializer(read_only=True, allow_null=True)
     target_user = UserSimpleSerializer(read_only=True)
 
     class Meta:
@@ -158,11 +158,18 @@ class DefectWriteSerializer(serializers.ModelSerializer):
         if related_testcase and related_testcase.project_id != project.id:
             raise serializers.ValidationError({'related_testcase_id': '测试用例不属于所选项目'})
 
-        attrs['project'] = project
-        attrs['version'] = version
-        attrs['assignee'] = self._get_related_value(attrs, 'assignee_id', User, 'assignee')
-        attrs['verifier'] = self._get_related_value(attrs, 'verifier_id', User, 'verifier')
-        attrs['related_testcase'] = related_testcase
+        relations = (
+            ('project_id', 'project', project),
+            ('version_id', 'version', version),
+            ('related_testcase_id', 'related_testcase', related_testcase),
+        )
+        for input_field, model_field, value in relations:
+            if self.instance is None or input_field in attrs:
+                attrs[model_field] = value
+
+        for input_field, model_field in (('assignee_id', 'assignee'), ('verifier_id', 'verifier')):
+            if self.instance is None or input_field in attrs:
+                attrs[model_field] = self._get_related_value(attrs, input_field, User, model_field)
         return attrs
 
     def create(self, validated_data):
@@ -171,7 +178,13 @@ class DefectWriteSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         self._drop_write_only_fields(validated_data)
-        return super().update(instance, validated_data)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        fields = [*validated_data, 'updated_at']
+        if not instance.code:
+            fields.append('code')
+        instance.save(update_fields=fields)
+        return instance
 
     def _get_project(self, project_id):
         try:

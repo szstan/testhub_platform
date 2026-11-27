@@ -1,9 +1,10 @@
 import csv
 import os
+from collections import Counter
 from datetime import timedelta
 
 from django.db import models, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Exists, OuterRef, Q
 from django.db.models.functions import TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
@@ -14,6 +15,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from rest_framework import filters, parsers, permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
@@ -98,6 +100,7 @@ class DefectViewSet(viewsets.ModelViewSet):
         'reopened': {'assigned', 'in_progress', 'resolved', 'rejected'},
         'closed': {'reopened'},
     }
+    LEGACY_CLOSE_COMMENT = '重开时补录历史关闭时间。原关闭人及关闭前状态未知，操作人为补录人。'
     # 目标状态 -> 用户操作名称（用于友好提示）
     STATUS_ACTION_LABELS = {
         'assigned': '指派',
@@ -259,9 +262,21 @@ class DefectViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(DefectDetailSerializer(serializer.instance).data, status=status.HTTP_201_CREATED, headers=headers)
 
+    def get_locked_defect(self):
+        # Lock the defect row before using its project, assignee or status for a write.
+        scope = self.filter_queryset(self.get_queryset()).order_by().values('pk')
+        pk = self.kwargs[self.lookup_url_kwarg or self.lookup_field]
+        try:
+            defect = Defect.objects.select_for_update().get(pk=pk, pk__in=scope)
+        except (Defect.DoesNotExist, TypeError, ValueError) as exc:
+            raise NotFound({'error': '缺陷不存在'}) from exc
+        self.check_object_permissions(self.request, defect)
+        return defect
+
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
-        instance = self.get_object()
+        instance = self.get_locked_defect()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         access_error = self.ensure_project_access(serializer.validated_data.get('project', instance.project))
@@ -273,16 +288,19 @@ class DefectViewSet(viewsets.ModelViewSet):
         serializer.save()
         return Response(DefectDetailSerializer(instance).data)
 
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
+        instance = self.get_locked_defect()
         role_error = self.ensure_project_role(instance.project, {'owner', 'admin'})
         if role_error:
             return role_error
-        return super().destroy(request, *args, **kwargs)
+        self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def assign(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'tester'}, self_roles=self.ACTION_SELF_ROLES['assign'])
         if role_error:
             return role_error
@@ -299,8 +317,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def resolve(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'developer'}, self_roles=self.ACTION_SELF_ROLES['resolve'])
         if role_error:
             return role_error
@@ -315,8 +334,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'], url_path='start-progress')
+    @transaction.atomic
     def start_progress(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'developer'}, self_roles=self.ACTION_SELF_ROLES['start_progress'])
         if role_error:
             return role_error
@@ -330,8 +350,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def verify(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'tester'}, self_roles=self.ACTION_SELF_ROLES['verify'])
         if role_error:
             return role_error
@@ -345,8 +366,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def reject(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'developer'}, self_roles=self.ACTION_SELF_ROLES['reject'])
         if role_error:
             return role_error
@@ -360,8 +382,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def reopen(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'tester', 'developer'}, self_roles=self.ACTION_SELF_ROLES['reopen'])
         if role_error:
             return role_error
@@ -376,8 +399,9 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def close(self, request, pk=None):
-        defect = self.get_object()
+        defect = self.get_locked_defect()
         role_error = self.ensure_defect_action_permission(defect, {'owner', 'admin', 'tester'}, self_roles=self.ACTION_SELF_ROLES['close'])
         if role_error:
             return role_error
@@ -387,7 +411,6 @@ class DefectViewSet(viewsets.ModelViewSet):
             defect,
             'closed',
             serializer.validated_data.get('comment', ''),
-            closed_at=timezone.now(),
         )
 
     @action(detail=True, methods=['post'], url_path='comments')
@@ -427,22 +450,25 @@ class DefectViewSet(viewsets.ModelViewSet):
         return Response(DefectAttachmentSerializer(attachment).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['post'], url_path='bulk-action')
+    @transaction.atomic
     def bulk_action(self, request):
         serializer = DefectBulkActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        defects = list(self.get_queryset().filter(id__in=data['defect_ids']))
-        defect_map = {defect.id: defect for defect in defects}
+        defect_ids = data['defect_ids']
+        scope = self.get_queryset().filter(pk__in=defect_ids).order_by().values('pk')
+        # Acquire locks in primary-key order, while keeping the requested response order.
+        defects = Defect.objects.select_for_update().filter(pk__in=scope).order_by('pk')
+        defect_map = {defect.pk: defect for defect in defects}
         results = []
 
-        with transaction.atomic():
-            for defect_id in data['defect_ids']:
-                defect = defect_map.get(defect_id)
-                if not defect:
-                    results.append({'id': defect_id, 'success': False, 'error': '缺陷不存在或无权访问'})
-                    continue
-                result = self.apply_bulk_action(defect, data)
-                results.append({'id': defect_id, **result})
+        for defect_id in defect_ids:
+            defect = defect_map.get(defect_id)
+            if not defect:
+                results.append({'id': defect_id, 'success': False, 'error': '缺陷不存在或无权访问'})
+                continue
+            result = self.apply_bulk_action(defect, data)
+            results.append({'id': defect_id, **result})
 
         return Response({'results': results})
 
@@ -481,7 +507,7 @@ class DefectViewSet(viewsets.ModelViewSet):
             'status_distribution': self.count_by(queryset, 'status'),
             'severity_distribution': self.count_by(queryset, 'severity'),
             'priority_distribution': self.count_by(queryset, 'priority'),
-            'version_distribution': self.count_by(queryset, 'version__name'),
+            'version_distribution': self.count_by_version(queryset),
             'module_distribution': self.count_by(queryset, 'module'),
             'assignee_distribution': self.count_by(queryset, 'assignee__username'),
         })
@@ -490,17 +516,39 @@ class DefectViewSet(viewsets.ModelViewSet):
     def trend(self, request):
         queryset = self.get_queryset()
         days = int(request.query_params.get('days', 7))
-        start_date = timezone.localdate() - timedelta(days=days - 1)
-        created_data = self.count_by_date(queryset.filter(created_at__date__gte=start_date), 'created_at')
-        closed_data = self.count_by_date(queryset.filter(closed_at__date__gte=start_date), 'closed_at')
+        end_date = timezone.localdate()
+        start_date = end_date - timedelta(days=days - 1)
+        date_range = (start_date, end_date)
+        created_rows = self.group_counts_by_date(
+            queryset.filter(created_at__date__range=date_range),
+            'created_at',
+        )
+        created_data = {row['day']: row['count'] for row in created_rows}
+
+        closing_transitions = self.get_closing_transitions()
+        history = closing_transitions.filter(
+            defect_id__in=queryset.order_by().values('pk'),
+            created_at__date__range=date_range,
+        )
+        legacy = queryset.filter(closed_at__date__range=date_range).filter(
+            ~Exists(closing_transitions.filter(defect_id=OuterRef('pk'))),
+        )
+        # 同一次查询读取流转和旧记录，避免补录时两次查询读到不同状态。
+        closed_rows = self.group_counts_by_date(history, 'created_at').union(
+            self.group_counts_by_date(legacy, 'closed_at'), all=True,
+        )
+        closed_data = {}
+        for row in closed_rows:
+            day = row['day']
+            closed_data[day] = closed_data.get(day, 0) + row['count']
+
         result = []
         for index in range(days):
             day = start_date + timedelta(days=index)
-            key = day.strftime('%Y-%m-%d')
             result.append({
-                'date': key,
-                'created': created_data.get(key, 0),
-                'closed': closed_data.get(key, 0),
+                'date': day.isoformat(),
+                'created': created_data.get(day, 0),
+                'closed': closed_data.get(day, 0),
             })
         return Response(result)
 
@@ -550,17 +598,43 @@ class DefectViewSet(viewsets.ModelViewSet):
         pdf.save()
         return response
 
+    def get_closing_transitions(self):
+        return DefectTransition.objects.filter(to_status='closed').exclude(from_status='closed')
+
     def transition_defect(self, defect, to_status, comment='', **updates):
+        """Write the state and its history for a defect locked by the caller."""
         from_status = defect.status
         if not self.is_transition_allowed(from_status, to_status):
             return Response(
                 {'error': self.get_transition_error(from_status, to_status)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        if from_status == to_status == 'closed':
+            return Response(DefectDetailSerializer(defect).data)
+
+        if to_status == 'reopened' and from_status == 'closed' and defect.closed_at:
+            if not self.get_closing_transitions().filter(defect=defect).exists():
+                DefectTransition.objects.create(
+                    defect=defect,
+                    from_status='',
+                    to_status='closed',
+                    operator=self.request.user,
+                    comment=self.LEGACY_CLOSE_COMMENT,
+                    created_at=defect.closed_at,
+                )
+
+        transition_at = timezone.now()
+        if to_status == 'closed':
+            updates['closed_at'] = transition_at
         for field_name, value in updates.items():
             setattr(defect, field_name, value)
         defect.status = to_status
-        defect.save()
+        fields = ['status', 'updated_at', *updates]
+        if not defect.code:
+            fields.append('code')
+        defect.save(update_fields=fields)
+
         DefectTransition.objects.create(
             defect=defect,
             from_status=from_status,
@@ -568,6 +642,7 @@ class DefectViewSet(viewsets.ModelViewSet):
             operator=self.request.user,
             target_user=updates.get('assignee'),
             comment=comment,
+            created_at=transition_at,
         )
         return Response(DefectDetailSerializer(defect).data)
 
@@ -632,7 +707,7 @@ class DefectViewSet(viewsets.ModelViewSet):
             defect.save(update_fields=['version', 'updated_at'])
             return {'success': True, 'status': defect.status}
         elif action_name == 'close':
-            response = self.transition_defect(defect, 'closed', comment, closed_at=timezone.now())
+            response = self.transition_defect(defect, 'closed', comment)
         elif action_name == 'reopen':
             response = self.transition_defect(defect, 'reopened', comment, resolved_at=None, closed_at=None)
         else:
@@ -656,13 +731,38 @@ class DefectViewSet(viewsets.ModelViewSet):
             queryset.values(field_name).annotate(count=Count('id')).order_by(field_name)
         )
 
-    def count_by_date(self, queryset, field_name):
-        data = queryset.annotate(day=TruncDate(field_name)).values('day').annotate(count=Count('id'))
-        return {
-            item['day'].strftime('%Y-%m-%d'): item['count']
-            for item in data
-            if item['day']
-        }
+    def count_by_version(self, queryset):
+        rows = (
+            queryset.values('version_id', 'version__name', 'project__name')
+            .annotate(count=Count('id'))
+            .order_by('version__name', 'version_id', 'project__name')
+        )
+        versions = {}
+        project_names = {}
+        for row in rows:
+            version_id = row['version_id']
+            version = versions.setdefault(version_id, {
+                'version_id': version_id,
+                'version__name': row['version__name'],
+                'count': 0,
+            })
+            version['count'] += row['count']
+            if version_id is not None:
+                project_names.setdefault(version_id, []).append(row['project__name'])
+
+        name_counts = Counter(version['version__name'] for version in versions.values())
+        for version_id, version in versions.items():
+            name = version['version__name']
+            if version_id is not None and name_counts[name] > 1:
+                projects = '、'.join(project_names[version_id])
+                version['label'] = f'{name}（{projects} · #{version_id}）'
+        return list(versions.values())
+
+    def group_counts_by_date(self, queryset, field_name):
+        return (
+            queryset.order_by().annotate(day=TruncDate(field_name))
+            .values('day').annotate(count=Count('id'))
+        )
 
     def register_pdf_font(self):
         font_name = 'DefectPdfFont'

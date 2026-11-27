@@ -167,7 +167,10 @@ const rowsFromDistribution = (data, options) => {
   return rows
     .map(item => {
       const key = item.key ?? item.status ?? item.severity ?? item.priority ?? item.version__name ?? item.module ?? item.assignee__username ?? item.name
-      const rawLabel = item.version__name ?? item.module ?? item.assignee__username ?? item.name ?? key
+      const hasVersionIdentity = item.version__name !== undefined || item.version_id !== undefined
+      const rawLabel = hasVersionIdentity
+        ? firstDefined(item.label, item.version__name, item.key)
+        : item.module ?? item.assignee__username ?? item.name ?? key
       return {
         key,
         label: options ? getOptionLabel(options, key) : (rawLabel || '未设置'),
@@ -189,7 +192,9 @@ const priorityRows = computed(() => rowsFromDistribution(
   summary.value.priority_distribution || summary.value.by_priority || summary.value.priority_counts,
   priorityOptions
 ))
-const versionRows = computed(() => rowsFromDistribution(summary.value.version_distribution, null).slice(0, 8))
+const versionRows = computed(() => rowsFromDistribution(summary.value.version_distribution, null)
+  .sort((left, right) => right.value - left.value)
+  .slice(0, 8))
 const moduleRows = computed(() => rowsFromDistribution(summary.value.module_distribution, null).slice(0, 8))
 const assigneeRows = computed(() => rowsFromDistribution(summary.value.assignee_distribution, null).slice(0, 8))
 

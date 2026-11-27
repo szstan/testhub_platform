@@ -37,6 +37,7 @@ apps/*/migrations/*
 
 # Additive execution/device/report migrations are part of the reviewable change.
 !apps/users/migrations/0003_userphonewritelock.py
+!apps/defects/migrations/0003_preserve_transition_operator_history.py
 !apps/executions/migrations/
 !apps/executions/migrations/*.py
 !apps/api_testing/migrations/
