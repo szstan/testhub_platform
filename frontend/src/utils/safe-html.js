@@ -4,6 +4,7 @@ const ALLOWED_TAGS = new Set([
   'A', 'BLOCKQUOTE', 'BR', 'CODE', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
   'LI', 'OL', 'P', 'PRE', 'STRONG', 'UL'
 ])
+const TABLE_TAGS = new Set(['TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD'])
 const ALLOWED_ATTRIBUTES = new Set(['href', 'title', 'target', 'rel', 'class'])
 
 function isSafeUrl(value) {
@@ -17,7 +18,7 @@ function isSafeUrl(value) {
   }
 }
 
-export function sanitizeHtml(html) {
+export function sanitizeHtml(html, { allowTables = false } = {}) {
   const rawHtml = String(html || '')
   const template = document.createElement('template')
   if (!template || !template.content || typeof template.content.querySelectorAll !== 'function') {
@@ -27,7 +28,7 @@ export function sanitizeHtml(html) {
 
   const elements = template.content.querySelectorAll('*')
   for (const element of Array.from(elements)) {
-    if (!ALLOWED_TAGS.has(element.tagName)) {
+    if (!ALLOWED_TAGS.has(element.tagName) && !(allowTables && TABLE_TAGS.has(element.tagName))) {
       element.replaceWith(document.createTextNode(element.textContent || ''))
       continue
     }
@@ -51,11 +52,11 @@ export function sanitizeHtml(html) {
   return template.innerHTML
 }
 
-export function renderSafeMarkdown(markdown) {
+export function renderSafeMarkdown(markdown, options = {}) {
   return sanitizeHtml(marked.parse(String(markdown || ''), {
     headerIds: false,
     mangle: false,
-  }))
+  }), options)
 }
 
 export function escapeHtml(value) {

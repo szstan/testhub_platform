@@ -1,345 +1,168 @@
 <template>
   <div class="requirement-analysis">
-    <div class="page-header">
-      <h1>{{ $t('requirementAnalysis.title') }}</h1>
-      <p>{{ $t('requirementAnalysis.subtitle') }}</p>
-    </div>
+    <header class="page-header">
+      <div>
+        <h1>{{ $t('requirementAnalysis.title') }}</h1>
+        <p>{{ $t('requirementAnalysis.workspaceSubtitle') }}</p>
+      </div>
+      <button class="button secondary" type="button" @click="openRecords">
+        {{ $t('requirementAnalysis.generationHistory') }}
+      </button>
+    </header>
 
-    <div v-if="generationError" class="generation-error" role="alert">
+    <div v-if="generationError" class="notice error" role="alert">
       <strong>{{ $t('requirementAnalysis.generateFailed') }}</strong>
       <p>{{ generationError }}</p>
     </div>
-
-    <!-- 配置引导弹出窗口 -->
-    <div v-if="showConfigGuide && !checkingConfig" class="modal-overlay" @click.self="showConfigGuide = false" :key="modalKey">
-      <div class="guide-config-modal">
-      <div class="guide-header">
-        <svg class="guide-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-          <path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372z" fill="#f59e0b"/>
-          <path d="M464 336a48 48 0 1 0 96 0 48 48 0 1 0-96 0zm72 112h-48c-4.4 0-8 3.6-8 8v272c0 4.4 3.6 8 8 8h48c4.4 0 8-3.6 8-8V456c0-4.4-3.6-8-8-8z" fill="#f59e0b"/>
-        </svg>
-        <div class="guide-title">
-          <h2>{{ $t('configGuide.title') }}</h2>
-          <p>{{ $t('configGuide.subtitle') }}</p>
-        </div>
-      </div>
-
-      <div class="config-groups">
-        <!-- 模型配置行 -->
-        <div class="config-group">
-          <div class="group-label">{{ $t('configGuide.modelConfig') }}</div>
-          <div class="config-items-row">
-            <div class="config-item-inline" :class="getConfigItemClass('writer_model')">
-              <span class="status-symbol" v-html="getStatusSymbol('writer_model')"></span>
-              <span class="config-label">{{ $t('configGuide.caseWriter') }}</span>
-              <span class="config-name" v-if="configStatus.writer_model.name">{{ configStatus.writer_model.name }}</span>
-              <span class="status-text" v-if="!configStatus.writer_model.configured">{{ $t('configGuide.unconfigured') }}</span>
-              <span class="status-text warning" v-else-if="!configStatus.writer_model.enabled">{{ $t('configGuide.disabled') }}</span>
-            </div>
-
-            <div class="config-item-inline" :class="getConfigItemClass('reviewer_model')">
-              <span class="status-symbol" v-html="getStatusSymbol('reviewer_model')"></span>
-              <span class="config-label">{{ $t('configGuide.caseReviewer') }}</span>
-              <span class="config-name" v-if="configStatus.reviewer_model.name">{{ configStatus.reviewer_model.name }}</span>
-              <span class="status-text" v-if="!configStatus.reviewer_model.configured">{{ $t('configGuide.unconfigured') }}</span>
-              <span class="status-text warning" v-else-if="!configStatus.reviewer_model.enabled">{{ $t('configGuide.disabled') }}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- 提示词配置行 -->
-        <div class="config-group">
-          <div class="group-label">{{ $t('configGuide.promptConfig') }}</div>
-          <div class="config-items-row">
-            <div class="config-item-inline" :class="getConfigItemClass('writer_prompt')">
-              <span class="status-symbol" v-html="getStatusSymbol('writer_prompt')"></span>
-              <span class="config-label">{{ $t('configGuide.caseWriter') }}</span>
-              <span class="config-name" v-if="configStatus.writer_prompt.name">{{ configStatus.writer_prompt.name }}</span>
-              <span class="status-text" v-if="!configStatus.writer_prompt.configured">{{ $t('configGuide.unconfigured') }}</span>
-              <span class="status-text warning" v-else-if="!configStatus.writer_prompt.enabled">{{ $t('configGuide.disabled') }}</span>
-            </div>
-
-            <div class="config-item-inline" :class="getConfigItemClass('reviewer_prompt')">
-              <span class="status-symbol" v-html="getStatusSymbol('reviewer_prompt')"></span>
-              <span class="config-label">{{ $t('configGuide.caseReviewer') }}</span>
-              <span class="config-name" v-if="configStatus.reviewer_prompt.name">{{ configStatus.reviewer_prompt.name }}</span>
-              <span class="status-text" v-if="!configStatus.reviewer_prompt.configured">{{ $t('configGuide.unconfigured') }}</span>
-              <span class="status-text warning" v-else-if="!configStatus.reviewer_prompt.enabled">{{ $t('configGuide.disabled') }}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- 生成行为配置行 -->
-        <div class="config-group">
-          <div class="group-label">{{ $t('configGuide.generationConfig') }}</div>
-          <div class="config-items-row">
-            <div class="config-item-inline" :class="getConfigItemClass('generation_config')">
-              <span class="status-symbol" v-html="getStatusSymbol('generation_config')"></span>
-              <span class="config-label">{{ $t('configGuide.generationSettings') }}</span>
-              <span class="config-name" v-if="configStatus.generation_config && configStatus.generation_config.name">{{ configStatus.generation_config.name }}</span>
-              <span class="status-text" v-if="!configStatus.generation_config || !configStatus.generation_config.configured">{{ $t('configGuide.unconfigured') }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-        <div class="guide-actions">
-          <button class="generate-manual-btn" @click="goToConfig">
-            {{ $t('configGuide.goToConfig') }}
-          </button>
-          <div class="skip-action" @click="showConfigGuide = false">
-            {{ $t('configGuide.configureLater') }}
-          </div>
-        </div>
-      </div>
+    <div v-if="monitoringError" class="notice warning" role="status">
+      <p>{{ monitoringError }}</p>
+      <button class="text-button" type="button" @click="retryMonitoring">{{ $t('requirementAnalysis.retryConnection') }}</button>
     </div>
 
-    <!-- 输出模式选择器 - 全局设置 -->
-    <div class="output-mode-section" v-if="!isGenerating && !showResults">
-      <div class="output-mode-card">
-        <h3>{{ $t('requirementAnalysis.outputModeTitle') }}</h3>
-        <p class="mode-section-desc">{{ $t('requirementAnalysis.outputModeDesc') }}</p>
-        <div class="output-mode-selector">
-          <label class="mode-option" :class="{ active: globalOutputMode === 'stream' }">
-            <input type="radio" v-model="globalOutputMode" value="stream">
-            <div class="mode-content">
-              <div class="mode-title">{{ $t('requirementAnalysis.realtimeStream') }}</div>
-              <div class="mode-desc">{{ $t('requirementAnalysis.realtimeStreamDesc') }}</div>
-            </div>
-          </label>
-          <label class="mode-option" :class="{ active: globalOutputMode === 'complete' }">
-            <input type="radio" v-model="globalOutputMode" value="complete">
-            <div class="mode-content">
-              <div class="mode-title">{{ $t('requirementAnalysis.completeOutput') }}</div>
-              <div class="mode-desc">{{ $t('requirementAnalysis.completeOutputDesc') }}</div>
-            </div>
-          </label>
+    <div v-if="isRestoring" class="empty-state" role="status">{{ $t('requirementAnalysis.restoringTask') }}</div>
+
+    <div v-else-if="!currentTaskId && !isGenerating" class="workspace-grid">
+      <section class="panel input-panel">
+        <div class="section-heading">
+          <span class="section-number">1</span>
+          <div><h2>{{ $t('requirementAnalysis.prepareRequirement') }}</h2><p>{{ $t('requirementAnalysis.inputHint') }}</p></div>
         </div>
-      </div>
-    </div>
-
-    <div class="main-content">
-      <!-- 手动输入需求描述区域 -->
-      <div class="manual-input-section" v-if="!isGenerating && !showResults">
-        <div class="manual-input-card">
-          <h2>{{ $t('requirementAnalysis.manualInputTitle') }}</h2>
-          <div class="input-form">
+        <form @submit.prevent="submitGeneration">
+          <fieldset :disabled="isSubmitting">
             <div class="form-group">
-              <label>{{ $t('requirementAnalysis.requirementTitle') }} <span class="required">*</span></label>
-              <input
-                v-model="manualInput.title"
-                type="text"
-                class="form-input"
-                :placeholder="$t('requirementAnalysis.titlePlaceholder')">
-            </div>
-
-            <div class="form-group">
-              <label>{{ $t('requirementAnalysis.requirementDescription') }} <span class="required">*</span></label>
-              <textarea
-                v-model="manualInput.description"
-                class="form-textarea"
-                rows="8"
-                :placeholder="$t('requirementAnalysis.descriptionPlaceholder')"></textarea>
-              <div class="char-count">{{ manualInput.description.length }}/2000</div>
-            </div>
-
-            <div class="form-group">
-              <label>{{ $t('requirementAnalysis.associatedProject') }}</label>
-              <select v-model="manualInput.selectedProject" class="form-select">
-                <option value="">{{ $t('requirementAnalysis.selectProject') }}</option>
-                <option v-for="project in projects" :key="project.id" :value="project.id">
-                  {{ project.name }}
-                </option>
+              <label for="generation-project">{{ $t('requirementAnalysis.associatedProject') }} <span class="required">*</span></label>
+              <select id="generation-project" v-model="selectedProject" :disabled="loadingProjects" required>
+                <option value="">{{ $t(loadingProjects ? 'requirementAnalysis.loadingProjects' : 'requirementAnalysis.selectProject') }}</option>
+                <option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option>
               </select>
-            </div>
-
-            <button
-              class="generate-manual-btn"
-              @click="generateFromManualInput"
-              :disabled="!canGenerateManual || isGenerating">
-              <span v-if="isGenerating">{{ $t('requirementAnalysis.generating') }}</span>
-              <span v-else>{{ $t('requirementAnalysis.generateButton') }}</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 分隔线 -->
-      <div class="divider" v-if="!isGenerating && !showResults">
-        <span>{{ $t('requirementAnalysis.dividerOr') }}</span>
-      </div>
-
-      <!-- 文档上传区域 -->
-      <div class="upload-section" v-if="!isGenerating && !showResults">
-        <div class="upload-card">
-          <h2>{{ $t('requirementAnalysis.uploadTitle') }}</h2>
-          <div class="upload-area"
-               @dragover.prevent
-               @drop="handleDrop"
-               :class="{ 'drag-over': isDragOver }"
-               @dragenter="isDragOver = true"
-               @dragleave="isDragOver = false">
-            <div v-if="!selectedFile" class="upload-placeholder">
-              <i class="upload-icon">📁</i>
-              <p>{{ $t('requirementAnalysis.dragDropText') }}</p>
-              <p class="upload-hint">{{ $t('requirementAnalysis.supportedFormats') }}</p>
-              <input
-                type="file"
-                ref="fileInput"
-                @change="handleFileSelect"
-                accept=".pdf,.doc,.docx,.txt,.md"
-                style="display: none;">
-              <button class="select-file-btn" @click="$refs.fileInput.click()">
-                {{ $t('requirementAnalysis.selectFile') }}
-              </button>
-            </div>
-
-            <div v-else class="file-selected">
-              <div class="file-info">
-                <i class="file-icon">📄</i>
-                <div class="file-details">
-                  <p class="file-name">{{ selectedFile.name }}</p>
-                  <p class="file-size">{{ formatFileSize(selectedFile.size) }}</p>
-                </div>
-                <button class="remove-file" @click="removeFile">❌</button>
+              <div v-if="projectsError" class="field-error" role="alert">
+                {{ projectsError }} <button type="button" class="text-button" @click="loadProjects">{{ $t('requirementAnalysis.retryLoad') }}</button>
               </div>
-            </div>
-          </div>
-
-          <div v-if="selectedFile" class="document-info">
-            <div class="form-group">
-              <label>{{ $t('requirementAnalysis.documentTitle') }}</label>
-              <input
-                v-model="documentTitle"
-                type="text"
-                class="form-input"
-                :placeholder="$t('requirementAnalysis.documentPlaceholder')">
+              <p v-else-if="!loadingProjects && !projects.length" class="field-hint">{{ $t('requirementAnalysis.noProjects') }}</p>
+              <p v-else class="field-hint">{{ $t('requirementAnalysis.projectHint') }}</p>
             </div>
 
             <div class="form-group">
-              <label>{{ $t('requirementAnalysis.associatedProject') }}</label>
-              <select v-model="selectedProject" class="form-select">
-                <option value="">{{ $t('requirementAnalysis.selectProject') }}</option>
-                <option v-for="project in projects" :key="project.id" :value="project.id">
-                  {{ project.name }}
-                </option>
-              </select>
+              <label for="generation-title">{{ $t('requirementAnalysis.requirementTitle') }} <span class="required">*</span></label>
+              <input id="generation-title" v-model="manualInput.title" maxlength="200" required :placeholder="$t('requirementAnalysis.titlePlaceholder')">
             </div>
 
-            <button
-              class="generate-btn"
-              @click="generateFromDocument"
-              :disabled="!documentTitle || !selectedProject || isGenerating">
-              <span v-if="isGenerating">{{ $t('requirementAnalysis.generating') }}</span>
-              <span v-else>{{ $t('requirementAnalysis.generateButton') }}</span>
-            </button>
-          </div>
-        </div>
-      </div>
+            <div class="source-selector" role="group" :aria-label="$t('requirementAnalysis.inputSource')">
+              <button type="button" :class="{ selected: inputSource === 'manual' }" :aria-pressed="inputSource === 'manual'" @click="inputSource = 'manual'">{{ $t('requirementAnalysis.textInput') }}</button>
+              <button type="button" :class="{ selected: inputSource === 'document' }" :aria-pressed="inputSource === 'document'" @click="inputSource = 'document'">{{ $t('requirementAnalysis.documentInput') }}</button>
+            </div>
 
-      <!-- 生成进度和结果 -->
-      <div v-if="isGenerating || showResults" class="generation-progress">
-        <div class="progress-card">
-          <h3>
-            {{ $t('requirementAnalysis.aiGeneratingTitle') }}
-            <span class="current-mode-badge">
-              ({{ globalOutputMode === 'stream' ? $t('requirementAnalysis.realtimeStream') : $t('requirementAnalysis.completeOutput') }})
-            </span>
-          </h3>
-          <div class="progress-info">
-            <div class="progress-item">
-              <span class="label">{{ $t('requirementAnalysis.taskId') }}</span>
-              <span class="value">{{ currentTaskId || $t('requirementAnalysis.preparing') }}</span>
+            <div v-if="inputSource === 'manual'" class="form-group">
+              <label for="generation-description">{{ $t('requirementAnalysis.requirementDescription') }} <span class="required">*</span></label>
+              <textarea id="generation-description" v-model="manualInput.description" :maxlength="maxInputLength" rows="12" required :placeholder="$t('requirementAnalysis.detailedPlaceholder')" />
+              <div class="input-meta"><span>{{ $t('requirementAnalysis.requirementHint') }}</span><span>{{ manualInput.description.length.toLocaleString() }} / {{ maxInputLength.toLocaleString() }}</span></div>
             </div>
-            <div class="progress-item">
-              <span class="label">{{ $t('requirementAnalysis.currentStatus') }}</span>
-              <span class="value">{{ showResults ? $t('requirementAnalysis.generationComplete') : progressText }}</span>
+            <div v-else class="form-group">
+              <input ref="fileInput" class="file-input" type="file" accept=".pdf,.docx,.txt,.md" :aria-label="$t('requirementAnalysis.selectFile')" @change="handleFileSelect">
+              <div class="upload-area" :class="{ 'drag-over': isDragOver }" @dragover.prevent="isDragOver = true" @dragleave.prevent="isDragOver = false" @drop.prevent="handleDrop">
+                <template v-if="selectedFile">
+                  <strong class="file-name">{{ selectedFile.name }}</strong>
+                  <span class="field-hint">{{ formatFileSize(selectedFile.size) }}</span>
+                  <button type="button" class="text-button" @click="removeFile">{{ $t('requirementAnalysis.removeSelectedFile') }}</button>
+                </template>
+                <template v-else>
+                  <strong>{{ $t('requirementAnalysis.dragDropText') }}</strong>
+                  <span class="field-hint">{{ $t('requirementAnalysis.supportedFormats') }}</span>
+                  <button type="button" class="button secondary" @click="$refs.fileInput.click()">{{ $t('requirementAnalysis.selectFile') }}</button>
+                </template>
+              </div>
+              <p class="field-hint">{{ $t('requirementAnalysis.documentHint') }}</p>
             </div>
-          </div>
 
-          <!-- 流式内容实时显示区域 -->
-          <div v-if="streamedContent" class="stream-content-display">
-            <div class="stream-header">
-              <span class="stream-title">{{ $t('requirementAnalysis.realtimeGeneratedContent') }}</span>
-              <span class="stream-status">{{ $t('requirementAnalysis.characters', { count: streamedContent.length }) }}</span>
+            <details class="advanced-settings">
+              <summary>{{ $t('requirementAnalysis.displaySettings') }}</summary>
+              <div class="radio-row">
+                <label><input v-model="globalOutputMode" type="radio" value="stream" @change="outputModeTouched = true">{{ $t('requirementAnalysis.realtimeStream') }}</label>
+                <label><input v-model="globalOutputMode" type="radio" value="complete" @change="outputModeTouched = true">{{ $t('requirementAnalysis.completeOutput') }}</label>
+              </div>
+              <p class="field-hint">{{ $t('requirementAnalysis.displayModeHint') }}</p>
+            </details>
+            <div class="submit-row">
+              <p class="field-hint" role="status">{{ submitHint }}</p>
+              <button class="button primary" type="submit" :disabled="!canSubmit">{{ $t('requirementAnalysis.startGeneration') }}</button>
             </div>
-            <div class="stream-content" v-html="formatMarkdown(streamedContent)"></div>
-          </div>
+          </fieldset>
+        </form>
+      </section>
 
-          <!-- 评审内容显示区域 -->
-          <div v-if="streamedReviewContent" class="stream-content-display" style="margin-top: 15px;">
-            <div class="stream-header">
-              <span class="stream-title">{{ $t('requirementAnalysis.aiReviewComments') }}</span>
-              <span class="stream-status">{{ $t('requirementAnalysis.characters', { count: streamedReviewContent.length }) }}</span>
-            </div>
-            <div class="stream-content" v-html="formatMarkdown(streamedReviewContent)"></div>
+      <aside class="sidebar">
+        <section class="panel config-panel">
+          <div class="section-heading"><span class="section-number">2</span><h2>{{ $t('requirementAnalysis.generationSetup') }}</h2></div>
+          <p v-if="checkingConfig" class="field-hint" role="status">{{ $t('requirementAnalysis.checkingConfiguration') }}</p>
+          <div v-else-if="configError" class="field-error" role="alert">
+            <p>{{ configError }}</p><button class="text-button" type="button" @click="checkConfigStatus">{{ $t('requirementAnalysis.retryLoad') }}</button>
           </div>
-
-          <!-- 最终版用例显示区域 -->
-          <div v-if="finalTestCases" class="stream-content-display" style="margin-top: 15px;">
-            <div class="stream-header">
-              <span class="stream-title">
-                {{ $t('requirementAnalysis.finalVersionTestCases') }}
-                <span v-if="isGenerating" class="streaming-indicator">{{ $t('requirementAnalysis.generating') }}</span>
-              </span>
-              <span class="stream-status">{{ $t('requirementAnalysis.characters', { count: finalTestCases.length }) }}</span>
-            </div>
-            <div class="stream-content final-testcases" v-html="formatMarkdown(finalTestCases)"></div>
-          </div>
-
-          <div class="progress-steps">
-            <div class="step" :class="{ active: currentStep >= 1 }">
-              <span class="step-number">1</span>
-              <span class="step-text">{{ $t('requirementAnalysis.stepAnalysis') }}</span>
-            </div>
-            <div class="step" :class="{ active: currentStep >= 2 }">
-              <span class="step-number">2</span>
-              <span class="step-text">{{ $t('requirementAnalysis.stepWriting') }}</span>
-            </div>
-            <div v-if="showReviewStep" class="step" :class="{ active: currentStep >= 3 }">
-              <span class="step-number">3</span>
-              <span class="step-text">{{ $t('requirementAnalysis.stepReview') }}</span>
-            </div>
-            <div class="step" :class="{ active: currentStep >= (showReviewStep ? 4 : 3) }">
-              <span class="step-number">{{ showReviewStep ? 4 : 3 }}</span>
-              <span class="step-text">{{ $t('requirementAnalysis.stepComplete') }}</span>
-            </div>
-          </div>
-
-          <!-- 任务完成后的操作按钮 -->
-          <div v-if="showResults" class="completion-actions">
-            <button class="download-btn" @click="downloadTestCases">
-              <span>📥 {{ $t('requirementAnalysis.downloadExcel') }}</span>
-            </button>
-            <button class="save-btn" @click="saveToTestCaseRecords">
-              <span>💾 {{ $t('requirementAnalysis.saveToRecords') }}</span>
-            </button>
-            <button class="new-generation-btn" @click="resetGeneration">
-              <span>📝 {{ $t('requirementAnalysis.newGeneration') }}</span>
-            </button>
-          </div>
-          <button v-else class="cancel-generation-btn" @click="cancelGeneration">
-            {{ $t('requirementAnalysis.cancelGeneration') }}
-          </button>
-        </div>
-      </div>
-
-      <!-- 旧的生成结果区域已废弃，保留用于兼容 -->
-      <!-- 现在使用流式显示区域 + 最终版用例区域 -->
-      <div v-if="false && showResults && generationResult" class="generation-result">
-        <div class="result-header">
-          <h2>{{ $t('requirementAnalysis.generationComplete') }}</h2>
-          <div class="result-summary">
-            <span class="summary-item">
-              {{ $t('requirementAnalysis.summaryTaskId', { taskId: generationResult.task_id }) }}
-            </span>
-            <span class="summary-item">
-              {{ $t('requirementAnalysis.summaryGenerationTime', { time: formatDateTime(generationResult.completed_at) }) }}
-            </span>
-          </div>
-        </div>
-      </div>
+          <template v-else>
+            <div class="config-status" :class="{ ready: configReady }"><span class="status-dot" />{{ $t(configReady ? 'requirementAnalysis.readyToGenerate' : 'requirementAnalysis.configurationNeeded') }}</div>
+            <dl class="config-list">
+              <div v-for="item in configItems" :key="item.key">
+                <dt>{{ $t(item.label) }}</dt><dd :class="{ missing: !item.ready }">{{ item.name || $t(item.ready ? 'requirementAnalysis.readyToGenerate' : 'requirementAnalysis.notConfigured') }}</dd>
+              </div>
+              <div><dt>{{ $t('requirementAnalysis.autoReview') }}</dt><dd>{{ $t(showReviewStep ? 'requirementAnalysis.reviewEnabled' : 'requirementAnalysis.reviewDisabled') }}</dd></div>
+            </dl>
+            <button v-if="!configReady" type="button" class="button secondary full-width" @click="goToConfig">{{ $t('configGuide.goToConfig') }}</button>
+            <button type="button" class="text-button" @click="checkConfigStatus">{{ $t('requirementAnalysis.refreshConfiguration') }}</button>
+          </template>
+        </section>
+        <section class="panel guidance-panel">
+          <h2>{{ $t('requirementAnalysis.workflowTitle') }}</h2>
+          <ol><li>{{ $t('requirementAnalysis.workflowInput') }}</li><li>{{ $t('requirementAnalysis.workflowReview') }}</li><li>{{ $t('requirementAnalysis.workflowImport') }}</li></ol>
+          <p>{{ $t('requirementAnalysis.qualityHint') }}</p>
+        </section>
+      </aside>
     </div>
+
+    <section v-else-if="!isRestoring" class="panel generation-panel" :aria-busy="isGenerating">
+      <div class="generation-heading">
+        <div><span class="eyebrow">{{ $t('requirementAnalysis.taskId') }} {{ currentTaskId || '—' }}</span><h2>{{ activeTitle || manualInput.title }}</h2></div>
+        <span class="status-badge" :class="taskStatus">{{ statusLabel }}</span>
+      </div>
+      <div class="progress-meta" role="status"><span>{{ progressText }}</span><span>{{ progress }}%</span></div>
+      <progress :value="progress" max="100" :aria-label="$t('requirementAnalysis.progress')" />
+      <ol class="progress-steps">
+        <li :class="{ active: currentStep >= 1 }">{{ $t('requirementAnalysis.stepAnalysis') }}</li>
+        <li :class="{ active: currentStep >= 2 }">{{ $t('requirementAnalysis.stepWriting') }}</li>
+        <li v-if="showReviewStep" :class="{ active: currentStep >= 3 }">{{ $t('requirementAnalysis.stepReview') }}</li>
+        <li :class="{ active: showResults }">{{ $t('requirementAnalysis.stepComplete') }}</li>
+      </ol>
+
+      <div v-if="showResults" class="completion-summary">
+        <div><strong>{{ $t('requirementAnalysis.resultCount', { count: canonicalCases.length }) }}</strong><p>{{ $t('requirementAnalysis.resultHint') }}</p><p>{{ $t('requirementAnalysis.remainingCases', { count: remainingCases.length }) }}</p></div>
+        <div class="action-row">
+          <button type="button" class="button secondary" :disabled="!canonicalCases.length" @click="downloadTestCases">{{ $t('requirementAnalysis.downloadExcel') }}</button>
+          <button type="button" class="button secondary" @click="openTaskDetail">{{ $t('requirementAnalysis.reviewAndEdit') }}</button>
+          <button type="button" class="button primary" :disabled="isSaving || isSaved || !canonicalCases.length" @click="saveToTestCaseRecords">{{ $t(isSaving ? 'requirementAnalysis.importingCases' : isSaved ? 'requirementAnalysis.casesImported' : 'requirementAnalysis.importCases') }}</button>
+        </div>
+      </div>
+
+      <div class="content-tabs" role="tablist" :aria-label="$t('requirementAnalysis.generatedContent')">
+        <button v-for="item in contentTabs" :id="`generation-tab-${item.key}`" :key="item.key" type="button" role="tab" :aria-selected="contentTab === item.key" :aria-controls="`generation-content-${item.key}`" :tabindex="contentTab === item.key ? 0 : -1" :class="{ selected: contentTab === item.key }" @click="contentTab = item.key" @keydown="navigateContentTabs($event, item.key)">{{ $t(item.label) }}</button>
+      </div>
+      <div :id="`generation-content-${contentTab}`" role="tabpanel" :aria-labelledby="`generation-tab-${contentTab}`" class="content-panel">
+        <template v-if="contentTab === 'final' && canonicalCases.length">
+          <div class="case-table-wrapper"><table class="case-table">
+            <thead><tr><th>{{ $t('requirementAnalysis.excelTestCaseNumber') }}</th><th>{{ $t('requirementAnalysis.excelTestScenario') }}</th><th>{{ $t('requirementAnalysis.excelPrecondition') }}</th><th>{{ $t('requirementAnalysis.excelTestSteps') }}</th><th>{{ $t('requirementAnalysis.excelExpectedResult') }}</th><th>{{ $t('requirementAnalysis.excelPriority') }}</th></tr></thead>
+            <tbody><tr v-for="testCase in visibleCases" :key="testCase.case_id"><td>{{ testCase.case_id }}</td><td>{{ testCase.title }}</td><td>{{ testCase.preconditions }}</td><td>{{ (testCase.steps || []).join('\n') }}</td><td>{{ testCase.expected_result }}</td><td><span class="priority-badge">{{ testCase.priority }}</span></td></tr></tbody>
+          </table></div>
+          <div v-if="canonicalCases.length > pageSize" class="pagination"><button type="button" class="button secondary" :disabled="casePage === 1" @click="casePage--">{{ $t('generatedTestCases.previousPage') }}</button><span>{{ casePage }} / {{ Math.ceil(canonicalCases.length / pageSize) }}</span><button type="button" class="button secondary" :disabled="casePage * pageSize >= canonicalCases.length" @click="casePage++">{{ $t('generatedTestCases.nextPage') }}</button></div>
+        </template>
+        <template v-else-if="activeContent">
+          <p v-if="contentTab === 'final' && showResults" class="field-error">{{ $t('requirementAnalysis.unstructuredResult') }}</p>
+          <div class="markdown-content" v-html="formatMarkdown(activeContent)" />
+        </template>
+        <div v-else class="empty-state" role="status">{{ $t(isGenerating ? 'requirementAnalysis.waitingForContent' : 'requirementAnalysis.noStageContent') }}</div>
+      </div>
+      <footer class="generation-footer">
+        <p class="field-hint">{{ $t(isGenerating ? 'requirementAnalysis.backgroundHint' : 'requirementAnalysis.historyHint') }}</p>
+        <button v-if="isGenerating" type="button" class="button danger" :disabled="isCancelling || !currentTaskId || isSubmitting" @click="cancelGeneration">{{ $t(isCancelling ? 'requirementAnalysis.cancelling' : 'requirementAnalysis.cancelGeneration') }}</button>
+        <button v-else type="button" class="button secondary" :disabled="isSaving" @click="resetGeneration">{{ $t(showResults ? 'requirementAnalysis.newGeneration' : 'requirementAnalysis.editAndRetry') }}</button>
+      </footer>
+    </section>
   </div>
 </template>
 
@@ -348,2275 +171,777 @@ import api from '@/utils/api'
 import { ElMessage } from 'element-plus'
 import * as XLSX from 'xlsx'
 import { useUserStore } from '@/stores/user'
+import { renderSafeMarkdown } from '@/utils/safe-html.js'
+
+const ACTIVE_STATUSES = ['pending', 'generating', 'reviewing', 'revising']
+const FILE_LIMIT = 10 * 1024 * 1024
+const MANUAL_INPUT_LIMIT = 50000
+const GENERATION_TEXT_LIMIT = 100000
+
+function errorText(error, fallback) {
+  const data = error?.response?.data
+  if (typeof data === 'string' && !data.trim().startsWith('<')) return data
+  if (data && typeof data === 'object') {
+    const messages = Object.values(data).flat().filter(value => typeof value === 'string')
+    if (messages.length) return messages.join('\n')
+  }
+  return error?.message || fallback
+}
+
+function newSubmissionId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  // getRandomValues also works on HTTP LAN deployments where randomUUID is unavailable.
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 15) | 64
+  bytes[8] = (bytes[8] & 63) | 128
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
 
 export default {
   name: 'RequirementAnalysisView',
   data() {
     return {
-      // 全局输出模式设置
-      globalOutputMode: 'stream',  // 默认使用流式输出
-
-      // 手动输入需求
-      manualInput: {
-        title: '',
-        description: '',
-        selectedProject: ''
-      },
-
-      // 文件上传
-      selectedFile: null,
-      documentTitle: '',
+      inputSource: 'manual',
+      manualInput: { title: '', description: '' },
+      restoredInputStyle: null,
+      restoredTitleLabel: '',
       selectedProject: '',
+      selectedFile: null,
       projects: [],
+      loadingProjects: true,
+      projectsError: '',
+      projectsLoadingRequest: false,
+      configLoadingRequest: false,
+      uploadedDocument: null,
       isDragOver: false,
-
-      // 生成状态
+      globalOutputMode: 'stream',
+      outputModeTouched: false,
+      configStatus: {},
+      checkingConfig: true,
+      configError: '',
+      showReviewStep: true,
+      isSubmitting: false,
       isGenerating: false,
+      isRestoring: false,
+      isCancelling: false,
+      isSaving: false,
       currentTaskId: null,
-      generationError: '',
+      taskStatus: 'pending',
+      activeTitle: '',
+      progress: 0,
       progressText: '',
       currentStep: 0,
-      pollInterval: null,
-      eventSource: null,  // SSE连接
-      streamedContent: '',  // 流式接收的内容
-      streamedReviewContent: '',  // 流式接收的评审内容
-      finalTestCases: '',  // 最终版用例
-      hasShownCompletionMessage: false,  // 是否已经显示过完成消息
-      showReviewStep: true,  // 是否显示评审步骤（根据生成配置决定）
-
-      // 生成结果
-      showResults: false,
+      generationError: '',
+      monitoringError: '',
+      streamedContent: '',
+      streamedReviewContent: '',
+      finalTestCases: '',
       generationResult: null,
-
-      // AI配置状态
-      configStatus: {
-        overall_status: 'unknown',
-        message: '',
-        writer_model: {
-          configured: false,
-          enabled: false,
-          name: null,
-          provider: null,
-          id: null,
-          required: true
-        },
-        writer_prompt: {
-          configured: false,
-          enabled: false,
-          name: null,
-          id: null,
-          required: true
-        },
-        reviewer_model: {
-          configured: false,
-          enabled: false,
-          name: null,
-          id: null,
-          required: true
-        },
-        reviewer_prompt: {
-          configured: false,
-          enabled: false,
-          name: null,
-          id: null,
-          required: true
-        },
-        generation_config: {
-          configured: false,
-          enabled: false,
-          name: null,
-          id: null,
-          required: true,
-          default_output_mode: null
-        }
-      },
-      showConfigGuide: false,
-      checkingConfig: true,
-      modalKey: 0  // 用于强制重新渲染弹窗
+      showResults: false,
+      hasShownCompletionMessage: false,
+      contentTab: 'draft',
+      casePage: 1,
+      pageSize: 10,
+      pollInterval: null,
+      pollInFlight: false,
+      eventSource: null,
+      finalizingTaskId: null,
+      runRevision: 0,
+      disposed: false,
+      storageKey: '',
+      pendingSubmissionId: '',
     }
   },
-
   computed: {
-    canGenerateManual() {
-      return this.manualInput.title.trim() &&
-             this.manualInput.description.trim() &&
-             this.manualInput.selectedProject &&
-             this.manualInput.description.length <= 2000
-    }
+    configItems() {
+      const keys = ['writer_model', 'writer_prompt', ...(this.showReviewStep ? ['reviewer_model', 'reviewer_prompt'] : [])]
+      const labels = { writer_model: 'requirementAnalysis.writerModel', writer_prompt: 'requirementAnalysis.writerPrompt', reviewer_model: 'requirementAnalysis.reviewerModel', reviewer_prompt: 'requirementAnalysis.reviewerPrompt' }
+      return keys.map(key => ({ key, label: labels[key], name: this.configStatus[key]?.name, ready: Boolean(this.configStatus[key]?.configured && this.configStatus[key]?.enabled) }))
+    },
+    configReady() { return !this.checkingConfig && !this.configError && this.configItems.every(item => item.ready) },
+    maxInputLength() {
+      if (this.restoredInputStyle === null) return MANUAL_INPUT_LIMIT
+      return Math.max(0, GENERATION_TEXT_LIMIT - this.buildRequirementText(this.manualInput.title.trim(), '', 'manual').length)
+    },
+    canGenerateManual() { return Boolean(this.selectedProject && this.manualInput.title.trim() && this.manualInput.title.trim().length <= 200 && this.manualInput.description.trim() && this.manualInput.description.length <= this.maxInputLength) },
+    canSubmit() {
+      const inputReady = this.inputSource === 'manual' ? this.canGenerateManual : Boolean(this.selectedProject && this.manualInput.title.trim() && this.manualInput.title.trim().length <= 200 && this.selectedFile)
+      return inputReady && this.configReady && !this.loadingProjects && !this.projectsError && !this.isSubmitting && !this.isGenerating && !this.isRestoring
+    },
+    submitHint() {
+      if (!this.selectedProject) return this.$t('requirementAnalysis.selectProjectFirst')
+      if (!this.manualInput.title.trim()) return this.$t('requirementAnalysis.titleRequired')
+      if (this.manualInput.title.trim().length > 200) return this.$t('requirementAnalysis.titleTooLong')
+      if (this.inputSource === 'manual' && !this.manualInput.description.trim()) return this.$t('requirementAnalysis.descriptionRequired')
+      if (this.inputSource === 'manual' && this.manualInput.description.length > this.maxInputLength) return this.$t('requirementAnalysis.descriptionTooLong', { limit: this.maxInputLength.toLocaleString() })
+      if (this.inputSource === 'document' && !this.selectedFile) return this.$t('requirementAnalysis.fileRequired')
+      return this.$t(this.configReady ? 'requirementAnalysis.readyHint' : 'requirementAnalysis.configurationNeeded')
+    },
+    canonicalCases() { return Array.isArray(this.generationResult?.canonical_cases) ? this.generationResult.canonical_cases : [] },
+    visibleCases() { return this.canonicalCases.slice((this.casePage - 1) * this.pageSize, this.casePage * this.pageSize) },
+    remainingCases() {
+      const adopted = new Set(Array.isArray(this.generationResult?.adopted_case_ids) ? this.generationResult.adopted_case_ids : [])
+      return this.canonicalCases.filter(testCase => !adopted.has(testCase.case_id))
+    },
+    isSaved() { return this.canonicalCases.length > 0 && this.remainingCases.length === 0 },
+    contentTabs() { return [{ key: 'final', label: 'requirementAnalysis.finalTestCases' }, { key: 'draft', label: 'requirementAnalysis.generationDraft' }, ...(this.showReviewStep || this.streamedReviewContent ? [{ key: 'review', label: 'requirementAnalysis.aiReviewFeedback' }] : [])] },
+    activeContent() { return this.contentTab === 'final' ? this.finalTestCases : this.contentTab === 'review' ? this.streamedReviewContent : this.streamedContent },
+    statusLabel() {
+      const labels = { pending: 'requirementAnalysis.pending', generating: 'requirementAnalysis.statusGenerating', reviewing: 'requirementAnalysis.statusReviewing', revising: 'requirementAnalysis.statusRevising', completed: 'requirementAnalysis.completed', failed: 'requirementAnalysis.failed', cancelled: 'requirementAnalysis.cancelled' }
+      return this.$t(labels[this.taskStatus] || 'requirementAnalysis.preparing')
+    },
   },
-
   mounted() {
     this.progressText = this.$t('requirementAnalysis.preparing')
+    const user = useUserStore().user
+    this.storageKey = user?.id ? `testhub:requirement-generation:${user.id}` : ''
     this.loadProjects()
     this.checkConfigStatus()
+    if (this.storageKey) {
+      try { this.pendingSubmissionId = sessionStorage.getItem(`${this.storageKey}:pending`) || '' } catch { /* Storage is optional. */ }
+    }
+    if (this.$route?.query?.task) this.restoreActiveTask(this.$route.query.task)
+    else if (this.pendingSubmissionId) this.restorePendingSubmission()
+    else this.restoreActiveTask()
   },
-
-  activated() {
-    // 当从其他页面返回时，重新检查配置状态
-    // 立即隐藏弹窗和遮罩层，强制重新渲染
-    this.showConfigGuide = false
-    this.checkingConfig = true
-    this.modalKey += 1  // 改变key值，强制重新渲染弹窗
-
-    // 延迟检查配置，确保页面完全加载后再显示弹窗
-    setTimeout(async () => {
-      await this.checkConfigStatus()
-    }, 200)
-  },
-
   beforeUnmount() {
-    if (this.pollInterval) {
-      clearInterval(this.pollInterval)
-      this.pollInterval = null
-    }
-    if (this.eventSource) {
-      this.eventSource.onopen = null
-      this.eventSource.onmessage = null
-      this.eventSource.onerror = null
-      this.eventSource.close()
-      this.eventSource = null
-    }
+    this.disposed = true
+    this.runRevision++
+    this.cleanupProgress()
   },
-
   methods: {
     async loadProjects() {
+      if (this.projectsLoadingRequest) return
+      this.projectsLoadingRequest = true
+      this.loadingProjects = true
+      this.projectsError = ''
       try {
-        const response = await api.get('/projects/')
-        this.projects = response.data.results || response.data
+        const projects = []
+        let page = 1
+        let next = true
+        while (next && page <= 100) {
+          const response = await api.get('/projects/', { params: { page, page_size: 100, ordering: 'id' } })
+          const data = response.data
+          const rows = Array.isArray(data) ? data : data.results
+          if (!Array.isArray(rows)) throw new Error(this.$t('requirementAnalysis.loadProjectsFailed'))
+          projects.push(...rows)
+          next = !Array.isArray(data) && Boolean(data.next)
+          page++
+        }
+        if (next) throw new Error(this.$t('requirementAnalysis.projectListTooLarge'))
+        if (!this.disposed) this.projects = [...new Map(projects.map(project => [project.id, project])).values()]
       } catch (error) {
-        console.error(this.$t('requirementAnalysis.loadProjectsFailed'), error)
+        if (!this.disposed) this.projectsError = errorText(error, this.$t('requirementAnalysis.loadProjectsFailed'))
+      } finally {
+        this.loadingProjects = false
+        this.projectsLoadingRequest = false
       }
     },
-
     async checkConfigStatus() {
+      if (this.configLoadingRequest) return
+      this.configLoadingRequest = true
+      this.checkingConfig = true
+      this.configError = ''
       try {
-        this.checkingConfig = true
-        const response = await api.get('/requirement-analysis/config/check/')
-        this.configStatus = response.data
-
-        // 判断逻辑：只有当"用例编写模型"、"用例评审模型"、"用例编写提示词"和"用例评审提示词"都配置且启用时，才不显示弹框
-        const writerModelReady = response.data.writer_model &&
-                                response.data.writer_model.configured &&
-                                response.data.writer_model.enabled
-
-        const reviewerModelReady = response.data.reviewer_model &&
-                                  response.data.reviewer_model.configured &&
-                                  response.data.reviewer_model.enabled
-
-        const writerPromptReady = response.data.writer_prompt &&
-                                 response.data.writer_prompt.configured &&
-                                 response.data.writer_prompt.enabled
-
-        const reviewerPromptReady = response.data.reviewer_prompt &&
-                                   response.data.reviewer_prompt.configured &&
-                                   response.data.reviewer_prompt.enabled
-
-        // 检查生成行为配置
-        const generationConfigReady = response.data.generation_config &&
-                                      response.data.generation_config.configured
-
-        // 只有五项都准备好时才不显示引导弹框
-        if (writerModelReady && reviewerModelReady && writerPromptReady && reviewerPromptReady && generationConfigReady) {
-          this.showConfigGuide = false
-
-          // 如果生成配置允许用户修改，则使用配置的默认输出模式
-          if (response.data.generation_config && response.data.generation_config.default_output_mode) {
-            this.globalOutputMode = response.data.generation_config.default_output_mode
-          }
-
-          // 根据生成配置的enable_auto_review决定是否显示评审步骤
-          if (response.data.generation_config && response.data.generation_config.enable_auto_review !== null) {
-            this.showReviewStep = response.data.generation_config.enable_auto_review
-          } else {
-            this.showReviewStep = true  // 默认显示
-          }
-        } else {
-          this.showConfigGuide = true
-        }
+        const { data } = await api.get('/requirement-analysis/config/check/')
+        if (this.disposed) return
+        this.configStatus = data
+        if (!this.currentTaskId && !this.isGenerating) this.showReviewStep = data.generation_config?.enable_auto_review !== false
+        if (!this.outputModeTouched && !this.isGenerating && !this.currentTaskId && ['stream', 'complete'].includes(data.generation_config?.default_output_mode)) this.globalOutputMode = data.generation_config.default_output_mode
       } catch (error) {
-        console.error('Failed to check config status:', error)
-        // 如果检查失败，默认不显示引导，避免影响正常使用
-        this.showConfigGuide = false
-        this.checkingConfig = false
+        if (!this.disposed) this.configError = errorText(error, this.$t('requirementAnalysis.configurationCheckFailed'))
       } finally {
         this.checkingConfig = false
+        this.configLoadingRequest = false
       }
     },
-
     goToConfig() {
-      // 智能判断跳转目标：优先跳转到未配置/未启用的页面
-      // 优先级：必需配置 > 可选配置，提示词 > 模型
-
-      // 0. 首先检查生成行为配置（generation_config）
-      if (!this.configStatus.generation_config || !this.configStatus.generation_config.configured) {
-        this.$router.push('/configuration/generation-config')
-        return
-      }
-
-      // 1. 优先检查必需的提示词配置（writer_prompt）
-      if (!this.configStatus.writer_prompt.configured || !this.configStatus.writer_prompt.enabled) {
-        this.$router.push('/configuration/prompt-config')
-        return
-      }
-
-      // 2. 检查必需的模型配置（writer_model）
-      if (!this.configStatus.writer_model.configured || !this.configStatus.writer_model.enabled) {
-        this.$router.push('/configuration/ai-model')
-        return
-      }
-
-      // 3. 检查可选的评审提示词（reviewer_prompt）
-      if (!this.configStatus.reviewer_prompt.configured || !this.configStatus.reviewer_prompt.enabled) {
-        this.$router.push('/configuration/prompt-config')
-        return
-      }
-
-      // 4. 检查可选的评审模型（reviewer_model）
-      if (!this.configStatus.reviewer_model.configured || !this.configStatus.reviewer_model.enabled) {
-        this.$router.push('/configuration/ai-model')
-        return
-      }
-
-      // 默认跳转到生成行为配置
-      this.$router.push('/configuration/generation-config')
+      const missing = this.configItems.find(item => !item.ready)
+      this.$router.push(missing?.key.endsWith('prompt') ? '/configuration/prompt-config' : '/configuration/ai-model')
     },
-
-    goToPromptConfig() {
-      this.$router.push('/configuration/prompt-config')
-    },
-
-    getConfigItemClass(configKey) {
-      const config = this.configStatus[configKey]
-      if (config.enabled) {
-        return 'status-enabled'
-      } else if (config.configured) {
-        return 'status-disabled'
-      } else {
-        return 'status-unconfigured'
-      }
-    },
-
-    getStatusIcon(configKey) {
-      const config = this.configStatus[configKey]
-      if (config.enabled) {
-        // 绿色对号
-        return '<path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm193.5 301.7l-210.6 292c-12.7 17.7-39 17.7-51.7 0L318.5 484.9c-3.8-5.3 0-12.7 6.5-12.7h46.9c10.2 0 19.9 4.9 25.9 13.3l71.2 98.8 157.2-218c6-8.3 15.6-13.3 25.9-13.3H699c6.5 0 10.3 7.4 6.5 12.7z" fill="#27ae60"/>'
-      } else if (config.configured) {
-        // 禁用图标（灰色圆圈和斜线）
-        return '<path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372zm128-412c0 4.4-3.6 8-8 8H392c-4.4 0-8-3.6-8-8v-48c0-4.4 3.6-8 8-8h240c4.4 0 8 3.6 8 8v48z" fill="#95a5a6"/>'
-      } else {
-        // 红色叉号
-        return '<path d="M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm165.4 618.2l-66-70.7c-10.6-10.1-28.1-10.1-38.8 0l-66.7 71.5-66.7-71.5c-10.6-10.1-28.1-10.1-38.8 0l-66 70.7c-9.9 10.6-9.9 27.4 0 38l66 70.7c10.6 10.1 28.1 10.1 38.8 0l66.7-71.5 66.7 71.5c10.6 10.1 28.1 10.1 38.8 0l66-70.7c9.9-10.6 9.9-27.4 0-38z" fill="#e74c3c"/>'
-      }
-    },
-
-    getStatusSymbol(configKey) {
-      const config = this.configStatus[configKey]
-      if (config.enabled) {
-        // 绿色对勾
-        return '<span style="color: #27ae60; font-size: 18px;">✓</span>'
-      } else if (config.configured) {
-        // 禁用图标
-        return '<span style="color: #95a5a6; font-size: 18px;">○</span>'
-      } else {
-        // 红色叉号
-        return '<span style="color: #e74c3c; font-size: 18px;">✗</span>'
-      }
-    },
-
+    openRecords() { this.$router.push({ name: 'GeneratedTestCases' }) },
+    openTaskDetail() { if (this.currentTaskId) this.$router.push({ name: 'TaskDetail', params: { taskId: this.currentTaskId } }) },
     handleDrop(event) {
       event.preventDefault()
       this.isDragOver = false
-      const files = event.dataTransfer.files
-      if (files.length > 0) {
-        this.handleFileSelect({ target: { files } })
-      }
+      if (!this.isSubmitting && event.dataTransfer.files.length) this.handleFileSelect({ target: { files: event.dataTransfer.files } })
     },
-
     handleFileSelect(event) {
-      const file = event.target.files[0]
-      if (file) {
-        const allowedTypes = [
-          'application/pdf',
-          'application/msword',
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          'text/plain',
-          'text/markdown',
-          'text/x-markdown'
-        ]
-
-        if (allowedTypes.includes(file.type) ||
-            file.name.match(/\.(pdf|doc|docx|txt|md)$/i)) {
-          this.selectedFile = file
-          this.documentTitle = file.name.replace(/\.[^/.]+$/, "")
-        } else {
-          ElMessage.error(this.$t('requirementAnalysis.invalidFileFormatDetail'))
-        }
+      const file = event.target.files?.[0]
+      if (!file || this.isSubmitting) return
+      if (!/\.(pdf|docx|txt|md)$/i.test(file.name)) {
+        ElMessage.error(this.$t('requirementAnalysis.invalidFileFormatDetail'))
+      } else if (!file.size || file.size > FILE_LIMIT) {
+        ElMessage.error(this.$t(file.size ? 'requirementAnalysis.fileTooLarge' : 'requirementAnalysis.emptyFile'))
+      } else {
+        this.selectedFile = file
+        if (!this.manualInput.title.trim()) this.manualInput.title = file.name.replace(/\.[^.]+$/, '').slice(0, 200)
       }
+      if (this.$refs.fileInput) this.$refs.fileInput.value = ''
     },
-
     removeFile() {
       this.selectedFile = null
-      this.documentTitle = ''
-      this.$refs.fileInput.value = ''
+      if (this.$refs.fileInput) this.$refs.fileInput.value = ''
     },
-
-    formatFileSize(bytes) {
-      if (bytes === 0) return '0 Bytes'
-      const k = 1024
-      const sizes = ['Bytes', 'KB', 'MB', 'GB']
-      const i = Math.floor(Math.log(bytes) / Math.log(k))
-      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    formatFileSize(bytes) { return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB` },
+    buildRequirementText(title, description, source = this.inputSource) {
+      if (source === 'manual' && this.restoredInputStyle === 'plain') return description
+      const label = source === 'manual' && this.restoredInputStyle === 'titled'
+        ? this.restoredTitleLabel
+        : this.$t('requirementAnalysis.requirementTitle')
+      return `${label}: ${title}\n\n${description}`
     },
-
-    async generateFromManualInput() {
-      if (!this.canGenerateManual) {
-        ElMessage.error(this.$t('requirementAnalysis.fillRequiredInfo'))
-        return
-      }
-
-      const requirementText = `${this.$t('requirementAnalysis.requirementTitle')}: ${this.manualInput.title}\n\n${this.$t('requirementAnalysis.requirementDescription')}:\n${this.manualInput.description}`
-
-      await this.startGeneration(
-        this.manualInput.title,
-        requirementText,
-        this.manualInput.selectedProject,
-        this.globalOutputMode  // 使用全局输出模式
-      )
+    restoreRequirementInput(task) {
+      const title = task.title || ''
+      const text = task.requirement_text || ''
+      // Recognize only the exact envelopes produced by this page, including older locale variants.
+      const labels = new Set([
+        this.$t('requirementAnalysis.requirementTitle'), this.$t('requirementAnalysis.documentTitle'),
+        '需求标题', 'Requirement Title', '文档标题', 'Document Title',
+      ])
+      const label = [...labels].find(value => text.startsWith(`${value}: ${title}\n\n`))
+      this.restoredInputStyle = label ? 'titled' : 'plain'
+      this.restoredTitleLabel = label || ''
+      this.manualInput.description = label ? text.slice(`${label}: ${title}\n\n`.length) : text
+      this.inputSource = 'manual'
+      this.selectedFile = null
+      this.uploadedDocument = null
     },
-
-    async generateFromDocument() {
-      if (!this.selectedFile || !this.documentTitle || !this.selectedProject) {
-        ElMessage.error(this.$t('requirementAnalysis.selectFileAndTitle') + '，并选择项目')
-        return
-      }
-
+    async submitGeneration() {
+      if (!this.canSubmit) return
+      // Lock before uploading or awaiting authentication, so repeated clicks cannot submit twice.
+      this.isSubmitting = true
+      this.isGenerating = true
+      const revision = ++this.runRevision
+      this.cleanupProgress()
+      this.generationError = ''
+      this.monitoringError = ''
+      this.showResults = false
+      this.generationResult = null
+      this.currentTaskId = null
+      this.taskStatus = 'pending'
+      this.progress = 0
+      this.currentStep = 1
+      this.streamedContent = ''
+      this.streamedReviewContent = ''
+      this.finalTestCases = ''
+      this.contentTab = 'draft'
+      this.casePage = 1
+      this.hasShownCompletionMessage = false
+      this.activeTitle = this.manualInput.title.trim()
+      const projectId = this.selectedProject
+      const outputMode = this.globalOutputMode
+      const useReviewer = this.showReviewStep
+      let requirementText = this.manualInput.description.trim()
+      let submitted = false
       try {
-        // 首先上传并提取文档内容
-        const formData = new FormData()
-        formData.append('title', this.documentTitle)
-        formData.append('file', this.selectedFile)
-        if (this.selectedProject) {
-          formData.append('project', this.selectedProject)
+        if (this.inputSource === 'document') {
+          this.progressText = this.$t('requirementAnalysis.extractingContent')
+          const cached = this.uploadedDocument
+          let documentId = cached?.file === this.selectedFile && cached?.projectId === projectId && cached?.title === this.activeTitle ? cached.id : null
+          if (!documentId) {
+            const file = this.selectedFile
+            const formData = new FormData()
+            formData.append('title', this.activeTitle)
+            formData.append('project', projectId)
+            formData.append('file', file)
+            const uploaded = await api.post('/requirement-analysis/documents/', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+            if (this.disposed || this.runRevision !== revision) return
+            documentId = uploaded.data.id
+            this.uploadedDocument = { id: documentId, file, projectId, title: this.activeTitle }
+          }
+          const extracted = await api.get(`/requirement-analysis/documents/${documentId}/extract_text/`)
+          requirementText = extracted.data.extracted_text?.trim()
+          if (!requirementText) throw new Error(this.$t('requirementAnalysis.extractionFailed'))
         }
-
-        ElMessage.info(this.$t('requirementAnalysis.extractingContent'))
-        const uploadResponse = await api.post('/requirement-analysis/documents/', formData, {
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
-        })
-
-        // 提取文档内容
-        const extractResponse = await api.get(`/requirement-analysis/documents/${uploadResponse.data.id}/extract_text/`)
-        const extractedText = extractResponse.data.extracted_text
-
-        if (!extractedText || extractedText.trim().length === 0) {
-          ElMessage.error(this.$t('requirementAnalysis.extractionFailed'))
+        if (this.disposed || this.runRevision !== revision) return
+        const text = this.buildRequirementText(this.activeTitle, requirementText)
+        if (text.length > GENERATION_TEXT_LIMIT) throw new Error(this.$t('requirementAnalysis.documentTooLong'))
+        this.progressText = this.$t('requirementAnalysis.creatingTask')
+        const submissionId = this.pendingSubmissionId || newSubmissionId()
+        this.rememberSubmission(submissionId)
+        submitted = true
+        const { data } = await api.post('/requirement-analysis/testcase-generation/generate/', { title: this.activeTitle, requirement_text: text, project: projectId, use_writer_model: true, use_reviewer_model: useReviewer, output_mode: outputMode, client_request_id: submissionId })
+        if (this.disposed || this.runRevision !== revision) return
+        if (!data.task_id) throw new Error(this.$t('requirementAnalysis.createTaskFailed'))
+        this.rememberSubmission(null)
+        this.currentTaskId = data.task_id
+        this.rememberTask(data.task_id)
+        if (data.replayed) {
+          this.isSubmitting = false
+          await this.restoreActiveTask(data.task_id)
+          ElMessage.warning(this.$t('requirementAnalysis.submissionRecovered'))
           return
         }
-
-        const requirementText = `${this.$t('requirementAnalysis.documentTitle')}: ${this.documentTitle}\n\n${this.$t('requirementAnalysis.documentContent')}:\n${extractedText}`
-
-        await this.startGeneration(
-          this.documentTitle,
-          requirementText,
-          this.selectedProject,
-          this.globalOutputMode  // 使用全局输出模式
-        )
-
-      } catch (error) {
-        console.error(this.$t('requirementAnalysis.documentProcessingFailed'), error)
-        ElMessage.error(this.$t('requirementAnalysis.documentProcessingFailed') + ': ' + (error.response?.data?.error || error.message))
-      }
-    },
-
-    async startGeneration(title, requirementText, projectId, outputMode = 'stream') {
-      // 在开始生成前，主动刷新token确保生成过程中不会过期
-      try {
-        const userStore = useUserStore()
-        if (userStore.accessToken && userStore.isTokenExpiringSoon()) {
-          console.log('Refreshing token before generation...')
-          await userStore.refreshAccessToken()
-          console.log('Token refreshed successfully, safe to start generation')
-        } else if (userStore.accessToken) {
-          console.log('Token status is good, no refresh needed')
+        if (data.task) {
+          this.showReviewStep = Boolean(data.task.reviewer_model_config)
+          this.globalOutputMode = data.task.output_mode || outputMode
         }
-      } catch (error) {
-        console.error('Token refresh failed:', error)
-        ElMessage.error(this.$t('requirementAnalysis.tokenRefreshFailed'))
-        return
-      }
-
-      this.isGenerating = true
-      this.currentTaskId = null
-      this.generationError = ''
-      this.currentStep = 1
-      this.progressText = this.$t('requirementAnalysis.creatingTask')
-      this.streamedContent = ''  // 清空流式内容
-      this.finalTestCases = ''  // 清空最终版用例
-      this.streamedReviewContent = ''  // 清空评审内容
-      this.hasShownCompletionMessage = false  // 重置完成消息标志位
-      this.showResults = false  // 隐藏上一次的结果
-
-      try {
-        // 调用新的生成API
-        const requestData = {
-          title: title,
-          requirement_text: requirementText,
-          use_writer_model: true,
-          use_reviewer_model: true,
-          output_mode: outputMode  // 添加输出模式参数
-        }
-
-        // 如果选择了项目，添加到请求中
-        if (projectId) {
-          requestData.project = projectId
-        }
-
-        const response = await api.post('/requirement-analysis/testcase-generation/generate/', requestData)
-
-        this.currentTaskId = response.data.task_id
         this.progressText = this.$t('requirementAnalysis.taskCreated')
-
-        ElMessage.success(this.$t('requirementAnalysis.generateSuccess'))
-
-        // 根据输出模式选择不同的进度获取方式
-        if (outputMode === 'stream') {
-          this.startStreamingProgress()
-        } else {
-          this.startPolling()
-        }
-
+        if (this.globalOutputMode === 'stream') this.startStreamingProgress()
+        else this.startPolling()
       } catch (error) {
-        console.error(this.$t('requirementAnalysis.createTaskFailed'), error)
-        ElMessage.error(this.$t('requirementAnalysis.createTaskFailed') + ': ' + (error.response?.data?.error || error.message))
+        if (this.disposed || this.runRevision !== revision) return
+        const existingTaskId = error.response?.data?.task_id
+        if (existingTaskId) {
+          this.rememberSubmission(null)
+          this.currentTaskId = existingTaskId
+          this.rememberTask(existingTaskId)
+          if (error.response.status === 409) {
+            this.isSubmitting = false
+            await this.restoreActiveTask(existingTaskId)
+            ElMessage.warning(this.$t('requirementAnalysis.submissionRecovered'))
+            return
+          }
+        } else if (submitted && (!error.response || error.response.status >= 500)) {
+          // The server may have committed the task before the response was lost.
+          this.isGenerating = false
+          this.isSubmitting = false
+          this.monitoringError = this.$t('requirementAnalysis.submissionUnconfirmed')
+          await this.restorePendingSubmission()
+          return
+        } else if (submitted) this.rememberSubmission(null)
+        this.taskStatus = 'failed'
+        this.generationError = errorText(error, this.$t('requirementAnalysis.createTaskFailed'))
+        this.progressText = this.$t('requirementAnalysis.statusFailed')
         this.isGenerating = false
+      } finally {
+        if (this.runRevision === revision) this.isSubmitting = false
       }
     },
-
+    isCurrentTask(taskId, revision) { return !this.disposed && this.currentTaskId === taskId && this.runRevision === revision },
+    cleanupProgress() {
+      if (this.pollInterval) clearInterval(this.pollInterval)
+      this.pollInterval = null
+      if (this.eventSource) {
+        this.eventSource.onmessage = null
+        this.eventSource.onerror = null
+        this.eventSource.close()
+      }
+      this.eventSource = null
+    },
     async startStreamingProgress() {
+      const taskId = this.currentTaskId
+      const revision = this.runRevision
       try {
-        const ticketResponse = await api.post(`/requirement-analysis/testcase-generation/${this.currentTaskId}/stream-ticket/`)
-        this.startStreamingProgressWithTicket(ticketResponse.data.ticket)
-      } catch (error) {
-        console.error('SSE ticket 获取失败，回退轮询', error)
+        const { data } = await api.post(`/requirement-analysis/testcase-generation/${taskId}/stream-ticket/`)
+        if (!this.isCurrentTask(taskId, revision) || !this.isGenerating) return
+        this.startStreamingProgressWithTicket(data.ticket)
+      } catch {
+        if (this.isCurrentTask(taskId, revision) && this.isGenerating) this.startPolling()
+      }
+    },
+    startStreamingProgressWithTicket(ticket) {
+      this.cleanupProgress()
+      const taskId = this.currentTaskId
+      const revision = this.runRevision
+      const stream = new EventSource(`${window.location.origin}/api/requirement-analysis/testcase-generation/${encodeURIComponent(taskId)}/stream_progress/?ticket=${encodeURIComponent(ticket)}`, { withCredentials: true })
+      this.eventSource = stream
+      stream.onmessage = event => {
+        if (!this.isCurrentTask(taskId, revision) || this.eventSource !== stream || !this.isGenerating) return
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'progress') this.updateTaskProgress(data)
+          else if (data.type === 'content') this.streamedContent += data.content || ''
+          else if (data.type === 'review_content') this.streamedReviewContent += data.content || ''
+          else if (data.type === 'final_content') this.finalTestCases += data.content || ''
+          else if (data.type === 'status') {
+            if (data.status === 'completed') this.fetchFinalResult(taskId, revision)
+            else if (data.status === 'failed') this.handleGenerationError()
+            else if (data.status === 'cancelled') this.finishCancelledTask()
+          } else if (data.type === 'done' && !this.finalizingTaskId) this.startPolling()
+        } catch { this.monitoringError = this.$t('requirementAnalysis.invalidProgressMessage') }
+      }
+      // Reconnecting a short-lived ticket can replay content. Resume from a snapshot instead.
+      stream.onerror = () => {
+        if (!this.isCurrentTask(taskId, revision) || this.eventSource !== stream || !this.isGenerating) return
         this.startPolling()
       }
     },
-
-    startStreamingProgressWithTicket(ticket) {
-      // 使用SSE进行流式进度获取
-      // 注意：EventSource不使用axios代理，需要直接指向后端服务器
-      // 完整的URL路径: /api/requirement-analysis/testcase-generation/{task_id}/stream_progress/
-
-      // 动态获取后端URL：使用当前页面的协议和主机名
-      // 在生产环境中(如Docker部署)，通常通过Nginx反向代理访问，端口应该是80或443(与当前页面一致)
-      // 而不是直接访问后端端口8000
-      const currentOrigin = window.location.origin
-      const apiUrl = `${currentOrigin}/api/requirement-analysis/testcase-generation/${this.currentTaskId}/stream_progress/?ticket=${encodeURIComponent(ticket)}`
-
-      console.log('SSE连接URL:', apiUrl)
-
-      // EventSource 使用短期 ticket；JWT 只通过 Axios 请求 ticket，不放进 URL。
-      this.eventSource = new EventSource(apiUrl, { withCredentials: true })
-
-      // 监听连接打开事件
-      this.eventSource.onopen = (event) => {
-        console.log('✅ SSE连接已打开', event)
-      }
-
-      this.eventSource.onmessage = (event) => {
-        console.log('📨 收到SSE消息:', event.data)
-
-        try {
-          const data = JSON.parse(event.data)
-          console.log('📦 解析后的数据:', data)
-
-          if (data.type === 'progress') {
-            // Update progress status
-            if (data.status === 'generating') {
-              this.currentStep = 2
-              this.progressText = `${this.$t('requirementAnalysis.statusGenerating')} ${data.progress}%`
-            } else if (data.status === 'reviewing') {
-              this.currentStep = 3
-              this.progressText = `${this.$t('requirementAnalysis.statusReviewing')} ${data.progress}%`
-            } else if (data.status === 'revising') {
-              this.currentStep = 3
-              this.progressText = `${this.$t('requirementAnalysis.statusRevising')} ${data.progress}%`
-            }
-          } else if (data.type === 'content') {
-            // Real-time streaming content (case generation)
-            console.log('✍️ Received streaming content:', data.content.length, 'characters')
-            this.streamedContent += data.content
-            this.currentStep = 2
-            this.progressText = this.$t('requirementAnalysis.statusGenerating')
-          } else if (data.type === 'review_content') {
-            // Real-time review content
-            console.log('📝 Received review content:', data.content.length, 'characters', 'Total length:', this.streamedReviewContent.length + data.content.length)
-            this.streamedReviewContent += data.content
-            this.currentStep = 3
-            this.progressText = this.$t('requirementAnalysis.statusReviewing')
-          } else if (data.type === 'final_content') {
-            // Real-time final test cases content
-            console.log('🎯 Received final cases content:', data.content.length, 'characters', 'Total length:', this.finalTestCases.length + data.content.length)
-            this.finalTestCases += data.content
-            this.currentStep = 3
-            this.progressText = '🎯 ' + this.$t('requirementAnalysis.statusRevising')
-          } else if (data.type === 'status') {
-            // Final status
-            console.log('📊 Received status update:', data.status)
-            if (data.status === 'completed') {
-              this.progressText = this.$t('requirementAnalysis.statusCompleted')
-              // Fetch final result
-              this.fetchFinalResult()
-            } else if (data.status === 'failed') {
-              this.progressText = this.$t('requirementAnalysis.statusFailed')
-              this.handleGenerationError()
-            }
-          } else if (data.type === 'done') {
-            // 流式结束，立即关闭EventSource，获取最终结果
-            console.log('✅ 流式传输完成')
-            if (this.eventSource) {
-              console.log('🔒 关闭SSE连接')
-              this.eventSource.close()
-              this.eventSource = null
-            }
-            this.fetchFinalResult()
-          }
-        } catch (e) {
-          console.error('❌ 解析SSE数据失败:', e, '原始数据:', event.data)
-        }
-      }
-
-      this.eventSource.onerror = (error) => {
-        console.log('⚠️ SSE连接事件:', error)
-
-        // 如果EventSource已经被关闭（在onmessage中关闭的），不做任何处理
-        if (!this.eventSource) {
-          console.log('ℹ️ EventSource已关闭，忽略错误事件')
-          return
-        }
-
-        console.log('EventSource状态:', {
-          readyState: this.eventSource.readyState,
-          url: this.eventSource.url
-        })
-
-        // 如果任务已经完成或不在生成中，不要降级
-        if (this.showResults || !this.isGenerating) {
-          console.log('ℹ️ 任务已完成或不在生成中，不降级到轮询')
-          // 清理EventSource
-          if (this.eventSource) {
-            this.eventSource.close()
-            this.eventSource = null
-          }
-          return
-        }
-
-        // readyState=2表示连接已关闭，readyState=0表示连接中断
-        // EventSource会自动重连（readyState=0），除非是致命错误（readyState=2）
-        if (this.eventSource.readyState === 2) {
-          console.error('❌ SSE连接永久关闭，降级到轮询模式')
-          this.eventSource.close()
-          this.eventSource = null
-          ElMessage.warning(this.$t('requirementAnalysis.streamConnectionInterrupted'))
-          this.startPolling()
-        } else if (this.eventSource.readyState === 0) {
-          // EventSource正在重连，等待一段时间后检查
-          console.log('🔄 SSE正在重连...')
-          setTimeout(() => {
-            // 如果5秒后还是断开状态，降级到轮询
-            if (this.eventSource && this.eventSource.readyState === 0) {
-              console.error('❌ SSE重连失败，降级到轮询模式')
-              this.eventSource.close()
-              this.eventSource = null
-              ElMessage.warning(this.$t('requirementAnalysis.streamConnectionInterrupted'))
-              this.startPolling()
-            }
-          }, 5000)
-        }
+    startPolling(immediate = true) {
+      if (!this.isGenerating || !this.currentTaskId || this.pollInterval) return
+      if (this.eventSource) this.cleanupProgress()
+      const taskId = this.currentTaskId
+      const revision = this.runRevision
+      this.pollInterval = setInterval(() => this.pollTask(taskId, revision), 3000)
+      if (immediate) this.pollTask(taskId, revision)
+    },
+    async pollTask(taskId, revision) {
+      if (!this.isCurrentTask(taskId, revision) || !this.isGenerating || this.pollInFlight) return
+      this.pollInFlight = true
+      try {
+        const { data } = await api.get(`/requirement-analysis/testcase-generation/${taskId}/progress/`)
+        if (!this.isCurrentTask(taskId, revision) || !this.isGenerating) return
+        this.monitoringError = ''
+        if (data.status === 'completed') await this.fetchFinalResult(taskId, revision)
+        else if (data.status === 'failed') await this.handleGenerationError(data)
+        else if (data.status === 'cancelled') this.finishCancelledTask()
+        else this.updateTaskProgress(data)
+      } catch (error) {
+        if (this.isCurrentTask(taskId, revision)) this.monitoringError = errorText(error, this.$t('requirementAnalysis.checkProgressFailed'))
+      } finally {
+        if (this.isCurrentTask(taskId, revision)) this.pollInFlight = false
       }
     },
-
-    async fetchFinalResult() {
+    updateTaskProgress(task) {
+      if (!ACTIVE_STATUSES.includes(task.status)) return
+      this.taskStatus = task.status
+      this.progress = Math.max(0, Math.min(99, Number(task.progress) || 0))
+      this.currentStep = task.status === 'pending' ? 1 : task.status === 'generating' ? 2 : 3
+      const labels = { pending: 'requirementAnalysis.taskCreated', generating: 'requirementAnalysis.statusGenerating', reviewing: 'requirementAnalysis.statusReviewing', revising: 'requirementAnalysis.statusRevising' }
+      this.progressText = this.$t(labels[task.status])
+      if (task.generated_test_cases) this.streamedContent = task.generated_test_cases
+      if (task.review_feedback) this.streamedReviewContent = task.review_feedback
+      if (task.final_test_cases) this.finalTestCases = task.final_test_cases
+    },
+    async fetchFinalResult(taskId = this.currentTaskId, revision = this.runRevision) {
+      if (!this.isCurrentTask(taskId, revision) || this.finalizingTaskId === taskId) return
+      this.finalizingTaskId = taskId
       try {
-        // 修复URL：去掉多余的/api/前缀（axios baseURL已经包含/api）
-        const response = await api.get(`/requirement-analysis/testcase-generation/${this.currentTaskId}/progress/`)
-        const task = response.data
-
-        this.generationResult = task
-        this.showResults = true
+        // The detail response owns canonical cases used by preview, export and adoption.
+        const { data } = await api.get(`/requirement-analysis/testcase-generation/${taskId}/`)
+        if (!this.isCurrentTask(taskId, revision) || !this.isGenerating) return
+        if (data.status === 'failed') { await this.handleGenerationError(data); return }
+        if (data.status === 'cancelled') { this.finishCancelledTask(); return }
+        if (data.status !== 'completed') { this.updateTaskProgress(data); this.startPolling(); return }
+        this.cleanupProgress()
+        this.generationResult = data
+        this.streamedContent = data.generated_test_cases || ''
+        this.streamedReviewContent = data.review_feedback || ''
+        this.finalTestCases = data.final_test_cases || ''
         this.isGenerating = false
-
-        // 设置第4步为完成状态
-        this.currentStep = 4
-
-        // 设置最终版用例（如果还没有通过流式接收完整）
-        if (task.final_test_cases) {
-          console.log('📝 Getting final cases from task object')
-          // 无论this.finalTestCases是否已有值，都用最新的final_test_cases覆盖
-          // 这样确保完整输出模式下也能正确显示最终版用例
-          this.finalTestCases = task.final_test_cases
-        }
-
-        // 如果评审内容为空，从task对象中获取
-        if (!this.streamedReviewContent && task.review_feedback) {
-          console.log('📝 Getting review content from task object')
-          this.streamedReviewContent = task.review_feedback
-        }
-
-        // 如果生成内容为空，从task对象中获取
-        if (!this.streamedContent && task.generated_test_cases) {
-          console.log('✍️ Getting generated content from task object')
-          this.streamedContent = task.generated_test_cases
-        }
-
-        if (this.eventSource) {
-          this.eventSource.close()
-          this.eventSource = null
-        }
-
-        // Only show completion message once
+        this.showResults = true
+        this.taskStatus = 'completed'
+        this.progress = 100
+        this.currentStep = this.showReviewStep ? 4 : 3
+        this.progressText = this.$t('requirementAnalysis.statusCompleted')
+        this.monitoringError = ''
+        this.contentTab = 'final'
         if (!this.hasShownCompletionMessage) {
           ElMessage.success(this.$t('requirementAnalysis.generateCompleteSuccess'))
           this.hasShownCompletionMessage = true
         }
       } catch (error) {
-        console.error('Failed to fetch final result:', error)
-        ElMessage.error(this.$t('requirementAnalysis.fetchResultFailed'))
-        this.isGenerating = false
+        if (this.isCurrentTask(taskId, revision)) {
+          this.monitoringError = errorText(error, this.$t('requirementAnalysis.fetchResultFailed'))
+          this.startPolling(false)
+        }
+      } finally {
+        if (this.isCurrentTask(taskId, revision)) this.finalizingTaskId = null
       }
     },
-
-    async handleGenerationError() {
+    async handleGenerationError(failedTask = null) {
       const failedTaskId = this.currentTaskId
+      const revision = this.runRevision
       this.isGenerating = false
-      if (this.eventSource) {
-        this.eventSource.close()
-        this.eventSource = null
+      if (this.eventSource) { this.eventSource.close(); this.eventSource = null }
+      if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null }
+      let task = failedTask
+      let message = this.$t('requirementAnalysis.unknownError')
+      if (!task && failedTaskId) {
+        try { task = (await api.get(`/requirement-analysis/testcase-generation/${encodeURIComponent(failedTaskId)}/progress/`)).data } catch { /* Keep a persistent fallback if failure details are unavailable. */ }
       }
-      if (this.pollInterval) {
-        clearInterval(this.pollInterval)
-        this.pollInterval = null
-      }
-
-      let errorMessage = this.$t('requirementAnalysis.unknownError')
-      if (failedTaskId) {
-        try {
-          const response = await api.get(
-            `/requirement-analysis/testcase-generation/${encodeURIComponent(failedTaskId)}/progress/`
-          )
-          if (this.currentTaskId !== failedTaskId) return
-
-          const taskError = response.data?.error_message
-          if (typeof taskError === 'string' && taskError.trim()) {
-            errorMessage = taskError.trim()
-          }
-        } catch (error) {
-          console.error('Failed to fetch generation failure details:', error)
-        }
-      }
-
-      if (this.currentTaskId !== failedTaskId) return
-      this.generationError = errorMessage
+      if (this.currentTaskId !== failedTaskId || this.runRevision !== revision || this.disposed) return
+      if (typeof task?.error_message === 'string' && task.error_message.trim()) message = task.error_message.trim()
+      if (task?.generated_test_cases) this.streamedContent = task.generated_test_cases
+      if (task?.review_feedback) this.streamedReviewContent = task.review_feedback
+      this.taskStatus = 'failed'
+      this.showResults = false
+      this.progressText = this.$t('requirementAnalysis.statusFailed')
+      this.generationError = message
     },
-
-    startPolling() {
-      this.pollInterval = setInterval(async () => {
-        try {
-          // 修复URL：去掉多余的/api/前缀（axios baseURL已经包含/api）
-          const response = await api.get(`/requirement-analysis/testcase-generation/${this.currentTaskId}/progress/`)
-          const task = response.data
-
-          console.log(`${this.$t('requirementAnalysis.taskStatus')}: ${task.status}, ${this.$t('requirementAnalysis.progress')}: ${task.progress}%`)
-
-          // 更新进度显示
-          if (task.status === 'generating') {
-            this.currentStep = 2
-            this.progressText = this.$t('requirementAnalysis.statusGenerating')
-          } else if (task.status === 'reviewing') {
-            this.currentStep = 3
-            this.progressText = this.$t('requirementAnalysis.statusReviewing')
-          } else if (task.status === 'completed') {
-            this.currentStep = 4
-            this.progressText = this.$t('requirementAnalysis.statusCompleted')
-
-            // 任务完成，显示结果
-            this.generationResult = task
-            this.showResults = true
-            this.isGenerating = false
-
-            // 设置显示内容（完整输出模式下需要）
-            if (task.generated_test_cases) {
-              console.log('✍️ Polling mode - Setting generated content')
-              this.streamedContent = task.generated_test_cases
-            }
-            if (task.review_feedback) {
-              console.log('📝 Polling mode - Setting review content')
-              this.streamedReviewContent = task.review_feedback
-            }
-            if (task.final_test_cases) {
-              console.log('🎯 Polling mode - Setting final test cases')
-              this.finalTestCases = task.final_test_cases
-            }
-
-            clearInterval(this.pollInterval)
-            this.pollInterval = null
-
-            // 只显示一次完成消息
-            if (!this.hasShownCompletionMessage) {
-              ElMessage.success(this.$t('requirementAnalysis.generateCompleteSuccess'))
-              this.hasShownCompletionMessage = true
-            }
-            return
-          } else if (task.status === 'failed') {
-            this.progressText = this.$t('requirementAnalysis.statusFailed')
-            this.isGenerating = false
-
-            clearInterval(this.pollInterval)
-            this.pollInterval = null
-
-            ElMessage.error(this.$t('requirementAnalysis.generateFailed') + ': ' + (task.error_message || this.$t('requirementAnalysis.unknownError')))
-            return
-          }
-
-        } catch (error) {
-          console.error(this.$t('requirementAnalysis.checkProgressFailed'), error)
-          // 继续轮询，不中断
-        }
-      }, 3000) // 每3秒检查一次
-    },
-
-    cancelGeneration() {
-      if (this.pollInterval) {
-        clearInterval(this.pollInterval)
-        this.pollInterval = null
-      }
-      this.isGenerating = false
-      this.currentTaskId = null
-      ElMessage.info(this.$t('requirementAnalysis.generationCancelled'))
-    },
-
-    // 下载测试用例为xlsx文件
-    async downloadTestCases() {
+    async cancelGeneration() {
+      if (this.isCancelling || !this.currentTaskId || !this.isGenerating) return
+      const taskId = this.currentTaskId
+      const revision = this.runRevision
+      this.isCancelling = true
       try {
-        // 解析最终测试用例内容
-        const finalTestCases = this.generationResult.final_test_cases;
-        const taskId = this.generationResult.task_id;
-
-        // 创建工作簿
-        const workbook = XLSX.utils.book_new();
-
-        // 过滤掉总结和建议部分，只保留测试用例内容
-        const filteredContent = this.filterTestCasesOnly(finalTestCases);
-
-        // 尝试解析表格格式的测试用例（参考AutoGenTestCase的做法）
-        const tableFormat = this.parseTableFormat(filteredContent);
-
-        let worksheetData = [];
-
-        if (tableFormat.length > 0) {
-          // 如果解析到表格格式，直接使用，但要确保表头正确
-          worksheetData = tableFormat;
-
-          // 检查并修正表头
-          if (worksheetData.length > 0) {
-            const header = worksheetData[0];
-            for (let i = 0; i < header.length; i++) {
-              if (header[i] && header[i].includes('测试步骤')) {
-                header[i] = header[i].replace('测试步骤', '操作步骤');
-              }
-              if (header[i] && header[i].includes('Test Steps')) {
-                header[i] = header[i].replace('Test Steps', '操作步骤');
-              }
-            }
-          }
-        } else {
-          // 否则尝试解析结构化格式
-          worksheetData = this.parseStructuredFormat(filteredContent);
-        }
-
-        // 将所有单元格中的<br>标签转换为换行符
-        worksheetData = worksheetData.map(row =>
-          row.map(cell => this.convertBrToNewline(cell))
-        );
-
-        // 创建工作表
-        const worksheet = XLSX.utils.aoa_to_sheet(worksheetData);
-
-        // 设置列宽
-        const colWidths = [
-          { wch: 15 }, // 测试用例编号
-          { wch: 30 }, // 测试场景
-          { wch: 25 }, // 前置条件
-          { wch: 40 }, // 操作步骤
-          { wch: 30 }, // 预期结果
-          { wch: 10 }  // 优先级
-        ];
-        worksheet['!cols'] = colWidths;
-
-        // 设置表头样式（加粗）
-        if (worksheetData.length > 1) {
-          for (let col = 0; col < Math.min(6, worksheetData[0].length); col++) {
-            const cellAddress = XLSX.utils.encode_cell({ r: 0, c: col });
-            if (!worksheet[cellAddress]) continue;
-            worksheet[cellAddress].s = {
-              font: { bold: true },
-              alignment: { horizontal: 'center', vertical: 'center', wrapText: true }
-            };
-          }
-
-          // 设置自动换行
-          for (let row = 1; row < worksheetData.length; row++) {
-            for (let col = 0; col < Math.min(6, worksheetData[row].length); col++) {
-              const cellAddress = XLSX.utils.encode_cell({ r: row, c: col });
-              if (worksheet[cellAddress]) {
-                worksheet[cellAddress].s = {
-                  alignment: { vertical: 'top', wrapText: true }
-                };
-              }
-            }
-          }
-        }
-
-        // 将工作表添加到工作簿
-        XLSX.utils.book_append_sheet(workbook, worksheet, this.$t('requirementAnalysis.testCaseSheetName'));
-
-        // 生成文件名（包含任务ID和日期）
-        const fileName = this.$t('requirementAnalysis.excelFileName', { taskId: taskId, date: new Date().toISOString().slice(0, 10) });
-
-        // 导出文件
-        XLSX.writeFile(workbook, fileName);
-
-        ElMessage.success(this.$t('requirementAnalysis.downloadSuccess'));
+        await api.post(`/requirement-analysis/testcase-generation/${taskId}/cancel/`)
+        if (!this.isCurrentTask(taskId, revision)) return
+        this.finishCancelledTask()
+        ElMessage.success(this.$t('requirementAnalysis.generationCancelled'))
       } catch (error) {
-        console.error(this.$t('requirementAnalysis.downloadFailed'), error);
-        ElMessage.error(this.$t('requirementAnalysis.downloadFailed') + ': ' + (error.message || this.$t('requirementAnalysis.unknownError')));
+        if (!this.isCurrentTask(taskId, revision)) return
+        this.monitoringError = errorText(error, this.$t('requirementAnalysis.cancelFailed'))
+        // A task can finish between clicking cancel and the server receiving the request.
+        this.pollTask(taskId, revision)
+      } finally {
+        if (this.isCurrentTask(taskId, revision)) this.isCancelling = false
       }
     },
-
-    // 保存到用例记录
+    finishCancelledTask() {
+      this.cleanupProgress()
+      this.isGenerating = false
+      this.showResults = false
+      this.taskStatus = 'cancelled'
+      this.progressText = this.$t('requirementAnalysis.generationCancelled')
+      this.monitoringError = ''
+    },
+    retryMonitoring() {
+      this.monitoringError = ''
+      if (this.pendingSubmissionId) { this.restorePendingSubmission(); return }
+      if (!this.currentTaskId) return
+      if (this.isGenerating) {
+        this.startPolling(false)
+        this.pollTask(this.currentTaskId, this.runRevision)
+      } else this.restoreActiveTask(this.currentTaskId)
+    },
     async saveToTestCaseRecords() {
+      if (this.isSaving || this.isSaved || !this.showResults || !this.canonicalCases.length) return
+      const taskId = this.currentTaskId
+      const revision = this.runRevision
+      this.isSaving = true
       try {
-        // 调用后端API保存到记录
-        const response = await api.post(`/requirement-analysis/testcase-generation/${this.generationResult.task_id}/save_to_records/`)
-
-        if (response.data.already_saved) {
-          ElMessage.info(this.$t('requirementAnalysis.alreadySaved'))
-        } else {
-          const importedCount = response.data.imported_count || 0
-          ElMessage.success(`测试用例已保存！已导入 ${importedCount} 条测试用例到测试用例管理系统`)
-        }
-
-        // 不跳转，留在当前页面
-        // this.$router.push('/generated-testcases')
+        const { data } = await api.post(`/requirement-analysis/testcase-generation/${taskId}/save_to_records/`)
+        if (!this.isCurrentTask(taskId, revision)) return
+        if (Array.isArray(data.adopted_case_ids)) this.generationResult.adopted_case_ids = data.adopted_case_ids
+        this.generationResult.is_saved_to_records = Boolean(this.generationResult.adopted_case_ids?.length || data.imported_count || data.already_saved)
+        ElMessage.success(this.$t(data.already_saved ? 'requirementAnalysis.alreadySaved' : 'requirementAnalysis.saveSuccess', { count: data.imported_count || 0 }))
       } catch (error) {
-        console.error(this.$t('requirementAnalysis.saveFailed'), error)
-        ElMessage.error(this.$t('requirementAnalysis.saveFailed') + ': ' + (error.response?.data?.error || error.message))
+        if (this.isCurrentTask(taskId, revision)) ElMessage.error(errorText(error, this.$t('requirementAnalysis.saveFailed')))
+      } finally {
+        if (this.isCurrentTask(taskId, revision)) this.isSaving = false
       }
     },
-
+    downloadTestCases() {
+      if (!this.canonicalCases.length) return
+      try {
+        const headers = ['excelTestCaseNumber', 'excelTestScenario', 'excelPrecondition', 'excelTestSteps', 'excelExpectedResult', 'excelPriority'].map(key => this.$t(`requirementAnalysis.${key}`))
+        const rows = this.canonicalCases.map(testCase => [testCase.case_id, testCase.title, testCase.preconditions || '', (testCase.steps || []).join('\n'), testCase.expected_result, testCase.priority])
+        const workbook = XLSX.utils.book_new()
+        const sheet = XLSX.utils.aoa_to_sheet([headers, ...rows])
+        sheet['!cols'] = [18, 36, 30, 50, 44, 12].map(wch => ({ wch }))
+        XLSX.utils.book_append_sheet(workbook, sheet, this.$t('requirementAnalysis.testCaseSheetName'))
+        XLSX.writeFile(workbook, this.$t('requirementAnalysis.excelFileName', { taskId: this.currentTaskId, date: new Date().toISOString().slice(0, 10) }))
+      } catch (error) { ElMessage.error(errorText(error, this.$t('requirementAnalysis.downloadFailed'))) }
+    },
+    rememberTask(taskId) {
+      if (!this.storageKey) return
+      try {
+        if (taskId) sessionStorage.setItem(this.storageKey, taskId)
+        else sessionStorage.removeItem(this.storageKey)
+      } catch { /* Storage may be unavailable; history remains accessible. */ }
+    },
+    rememberSubmission(submissionId) {
+      this.pendingSubmissionId = submissionId || ''
+      if (!this.storageKey) return
+      try {
+        if (submissionId) sessionStorage.setItem(`${this.storageKey}:pending`, submissionId)
+        else sessionStorage.removeItem(`${this.storageKey}:pending`)
+      } catch { /* Keep the in-memory key when storage is unavailable. */ }
+    },
+    async restorePendingSubmission() {
+      const submissionId = this.pendingSubmissionId
+      if (!submissionId || this.isRestoring) return
+      const revision = this.runRevision
+      this.isRestoring = true
+      try {
+        const { data } = await api.get('/requirement-analysis/testcase-generation/submission/', { params: { client_request_id: submissionId } })
+        if (this.disposed || this.runRevision !== revision || this.pendingSubmissionId !== submissionId) return
+        if (!data.task_id) throw new Error(this.$t('requirementAnalysis.submissionUnconfirmed'))
+        this.rememberSubmission(null)
+        this.monitoringError = ''
+        await this.restoreActiveTask(data.task_id)
+      } catch (error) {
+        if (this.disposed || this.runRevision !== revision) return
+        if ([400, 401, 403].includes(error.response?.status)) this.rememberSubmission(null)
+        this.monitoringError = this.$t('requirementAnalysis.submissionUnconfirmed')
+      } finally {
+        if (this.runRevision === revision) this.isRestoring = false
+      }
+    },
+    async restoreActiveTask(explicitTaskId) {
+      let taskId = explicitTaskId
+      if (!taskId && this.storageKey) {
+        try { taskId = sessionStorage.getItem(this.storageKey) } catch { return }
+      }
+      if (!taskId || !/^[A-Za-z0-9_-]{1,100}$/.test(taskId)) return
+      const revision = ++this.runRevision
+      this.cleanupProgress()
+      this.pollInFlight = false
+      this.finalizingTaskId = null
+      this.isRestoring = true
+      this.currentTaskId = taskId
+      this.rememberTask(taskId)
+      try {
+        const { data } = await api.get(`/requirement-analysis/testcase-generation/${taskId}/`)
+        if (!this.isCurrentTask(taskId, revision)) return
+        this.activeTitle = data.title
+        this.manualInput.title = data.title || ''
+        this.restoreRequirementInput(data)
+        this.selectedProject = data.project || ''
+        this.showReviewStep = Boolean(data.reviewer_model_config)
+        this.globalOutputMode = data.output_mode || 'complete'
+        this.isGenerating = true
+        if (data.status === 'completed') await this.fetchFinalResult(taskId, revision)
+        else if (data.status === 'failed') await this.handleGenerationError(data)
+        else if (data.status === 'cancelled') this.finishCancelledTask()
+        else {
+          this.updateTaskProgress(data)
+          // Resume from snapshots, avoiding duplicated streamed chunks after a reload.
+          this.startPolling()
+        }
+      } catch (error) {
+        if (!this.isCurrentTask(taskId, revision)) return
+        this.isGenerating = false
+        if ([401, 403, 404].includes(error.response?.status)) {
+          this.currentTaskId = null
+          this.rememberTask(null)
+        } else this.monitoringError = errorText(error, this.$t('requirementAnalysis.restoreFailed'))
+      } finally {
+        if (this.runRevision === revision) this.isRestoring = false
+      }
+    },
     resetGeneration() {
-      // 重置生成状态
-      this.isGenerating = false;
-      this.currentTaskId = null;
-      this.progressText = this.$t('requirementAnalysis.preparing');
-      this.currentStep = 0;
-      this.showResults = false;
-      this.generationResult = null;
-      this.generationError = '';
-
-      // 清空流式内容和最终版用例
-      this.streamedContent = '';
-      this.streamedReviewContent = '';
-      this.finalTestCases = '';
-
-      if (this.pollInterval) {
-        clearInterval(this.pollInterval);
-        this.pollInterval = null;
+      if (this.isGenerating || this.isSubmitting || this.isSaving) return
+      this.runRevision++
+      this.cleanupProgress()
+      this.rememberTask(null)
+      this.rememberSubmission(null)
+      this.currentTaskId = null
+      this.generationResult = null
+      this.showResults = false
+      this.generationError = ''
+      this.monitoringError = ''
+      this.streamedContent = ''
+      this.streamedReviewContent = ''
+      this.finalTestCases = ''
+      this.finalizingTaskId = null
+      this.pollInFlight = false
+      this.progress = 0
+      this.currentStep = 0
+      if (this.$route?.query?.task) {
+        const query = { ...this.$route.query }
+        delete query.task
+        this.$router.replace({ query })
       }
-
-      // 刷新页面以获取最新的配置
-      window.location.reload();
+      this.checkConfigStatus()
     },
-
-    // 格式化日期时间
-    formatDateTime(dateTimeString) {
-      if (!dateTimeString) return '';
-      const date = new Date(dateTimeString);
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      const hours = String(date.getHours()).padStart(2, '0');
-      const minutes = String(date.getMinutes()).padStart(2, '0');
-      return `${year}-${month}-${day} ${hours}:${minutes}`;
-    },
-
-    // 格式化Markdown为HTML（简化版）
-    formatMarkdown(content) {
-      if (!content) return '';
-
-      // 先去除"新增"标记，在markdown转换之前处理
-      // 这样可以避免markdown转换后无法匹配的问题
-      let html = content
-          .replace(/\*\*新增\*\*-/g, '')  // **新增**-xxx -> xxx (保留xxx的原有格式)
-          .replace(/新增-/g, '');  // 新增-xxx -> xxx (保留xxx的原有格式)
-
-      // 转义HTML特殊字符
-      html = html
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
-
-      // 转换Markdown语法
-      // 标题 #
-      html = html.replace(/^#{6}\s+(.+)$/gm, '<h6>$1</h6>');
-      html = html.replace(/^#{5}\s+(.+)$/gm, '<h5>$1</h5>');
-      html = html.replace(/^#{4}\s+(.+)$/gm, '<h4>$1</h4>');
-      html = html.replace(/^#{3}\s+(.+)$/gm, '<h3>$1</h3>');
-      html = html.replace(/^#{2}\s+(.+)$/gm, '<h2>$1</h2>');
-      html = html.replace(/^#{1}\s+(.+)$/gm, '<h1>$1</h1>');
-
-      // 粗体 **text** 或 __text__
-      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-      html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
-
-      // 斜体 *text* 或 _text_
-      html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-      html = html.replace(/_(.+?)_/g, '<em>$1</em>');
-
-      // 代码块 ```code```
-      html = html.replace(/```([\s\S]+?)```/g, '<pre><code>$1</code></pre>');
-
-      // 行内代码 `code`
-      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-      // 换行符转换为<br>
-      html = html.replace(/\n/g, '<br>');
-
-      return html;
-    },
-
-    // 将HTML的<br>标签转换为换行符（用于Excel导出）
-    convertBrToNewline(text) {
-      if (!text) return '';
-      return text.replace(/<br\s*\/?>/gi, '\n');
-    },
-
-    // 过滤掉总结和建议部分，只保留测试用例内容
-    filterTestCasesOnly(content) {
-      if (!content) return '';
-
-      const lines = content.split('\n');
-      const filteredLines = [];
-      let inTestCaseSection = true;
-
-      for (let line of lines) {
-        const trimmedLine = line.trim();
-
-        // 检查是否到了总结或建议部分
-        if (trimmedLine.includes('总结') ||
-            trimmedLine.includes('建议') ||
-            trimmedLine.includes('Summary') ||
-            trimmedLine.includes('Recommendation') ||
-            trimmedLine.includes('最后') ||
-            trimmedLine.includes('补充说明')) {
-          inTestCaseSection = false;
-          break;
-        }
-
-        if (inTestCaseSection) {
-          filteredLines.push(line);
-        }
+    navigateContentTabs(event, key) {
+      const keys = this.contentTabs.map(item => item.key)
+      const index = keys.indexOf(key)
+      let next
+      if (event.key === 'ArrowRight') next = keys[(index + 1) % keys.length]
+      else if (event.key === 'ArrowLeft') next = keys[(index + keys.length - 1) % keys.length]
+      else if (event.key === 'Home') next = keys[0]
+      else if (event.key === 'End') next = keys[keys.length - 1]
+      if (next) {
+        event.preventDefault()
+        this.contentTab = next
+        this.$nextTick(() => document.getElementById(`generation-tab-${next}`)?.focus())
       }
-
-      return filteredLines.join('\n');
     },
-
-    // 解析表格格式的测试用例（参考AutoGenTestCase的做法）
-    parseTableFormat(content) {
-      if (!content) return [];
-
-      const lines = content.split('\n').filter(line => line.trim());
-      const worksheetData = [];
-
-      for (let line of lines) {
-        const trimmedLine = line.trim();
-
-        // 检查是否是表格行（包含|分隔符，且不是分隔线）
-        if (trimmedLine.includes('|') && !trimmedLine.includes('--------')) {
-          const cells = trimmedLine.split('|').map(cell => cell.trim()).filter(cell => cell);
-          if (cells.length > 1) {
-            worksheetData.push(cells);
-          }
-        }
-      }
-
-      return worksheetData;
-    },
-
-    // 解析结构化格式的测试用例
-    parseStructuredFormat(content) {
-      if (!content) return [];
-
-      const lines = content.split('\n').filter(line => line.trim());
-      const worksheetData = [];
-
-      // 添加表头
-      worksheetData.push([
-        this.$t('requirementAnalysis.excelTestCaseNumber'),
-        this.$t('requirementAnalysis.excelTestScenario'),
-        this.$t('requirementAnalysis.excelPrecondition'),
-        this.$t('requirementAnalysis.excelTestSteps'),
-        this.$t('requirementAnalysis.excelExpectedResult'),
-        this.$t('requirementAnalysis.excelPriority')
-      ]);
-
-      let currentTestCase = {};
-      let testCaseNumber = 1;
-      let i = 0;
-
-      while (i < lines.length) {
-        const line = lines[i].trim();
-
-        // 识别测试用例开始标志
-        if (line.includes('测试用例') || line.includes('Test Case') ||
-            line.match(/^(\d+\.|\*|\-|\d+、)/)) {
-
-          // 如果之前有测试用例数据，先保存
-          if (Object.keys(currentTestCase).length > 0) {
-            worksheetData.push([
-              currentTestCase.number || `TC${testCaseNumber}`,
-              currentTestCase.scenario || '',
-              currentTestCase.precondition || '',
-              currentTestCase.steps || '',
-              currentTestCase.expected || '',
-              currentTestCase.priority || '中'
-            ]);
-            testCaseNumber++;
-          }
-
-          // 开始新的测试用例
-          currentTestCase = {
-            number: `TC${testCaseNumber}`,
-            scenario: line.replace(/^(\d+\.|\*|\-|\d+、)\s*/, '').replace(/测试用例\d*[:：]?\s*/, ''),
-            precondition: '',
-            steps: '',
-            expected: '',
-            priority: '中'
-          };
-          i++;
-        }
-        // 识别前置条件
-        else if (line.includes('前置条件') || line.includes('前提') ||
-            line.includes('Precondition')) {
-          let precondition = line.replace(/.*?[:：]\s*/, '');
-          // 收集后续的前置条件行
-          i++;
-          while (i < lines.length) {
-            const nextLine = lines[i].trim();
-            if (nextLine.includes('测试步骤') || nextLine.includes('操作步骤') ||
-                nextLine.includes('Test Steps') || nextLine.includes('步骤') ||
-                nextLine.includes('预期结果') || nextLine.includes('Expected') ||
-                nextLine.includes('优先级') || nextLine.includes('Priority') ||
-                nextLine.includes('测试用例') || nextLine.includes('Test Case') ||
-                nextLine.match(/^(\d+\.|\*|\-|\d+、)/)) {
-              break;
-            }
-            if (nextLine) {
-              precondition += '\n' + nextLine;
-            }
-            i++;
-          }
-          currentTestCase.precondition = precondition;
-        }
-        // 识别测试步骤
-        else if (line.includes('测试步骤') || line.includes('操作步骤') ||
-            line.includes('Test Steps') || line.includes('步骤')) {
-          let steps = line.replace(/.*?[:：]\s*/, '');
-          // 收集后续的步骤行
-          i++;
-          while (i < lines.length) {
-            const nextLine = lines[i].trim();
-            if (nextLine.includes('预期结果') || nextLine.includes('Expected') ||
-                nextLine.includes('优先级') || nextLine.includes('Priority') ||
-                nextLine.includes('测试用例') || nextLine.includes('Test Case') ||
-                nextLine.match(/^(\d+\.|\*|\-|\d+、)/)) {
-              break;
-            }
-            if (nextLine) {
-              steps += '\n' + nextLine;
-            }
-            i++;
-          }
-          currentTestCase.steps = steps;
-        }
-        // 识别预期结果
-        else if (line.includes('预期结果') || line.includes('Expected') ||
-            line.includes('期望')) {
-          let expected = line.replace(/.*?[:：]\s*/, '');
-          // 收集后续的结果行
-          i++;
-          while (i < lines.length) {
-            const nextLine = lines[i].trim();
-            if (nextLine.includes('优先级') || nextLine.includes('Priority') ||
-                nextLine.includes('测试用例') || nextLine.includes('Test Case') ||
-                nextLine.match(/^(\d+\.|\*|\-|\d+、)/)) {
-              break;
-            }
-            if (nextLine) {
-              expected += '\n' + nextLine;
-            }
-            i++;
-          }
-          currentTestCase.expected = expected;
-        }
-        // 识别优先级
-        else if (line.includes('优先级') || line.includes('Priority')) {
-          currentTestCase.priority = line.replace(/.*?[:：]\s*/, '');
-          i++;
-        }
-        // 如果是没有明确标识的行，可能是场景描述的延续
-        else if (Object.keys(currentTestCase).length > 0 &&
-            !currentTestCase.steps && !currentTestCase.expected &&
-            !currentTestCase.precondition) {
-          if (currentTestCase.scenario && line.length > 5) {
-            currentTestCase.scenario += '\n' + line;
-          }
-          i++;
-        } else {
-          i++;
-        }
-      }
-
-      // 保存最后一个测试用例
-      if (Object.keys(currentTestCase).length > 0) {
-        worksheetData.push([
-          currentTestCase.number || `TC${testCaseNumber}`,
-          currentTestCase.scenario || '',
-          currentTestCase.precondition || '',
-          currentTestCase.steps || '',
-          currentTestCase.expected || '',
-          currentTestCase.priority || '中'
-        ]);
-      }
-
-      // 如果没有解析到结构化数据，则按原格式输出
-      if (worksheetData.length <= 1) {
-        worksheetData.length = 0; // 清空
-        worksheetData.push([this.$t('requirementAnalysis.testCaseContent')]);
-        content.split('\n').forEach((line, index) => {
-          if (line.trim()) {
-            worksheetData.push([line.trim()]);
-          }
-        });
-      }
-
-      return worksheetData;
-    }
-  }
+    formatMarkdown(content) { return renderSafeMarkdown(content || '', { allowTables: true }) },
+  },
 }
 </script>
 
 <style scoped>
-.requirement-analysis {
-  padding: 20px;
-  max-width: 1200px;
-  margin: 0 auto;
-  position: relative;
-}
-
-.page-header {
-  text-align: center;
-  margin-bottom: 40px;
-}
-
-.page-header h1 {
-  font-size: 2.5rem;
-  color: #2c3e50;
-  margin-bottom: 10px;
-}
-
-.page-header p {
-  color: #666;
-  font-size: 1.1rem;
-}
-
-.generation-error {
-  max-width: 1000px;
-  margin: -20px auto 24px;
-  padding: 14px 18px;
-  border: 1px solid #efb5b5;
-  border-left: 4px solid #c62828;
-  border-radius: 6px;
-  background: #fff5f5;
-  color: #7a1f1f;
-  overflow-wrap: anywhere;
-}
-
-.generation-error strong {
-  display: block;
-  margin-bottom: 6px;
-}
-
-.generation-error p {
-  margin: 0;
-  white-space: pre-wrap;
-}
-
-/* 输出模式设置区域 - 全局 */
-.output-mode-section {
-  margin-bottom: 30px;
-}
-
-.output-mode-card {
-  background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-  border: 1px solid rgba(226, 232, 240, 0.8);
-  transition: all 0.3s ease;
-}
-
-.output-mode-card:hover {
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
-}
-
-.output-mode-card h3 {
-  font-size: 1.3rem;
-  color: #1a202c;
-  margin: 0 0 8px 0;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.mode-section-desc {
-  color: #64748b;
-  font-size: 0.9rem;
-  margin: 0 0 16px 0;
-  line-height: 1.5;
-}
-
-/* 配置引导弹出窗口 */
-.modal-overlay {
-  position: fixed !important;
-  top: 0 !important;
-  left: 0 !important;
-  right: 0 !important;
-  bottom: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  background: rgba(15, 23, 42, 0.6) !important;
-  backdrop-filter: blur(4px);
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  z-index: 9999 !important;
-  padding: 20px;
-  margin: 0 !important;
-  opacity: 1 !important;
-}
-
-.guide-config-modal {
-  background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%) !important;
-  border-radius: 24px;
-  padding: 36px;
-  max-width: 850px;
-  width: 100%;
-  max-height: 90vh;
-  overflow-y: auto;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
-  border: 1px solid rgba(226, 232, 240, 0.8);
-  position: relative;
-  flex-shrink: 0;
-  margin: auto;
-  opacity: 1 !important;
-}
-
-.guide-config-modal::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 5px;
-  background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-  border-radius: 24px 24px 0 0;
-}
-
-.guide-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 28px;
-}
-
-.guide-icon {
-  width: 56px;
-  height: 56px;
-  flex-shrink: 0;
-  filter: drop-shadow(0 4px 8px rgba(245, 158, 11, 0.2));
-}
-
-.guide-title h2 {
-  font-size: 1.6rem;
-  color: #1a202c;
-  margin: 0 0 6px 0;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
-.guide-title p {
-  color: #64748b;
-  font-size: 0.95rem;
-  margin: 0;
-  font-weight: 400;
-}
-
-.config-groups {
-  margin-bottom: 24px;
-}
-
-.config-group {
-  margin-bottom: 20px;
-}
-
-.group-label {
-  font-size: 0.85rem;
-  color: #94a3b8;
-  margin-bottom: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.config-items-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
-}
-
-.config-item-inline {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 16px 20px;
-  border-radius: 12px;
-  border: 2px solid transparent;
-  position: relative;
-  overflow: hidden;
-  font-weight: 500;
-}
-
-.config-item-inline::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  border-radius: 12px 0 0 12px;
-}
-
-.config-item-inline.optional {
-  opacity: 0.75;
-}
-
-/* 根据状态设置背景色和样式 */
-.config-item-inline.status-enabled {
-  background: linear-gradient(135deg, rgba(236, 253, 245, 0.9) 0%, rgba(220, 252, 231, 0.6) 100%);
-  border-color: rgba(34, 197, 94, 0.2);
-  box-shadow: 0 4px 12px rgba(34, 197, 94, 0.1);
-}
-
-.config-item-inline.status-enabled::before {
-  background: linear-gradient(180deg, #22c55e 0%, #16a34a 100%);
-}
-
-.config-item-inline.status-disabled {
-  background: linear-gradient(135deg, rgba(254, 249, 195, 0.9) 0%, rgba(254, 240, 138, 0.6) 100%);
-  border-color: rgba(234, 179, 8, 0.2);
-  box-shadow: 0 4px 12px rgba(234, 179, 8, 0.1);
-}
-
-.config-item-inline.status-disabled::before {
-  background: linear-gradient(180deg, #eab308 0%, #ca8a04 100%);
-}
-
-.config-item-inline.status-unconfigured {
-  background: linear-gradient(135deg, rgba(254, 242, 242, 0.9) 0%, rgba(254, 226, 226, 0.6) 100%);
-  border-color: rgba(239, 68, 68, 0.2);
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.1);
-}
-
-.config-item-inline.status-unconfigured::before {
-  background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
-}
-
-.status-symbol {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  font-size: 20px;
-}
-
-.config-label {
-  font-size: 0.95rem;
-  color: #334155;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.config-name {
-  font-size: 0.85rem;
-  color: #64748b;
-  margin-left: 4px;
-  font-weight: 500;
-}
-
-.status-text {
-  margin-left: auto;
-  padding: 6px 14px;
-  border-radius: 20px;
-  font-size: 0.75rem;
-  font-weight: 700;
-  background: #ef4444;
-  color: white;
-  white-space: nowrap;
-  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.2);
-}
-
-.status-text.warning {
-  background: #eab308;
-  box-shadow: 0 2px 6px rgba(234, 179, 8, 0.2);
-}
-
-.guide-actions {
-  display: flex !important;
-  flex-direction: column !important;
-  align-items: center !important;
-  gap: 12px;
-  margin-top: 30px;
-  width: 100%;
-}
-
-.guide-actions button {
-  flex: none !important;
-  width: 240px !important;
-  height: 50px !important;
-  padding: 0 24px !important;
-  border-radius: 12px;
-  font-size: 0.95rem;
-  font-weight: 600;
-  display: inline-flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  text-align: center;
-  white-space: nowrap;
-  opacity: 1 !important;
-  cursor: pointer;
-  box-sizing: border-box !important;
-}
-
-.guide-actions .generate-manual-btn {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-  color: white !important;
-  border: 2px solid transparent !important;
-  box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
-}
-
-.guide-actions .skip-action {
-  font-size: 0.85rem;
-  color: #94a3b8;
-  cursor: pointer;
-  text-decoration: none;
-  padding: 4px 8px;
-  transition: color 0.3s;
-}
-
-.guide-actions .skip-action:hover {
-  color: #64748b;
-  text-decoration: underline;
-}
-
-
-.manual-input-card, .upload-card {
-  background: white;
-  border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-  border: 1px solid #e1e8ed;
-  margin-bottom: 30px;
-}
-
-.manual-input-card h2, .upload-card h2 {
-  color: #2c3e50;
-  margin-bottom: 20px;
-  font-size: 1.5rem;
-}
-
-.form-group {
-  margin-bottom: 20px;
-}
-
-.form-group label {
-  display: block;
-  margin-bottom: 8px;
-  font-weight: 600;
-  color: #2c3e50;
-}
-
-/* 输出模式选择器 */
-.output-mode-selector {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  align-items: stretch;
-}
-
-.mode-option {
-  position: relative;
-  cursor: pointer;
-  display: flex;
-}
-
-.mode-option input[type="radio"] {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-
-.mode-content {
-  border: 2px solid #e2e8f0;
-  border-radius: 12px;
-  padding: 16px;
-  transition: all 0.3s ease;
-  background: white;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  width: 100%;
-  box-sizing: border-box;
-}
-
-.mode-option:hover .mode-content {
-  border-color: #3b82f6;
-  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1);
-}
-
-.mode-option.active .mode-content {
-  border-color: #3b82f6;
-  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-  box-shadow: 0 4px 16px rgba(59, 130, 246, 0.2);
-}
-
-.mode-title {
-  font-size: 1rem;
-  font-weight: 600;
-  color: #1e293b;
-  margin-bottom: 6px;
-}
-
-.mode-desc {
-  font-size: 0.85rem;
-  color: #64748b;
-  line-height: 1.4;
-}
-
-.mode-option.active .mode-title {
-  color: #2563eb;
-}
-
-.mode-option.active .mode-desc {
-  color: #475569;
-}
-
-.form-input, .form-select, .form-textarea {
-  width: 100%;
-  padding: 12px;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  font-size: 1rem;
-  transition: border-color 0.3s ease;
-}
-
-.form-input:focus, .form-select:focus, .form-textarea:focus {
-  outline: none;
-  border-color: #3498db;
-  box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2);
-}
-
-.form-textarea {
-  resize: vertical;
-  font-family: inherit;
-}
-
-.char-count {
-  text-align: right;
-  font-size: 0.85rem;
-  color: #666;
-  margin-top: 5px;
-}
-
-.required {
-  color: #e74c3c;
-}
-
-.generate-manual-btn, .generate-btn {
-  background: #27ae60;
-  color: white;
-  border: none;
-  padding: 15px 30px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 1.1rem;
-  transition: background 0.3s ease;
-  width: 100%;
-  margin-top: 10px;
-}
-
-.generate-manual-btn:hover:not(:disabled), .generate-btn:hover:not(:disabled) {
-  background: #219a52;
-}
-
-.generate-manual-btn:disabled, .generate-btn:disabled {
-  background: #bdc3c7;
-  cursor: not-allowed;
-}
-
-.divider {
-  text-align: center;
-  margin: 40px 0;
-  position: relative;
-}
-
-.divider::before {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: #ddd;
-}
-
-.divider span {
-  background: white;
-  padding: 0 20px;
-  color: #666;
-  font-size: 1rem;
-}
-
-.upload-area {
-  border: 2px dashed #ddd;
-  border-radius: 8px;
-  padding: 40px;
-  text-align: center;
-  transition: border-color 0.3s ease;
-  margin-bottom: 20px;
-}
-
-.upload-area.drag-over {
-  border-color: #3498db;
-  background: #f8f9fa;
-}
-
-.upload-placeholder {
-  color: #666;
-}
-
-.upload-icon {
-  font-size: 3rem;
-  margin-bottom: 15px;
-  display: block;
-}
-
-.upload-hint {
-  color: #999;
-  font-size: 0.9rem;
-  margin-top: 5px;
-}
-
-.select-file-btn {
-  background: #3498db;
-  color: white;
-  border: none;
-  padding: 10px 20px;
-  border-radius: 6px;
-  cursor: pointer;
-  margin-top: 15px;
-}
-
-.file-selected {
-  padding: 20px;
-  background: #f8f9fa;
-  border-radius: 6px;
-}
-
-.file-info {
-  display: flex;
-  align-items: center;
-  gap: 15px;
-}
-
-.file-icon {
-  font-size: 2rem;
-}
-
-.file-details {
-  flex: 1;
-}
-
-.file-name {
-  font-weight: 600;
-  margin: 0;
-}
-
-.file-size {
-  color: #666;
-  font-size: 0.9rem;
-  margin: 5px 0 0 0;
-}
-
-.remove-file {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 1.2rem;
-}
-
-.generation-progress {
-  margin: 40px 0;
-}
-
-.progress-card {
-  background: white;
-  border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-  border: 1px solid #e1e8ed;
-  text-align: center;
-}
-
-.progress-card h3 {
-  color: #2c3e50;
-  margin-bottom: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.current-mode-badge {
-  display: inline-block;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
-  padding: 4px 12px;
-  border-radius: 20px;
-  font-size: 0.85rem;
-  font-weight: 500;
-  margin-left: 8px;
-  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
-}
-
-.progress-info {
-  display: flex;
-  justify-content: center;
-  gap: 30px;
-  margin-bottom: 30px;
-  flex-wrap: wrap;
-}
-
-.progress-item {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.progress-item .label {
-  font-size: 0.9rem;
-  color: #666;
-}
-
-.progress-item .value {
-  font-weight: 600;
-  color: #2c3e50;
-}
-
-/* 流式内容显示区域 */
-.stream-content-display {
-  margin: 20px 0;
-  border: 2px solid #e1e8ed;
-  border-radius: 8px;
-  overflow: hidden;
-  background: #f8f9fa;
-}
-
-.stream-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 16px;
-  background: #e9ecef;
-  border-bottom: 1px solid #dee2e6;
-}
-
-.stream-title {
-  font-weight: 600;
-  color: #495057;
-  font-size: 0.95rem;
-}
-
-.stream-status {
-  font-size: 0.85rem;
-  color: #6c757d;
-  background: white;
-  padding: 4px 10px;
-  border-radius: 12px;
-  border: 1px solid #dee2e6;
-}
-
-.stream-content {
-  max-height: 400px;
-  overflow-y: auto;
-  padding: 16px;
-  text-align: left;
-  background: white;
-  font-size: 0.9rem;
-  line-height: 1.6;
-  color: #2c3e50;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-}
-
-.stream-content::-webkit-scrollbar {
-  width: 8px;
-}
-
-.stream-content::-webkit-scrollbar-track {
-  background: #f1f1f1;
-  border-radius: 4px;
-}
-
-.stream-content::-webkit-scrollbar-thumb {
-  background: #c1c1c1;
-  border-radius: 4px;
-}
-
-.stream-content::-webkit-scrollbar-thumb:hover {
-  background: #a8a8a8;
-}
-
-/* 最终版用例特殊样式 */
-.stream-content.final-testcases {
-  background: #f0f7ff;
-  border-left: 4px solid #2196F3;
-}
-
-.stream-content.final-testcases::before {
-  content: '📋 最终版本';
-  display: block;
-  font-weight: 600;
-  color: #2196F3;
-  margin-bottom: 12px;
-  padding-bottom: 8px;
-  border-bottom: 2px solid #e3f2fd;
-}
-
-/* 流式输出指示器 */
-.streaming-indicator {
-  font-size: 0.85em;
-  margin-left: 8px;
-  color: #4CAF50;
-  animation: pulse 1.5s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
-}
-
-.stream-content h1,
-.stream-content h2,
-.stream-content h3,
-.stream-content h4,
-.stream-content h5,
-.stream-content h6 {
-  margin-top: 1em;
-  margin-bottom: 0.5em;
-  color: #2c3e50;
-  font-weight: 600;
-}
-
-.stream-content code {
-  background: #f1f3f5;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: 'Courier New', monospace;
-  font-size: 0.85em;
-}
-
-.stream-content pre {
-  background: #f1f3f5;
-  padding: 12px;
-  border-radius: 6px;
-  overflow-x: auto;
-  margin: 10px 0;
-}
-
-.stream-content pre code {
-  background: none;
-  padding: 0;
-}
-
-.progress-steps {
-  display: flex;
-  justify-content: center;
-  gap: 20px;
-  margin-bottom: 30px;
-  flex-wrap: wrap;
-}
-
-.step {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  opacity: 0.4;
-  transition: opacity 0.3s ease;
-}
-
-.step.active {
-  opacity: 1;
-}
-
-.step-number {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: #ddd;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 600;
-  color: white;
-}
-
-.step.active .step-number {
-  background: #3498db;
-}
-
-.step-text {
-  font-size: 0.9rem;
-  color: #666;
-}
-
-.cancel-generation-btn {
-  background: #e74c3c;
-  color: white;
-  border: none;
-  padding: 10px 20px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.completion-actions {
-  display: flex;
-  gap: 12px;
-  margin-top: 20px;
-  flex-wrap: wrap;
-}
-
-.completion-actions button {
-  flex: 1;
-  min-width: 150px;
-  padding: 12px 20px;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  font-weight: 500;
-  transition: all 0.3s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.completion-actions .download-btn {
-  background: #28a745;
-  color: white;
-  font-size: 1rem;
-}
-
-.completion-actions .download-btn:hover {
-  background: #218838;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(40, 167, 69, 0.3);
-}
-
-.completion-actions .save-btn {
-  background: #007bff;
-  color: white;
-  font-size: 1rem;
-}
-
-.completion-actions .save-btn:hover {
-  background: #0056b3;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.3);
-}
-
-.completion-actions .new-generation-btn {
-  background: #6c757d;
-  color: white;
-  font-size: 1rem;
-}
-
-.completion-actions .new-generation-btn:hover {
-  background: #5a6268;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(108, 117, 125, 0.3);
-}
-
-.generation-result {
-  margin: 40px 0;
-}
-
-.result-header {
-  background: white;
-  border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-  border: 1px solid #e1e8ed;
-  margin-bottom: 20px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 20px;
-}
-
-.result-header h2 {
-  color: #27ae60;
-  margin: 0;
-}
-
-.result-summary {
-  display: flex;
-  gap: 20px;
-  flex-wrap: wrap;
-}
-
-.summary-item {
-  color: #666;
-  font-size: 0.9rem;
-}
-
-.new-generation-btn {
-  background: #3498db;
-  color: white;
-  border: none;
-  padding: 10px 20px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.generated-testcases-section, .review-feedback-section, .final-testcases-section {
-  background: white;
-  border-radius: 12px;
-  padding: 30px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-  border: 1px solid #e1e8ed;
-  margin-bottom: 20px;
-}
-
-.generated-testcases-section h3, .review-feedback-section h3, .final-testcases-section h3 {
-  color: #2c3e50;
-  margin-bottom: 20px;
-}
-
-.testcase-content, .review-content {
-  background: #f8f9fa;
-  border-radius: 6px;
-  padding: 20px;
-  border-left: 4px solid #3498db;
-}
-
-.testcase-content pre, .review-content pre {
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  margin: 0;
-  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
-  font-size: 0.9rem;
-  line-height: 1.6;
-}
-
-@media (max-width: 768px) {
-  .result-header {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .progress-info, .result-summary {
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .progress-steps {
-    gap: 10px;
-  }
-}
-
-.actions-section {
-  display: flex;
-  gap: 20px;
-  justify-content: center;
-  margin-top: 30px;
-  flex-wrap: wrap;
-}
-
-.download-btn, .save-btn {
-  padding: 12px 24px;
-  border: none;
-  border-radius: 6px;
-  font-size: 1rem;
-  font-weight: 600;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  transition: all 0.3s ease;
-}
-
-.download-btn {
-  background-color: #1abc9c;
-  color: white;
-}
-
-.download-btn:hover {
-  background-color: #16a085;
-}
-
-.save-btn {
-  background-color: #3498db;
-  color: white;
-}
-
-.save-btn:hover {
-  background-color: #2980b9;
-}
-
-@media (max-width: 768px) {
-  .actions-section {
-    flex-direction: column;
-    align-items: center;
-  }
-
-  .download-btn, .save-btn {
-    width: 100%;
-    max-width: 300px;
-    justify-content: center;
-  }
-}
-</style>
-
-<style>
-/* 全局样式：确保弹窗不受任何容器限制 */
-.modal-overlay {
-  position: fixed !important;
-  top: 0 !important;
-  left: 0 !important;
-  right: 0 !important;
-  bottom: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  max-width: none !important;
-  max-height: none !important;
-  background: rgba(15, 23, 42, 0.6) !important;
-  backdrop-filter: blur(4px);
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  z-index: 9999 !important;
-  padding: 20px;
-  margin: 0 !important;
-  opacity: 1 !important;
-  box-sizing: border-box !important;
-}
-
-.guide-config-modal {
-  background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%) !important;
-  border-radius: 24px;
-  padding: 36px;
-  max-width: 850px !important;
-  width: 100% !important;
-  min-width: 300px !important;
-  max-height: 90vh;
-  overflow-y: auto;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
-  border: 1px solid rgba(226, 232, 240, 0.8);
-  position: relative;
-  flex-shrink: 0;
-  margin: auto;
-  opacity: 1 !important;
-  box-sizing: border-box !important;
-}
-
-/* 全局按钮样式 */
-.guide-actions {
-  display: flex !important;
-  flex-direction: column !important;
-  align-items: center !important;
-  gap: 12px;
-  margin-top: 30px;
-  width: 100%;
-}
-
-.guide-actions button {
-  flex: none !important;
-  width: 240px !important;
-  height: 50px !important;
-  padding: 0 24px !important;
-  border-radius: 12px;
-  font-size: 0.95rem;
-  font-weight: 600;
-  display: inline-flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  text-align: center;
-  white-space: nowrap;
-  opacity: 1 !important;
-  box-sizing: border-box !important;
-  cursor: pointer;
-}
-
-.guide-actions .generate-manual-btn {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-  color: white !important;
-  border: 2px solid transparent !important;
-  box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
-}
-
-.guide-actions .skip-action {
-  font-size: 0.85rem;
-  color: #94a3b8;
-  cursor: pointer;
-  text-decoration: none;
-  padding: 4px 8px;
-  transition: color 0.3s;
-}
-
-.guide-actions .skip-action:hover {
-  color: #64748b;
-  text-decoration: underline;
-}
+.requirement-analysis { max-width: 1440px; margin: 0 auto; padding: 28px 32px 40px; color: var(--el-text-color-primary, #202b3d); }
+.page-header, .generation-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 24px; }
+h1 { font-size: 26px; line-height: 1.4; margin: 0 0 8px; font-weight: 650; }
+h2 { font-size: 17px; margin: 0; font-weight: 600; }
+p { line-height: 1.7; }
+.page-header p, .section-heading p { color: var(--el-text-color-secondary, #68778d); margin: 0; font-size: 14px; }
+.workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 24px; align-items: start; }
+.panel { background: var(--el-bg-color, white); border: 1px solid var(--el-border-color-light, #e5eaf1); border-radius: 12px; padding: 26px; }
+.section-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+.section-heading p { font-size: 13px; margin-top: 5px; }
+.section-number { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 30px; border-radius: 8px; background: var(--el-color-primary-light-9, #ecf5ff); color: var(--el-color-primary, #409eff); font-weight: 650; }
+fieldset { padding: 0; border: 0; margin: 0; min-width: 0; }
+.form-group { margin-bottom: 22px; }
+.form-group > label { display: block; font-size: 14px; font-weight: 550; margin-bottom: 9px; }
+.required, .field-error { color: var(--el-color-danger, #d74747); }
+input:not([type=radio]):not([type=file]), select, textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--el-border-color, #d7dfe9); border-radius: 7px; padding: 11px 12px; background: var(--el-fill-color-blank, white); color: inherit; font: inherit; font-size: 14px; }
+textarea { resize: vertical; min-height: 230px; line-height: 1.8; }
+input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--el-color-primary, #409eff); outline-offset: 3px; }
+.field-hint, .input-meta { font-size: 12px; color: var(--el-text-color-secondary, #68778d); margin: 8px 0 0; line-height: 1.6; }
+.field-error { font-size: 13px; margin-top: 8px; }
+.input-meta { display: flex; justify-content: space-between; gap: 16px; }
+.input-meta > span:last-child { white-space: nowrap; }
+.source-selector { display: inline-flex; border: 1px solid var(--el-border-color-light, #e5eaf1); border-radius: 8px; padding: 4px; background: var(--el-fill-color-light, #f5f7fa); margin-bottom: 20px; }
+.source-selector button, .content-tabs button { font: inherit; font-size: 14px; padding: 9px 18px; border: 0; border-radius: 5px; background: transparent; color: var(--el-text-color-secondary, #68778d); cursor: pointer; }
+.source-selector .selected { background: var(--el-bg-color, white); color: var(--el-color-primary, #409eff); box-shadow: 0 1px 4px #192d4810; font-weight: 550; }
+.button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; min-height: 40px; font: inherit; font-size: 13px; font-weight: 550; border: 1px solid transparent; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.primary { background: var(--el-color-primary, #409eff); color: white; }
+.secondary { border-color: var(--el-border-color, #d7dfe9); background: var(--el-bg-color, white); color: var(--el-text-color-regular, #47556c); }
+.danger { border-color: var(--el-color-danger-light-5, #fab6b6); background: var(--el-color-danger-light-9, #fef0f0); color: var(--el-color-danger, #d74747); }
+.button:disabled { cursor: not-allowed; opacity: .5; }
+.button:not(:disabled):hover { filter: brightness(.97); }
+.text-button { font: inherit; font-size: 13px; color: var(--el-color-primary, #409eff); background: transparent; border: 0; padding: 5px 0; cursor: pointer; }
+.advanced-settings { border-top: 1px solid var(--el-border-color-light, #e5eaf1); padding: 18px 0; font-size: 13px; }
+.advanced-settings summary { cursor: pointer; color: var(--el-text-color-regular, #47556c); }
+.radio-row { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 16px; }
+.radio-row label { display: inline-flex; align-items: center; gap: 6px; }
+input[type=radio] { accent-color: var(--el-color-primary, #409eff); }
+.submit-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--el-border-color-light, #e5eaf1); padding-top: 20px; }
+.submit-row .field-hint { margin: 0; }
+.sidebar { display: grid; gap: 18px; }
+.sidebar .panel { padding: 22px; }
+.config-status { display: flex; align-items: center; gap: 8px; color: var(--el-color-warning, #a86a1d); font-size: 13px; margin: 0 0 18px; }
+.config-status.ready { color: var(--el-color-success, #529b2e); }
+.status-dot { width: 7px; height: 7px; background: currentColor; border-radius: 50%; }
+.config-list { margin: 0 0 18px; font-size: 13px; }
+.config-list > div { padding: 10px 0; border-bottom: 1px solid var(--el-border-color-lighter, #eef1f5); }
+.config-list dt { font-size: 12px; color: var(--el-text-color-secondary, #68778d); margin-bottom: 4px; }
+.config-list dd { margin: 0; overflow-wrap: anywhere; }
+.config-list .missing { color: var(--el-color-danger, #d74747); }
+.full-width { width: 100%; margin-bottom: 8px; }
+.guidance-panel ol { padding-left: 18px; margin: 18px 0; font-size: 13px; line-height: 1.8; color: var(--el-text-color-regular, #47556c); }
+.guidance-panel li + li { margin-top: 12px; }
+.guidance-panel > p { font-size: 12px; color: var(--el-text-color-secondary, #68778d); margin-bottom: 0; border-top: 1px solid var(--el-border-color-light, #e5eaf1); padding-top: 14px; }
+.file-input { display: none; }
+.upload-area { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; border: 1px dashed var(--el-border-color, #d7dfe9); border-radius: 8px; padding: 44px 20px; background: var(--el-fill-color-lighter, #fafbfc); }
+.upload-area strong { font-size: 14px; font-weight: 500; }
+.drag-over { border-color: var(--el-color-primary, #409eff); background: var(--el-color-primary-light-9, #ecf5ff); }
+.file-name { overflow-wrap: anywhere; max-width: 100%; }
+.notice { border-radius: 8px; padding: 14px 18px; margin-bottom: 20px; font-size: 13px; border: 1px solid; }
+.notice p { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.notice.error { background: var(--el-color-danger-light-9, #fef0f0); color: var(--el-color-danger, #d74747); border-color: var(--el-color-danger-light-7, #fbc4c4); }
+.notice.warning { background: var(--el-color-warning-light-9, #fdf6ec); color: var(--el-color-warning-dark-2, #b88230); border-color: var(--el-color-warning-light-7, #f3d19e); }
+.generation-heading { margin-bottom: 20px; }
+.generation-heading h2 { margin-top: 8px; font-size: 21px; overflow-wrap: anywhere; }
+.eyebrow { font-size: 12px; color: var(--el-text-color-secondary, #68778d); }
+.status-badge { padding: 7px 12px; border-radius: 6px; font-size: 12px; color: var(--el-color-primary, #409eff); background: var(--el-color-primary-light-9, #ecf5ff); white-space: nowrap; }
+.status-badge.completed { background: var(--el-color-success-light-9, #f0f9eb); color: var(--el-color-success-dark-2, #529b2e); }
+.status-badge.failed, .status-badge.cancelled { background: var(--el-fill-color, #f0f2f5); color: var(--el-text-color-regular, #47556c); }
+.progress-meta { display: flex; justify-content: space-between; gap: 16px; color: var(--el-text-color-secondary, #68778d); font-size: 13px; }
+progress { width: 100%; height: 8px; border: 0; border-radius: 8px; overflow: hidden; appearance: none; margin: 10px 0 18px; accent-color: var(--el-color-primary, #409eff); }
+progress::-webkit-progress-bar { background: var(--el-fill-color, #f0f2f5); border-radius: 8px; }
+progress::-webkit-progress-value { background: var(--el-color-primary, #409eff); border-radius: 8px; }
+.progress-steps { display: flex; justify-content: space-between; padding: 0; margin: 0 0 28px; gap: 8px; list-style: none; counter-reset: step; }
+.progress-steps li { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--el-text-color-placeholder, #9ca7b7); }
+.progress-steps li::before { counter-increment: step; content: counter(step); display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: var(--el-fill-color, #f0f2f5); }
+.progress-steps .active { color: var(--el-color-primary, #409eff); }
+.progress-steps .active::before { background: var(--el-color-primary-light-9, #ecf5ff); }
+.completion-summary { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; padding: 20px; margin-bottom: 20px; background: var(--el-fill-color-lighter, #fafbfc); border-radius: 8px; }
+.completion-summary strong { font-size: 16px; }
+.completion-summary p { margin: 5px 0 0; font-size: 12px; color: var(--el-text-color-secondary, #68778d); }
+.action-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.content-tabs { display: flex; gap: 12px; border-bottom: 1px solid var(--el-border-color-light, #e5eaf1); }
+.content-tabs button { border-radius: 0; border-bottom: 2px solid transparent; padding: 12px 8px; }
+.content-tabs .selected { color: var(--el-color-primary, #409eff); border-bottom-color: var(--el-color-primary, #409eff); font-weight: 550; }
+.content-panel { min-height: 240px; padding-top: 20px; }
+.empty-state { display: flex; align-items: center; justify-content: center; min-height: 220px; color: var(--el-text-color-secondary, #68778d); font-size: 14px; }
+.case-table-wrapper { overflow: auto; max-height: 620px; }
+.case-table { border-collapse: collapse; width: 100%; font-size: 13px; text-align: left; line-height: 1.7; }
+.case-table th { position: sticky; top: 0; background: var(--el-fill-color-light, #f5f7fa); font-weight: 550; color: var(--el-text-color-regular, #47556c); white-space: nowrap; }
+.case-table td, .case-table th { padding: 13px 14px; border-bottom: 1px solid var(--el-border-color-lighter, #eef1f5); vertical-align: top; }
+.case-table td { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 140px; }
+.case-table td:first-child, .case-table td:last-child { min-width: 75px; }
+.case-table td:nth-child(4), .case-table td:nth-child(5) { min-width: 190px; }
+.priority-badge { font-size: 12px; font-weight: 600; color: var(--el-color-primary, #409eff); }
+.pagination { display: flex; justify-content: flex-end; align-items: center; gap: 16px; font-size: 13px; padding-top: 16px; }
+.markdown-content { overflow: auto; max-height: 620px; font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.markdown-content :deep(table) { border-collapse: collapse; min-width: 100%; }
+.markdown-content :deep(th), .markdown-content :deep(td) { padding: 10px 14px; border: 1px solid var(--el-border-color-light, #e5eaf1); text-align: left; vertical-align: top; min-width: 100px; }
+.markdown-content :deep(th) { background: var(--el-fill-color-light, #f5f7fa); }
+.markdown-content :deep(pre) { background: var(--el-fill-color-light, #f5f7fa); padding: 16px; border-radius: 6px; overflow: auto; }
+.markdown-content :deep(h1), .markdown-content :deep(h2), .markdown-content :deep(h3) { line-height: 1.6; margin: 16px 0 8px; }
+.generation-footer { display: flex; justify-content: space-between; align-items: center; gap: 20px; border-top: 1px solid var(--el-border-color-light, #e5eaf1); margin-top: 22px; padding-top: 18px; }
+.generation-footer p { margin: 0; }
+@media (max-width: 1100px) { .requirement-analysis { padding: 24px 20px; } .workspace-grid { grid-template-columns: minmax(0, 1fr) 270px; gap: 18px; } .panel { padding: 20px; } }
+@media (max-width: 800px) { .workspace-grid { grid-template-columns: minmax(0, 1fr); } .sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); } .requirement-analysis { padding: 18px 12px; } .page-header { align-items: flex-start; } h1 { font-size: 22px; } }
+@media (max-width: 560px) { .sidebar { grid-template-columns: minmax(0, 1fr); } .page-header { flex-wrap: wrap; } .input-meta { flex-wrap: wrap; gap: 4px; } .submit-row, .generation-footer { align-items: stretch; flex-direction: column; } .generation-heading { align-items: flex-start; } .progress-steps li { font-size: 11px; gap: 4px; } .progress-steps li::before { display: none; } .action-row { width: 100%; } .action-row .button { flex: 1; } .source-selector button { padding: 9px 14px; } .content-tabs { gap: 6px; } .content-tabs button { font-size: 12px; } }
 </style>

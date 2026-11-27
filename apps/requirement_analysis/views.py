@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import re
 import os  # Added import
@@ -42,11 +43,12 @@ from .serializers import (
     LegacyTestCaseGenerationRequestSerializer, TestCaseGenerationRequestSerializer,
     TestCaseReviewRequestSerializer,
     AIModelConfigSerializer, PromptConfigSerializer, TestCaseGenerationTaskSerializer,
-    GenerationConfigSerializer
+    TestCaseGenerationSubmissionLookupSerializer, GenerationConfigSerializer
 )
-from .services import RequirementAnalysisService, DocumentProcessor
+from .services import RequirementAnalysisService, DocumentProcessor, DocumentExtractionError
 from .ai_contracts import parse_generated_cases
 from .adoption import AdoptionError, adopt_cases, select_case_ids
+from .permissions import GenerationTaskPermission, user_can_write_project
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,44 @@ def _project_for_user(user, project_id):
             models.Q(owner=user) | models.Q(members=user)
         )
     return queryset.first()
+
+
+def _submission_task_id(user_id, client_request_id):
+    digest = hashlib.sha256(f'{user_id}:{client_request_id}'.encode('utf-8')).hexdigest()[:32].upper()
+    return f'TASK_{digest}'
+
+
+def _visible_ai_model_configs(user, role=None):
+    """Return model configs that generate requests are allowed to select."""
+    queryset = AIModelConfig.objects.all()
+    if user is None or not getattr(user, 'is_authenticated', False):
+        queryset = queryset.filter(
+            models.Q(created_by__is_staff=True) | models.Q(created_by__is_superuser=True)
+        )
+    elif not (user.is_staff or user.is_superuser):
+        queryset = queryset.filter(
+            models.Q(created_by=user)
+            | models.Q(created_by__is_staff=True)
+            | models.Q(created_by__is_superuser=True)
+        )
+    if role:
+        queryset = queryset.filter(role=role)
+    return queryset.order_by('-created_at')
+
+
+def _model_config_status_fields(config, user, *, include_provider=False):
+    can_view = config is not None and (
+        getattr(user, 'is_staff', False)
+        or getattr(user, 'is_superuser', False)
+        or config.created_by_id == getattr(user, 'pk', None)
+    )
+    fields = {
+        'name': config.name if can_view else None,
+        'id': config.id if can_view else None,
+    }
+    if include_provider:
+        fields['provider'] = config.get_model_type_display() if can_view else None
+    return fields
 
 
 def _task_accessible_to_user(task, user):
@@ -208,18 +248,33 @@ class RequirementDocumentViewSet(viewsets.ModelViewSet):
         document = self.get_object()
 
         try:
-            if not document.extracted_text:
+            cached_text = document.extracted_text.strip()
+            legacy_error_prefixes = (
+                'PDF文本提取失败:', 'Word文档文本提取失败:',
+                '文本文件读取失败:', '不支持的文档类型',
+            )
+            if cached_text.startswith(legacy_error_prefixes):
+                cached_text = ''
+
+            if not cached_text:
                 text = DocumentProcessor.extract_text(document)
                 document.extracted_text = text
                 document.save()
+                cached_text = text
 
             return Response({
-                'extracted_text': document.extracted_text,
-                'text_length': len(document.extracted_text)
+                'extracted_text': cached_text,
+                'text_length': len(cached_text)
             }, status=status.HTTP_200_OK)
 
+        except DocumentExtractionError as exc:
+            logger.info('文档文本提取失败: document_id=%s error=%s', document.pk, exc)
+            return Response(
+                {'error': f'提取文本失败: {exc}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         except Exception as e:
-            logger.error(f"提取文本时出错: {e}")
+            logger.exception('提取文本时出错: document_id=%s', document.pk)
             return Response(
                 {'error': f'提取文本失败: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -1396,7 +1451,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     """测试用例生成任务视图集"""
     queryset = TestCaseGenerationTask.objects.all()
     serializer_class = TestCaseGenerationTaskSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [GenerationTaskPermission]
     pagination_class = TestCaseGenerationTaskPagination
     http_method_names = ['get', 'post', 'patch', 'delete']  # 允许GET、POST、PATCH和DELETE方法
     lookup_field = 'task_id'  # 使用task_id作为查找字段
@@ -1426,145 +1481,194 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
         return queryset.order_by('-created_at')
 
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {'error': '请使用 generate 接口创建生成任务'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
     @action(detail=False, methods=['post'])
     def generate(self, request):
-        """创建新的测试用例生成任务"""
+        """Create and dispatch a test-case generation task."""
         try:
             serializer = TestCaseGenerationRequestSerializer(data=request.data)
             if not serializer.is_valid():
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
             validated_data = serializer.validated_data
-            if validated_data.get('project'):
+            client_request_id = validated_data.get('client_request_id')
+            task_id = (
+                _submission_task_id(request.user.pk, client_request_id)
+                if client_request_id is not None else None
+            )
+            output_mode_explicit = 'output_mode' in request.data
+            dispatch_result = []
+
+            with transaction.atomic():
+                request.user.__class__.objects.select_for_update().get(pk=request.user.pk)
+
+                if task_id:
+                    existing = TestCaseGenerationTask.objects.filter(
+                        created_by=request.user,
+                        task_id=task_id,
+                    ).first()
+                    if existing:
+                        matches = (
+                            existing.title == validated_data['title']
+                            and existing.requirement_text == validated_data['requirement_text']
+                            and existing.project_id == validated_data['project']
+                            and (
+                                not output_mode_explicit
+                                or existing.output_mode == validated_data['output_mode']
+                            )
+                        )
+                        if not matches:
+                            return Response(
+                                {'error': 'client_request_id 已用于不同的任务内容', 'task_id': existing.task_id},
+                                status=status.HTTP_409_CONFLICT,
+                            )
+                        return Response({
+                            'task_id': existing.task_id,
+                            'task': TestCaseGenerationTaskSerializer(existing).data,
+                            'replayed': True,
+                        }, status=status.HTTP_200_OK)
+
                 project = _project_for_user(request.user, validated_data['project'])
-                if not project:
-                    return Response({'error': '无权使用该项目'}, status=status.HTTP_403_FORBIDDEN)
+                if not project or not user_can_write_project(request.user, project):
+                    return Response({'error': '无权写入该项目'}, status=status.HTTP_403_FORBIDDEN)
                 validated_data['project'] = project.id
 
-            # 获取活跃的配置
-            writer_config = None
-            reviewer_config = None
-            writer_prompt = None
-            reviewer_prompt = None
+                generation_config = GenerationConfig.get_active_config()
+                auto_review_enabled = GenerationConfig.auto_review_enabled_for(generation_config)
 
-            if validated_data.get('use_writer_model', True):
-                writer_configs = AIModelConfig.objects.filter(role='writer', is_active=True)
-                if not (request.user.is_staff or request.user.is_superuser):
-                    writer_configs = writer_configs.filter(
-                        models.Q(created_by=request.user)
-                        | models.Q(created_by__is_staff=True)
-                        | models.Q(created_by__is_superuser=True)
-                    )
-                writer_config = writer_configs.order_by('-created_at').first()
+                writer_config = None
+                reviewer_config = None
+                writer_prompt = None
+                reviewer_prompt = None
 
-                if not writer_config:
-                    return Response(
-                        {'error': '未找到可用的测试用例编写模型配置'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                if validated_data.get('use_writer_model', True):
+                    writer_config = _visible_ai_model_configs(request.user, role='writer').filter(
+                        is_active=True
+                    ).first()
+                    if not writer_config:
+                        return Response(
+                            {'error': '未找到可用的测试用例编写模型配置'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
 
-                writer_prompt = PromptConfig.get_active_config('writer')
-                if not writer_prompt:
-                    return Response(
-                        {'error': '未找到可用的测试用例编写提示词配置'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                    writer_prompt = PromptConfig.get_active_config('writer')
+                    if not writer_prompt:
+                        return Response(
+                            {'error': '未找到可用的测试用例编写提示词配置'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
 
-            if validated_data.get('use_reviewer_model', True):
-                reviewer_configs = AIModelConfig.objects.filter(role='reviewer', is_active=True)
-                if not (request.user.is_staff or request.user.is_superuser):
-                    reviewer_configs = reviewer_configs.filter(
-                        models.Q(created_by=request.user)
-                        | models.Q(created_by__is_staff=True)
-                        | models.Q(created_by__is_superuser=True)
-                    )
-                reviewer_config = reviewer_configs.order_by('-created_at').first()
+                if auto_review_enabled:
+                    reviewer_config = _visible_ai_model_configs(request.user, role='reviewer').filter(
+                        is_active=True
+                    ).first()
+                    if not reviewer_config:
+                        return Response(
+                            {'error': '未找到可用的测试用例评审模型配置'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
 
-                if not reviewer_config:
-                    return Response(
-                        {'error': '未找到可用的测试用例评审模型配置'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                    reviewer_prompt = PromptConfig.get_active_config('reviewer')
+                    if not reviewer_prompt:
+                        return Response(
+                            {'error': '未找到可用的测试用例评审提示词配置'},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
 
-                reviewer_prompt = PromptConfig.get_active_config('reviewer')
-                if not reviewer_prompt:
-                    return Response(
-                        {'error': '未找到可用的测试用例评审提示词配置'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
+                task_data = {
+                    'title': validated_data['title'],
+                    'requirement_text': validated_data['requirement_text'],
+                    'project': project.id,
+                    'writer_model_config': writer_config.id if writer_config else None,
+                    'reviewer_model_config': reviewer_config.id if reviewer_config else None,
+                    'writer_prompt_config': writer_prompt.id if writer_prompt else None,
+                    'reviewer_prompt_config': reviewer_prompt.id if reviewer_prompt else None,
+                }
 
-            # 创建任务
-            task_data = {
-                'title': validated_data['title'],
-                'requirement_text': validated_data['requirement_text'],
-                'writer_model_config': writer_config.id if writer_config else None,
-                'reviewer_model_config': reviewer_config.id if reviewer_config else None,
-                'writer_prompt_config': writer_prompt.id if writer_prompt else None,
-                'reviewer_prompt_config': reviewer_prompt.id if reviewer_prompt else None,
-            }
-
-            # 如果请求中包含项目ID，添加到任务数据中
-            if 'project' in validated_data and validated_data['project']:
-                task_data['project'] = validated_data['project']
-
-            # 处理输出模式：优先使用用户指定的，否则使用生成行为配置的默认值
-            output_mode = request.data.get('output_mode')
-            if output_mode and output_mode in ['stream', 'complete']:
-                task_data['output_mode'] = output_mode
-            else:
-                # 从生成行为配置中读取默认值
-                from .models import GenerationConfig
-                gen_config = GenerationConfig.get_active_config()
-                if gen_config:
-                    task_data['output_mode'] = gen_config.default_output_mode
+                output_mode = validated_data.get('output_mode')
+                if output_mode:
+                    task_data['output_mode'] = output_mode
+                elif generation_config:
+                    task_data['output_mode'] = generation_config.default_output_mode
                 else:
-                    # 如果没有配置，默认使用流式输出
                     task_data['output_mode'] = 'stream'
 
-            task_serializer = TestCaseGenerationTaskSerializer(
-                data=task_data,
-                context={'request': request}
-            )
+                task_serializer = TestCaseGenerationTaskSerializer(
+                    data=task_data,
+                    context={'request': request, 'server_selected_config_refs': True},
+                )
+                if not task_serializer.is_valid():
+                    return Response(task_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            if task_serializer.is_valid():
-                with transaction.atomic():
-                    request.user.__class__.objects.select_for_update().get(pk=request.user.pk)
-                    active_count = TestCaseGenerationTask.objects.filter(
-                        created_by=request.user,
-                        status__in=['pending', 'generating', 'reviewing', 'revising'],
-                    ).count()
-                    if active_count >= 2:
-                        return Response(
-                            {'error': '同时运行的生成任务已达到上限，请等待现有任务完成'},
-                            status=status.HTTP_429_TOO_MANY_REQUESTS,
-                        )
-                    task = task_serializer.save()
-
-                # Publish only after the task row is committed; the worker receives its database ID.
-                from .tasks import dispatch_generation_task
-                dispatch_result = []
-                transaction.on_commit(lambda: dispatch_result.append(dispatch_generation_task(task.pk)))
-                if dispatch_result and dispatch_result[0] is None:
-                    task.refresh_from_db()
+                active_count = TestCaseGenerationTask.objects.filter(
+                    created_by=request.user,
+                    status__in=['pending', 'generating', 'reviewing', 'revising'],
+                ).count()
+                if active_count >= 2:
                     return Response(
-                        {'error': task.error_message or '无法提交生成任务到 Celery', 'task_id': task.task_id},
-                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        {'error': '同时运行的生成任务已达到上限，请等待现有任务完成'},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
                     )
 
-                return Response({
-                    'message': '测试用例生成任务已创建',
-                    'task_id': task.task_id,
-                    'task': task_serializer.data
-                }, status=status.HTTP_201_CREATED)
-            else:
-                return Response(task_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                save_kwargs = {
+                    'output_mode': task_data['output_mode'],
+                    'writer_model_config': writer_config,
+                    'reviewer_model_config': reviewer_config,
+                    'writer_prompt_config': writer_prompt,
+                    'reviewer_prompt_config': reviewer_prompt,
+                }
+                if task_id:
+                    save_kwargs['task_id'] = task_id
+                task = task_serializer.save(**save_kwargs)
+
+                # Dispatch only after commit, and never from an idempotent replay.
+                from .tasks import dispatch_generation_task
+                transaction.on_commit(lambda: dispatch_result.append(dispatch_generation_task(task.pk)))
+
+            if dispatch_result and dispatch_result[0] is None:
+                task.refresh_from_db()
+                return Response(
+                    {'error': task.error_message or '无法提交生成任务到 Celery', 'task_id': task.task_id},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+
+            return Response({
+                'message': '测试用例生成任务已创建',
+                'task_id': task.task_id,
+                'task': task_serializer.data,
+            }, status=status.HTTP_201_CREATED)
 
         except Exception as e:
             logger.error(f"创建生成任务时出错: {e}")
             return Response(
                 {'error': f'创建任务失败: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+    @action(detail=False, methods=['get'], url_path='submission')
+    def submission(self, request):
+        """Recover a task from a client-generated submission UUID."""
+        serializer = TestCaseGenerationSubmissionLookupSerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        task_id = _submission_task_id(request.user.pk, serializer.validated_data['client_request_id'])
+        task = TestCaseGenerationTask.objects.filter(
+            task_id=task_id,
+            created_by=request.user,
+        ).first()
+        if task is None:
+            return Response({'error': '任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'task_id': task.task_id,
+            'task': TestCaseGenerationTaskSerializer(task).data,
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='stream-ticket')
     def issue_stream_ticket(self, request, task_id=None):
@@ -2568,150 +2672,108 @@ class ConfigStatusViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def check(self, request):
-        """检查AI配置状态"""
+        """Check configuration readiness using the same selection rules as generate."""
         try:
-            # 检查AI模型配置
-            ai_model_configs = AIModelConfig.objects.filter(
+            user = getattr(request, 'user', None)
+            visible_models = _visible_ai_model_configs(user).filter(
                 role__in=['writer', 'reviewer']
-            ).exclude(role__in=['browser_use_text', 'browser_use_vision'])
+            )
+            writer_model_enabled = visible_models.filter(role='writer', is_active=True).first()
+            writer_model_disabled = visible_models.filter(role='writer', is_active=False).first()
+            reviewer_model_enabled = visible_models.filter(role='reviewer', is_active=True).first()
+            reviewer_model_disabled = visible_models.filter(role='reviewer', is_active=False).first()
 
-            # 检查writer模型配置
-            writer_model_enabled = ai_model_configs.filter(
-                role='writer',
-                is_active=True
-            ).first()
-
-            writer_model_disabled = ai_model_configs.filter(
-                role='writer',
-                is_active=False
-            ).first()
-
-            # 检查reviewer模型配置
-            reviewer_model_enabled = ai_model_configs.filter(
-                role='reviewer',
-                is_active=True
-            ).first()
-
-            reviewer_model_disabled = ai_model_configs.filter(
-                role='reviewer',
-                is_active=False
-            ).first()
-
-            # 检查writer提示词配置
             writer_prompt_enabled = PromptConfig.objects.filter(
-                prompt_type='writer',
-                is_active=True
+                prompt_type='writer', is_active=True
             ).first()
-
             writer_prompt_disabled = PromptConfig.objects.filter(
-                prompt_type='writer',
-                is_active=False
+                prompt_type='writer', is_active=False
             ).first()
-
-            # 检查reviewer提示词配置
             reviewer_prompt_enabled = PromptConfig.objects.filter(
-                prompt_type='reviewer',
-                is_active=True
+                prompt_type='reviewer', is_active=True
             ).first()
-
             reviewer_prompt_disabled = PromptConfig.objects.filter(
-                prompt_type='reviewer',
-                is_active=False
+                prompt_type='reviewer', is_active=False
             ).first()
 
-            # 判断必需配置（writer）
-            writer_configured = (
-                    writer_model_enabled is not None and
-                    writer_prompt_enabled is not None
-            )
-
-            # 判断可选配置（reviewer）
-            reviewer_configured = (
-                    reviewer_model_enabled is not None and
-                    reviewer_prompt_enabled is not None
-            )
-
-            # 检查生成行为配置
             generation_config = GenerationConfig.get_active_config()
+            auto_review_enabled = GenerationConfig.auto_review_enabled_for(generation_config)
+            reviewer_required = auto_review_enabled
 
-            # 判断是否有禁用的配置
-            has_disabled = (
-                    writer_model_disabled is not None or
-                    writer_prompt_disabled is not None or
-                    reviewer_model_disabled is not None or
-                    reviewer_prompt_disabled is not None
+            required_readiness = [
+                (writer_model_enabled, writer_model_disabled),
+                (writer_prompt_enabled, writer_prompt_disabled),
+            ]
+            if reviewer_required:
+                required_readiness.extend([
+                    (reviewer_model_enabled, reviewer_model_disabled),
+                    (reviewer_prompt_enabled, reviewer_prompt_disabled),
+                ])
+
+            if all(enabled is not None for enabled, _ in required_readiness):
+                overall_status = 'enabled'
+                message = '配置完整且已启用'
+            elif any(enabled is None and disabled is not None for enabled, disabled in required_readiness):
+                overall_status = 'disabled'
+                message = '必需配置存在但处于禁用状态'
+            else:
+                overall_status = 'not_configured'
+                message = '缺少必需的AI模型或提示词配置'
+
+            writer_model_details = _model_config_status_fields(
+                writer_model_enabled or writer_model_disabled, user, include_provider=True
+            )
+            reviewer_model_details = _model_config_status_fields(
+                reviewer_model_enabled or reviewer_model_disabled, user
             )
 
-            # 判断整体状态
-            if writer_configured:
-                if has_disabled:
-                    overall_status = 'disabled'
-                    message = '配置完整，但部分配置处于禁用状态'
-                else:
-                    overall_status = 'enabled'
-                    message = '配置完整且已启用'
-            else:
-                # writer配置不完整
-                if writer_model_enabled or writer_prompt_enabled:
-                    overall_status = 'disabled'
-                    message = '检测到已配置但未启用的配置'
-                else:
-                    overall_status = 'not_configured'
-                    message = '尚未配置AI模型和提示词'
-
-            # 构建返回数据
             response_data = {
                 'overall_status': overall_status,
                 'message': message,
                 'writer_model': {
                     'configured': writer_model_enabled is not None or writer_model_disabled is not None,
                     'enabled': writer_model_enabled is not None,
-                    'name': (writer_model_enabled or writer_model_disabled).name if (
-                            writer_model_enabled or writer_model_disabled) else None,
-                    'provider': (writer_model_enabled or writer_model_disabled).get_model_type_display() if (
-                            writer_model_enabled or writer_model_disabled) else None,
-                    'id': (writer_model_enabled or writer_model_disabled).id if (
-                            writer_model_enabled or writer_model_disabled) else None,
-                    'required': True
+                    **writer_model_details,
+                    'required': True,
                 },
                 'writer_prompt': {
                     'configured': writer_prompt_enabled is not None or writer_prompt_disabled is not None,
                     'enabled': writer_prompt_enabled is not None,
-                    'name': (writer_prompt_enabled or writer_prompt_disabled).name if (
-                            writer_prompt_enabled or writer_prompt_disabled) else None,
-                    'id': (writer_prompt_enabled or writer_prompt_disabled).id if (
-                            writer_prompt_enabled or writer_prompt_disabled) else None,
-                    'required': True
+                    'name': writer_prompt_enabled.name if writer_prompt_enabled else (
+                        writer_prompt_disabled.name if writer_prompt_disabled else None
+                    ),
+                    'id': writer_prompt_enabled.id if writer_prompt_enabled else (
+                        writer_prompt_disabled.id if writer_prompt_disabled else None
+                    ),
+                    'required': True,
                 },
                 'reviewer_model': {
                     'configured': reviewer_model_enabled is not None or reviewer_model_disabled is not None,
                     'enabled': reviewer_model_enabled is not None,
-                    'name': (reviewer_model_enabled or reviewer_model_disabled).name if (
-                            reviewer_model_enabled or reviewer_model_disabled) else None,
-                    'id': (reviewer_model_enabled or reviewer_model_disabled).id if (
-                            reviewer_model_enabled or reviewer_model_disabled) else None,
-                    'required': False
+                    **reviewer_model_details,
+                    'required': reviewer_required,
                 },
                 'reviewer_prompt': {
                     'configured': reviewer_prompt_enabled is not None or reviewer_prompt_disabled is not None,
                     'enabled': reviewer_prompt_enabled is not None,
-                    'name': (reviewer_prompt_enabled or reviewer_prompt_disabled).name if (
-                            reviewer_prompt_enabled or reviewer_prompt_disabled) else None,
-                    'id': (reviewer_prompt_enabled or reviewer_prompt_disabled).id if (
-                            reviewer_prompt_enabled or reviewer_prompt_disabled) else None,
-                    'required': False
+                    'name': reviewer_prompt_enabled.name if reviewer_prompt_enabled else (
+                        reviewer_prompt_disabled.name if reviewer_prompt_disabled else None
+                    ),
+                    'id': reviewer_prompt_enabled.id if reviewer_prompt_enabled else (
+                        reviewer_prompt_disabled.id if reviewer_prompt_disabled else None
+                    ),
+                    'required': reviewer_required,
                 },
                 'generation_config': {
                     'configured': generation_config is not None,
                     'enabled': generation_config is not None,
                     'name': generation_config.name if generation_config else None,
                     'id': generation_config.id if generation_config else None,
-                    'required': True,
-                    'default_output_mode': generation_config.default_output_mode if generation_config else None,
-                    'enable_auto_review': generation_config.enable_auto_review if generation_config else None
-                }
+                    'required': False,
+                    'default_output_mode': generation_config.default_output_mode if generation_config else 'stream',
+                    'enable_auto_review': auto_review_enabled,
+                },
             }
-
             return Response(response_data, status=status.HTTP_200_OK)
 
         except Exception as e:

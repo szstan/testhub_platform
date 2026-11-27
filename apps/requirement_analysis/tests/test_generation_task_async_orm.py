@@ -18,6 +18,12 @@ from apps.users.models import User
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
+CASE_OUTPUT = (
+    '| 用例编号 | 测试场景 | 前置条件 | 操作步骤 | 预期结果 | 优先级 |\n'
+    '| --- | --- | --- | --- | --- | --- |\n'
+    '| TC-001 | Async ORM case | A user is registered | Submit valid credentials | Login succeeds | P1 |\n'
+)
+
 
 @pytest.mark.parametrize('output_mode', ['stream', 'complete'])
 def test_generation_worker_eager_loads_async_config_relations(monkeypatch, output_mode):
@@ -62,11 +68,11 @@ def test_generation_worker_eager_loads_async_config_relations(monkeypatch, outpu
 
     async def fake_provider_stream(config, messages, callback=None, max_tokens=None):
         provider_stream_roles.append(config.role)
-        yield 'TC-001: generated test case\n'
+        yield CASE_OUTPUT
 
     async def fake_provider_request(config, messages, max_tokens=None):
         provider_request_roles.append(config.role)
-        return {'choices': [{'message': {'content': 'TC-001: generated test case\n'}}]}
+        return {'choices': [{'message': {'content': CASE_OUTPUT}}]}
 
     monkeypatch.setattr(
         AIModelService,

@@ -1,10 +1,12 @@
 from collections import Counter
 import re
 
-from django.db import models, transaction
+from django.db import transaction
 from django.utils import timezone
 
 from apps.projects.models import Project
+from apps.requirement_analysis.ai_contracts import AIContractError, validate_executable_cases
+from apps.requirement_analysis.permissions import user_can_write_project
 from apps.testcases.models import TestCase
 
 
@@ -103,13 +105,8 @@ def select_case_ids(
 def resolve_project(task, user, requested_project_id=None):
     if task.project_id:
         project = task.project
-        if not (user.is_staff or user.is_superuser):
-            has_access = (
-                project.owner_id == user.id
-                or project.members.filter(pk=user.pk).exists()
-            )
-            if not has_access:
-                raise AdoptionError('无权使用该项目', status_code=403)
+        if not user_can_write_project(user, project):
+            raise AdoptionError('无权使用该项目', status_code=403)
         return project
     if requested_project_id in (None, ''):
         raise AdoptionError('任务未绑定项目，请提供可访问的 project_id')
@@ -120,11 +117,8 @@ def resolve_project(task, user, requested_project_id=None):
     ):
         raise AdoptionError('project_id 无效')
 
-    projects = Project.objects.filter(pk=int(requested_project_id))
-    if not (user.is_staff or user.is_superuser):
-        projects = projects.filter(models.Q(owner=user) | models.Q(members=user))
-    project = projects.first()
-    if project is None:
+    project = Project.objects.filter(pk=int(requested_project_id)).first()
+    if project is None or not user_can_write_project(user, project):
         raise AdoptionError('无权使用该项目', status_code=403)
     return project
 
@@ -132,13 +126,15 @@ def resolve_project(task, user, requested_project_id=None):
 @transaction.atomic
 def adopt_cases(task, canonical_cases, case_ids, user, requested_project_id=None):
     canonical_by_id = {case['case_id']: case for case in canonical_cases}
+    selected_cases = [canonical_by_id[case_id] for case_id in case_ids]
+    try:
+        validate_executable_cases(selected_cases)
+    except AIContractError as exc:
+        raise AdoptionError(str(exc)) from exc
+
     adopted_ids = previous_adopted_case_ids(task, canonical_cases)
     adopted_set = set(adopted_ids)
-    cases_to_adopt = [
-        canonical_by_id[case_id]
-        for case_id in case_ids
-        if case_id not in adopted_set
-    ]
+    cases_to_adopt = [case for case in selected_cases if case['case_id'] not in adopted_set]
     project = (
         resolve_project(task, user, requested_project_id)
         if task.project_id or cases_to_adopt

@@ -5,6 +5,7 @@ from .models import (
     GenerationConfig
 )
 from .ai_contracts import parse_generated_cases
+from .permissions import user_can_write_project
 
 
 class RequirementDocumentSerializer(serializers.ModelSerializer):
@@ -284,7 +285,7 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCaseGenerationTask
         fields = ['id', 'task_id', 'title', 'requirement_text', 'status', 'status_display',
-                 'progress', 'project', 'project_name', 'writer_model_config', 'writer_model_name', 
+                 'progress', 'project', 'project_name', 'output_mode', 'writer_model_config', 'writer_model_name',
                  'reviewer_model_config', 'reviewer_model_name', 'writer_prompt_config', 'writer_prompt_name',
                  'reviewer_prompt_config', 'reviewer_prompt_name', 'generated_test_cases',
                  'review_feedback', 'final_test_cases', 'canonical_cases', 'adopted_case_ids',
@@ -292,22 +293,36 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
                  'created_by', 'created_by_name', 'created_at', 'updated_at', 'completed_at']
         read_only_fields = ['task_id', 'status', 'progress', 'generated_test_cases',
                           'review_feedback', 'final_test_cases', 'canonical_cases', 'adopted_case_ids',
-                          'is_saved_to_records', 'saved_at', 'generation_log',
-                          'error_message', 'created_by', 'completed_at']
+                          'is_saved_to_records', 'saved_at', 'generation_log', 'output_mode',
+                          'error_message', 'created_by', 'completed_at', 'writer_model_config',
+                          'reviewer_model_config', 'writer_prompt_config', 'reviewer_prompt_config']
 
     def get_canonical_cases(self, obj):
         return parse_generated_cases(obj.final_test_cases)
+
+    def validate(self, attrs):
+        config_fields = {
+            'writer_model_config', 'reviewer_model_config',
+            'writer_prompt_config', 'reviewer_prompt_config',
+        }
+        submitted_config_fields = config_fields.intersection(self.initial_data)
+        if submitted_config_fields and (
+            self.instance is not None or not self.context.get('server_selected_config_refs')
+        ):
+            raise serializers.ValidationError({
+                field: '生成配置由服务端选择，不能通过任务请求修改'
+                for field in sorted(submitted_config_fields)
+            })
+        return attrs
 
     def validate_project(self, value):
         if value is None:
             raise serializers.ValidationError('项目不能为空')
         request = self.context.get('request')
         user = getattr(request, 'user', None)
-        if not user or not user.is_authenticated:
-            raise serializers.ValidationError('必须登录后配置生成任务')
-        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+        if user_can_write_project(user, value):
             return value
-        raise serializers.ValidationError('无权使用该项目')
+        raise serializers.ValidationError('无权写入该项目')
 
     def update(self, instance, validated_data):
         if 'project' in validated_data and (validated_data['project'] is None or validated_data['project'].pk != instance.project_id):
@@ -321,8 +336,9 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
         if not user.is_authenticated:
             raise serializers.ValidationError('必须登录后创建生成任务')
         validated_data['created_by'] = user
-        
-        validated_data['task_id'] = f"TASK_{uuid.uuid4().hex[:8].upper()}"
+
+        if not validated_data.get('task_id'):
+            validated_data['task_id'] = f"TASK_{uuid.uuid4().hex[:8].upper()}"
         
         return super().create(validated_data)
 
@@ -331,9 +347,24 @@ class TestCaseGenerationRequestSerializer(serializers.Serializer):
     """新的测试用例生成请求序列化器"""
     title = serializers.CharField(max_length=200, help_text="任务标题")
     requirement_text = serializers.CharField(max_length=100000, help_text="需求描述")
-    project = serializers.IntegerField(required=True, allow_null=False, help_text="项目 ID")
+    project = serializers.IntegerField(min_value=1, required=True, allow_null=False, help_text="项目 ID")
+    client_request_id = serializers.UUIDField(required=False, help_text="客户端提交 UUID")
+    output_mode = serializers.ChoiceField(
+        choices=TestCaseGenerationTask.OUTPUT_MODE_CHOICES,
+        required=False,
+        help_text="输出模式",
+    )
     use_writer_model = serializers.BooleanField(default=True, help_text="是否使用编写模型")
     use_reviewer_model = serializers.BooleanField(default=True, help_text="是否使用评审模型")
+
+    def validate_use_writer_model(self, value):
+        if not value:
+            raise serializers.ValidationError('必须启用测试用例编写模型')
+        return value
+
+
+class TestCaseGenerationSubmissionLookupSerializer(serializers.Serializer):
+    client_request_id = serializers.UUIDField(required=True)
 
 
 class GenerationConfigSerializer(serializers.ModelSerializer):

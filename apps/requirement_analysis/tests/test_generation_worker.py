@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import threading
 import uuid
 from datetime import timedelta
@@ -33,7 +34,12 @@ from apps.users.models import User
 pytestmark = pytest.mark.django_db(transaction=True)
 
 
-CASE_TEXT = 'TC-001: Generated case\n'
+CASE_TEXT = (
+    '| 用例编号 | 测试场景 | 前置条件 | 操作步骤 | 预期结果 | 优先级 |\n'
+    '| --- | --- | --- | --- | --- | --- |\n'
+    '| TC-001 | Generated case | A test user exists | Submit a valid request | The request succeeds | P1 |\n'
+)
+REVISED_CASE_TEXT = CASE_TEXT.replace('Generated case', 'Revised case')
 
 
 def setup_generation(username, *, is_admin=False, auto_review=True, review_timeout=120):
@@ -64,7 +70,8 @@ def setup_generation(username, *, is_admin=False, auto_review=True, review_timeo
 
 
 def make_task(user, relations, *, status='pending', output_mode='stream', claim_id='claim-current'):
-    _, _, writer_model, reviewer_model, writer_prompt, reviewer_prompt, _ = relations
+    _, _, writer_model, reviewer_model, writer_prompt, reviewer_prompt, generation_config = relations
+    auto_review_enabled = GenerationConfig.auto_review_enabled_for(generation_config)
     return GenerationTask.objects.create(
         task_id=f'TASK_{uuid.uuid4().hex[:10].upper()}',
         title='Worker test task',
@@ -72,23 +79,26 @@ def make_task(user, relations, *, status='pending', output_mode='stream', claim_
         status=status,
         output_mode=output_mode,
         writer_model_config=writer_model,
-        reviewer_model_config=reviewer_model,
+        reviewer_model_config=reviewer_model if auto_review_enabled else None,
         writer_prompt_config=writer_prompt,
-        reviewer_prompt_config=reviewer_prompt,
+        reviewer_prompt_config=reviewer_prompt if auto_review_enabled else None,
         created_by=user,
         celery_task_id=claim_id,
     )
 
 
-def post_generate(user, project, *, output_mode='stream'):
+def post_generate(user, project, *, output_mode='stream', **options):
+    project_id = options.pop('project_id', project.pk)
+    payload = {
+        'title': 'Queued task',
+        'requirement_text': 'A mocked requirement.',
+        'project': project_id,
+        'output_mode': output_mode,
+        **options,
+    }
     request = APIRequestFactory().post(
         '/api/requirement-analysis/testcase-generation/generate/',
-        {
-            'title': 'Queued task',
-            'requirement_text': 'A mocked requirement.',
-            'project': project.pk,
-            'output_mode': output_mode,
-        },
+        payload,
         format='json',
     )
     force_authenticate(request, user=user)
@@ -97,6 +107,15 @@ def post_generate(user, project, *, output_mode='stream'):
 
 def run_worker(task):
     return generate_test_case_task.run(task.pk, task.celery_task_id)
+
+
+def get_submission(user, client_request_id):
+    request = APIRequestFactory().get(
+        '/api/requirement-analysis/testcase-generation/submission/',
+        {'client_request_id': client_request_id},
+    )
+    force_authenticate(request, user=user)
+    return GenerationTaskViewSet.as_view({'get': 'submission'})(request)
 
 
 def test_generate_endpoint_persists_and_dispatches_only_the_database_id(monkeypatch):
@@ -121,6 +140,240 @@ def test_generate_endpoint_persists_and_dispatches_only_the_database_id(monkeypa
     provider_called.assert_not_called()
 
 
+def test_generate_replays_same_client_request_id_without_redispatch(monkeypatch):
+    user, project, *_ = setup_generation('generation-idempotent-replay', auto_review=False)
+    client_request_id = uuid.uuid4()
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    created = post_generate(
+        user, project, client_request_id=str(client_request_id), task_id='TASK_CLIENT_OVERRIDE'
+    )
+    task = GenerationTask.objects.get(created_by=user)
+    task.status = 'completed'
+    task.save(update_fields=['status'])
+    replayed = post_generate(
+        user, project, client_request_id=str(client_request_id), task_id='TASK_CLIENT_OVERRIDE'
+    )
+
+    expected_digest = hashlib.sha256(f'{user.pk}:{client_request_id}'.encode()).hexdigest()[:32].upper()
+    assert created.status_code == 201
+    assert created.data['task_id'] == f'TASK_{expected_digest}'
+    assert replayed.status_code == 200
+    assert set(replayed.data) == {'task_id', 'task', 'replayed'}
+    assert replayed.data['task']['status'] == 'completed'
+    assert GenerationTask.objects.filter(created_by=user).count() == 1
+    dispatch.assert_called_once()
+
+
+@pytest.mark.parametrize('field', ['title', 'requirement_text', 'project', 'output_mode'])
+def test_generate_rejects_conflicting_payload_for_existing_client_request_id(monkeypatch, field):
+    user, project, *_ = setup_generation(f'generation-idempotency-conflict-{field}', auto_review=False)
+    client_request_id = str(uuid.uuid4())
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+    created = post_generate(user, project, client_request_id=client_request_id)
+    original_task_id = created.data['task_id']
+
+    changes = {
+        'title': {'title': 'Different title'},
+        'requirement_text': {'requirement_text': 'Different requirement.'},
+        'project': {'project_id': Project.objects.create(name='Other project', owner=user).pk},
+        'output_mode': {'output_mode': 'complete'},
+    }
+    conflict = post_generate(user, project, client_request_id=client_request_id, **changes[field])
+
+    assert conflict.status_code == 409
+    assert conflict.data['task_id'] == original_task_id
+    assert GenerationTask.objects.filter(created_by=user).count() == 1
+    dispatch.assert_called_once()
+
+
+def test_generate_replays_existing_submission_before_model_configuration_validation(monkeypatch):
+    user, project, writer_model, *_ = setup_generation(
+        'generation-idempotent-no-model', auto_review=False
+    )
+    client_request_id = str(uuid.uuid4())
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+    created = post_generate(user, project, client_request_id=client_request_id)
+
+    writer_model.is_active = False
+    writer_model.save(update_fields=['is_active'])
+    replayed = post_generate(user, project, client_request_id=client_request_id)
+
+    assert created.status_code == 201
+    assert replayed.status_code == 200
+    assert replayed.data['task_id'] == created.data['task_id']
+    assert replayed.data['replayed'] is True
+    dispatch.assert_called_once()
+
+
+def test_generate_creates_distinct_tasks_for_distinct_client_request_ids(monkeypatch):
+    user, project, *_ = setup_generation('generation-distinct-client-ids', auto_review=False)
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    first = post_generate(user, project, client_request_id=str(uuid.uuid4()))
+    second = post_generate(user, project, client_request_id=str(uuid.uuid4()))
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.data['task_id'] != second.data['task_id']
+    assert GenerationTask.objects.filter(created_by=user).count() == 2
+    assert dispatch.call_count == 2
+
+
+def test_submission_lookup_validates_uuid_and_does_not_expose_other_users_task(monkeypatch):
+    user, project, *_ = setup_generation('generation-submission-owner', auto_review=False)
+    client_request_id = str(uuid.uuid4())
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+    created = post_generate(user, project, client_request_id=client_request_id)
+
+    recovered = get_submission(user, client_request_id)
+    invalid = get_submission(user, 'not-a-uuid')
+    other_user = User.objects.create_user(username='generation-submission-other', password='test-pass')
+    project.members.add(other_user)
+    private_lookup = get_submission(other_user, client_request_id)
+
+    assert created.status_code == 201
+    assert recovered.status_code == 200
+    assert recovered.data['task_id'] == created.data['task_id']
+    assert recovered.data['task']['id'] == created.data['task']['id']
+    assert invalid.status_code == 400
+    assert 'client_request_id' in invalid.data
+    assert private_lookup.status_code == 404
+    assert 'task_id' not in private_lookup.data
+    dispatch.assert_called_once()
+
+
+def test_generate_persists_explicit_complete_output_mode(monkeypatch):
+    user, project, writer_model, reviewer_model, writer_prompt, reviewer_prompt, _ = setup_generation(
+        'generation-complete-output-mode', auto_review=True
+    )
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project, output_mode='complete')
+
+    assert response.status_code == 201
+    task = GenerationTask.objects.get(task_id=response.data['task_id'])
+    assert task.output_mode == 'complete'
+    assert task.writer_model_config_id == writer_model.pk
+    assert task.reviewer_model_config_id == reviewer_model.pk
+    assert task.writer_prompt_config_id == writer_prompt.pk
+    assert task.reviewer_prompt_config_id == reviewer_prompt.pk
+    assert response.data['task']['output_mode'] == 'complete'
+    dispatch.assert_called_once()
+
+
+def test_generate_does_not_require_reviewer_when_auto_review_is_disabled(monkeypatch):
+
+    user, project, _, reviewer_model, _, reviewer_prompt, _ = setup_generation(
+        'generation-no-review-config', auto_review=False
+    )
+    reviewer_model.delete()
+    reviewer_prompt.delete()
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project)
+
+    assert response.status_code == 201
+    task = GenerationTask.objects.get(task_id=response.data['task_id'])
+    assert task.reviewer_model_config_id is None
+    assert task.reviewer_prompt_config_id is None
+    dispatch.assert_called_once()
+
+
+def test_generate_requires_reviewer_when_auto_review_is_enabled(monkeypatch):
+    user, project, _, reviewer_model, _, reviewer_prompt, _ = setup_generation(
+        'generation-review-required', auto_review=True
+    )
+    reviewer_model.delete()
+    reviewer_prompt.delete()
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project)
+
+    assert response.status_code == 400
+    assert response.data['error'] == '未找到可用的测试用例评审模型配置'
+    assert GenerationTask.objects.filter(created_by=user).count() == 0
+    dispatch.assert_not_called()
+
+
+def test_generate_uses_review_default_when_no_generation_config_exists(monkeypatch):
+    user, project, _, reviewer_model, _, reviewer_prompt, generation_config = setup_generation(
+        'generation-default-review', auto_review=True
+    )
+    generation_config.delete()
+    reviewer_model.delete()
+    reviewer_prompt.delete()
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project)
+
+    assert response.status_code == 400
+    assert response.data['error'] == '未找到可用的测试用例评审模型配置'
+    dispatch.assert_not_called()
+
+
+def test_generate_rejects_disabling_the_required_writer_model(monkeypatch):
+    user, project, *_ = setup_generation('generation-writer-required', auto_review=False)
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project, use_writer_model=False)
+
+    assert response.status_code == 400
+    assert 'use_writer_model' in response.data
+    assert GenerationTask.objects.filter(created_by=user).count() == 0
+    dispatch.assert_not_called()
+
+
+def test_generate_cannot_use_another_users_writer_model(monkeypatch):
+    user = User.objects.create_user(username='generation-model-caller', password='test-pass')
+    project = Project.objects.create(name='generation-model-caller project', owner=user)
+    setup_generation('generation-model-owner', auto_review=False)
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = post_generate(user, project)
+
+    assert response.status_code == 400
+    assert response.data['error'] == '未找到可用的测试用例编写模型配置'
+    assert GenerationTask.objects.filter(created_by=user).count() == 0
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(('field', 'invalid_value'), [('project', 0), ('output_mode', 'invalid')])
+def test_generate_rejects_invalid_project_and_output_mode(monkeypatch, field, invalid_value):
+    user, project, *_ = setup_generation('generation-invalid-request', auto_review=False)
+    payload = {
+        'title': 'Invalid request',
+        'requirement_text': 'A mocked requirement.',
+        'project': project.pk,
+        'output_mode': 'stream',
+    }
+    payload[field] = invalid_value
+    request = APIRequestFactory().post(
+        '/api/requirement-analysis/testcase-generation/generate/', payload, format='json'
+    )
+    force_authenticate(request, user=user)
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+
+    response = GenerationTaskViewSet.as_view({'post': 'generate'})(request)
+
+    assert response.status_code == 400
+    assert field in response.data
+    assert GenerationTask.objects.filter(created_by=user).count() == 0
+    dispatch.assert_not_called()
+
+
 def test_generation_admission_enforces_two_active_tasks_per_user(monkeypatch):
     user, project, *_ = setup_generation('generation-admission', auto_review=False)
     other_user, other_project, *_ = setup_generation('generation-admission-other', auto_review=False)
@@ -140,6 +393,68 @@ def test_generation_admission_enforces_two_active_tasks_per_user(monkeypatch):
         status__in=('pending', 'generating', 'reviewing', 'revising'),
     ).count() == 2
     assert dispatch.call_count == 3
+
+
+def test_worker_fails_unparseable_output_and_preserves_raw_generation(monkeypatch):
+    relations = setup_generation('generation-unparseable-output', auto_review=False)
+    task = make_task(relations[0], relations, output_mode='complete')
+    raw_output = 'Provider returned prose without any test case.'
+
+    async def writer(_worker_task):
+        return raw_output
+
+    monkeypatch.setattr(AIModelService, 'generate_test_cases', writer)
+
+    result = run_worker(task)
+
+    task.refresh_from_db()
+    assert result == {'task_id': task.pk, 'status': 'failed', 'stage': 'writer'}
+    assert task.status == 'failed'
+    assert task.completed_at is None
+    assert task.generated_test_cases == raw_output
+    assert task.final_test_cases == raw_output
+    assert '无法解析为测试用例' in task.error_message
+
+
+@pytest.mark.parametrize(
+    ('raw_output', 'message'),
+    [
+        ('TC-001: A heading without steps or expected result\n', 'steps'),
+        (
+            '| Case ID | Title | Preconditions | Steps | Expected result | Priority |\n'
+            '| --- | --- | --- | --- | --- | --- |\n'
+            '| TC-002 | Blank steps | A user exists |   | A message appears | P2 |\n',
+            'steps',
+        ),
+        (
+            '| Case ID | Title | Preconditions | Steps | Expected result | Priority |\n'
+            '| --- | --- | --- | --- | --- | --- |\n'
+            '| TC-003 | Blank expected | A user exists | Submit invalid input |   | P2 |\n',
+            'expected_result',
+        ),
+    ],
+)
+def test_worker_fails_unexecutable_cases_and_preserves_raw_generation(monkeypatch, raw_output, message):
+    relations = setup_generation(
+        f'generation-incomplete-{hashlib.sha1(raw_output.encode()).hexdigest()[:8]}',
+        auto_review=False,
+    )
+    task = make_task(relations[0], relations, output_mode='complete')
+
+    async def writer(_worker_task):
+        return raw_output
+
+    monkeypatch.setattr(AIModelService, 'generate_test_cases', writer)
+
+    result = run_worker(task)
+
+    task.refresh_from_db()
+    assert result == {'task_id': task.pk, 'status': 'failed', 'stage': 'writer'}
+    assert task.status == 'failed'
+    assert task.completed_at is None
+    assert task.generated_test_cases == raw_output
+    assert task.final_test_cases == raw_output
+    assert message in task.error_message
 
 
 def test_broker_dispatch_failure_is_persisted_and_reported(monkeypatch):
@@ -198,6 +513,59 @@ def test_long_running_mock_provider_does_not_block_generation_config_api(monkeyp
     assert task.status == 'completed'
 
 
+@pytest.mark.parametrize(
+    ('auto_review_at_creation', 'auto_review_at_execution'),
+    [(True, False), (False, True)],
+)
+def test_worker_review_policy_uses_task_configuration_snapshot(
+    monkeypatch, auto_review_at_creation, auto_review_at_execution
+):
+    user, project, *_relations, generation_config = setup_generation(
+        f'generation-review-snapshot-{auto_review_at_creation}',
+        auto_review=auto_review_at_creation,
+    )
+    dispatch = Mock(return_value=None)
+    monkeypatch.setattr(generate_test_case_task, 'apply_async', dispatch)
+    response = post_generate(user, project)
+    task = GenerationTask.objects.get(task_id=response.data['task_id'])
+    assert bool(task.reviewer_model_config_id and task.reviewer_prompt_config_id) is auto_review_at_creation
+    assert bool(response.data['task']['reviewer_model_config']) is auto_review_at_creation
+
+    generation_config.enable_auto_review = auto_review_at_execution
+    generation_config.save(update_fields=['enable_auto_review'])
+    review_calls = []
+
+    async def writer(_task, callback=None):
+        await callback(CASE_TEXT)
+        return CASE_TEXT
+
+    async def reviewer(_task, generated, callback=None):
+        review_calls.append(generated)
+        feedback = 'Review is complete.'
+        await callback(feedback)
+        return feedback
+
+    async def revision(_task, generated, feedback, callback=None):
+        await callback(REVISED_CASE_TEXT)
+        return REVISED_CASE_TEXT
+
+    monkeypatch.setattr(AIModelService, 'generate_test_cases_stream', writer)
+    monkeypatch.setattr(AIModelService, 'review_test_cases_stream', reviewer)
+    monkeypatch.setattr(AIModelService, 'revise_test_cases_based_on_review', revision)
+
+    result = run_worker(task)
+
+    task.refresh_from_db()
+    assert result['status'] == 'completed'
+    assert len(review_calls) == int(auto_review_at_creation)
+    if auto_review_at_creation:
+        assert task.review_feedback == 'Review is complete.'
+        assert task.final_test_cases == REVISED_CASE_TEXT
+    else:
+        assert task.review_feedback == ''
+        assert task.final_test_cases == CASE_TEXT
+
+
 def test_worker_persists_progress_buffers_and_stage_transitions(monkeypatch):
     relations = setup_generation('generation-progress', auto_review=True)
     user = relations[0]
@@ -223,7 +591,7 @@ def test_worker_persists_progress_buffers_and_stage_transitions(monkeypatch):
 
     async def revision(worker_task, generated, feedback, callback=None):
         observed_states.append(await state())
-        revised = 'TC-001: Revised case\n'
+        revised = REVISED_CASE_TEXT
         await callback(revised)
         return revised
 
@@ -241,7 +609,7 @@ def test_worker_persists_progress_buffers_and_stage_transitions(monkeypatch):
     assert task.stream_buffer == CASE_TEXT
     assert task.stream_position == len(CASE_TEXT)
     assert task.review_feedback == 'Review is complete.'
-    assert task.final_test_cases == 'TC-001: Revised case\n'
+    assert task.final_test_cases == REVISED_CASE_TEXT
 
 
 def test_writer_provider_failure_retries_once_and_resets_partial_stream(monkeypatch):
@@ -360,8 +728,8 @@ def test_same_task_redelivery_restarts_work_and_fences_the_lost_worker(monkeypat
             provider_started.set()
             while not release_lost_worker.is_set():
                 await asyncio.sleep(0.01)
-            return 'TC-001: stale worker output\n'
-        return 'TC-001: redelivered worker output\n'
+            return CASE_TEXT.replace('Generated case', 'Stale worker output')
+        return CASE_TEXT.replace('Generated case', 'Redelivered worker output')
 
     monkeypatch.setattr(AIModelService, 'generate_test_cases', writer)
     lost_worker = threading.Thread(
@@ -385,7 +753,7 @@ def test_same_task_redelivery_restarts_work_and_fences_the_lost_worker(monkeypat
     assert lost_worker_result == [{'task_id': task.pk, 'status': 'superseded'}]
     task.refresh_from_db()
     assert task.status == 'completed'
-    assert task.final_test_cases == 'TC-001: redelivered worker output\n'
+    assert task.final_test_cases == CASE_TEXT.replace('Generated case', 'Redelivered worker output')
     assert task.worker_claim_id == ''
 
 

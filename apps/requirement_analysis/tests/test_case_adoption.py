@@ -1,7 +1,7 @@
 import pytest
 from rest_framework.test import APIClient
 
-from apps.projects.models import Project
+from apps.projects.models import Project, ProjectMember
 from apps.requirement_analysis.ai_contracts import parse_generated_cases
 from apps.requirement_analysis.models import TestCaseGenerationTask as GenerationTask
 from apps.testcases.models import TestCase as SavedTestCase
@@ -44,12 +44,13 @@ def make_user(username):
     return User.objects.create_user(username=username, password='StrongPass123')
 
 
-def make_task(user, project=None, content=CURRENT_MARKDOWN):
+def make_task(user, project=None, content=CURRENT_MARKDOWN, *, output_mode='stream'):
     return GenerationTask.objects.create(
         task_id=f'TASK_{user.username.upper()}',
         title='Generated cases',
         requirement_text='Login behavior',
         status='completed',
+        output_mode=output_mode,
         final_test_cases=content,
         project=project,
         created_by=user,
@@ -77,7 +78,7 @@ def save_to_records_url(task):
 def test_current_markdown_is_exposed_and_selected_adoption_uses_case_ids():
     user = make_user('adoption-contract')
     project = Project.objects.create(name='Adoption project', owner=user)
-    task = make_task(user, project)
+    task = make_task(user, project, output_mode='complete')
     client = adoption_client(user)
 
     old_parser_cases = GenerationTaskViewSet()._parse_text_format(CURRENT_MARKDOWN)
@@ -86,6 +87,7 @@ def test_current_markdown_is_exposed_and_selected_adoption_uses_case_ids():
 
     detail = client.get(f'/api/requirement-analysis/testcase-generation/{task.task_id}/')
     assert detail.status_code == 200
+    assert detail.json()['output_mode'] == 'complete'
     assert [case['case_id'] for case in detail.json()['canonical_cases']] == ['AI-001', 'AI-002']
     assert detail.json()['canonical_cases'][0] == {
         'case_id': 'AI-001',
@@ -361,3 +363,91 @@ def test_save_to_records_uses_case_ids_and_adopts_only_remaining_cases():
     assert SavedTestCase.objects.filter(project=project).count() == 2
     task.refresh_from_db()
     assert task.adopted_case_ids == ['AI-001', 'AI-002']
+
+
+INCOMPLETE_MIXED_MARKDOWN = """## AI-101: Valid case
+### Preconditions
+A user exists.
+### Steps
+1. Submit valid credentials.
+### Expected result
+The user is signed in.
+
+## AI-102: Incomplete case
+### Preconditions
+A user exists.
+### Steps
+
+### Expected result
+
+"""
+
+
+def test_selected_adoption_allows_valid_case_but_rejects_selected_incomplete_case_atomically():
+    user = make_user('adoption-mixed-valid-invalid')
+    project = Project.objects.create(name='Mixed adoption project', owner=user)
+    task = make_task(user, project, content=INCOMPLETE_MIXED_MARKDOWN)
+    client = adoption_client(user)
+
+    valid = client.post(adoption_url(task), {'case_ids': ['AI-101']}, format='json')
+    invalid = client.post(adoption_url(task), {'case_ids': ['AI-102']}, format='json')
+    remaining = client.post(save_to_records_url(task), {}, format='json')
+
+    assert valid.status_code == 200
+    assert valid.json()['adopted_count'] == 1
+    assert invalid.status_code == 400
+    assert remaining.status_code == 400
+    assert SavedTestCase.objects.filter(project=project).count() == 1
+    saved = SavedTestCase.objects.get(project=project)
+    assert saved.title == 'Valid case'
+    assert saved.steps.strip()
+    assert saved.expected_result.strip()
+    task.refresh_from_db()
+    assert task.adopted_case_ids == ['AI-101']
+    assert task.is_saved_to_records is True
+
+
+@pytest.mark.parametrize(
+    ('route_builder', 'payload'),
+    [
+        (adoption_url, {'case_ids': ['AI-102']}),
+        (batch_adoption_url, {'case_ids': ['AI-102']}),
+        (save_to_records_url, {}),
+    ],
+)
+def test_each_adoption_entrypoint_rejects_incomplete_cases_before_writing(route_builder, payload):
+    user = make_user(f'adoption-invalid-{route_builder.__name__}')
+    project = Project.objects.create(name='Invalid adoption project', owner=user)
+    task = make_task(user, project, content=INCOMPLETE_MIXED_MARKDOWN)
+    client = adoption_client(user)
+
+    response = client.post(route_builder(task), payload, format='json')
+
+    assert response.status_code == 400
+    assert SavedTestCase.objects.filter(project=project).count() == 0
+    task.refresh_from_db()
+    assert task.adopted_case_ids == []
+    assert task.is_saved_to_records is False
+    assert task.saved_at is None
+
+
+@pytest.mark.parametrize('route_builder', [batch_adoption_url, save_to_records_url])
+def test_unbound_task_creator_cannot_adopt_into_viewer_only_project(route_builder):
+    creator = make_user(f'adoption-unbound-viewer-{route_builder.__name__}')
+    project_owner = make_user(f'adoption-unbound-viewer-owner-{route_builder.__name__}')
+    target_project = Project.objects.create(name='Viewer-only adoption target', owner=project_owner)
+    ProjectMember.objects.create(project=target_project, user=creator, role='viewer')
+    task = make_task(creator)
+    client = adoption_client(creator)
+
+    response = client.post(
+        route_builder(task), {'project_id': target_project.pk}, format='json'
+    )
+
+    assert response.status_code == 403
+    assert SavedTestCase.objects.filter(project=target_project).count() == 0
+    task.refresh_from_db()
+    assert task.project_id is None
+    assert task.adopted_case_ids == []
+    assert task.is_saved_to_records is False
+    assert task.saved_at is None

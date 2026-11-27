@@ -10,6 +10,7 @@ from django.conf import settings
 from django.db import close_old_connections, transaction
 from django.utils import timezone
 
+from .ai_contracts import AIContractError, parse_generated_cases, validate_executable_cases
 from .models import AIModelService, GenerationConfig, TestCaseGenerationTask
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,9 @@ def execute_generation_task(task_pk, claim_id):
             ).get(pk=task_pk)
 
         generation_config = GenerationConfig.get_active_config()
-        enable_auto_review = generation_config.enable_auto_review if generation_config else True
+        enable_auto_review = bool(
+            task.reviewer_model_config_id and task.reviewer_prompt_config_id
+        )
         review_timeout = _review_timeout(generation_config)
         logger.info(
             'Starting testcase generation: task_id=%s output_mode=%s writer_config=%s reviewer_config=%s',
@@ -253,6 +256,7 @@ def execute_generation_task(task_pk, claim_id):
                 progress=60,
             )
 
+        final_raw_output = getattr(generated_cases, 'raw_output', None) or str(generated_cases or '')
         final_cases = None
         if enable_auto_review and task.reviewer_model_config and task.reviewer_prompt_config:
             review_chunks = []
@@ -296,7 +300,7 @@ def execute_generation_task(task_pk, claim_id):
             except GenerationClaimLost:
                 raise
             except Exception as exc:
-                review_feedback = f'评审过程出现异常: {exc}\n\n建议：测试用例结构完整，可以使用。'
+                review_feedback = f'评审过程出现异常: {exc}\n\n自动评审未完成，请人工检查原始用例。'
                 logger.warning('Testcase review failed; keeping generated cases: task_id=%s', task_pk, exc_info=True)
                 final_cases = _finalize_cases(generated_cases)
                 persist(review_feedback=review_feedback, final_test_cases=final_cases)
@@ -333,11 +337,12 @@ def execute_generation_task(task_pk, claim_id):
                         ),
                         reset_revision,
                     ))
-                    final_cases = (
-                        _finalize_cases(revised_cases, fix_incomplete=True)
-                        if revised_cases
-                        else final_buffer
-                    )
+                    if revised_cases:
+                        final_raw_output = getattr(revised_cases, 'raw_output', None) or str(revised_cases)
+                        final_cases = _finalize_cases(revised_cases, fix_incomplete=True)
+                    else:
+                        final_raw_output = final_buffer
+                        final_cases = final_buffer
                 except GenerationClaimLost:
                     raise
                 except Exception as exc:
@@ -349,6 +354,15 @@ def execute_generation_task(task_pk, claim_id):
 
         if final_cases is None:
             final_cases = _finalize_cases(generated_cases)
+        canonical_cases = parse_generated_cases(final_cases)
+        if not canonical_cases:
+            persist(final_test_cases=final_raw_output)
+            raise ValueError('最终生成内容无法解析为测试用例')
+        try:
+            validate_executable_cases(canonical_cases)
+        except AIContractError as exc:
+            persist(final_test_cases=final_raw_output)
+            raise ValueError(f'最终生成用例字段不完整: {exc}') from exc
         persist(
             worker_claim_id='',
             status='completed',

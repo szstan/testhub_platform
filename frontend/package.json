@@ -10,6 +10,7 @@
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --ignore-path .gitignore",
     "test:auth": "node --test tests/auth.test.mjs",
     "test:case-adoption": "node --test tests/generated-case-adoption.test.mjs",
+    "test:requirement-generation": "node --test tests/requirement-generation-errors.test.mjs tests/requirement-generation-workflow.test.mjs tests/generated-case-adoption.test.mjs",
     "test:execution-workflows": "node --test tests/execution-workflows.test.mjs tests/openapi-workflow.test.mjs tests/dataset-options.test.mjs tests/requirement-generation-errors.test.mjs",
     "test:interface-management-pagination": "node --test tests/interface-management-pagination.test.mjs",
     "test:app-screenshot-diagnostics": "node --test tests/app-screenshot-diagnostics.test.mjs",

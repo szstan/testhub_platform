@@ -738,7 +738,7 @@ export default {
         if (response.data.task_deleted) {
           ElMessage.success(this.$t('taskDetail.allDiscardedSuccess'))
           // 返回到AI生成用例记录列表
-          this.$router.push('/generated-testcases')
+          this.$router.push({ name: 'GeneratedTestCases' })
         } else {
           ElMessage.success(this.$t('taskDetail.discardSuccess', { count: response.data.discarded_count }))
 
@@ -933,7 +933,7 @@ export default {
         if (response.data.task_deleted) {
           ElMessage.success(this.$t('taskDetail.allDiscardedSuccess'))
           // 返回到AI生成用例记录列表
-          this.$router.push('/generated-testcases')
+          this.$router.push({ name: 'GeneratedTestCases' })
         } else {
           ElMessage.success(this.$t('taskDetail.caseDiscardedSuccess'))
 

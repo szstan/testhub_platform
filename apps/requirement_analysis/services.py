@@ -10,7 +10,10 @@ from datetime import datetime
 try:
     from PyPDF2 import PdfReader
 except ImportError:
-    from PyPDF2 import PdfFileReader as PdfReader
+    try:
+        from PyPDF2 import PdfFileReader as PdfReader
+    except ImportError:
+        PdfReader = None
     
 try:
     import docx
@@ -24,68 +27,102 @@ from .models import RequirementDocument, RequirementAnalysis, BusinessRequiremen
 logger = logging.getLogger(__name__)
 
 
+class DocumentExtractionError(ValueError):
+    """A document is invalid or cannot yield usable requirement text."""
+
+
 class DocumentProcessor:
     """文档处理服务"""
-    
+
     @staticmethod
     def extract_text_from_pdf(file_path: str) -> str:
         """从PDF文件提取文本"""
+        if PdfReader is None:
+            raise DocumentExtractionError('PDF文本提取依赖未安装')
+
         try:
-            text = ""
             with open(file_path, 'rb') as file:
                 pdf_reader = PdfReader(file)
+                pages_text = []
                 for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            return text.strip()
-        except Exception as e:
-            logger.error(f"PDF文本提取失败: {e}")
-            return f"PDF文本提取失败: {str(e)}"
-    
+                    extract_page_text = getattr(page, 'extract_text', None) or getattr(page, 'extractText', None)
+                    if extract_page_text is None:
+                        raise ValueError('PDF page text extraction is unavailable')
+                    page_text = extract_page_text()
+                    if page_text:
+                        pages_text.append(page_text)
+
+            text = '\n'.join(pages_text).strip()
+            if not text:
+                raise DocumentExtractionError('PDF中没有可提取的文本，可能是空文档或扫描版')
+            return text
+        except DocumentExtractionError:
+            raise
+        except Exception as exc:
+            logger.exception('PDF文本提取失败')
+            raise DocumentExtractionError('PDF文件损坏或无法读取') from exc
+
     @staticmethod
     def extract_text_from_docx(file_path: str) -> str:
         """从Word文档提取文本"""
+        if docx is None:
+            raise DocumentExtractionError('DOCX文本提取依赖未安装')
+
         try:
-            doc = docx.Document(file_path)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            return text.strip()
-        except Exception as e:
-            logger.error(f"Word文档文本提取失败: {e}")
-            return f"Word文档文本提取失败: {str(e)}"
-    
+            document = docx.Document(file_path)
+            content = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        content.append(' | '.join(cells))
+            text = '\n'.join(content).strip()
+            if not text:
+                raise DocumentExtractionError('DOCX文档中没有可提取的文本')
+            return text
+        except DocumentExtractionError:
+            raise
+        except Exception as exc:
+            logger.exception('Word文档文本提取失败')
+            raise DocumentExtractionError('DOCX文件损坏或无法读取') from exc
+
     @staticmethod
     def extract_text_from_txt(file_path: str) -> str:
         """从文本文件提取文本"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read().strip()
+            with open(file_path, 'r', encoding='utf-8-sig') as file:
+                text = file.read()
         except UnicodeDecodeError:
             try:
                 with open(file_path, 'r', encoding='gbk') as file:
-                    return file.read().strip()
-            except Exception as e:
-                logger.error(f"文本文件读取失败: {e}")
-                return f"文本文件读取失败: {str(e)}"
-        except Exception as e:
-            logger.error(f"文本文件读取失败: {e}")
-            return f"文本文件读取失败: {str(e)}"
-    
+                    text = file.read()
+            except UnicodeDecodeError as exc:
+                raise DocumentExtractionError('文本文件编码无法识别') from exc
+            except OSError as exc:
+                raise DocumentExtractionError('文本文件无法读取') from exc
+        except OSError as exc:
+            raise DocumentExtractionError('文本文件无法读取') from exc
+
+        text = text.strip()
+        if not text:
+            raise DocumentExtractionError('文本文件为空')
+        return text
+
     @classmethod
     def extract_text(cls, document: RequirementDocument) -> str:
         """根据文档类型提取文本"""
-        file_path = document.file.path
-        
+        try:
+            file_path = document.file.path
+        except Exception as exc:
+            raise DocumentExtractionError('文档文件无法访问') from exc
+
         if document.document_type == 'pdf':
             return cls.extract_text_from_pdf(file_path)
-        elif document.document_type == 'docx':
+        if document.document_type == 'docx':
             return cls.extract_text_from_docx(file_path)
-        elif document.document_type == 'txt':
+        if document.document_type in ('txt', 'md'):
             return cls.extract_text_from_txt(file_path)
-        elif document.document_type == 'md':
-            return cls.extract_text_from_txt(file_path)
-        else:
-            return "不支持的文档类型"
+        raise DocumentExtractionError('不支持的文档类型')
 
 
 class AIService:

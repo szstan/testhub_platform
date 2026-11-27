@@ -31,7 +31,7 @@ def _steps(value: Any) -> list[str]:
     if isinstance(value, str):
         rows = [line.strip() for line in value.splitlines() if line.strip()]
     elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        rows = [str(item).strip() for item in value if str(item).strip()]
+        rows = [str(item).strip() for item in value if item is not None and str(item).strip()]
     else:
         rows = []
     if not rows:
@@ -185,7 +185,7 @@ def _priority(value: Any) -> str:
 
 def _case_steps(value: Any) -> list[str]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        source = [str(item) for item in value]
+        source = [str(item) for item in value if item is not None]
     else:
         source = re.split(r"\r?\n|<br\s*/?>", str(value or ""), flags=re.IGNORECASE)
     steps = []
@@ -394,6 +394,32 @@ def parse_generated_cases(content: Any) -> list[dict[str, Any]]:
         if raw_cases:
             return _canonical_cases(raw_cases)
     return []
+
+
+def validate_executable_cases(cases: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+    """Reject canonical cases that cannot be executed or evaluated."""
+    errors = []
+    for index, case in enumerate(cases, start=1):
+        case_label = str(case.get("case_id") or index)
+        if not str(case.get("title") or "").strip():
+            errors.append(f"{case_label}: title is required")
+
+        steps = case.get("steps")
+        if isinstance(steps, str):
+            has_steps = any(step.strip() for step in steps.splitlines())
+        elif isinstance(steps, Sequence) and not isinstance(steps, (bytes, bytearray, str)):
+            has_steps = any(step is not None and str(step).strip() for step in steps)
+        else:
+            has_steps = False
+        if not has_steps:
+            errors.append(f"{case_label}: steps must contain at least one item")
+
+        if not str(case.get("expected_result") or "").strip():
+            errors.append(f"{case_label}: expected_result is required")
+
+    if errors:
+        raise AIContractError("; ".join(errors))
+    return cases
 
 
 class NormalizedGenerationOutput(str):

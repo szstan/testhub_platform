@@ -719,60 +719,12 @@ export default {
 
     // 获取测试用例条数
     getTestCaseCount(task) {
-      if (!task.final_test_cases) {
-        return 0
-      }
-
-      // 解析测试用例内容，计算条数
-      const content = task.final_test_cases
-      const lines = content.split('\n').filter(line => line.trim())
-
-      // 尝试表格格式
-      let tableRows = 0
-      let isFirstRow = true
-      let isTableFormat = false
-
-      for (let line of lines) {
-        if (line.includes('|') && !line.includes('--------')) {
-          const cells = line.split('|').map(cell => cell.trim()).filter(cell => cell)
-          if (cells.length > 1) {
-            // 检查第一行是否是表头
-            if (isFirstRow) {
-              isFirstRow = false
-              // 如果第一行包含表头标识，标记为表格格式
-              if (line.includes('测试用例编号') || line.includes('ID') || line.includes('用例ID') ||
-                  line.includes('场景') || line.includes('步骤')) {
-                isTableFormat = true
-                continue  // 跳过表头行
-              }
-            }
-
-            tableRows++
-            if (tableRows >= 1) {
-              isTableFormat = true
-            }
-          }
-        }
-      }
-
-      if (isTableFormat && tableRows > 0) {
-        return tableRows
-      }
-
-      // 尝试结构化文本格式
-      let caseCount = 0
-      for (const line of lines) {
-        if (line.includes('测试用例') || line.includes('Test Case') || line.match(/^(\d+\.|测试场景)/)) {
-          caseCount++
-        }
-      }
-
-      return caseCount || 0
+      return Array.isArray(task.canonical_cases) ? task.canonical_cases.length : 0
     },
 
     viewTaskDetail(task) {
-      if (['pending', 'generating', 'reviewing'].includes(task.status)) {
-        ElMessage.info(this.$t('generatedTestCases.generatingWait'))
+      if (['pending', 'generating', 'reviewing', 'revising', 'cancelled'].includes(task.status)) {
+        this.$router.push({ name: 'RequirementAnalysis', query: { task: task.task_id } })
         return
       }
       

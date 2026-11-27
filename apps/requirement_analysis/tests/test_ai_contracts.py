@@ -8,6 +8,7 @@ from apps.requirement_analysis.ai_contracts import (
     parse_draft,
     render_markdown,
     summarize_generation_output,
+    validate_executable_cases,
 )
 
 
@@ -59,3 +60,27 @@ def test_malformed_optional_fields_raise_contract_error():
         parse_draft('{"test_cases": [{"title": "x", "steps": ["ok"], "expected_result": "ok", "source_refs": {}}]}')
     with pytest.raises(AIContractError):
         parse_draft('{"test_cases": [{"title": "x", "steps": ["ok"], "expected_result": "ok", "confidence": "bad"}]}')
+
+
+@pytest.mark.parametrize(
+    ('case', 'field'),
+    [
+        ({'title': '  ', 'steps': ['Run'], 'expected_result': 'Done'}, 'title'),
+        ({'title': 'Case', 'steps': ['  '], 'expected_result': 'Done'}, 'steps'),
+        ({'title': 'Case', 'steps': [None], 'expected_result': 'Done'}, 'steps'),
+        ({'title': 'Case', 'steps': ['Run'], 'expected_result': '  '}, 'expected_result'),
+    ],
+)
+def test_executable_case_validation_requires_title_steps_and_expected_result(case, field):
+    with pytest.raises(AIContractError, match=field):
+        validate_executable_cases([case])
+
+
+def test_null_json_steps_do_not_become_a_literal_none_action():
+    payload = {'test_cases': [{'title': 'Login', 'steps': [None], 'expected_result': 'Dashboard'}]}
+    with pytest.raises(AIContractError, match='steps'):
+        parse_draft(payload)
+
+    payload['test_cases'][0]['steps'] = [None, 'Enter valid credentials']
+    draft = parse_draft(payload)
+    assert draft['cases'][0]['steps'] == ['Enter valid credentials']

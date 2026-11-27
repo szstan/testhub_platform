@@ -11,6 +11,7 @@ async function setup(api, clearedIntervals = []) {
     '@/utils/api': { default: api },
     xlsx: { utils: {}, writeFile() {} },
     '@/stores/user': { useUserStore: () => ({}) },
+    '@/utils/safe-html.js': { renderSafeMarkdown: content => content },
   }, {
     clearInterval: handle => clearedIntervals.push(handle),
     console: { error() {}, log() {}, warn() {} },
@@ -102,6 +103,32 @@ test('failed generation task detail opens and displays the stored error', async 
   assert.deepEqual(openedUrls, [])
   const source = await readFile(new URL('../src/views/requirement-analysis/GeneratedTestCaseList.vue', import.meta.url), 'utf8')
   assert.match(source, /selectedTaskDetail\.error_message/)
+})
+
+test('running and cancelled tasks reopen the generation workspace with their task ID', async () => {
+  const instance = await setupGeneratedTestCaseList()
+  const routes = []
+  const state = { $router: { push: route => routes.push(route) } }
+
+  for (const status of ['pending', 'generating', 'reviewing', 'revising', 'cancelled']) {
+    instance.component.methods.viewTaskDetail.call(state, { task_id: 'TASK_RESUME', status })
+  }
+
+  assert.equal(routes.length, 5)
+  for (const route of routes) {
+    assert.equal(route.name, 'RequirementAnalysis')
+    assert.equal(route.query.task, 'TASK_RESUME')
+  }
+})
+
+test('history counts canonical cases without counting Markdown separator rows', async () => {
+  const instance = await setupGeneratedTestCaseList()
+  const count = instance.component.methods.getTestCaseCount({
+    final_test_cases: '| ID | 场景 |\n| --- | --- |\n| 001 | 场景 |',
+    canonical_cases: [{ case_id: '001' }],
+  })
+
+  assert.equal(count, 1)
 })
 
 test('completed generation task detail keeps its existing route', async () => {
