@@ -39,6 +39,7 @@ from .models import (
     TestRunCaseHistory,
 )
 from apps.projects.models import Project
+from apps.projects.access import user_can_write_project
 from apps.testcases.models import TestCase
 from apps.users.serializers import UserSimpleSerializer
 from apps.versions.models import Version
@@ -725,7 +726,7 @@ class TestRunCaseHistorySerializer(serializers.ModelSerializer):
     
     class Meta:
         model = TestRunCaseHistory
-        fields = ('id', 'status', 'actual_result', 'comments', 'executed_by', 'executed_at')
+        fields = ('id', 'status', 'actual_result', 'comments', 'defects', 'elapsed_time', 'executed_by', 'executed_at')
 
 class TestRunCaseSimpleSerializer(serializers.ModelSerializer):
     testcase = serializers.StringRelatedField()
@@ -794,6 +795,7 @@ class TestRunCaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestRunCase
         fields = '__all__'
+        read_only_fields = ('executed_by', 'executed_at', 'created_at', 'updated_at')
 
     def validate(self, attrs):
         test_run = attrs.get('test_run', getattr(self.instance, 'test_run', None))
@@ -802,4 +804,6 @@ class TestRunCaseSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'testcase': '测试用例必须属于执行任务所在项目'})
         user = self.context.get('request').user if self.context.get('request') else None
         _ensure_project_access(user, getattr(test_run, 'project', None), '没有权限管理该执行任务用例')
+        if user is not None and not user_can_write_project(user, getattr(test_run, 'project', None)):
+            raise PermissionDenied('没有权限修改该执行任务用例')
         return attrs

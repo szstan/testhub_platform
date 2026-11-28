@@ -1,61 +1,16 @@
 <template>
   <div class="dashboard-container">
     <!-- 数据概览 -->
-    <div class="stats-section">
-      <el-row :gutter="20">
-        <el-col :span="6">
-          <el-card shadow="hover" class="stat-card">
-            <div class="stat-content">
-              <div class="stat-icon bg-blue">
-                <el-icon><Folder /></el-icon>
-              </div>
-              <div class="stat-info">
-                <div class="stat-value">{{ projectCount }}</div>
-                <div class="stat-label">{{ $t('apiTesting.dashboard.apiProjects') }}</div>
-              </div>
-            </div>
-          </el-card>
-        </el-col>
-        <el-col :span="6">
-          <el-card shadow="hover" class="stat-card">
-            <div class="stat-content">
-              <div class="stat-icon bg-green">
-                <el-icon><Link /></el-icon>
-              </div>
-              <div class="stat-info">
-                <div class="stat-value">{{ interfaceCount }}</div>
-                <div class="stat-label">{{ $t('apiTesting.dashboard.interfaceCount') }}</div>
-              </div>
-            </div>
-          </el-card>
-        </el-col>
-        <el-col :span="6">
-          <el-card shadow="hover" class="stat-card">
-            <div class="stat-content">
-              <div class="stat-icon bg-purple">
-                <el-icon><Collection /></el-icon>
-              </div>
-              <div class="stat-info">
-                <div class="stat-value">{{ suiteCount }}</div>
-                <div class="stat-label">{{ $t('apiTesting.dashboard.testSuites') }}</div>
-              </div>
-            </div>
-          </el-card>
-        </el-col>
-        <el-col :span="6">
-          <el-card shadow="hover" class="stat-card">
-            <div class="stat-content">
-              <div class="stat-icon bg-orange">
-                <el-icon><Timer /></el-icon>
-              </div>
-              <div class="stat-info">
-                <div class="stat-value">{{ historyCount }}</div>
-                <div class="stat-label">{{ $t('apiTesting.dashboard.executionRecords') }}</div>
-              </div>
-            </div>
-          </el-card>
-        </el-col>
-      </el-row>
+    <div class="stats-section overview-grid">
+      <el-card v-for="card in statsCards" :key="card.path" shadow="hover" class="stat-card">
+        <button type="button" class="stat-content stat-navigation" @click="router.push(card.path)">
+          <div class="stat-icon" :class="card.color"><el-icon><component :is="card.icon" /></el-icon></div>
+          <div class="stat-info">
+            <div class="stat-value">{{ card.value }}</div>
+            <div class="stat-label">{{ card.label }}</div>
+          </div>
+        </button>
+      </el-card>
     </div>
     
     <!-- 最近活动和快速操作 -->
@@ -94,42 +49,50 @@
       <el-col :span="12">
         <el-card class="quick-actions" :title="$t('apiTesting.dashboard.quickActions.title')" shadow="hover">
           <div class="actions-grid">
-            <div class="action-item" @click="goToProjects">
+            <button type="button" class="action-item" @click="goToProjects">
               <div class="action-icon bg-blue">
                 <el-icon><Folder /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.projectManagement') }}</div>
-            </div>
-            <div class="action-item" @click="goToInterfaces">
+            </button>
+            <button type="button" class="action-item" @click="goToInterfaces">
               <div class="action-icon bg-green">
                 <el-icon><Link /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.interfaceManagement') }}</div>
-            </div>
-            <div class="action-item" @click="goToAutomation">
+            </button>
+            <button type="button" class="action-item" @click="goToCases">
+              <div class="action-icon bg-indigo"><el-icon><Document /></el-icon></div>
+              <div class="action-label">{{ $t('menu.apiTestCases') }}</div>
+            </button>
+            <button type="button" class="action-item" @click="goToCreateCase">
+              <div class="action-icon bg-blue"><el-icon><Edit /></el-icon></div>
+              <div class="action-label">{{ $t('menu.apiCaseCreate') }}</div>
+            </button>
+            <button type="button" class="action-item" @click="goToAutomation">
               <div class="action-icon bg-cyan">
                 <el-icon><VideoPlay /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.automationTesting') }}</div>
-            </div>
-            <div class="action-item" @click="goToHistory">
+            </button>
+            <button type="button" class="action-item" @click="goToHistory">
               <div class="action-icon bg-purple">
                 <el-icon><Timer /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.requestHistory') }}</div>
-            </div>
-            <div class="action-item" @click="goToEnvironments">
+            </button>
+            <button type="button" class="action-item" @click="goToEnvironments">
               <div class="action-icon bg-orange">
                 <el-icon><Setting /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.environmentManagement') }}</div>
-            </div>
-            <div class="action-item" @click="goToReports">
+            </button>
+            <button type="button" class="action-item" @click="goToReports">
               <div class="action-icon bg-indigo">
                 <el-icon><DataAnalysis /></el-icon>
               </div>
               <div class="action-label">{{ $t('apiTesting.dashboard.quickActions.testReport') }}</div>
-            </div>
+            </button>
           </div>
         </el-card>
       </el-col>
@@ -181,13 +144,12 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   Folder, Link, Collection, Timer,
   VideoPlay, Setting, DataAnalysis,
-  Plus, Edit, Delete, Operation
+  Plus, Edit, Delete, Operation, Document
 } from '@element-plus/icons-vue'
 import router from '@/router'
 import {
@@ -202,6 +164,14 @@ const projectCount = ref(0)
 const interfaceCount = ref(0)
 const suiteCount = ref(0)
 const historyCount = ref(0)
+const caseCount = ref(0)
+const statsCards = computed(() => [
+  { path: '/api-testing/projects', label: t('apiTesting.dashboard.apiProjects'), value: projectCount.value, icon: Folder, color: 'bg-blue' },
+  { path: '/api-testing/interfaces', label: t('apiTesting.dashboard.interfaceCount'), value: interfaceCount.value, icon: Link, color: 'bg-green' },
+  { path: '/api-testing/test-cases', label: t('menu.apiTestCases'), value: caseCount.value, icon: Document, color: 'bg-blue' },
+  { path: '/api-testing/automation', label: t('apiTesting.dashboard.testSuites'), value: suiteCount.value, icon: Collection, color: 'bg-purple' },
+  { path: '/api-testing/history', label: t('apiTesting.dashboard.executionRecords'), value: historyCount.value, icon: Timer, color: 'bg-orange' }
+])
 
 const loading = ref(false)
 const operationLogs = ref([])
@@ -222,6 +192,7 @@ const loadDashboardData = async () => {
     interfaceCount.value = stats.interface_count || 0
     suiteCount.value = stats.suite_count || 0
     historyCount.value = stats.history_count || 0
+    caseCount.value = stats.case_count || 0
     
     // 更新操作日志
     operationLogs.value = logsRes.data.results || []
@@ -242,6 +213,9 @@ const goToProjects = () => {
 const goToInterfaces = () => {
   router.push('/api-testing/interfaces')
 }
+
+const goToCases = () => router.push('/api-testing/test-cases')
+const goToCreateCase = () => router.push('/api-testing/test-cases/create')
 
 const goToAutomation = () => {
   router.push('/api-testing/automation')
@@ -303,6 +277,24 @@ onMounted(() => {
 .dashboard-container {
   width: 100%;
 }
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 20px;
+}
+.stat-navigation {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.stat-navigation:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 4px; }
+@media (max-width: 1200px) { .overview-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 .stats-section {
   margin-bottom: 40px;
@@ -399,12 +391,23 @@ onMounted(() => {
 }
 
 .action-item {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  color: inherit;
+  font: inherit;
   text-align: center;
   padding: 15px 10px;
   border-radius: 8px;
   background-color: #f9f9f9;
   cursor: pointer;
   transition: all 0.3s ease;
+}
+
+.action-item:focus-visible {
+  outline: 2px solid #1677a8;
+  outline-offset: 2px;
 }
 
 .action-item:hover {

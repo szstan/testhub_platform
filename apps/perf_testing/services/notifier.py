@@ -35,22 +35,46 @@ def build_message(execution):
     return '\n'.join(lines)
 
 
-def send_execution_notification(execution, channel_ids):
-    """按渠道 ID 列表发送压测结果。返回发送结果明细。"""
-    if not channel_ids:
+def send_execution_notification(execution, channel_ids, owner_id=None):
+    """Send only through currently enabled channels still owned by the saved actor."""
+    if not isinstance(channel_ids, (list, tuple, set)) or not channel_ids:
+        return []
+
+    normalized_ids = []
+    for value in channel_ids:
+        if isinstance(value, bool):
+            continue
+        try:
+            channel_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if channel_id > 0 and channel_id not in normalized_ids:
+            normalized_ids.append(channel_id)
+    if not normalized_ids or owner_id is None:
         return []
 
     try:
+        from django.contrib.auth import get_user_model
+        from apps.monitor.access import is_monitor_admin
         from apps.monitor.models import NotificationChannel
         from apps.monitor.utils.notifiers import send_via_channel
     except ImportError as exc:
         logger.warning('通知模块不可用: %s', exc)
         return []
 
+    owner = get_user_model().objects.filter(pk=owner_id, is_active=True).only(
+        'is_staff', 'is_superuser').first()
+    if owner is None:
+        return []
+    channels = NotificationChannel.objects.filter(
+        id__in=normalized_ids, enabled=True)
+    if not is_monitor_admin(owner):
+        channels = channels.filter(created_by_id=owner_id)
+
     message = build_message(execution)
     subject = f'性能测试结果 - {execution.scenario.name} - {execution.sla_result}'
     results = []
-    for channel in NotificationChannel.objects.filter(id__in=channel_ids, enabled=True):
+    for channel in channels:
         try:
             ok = send_via_channel(channel, message, subject=subject)
             results.append({'channel': channel.name, 'success': bool(ok)})

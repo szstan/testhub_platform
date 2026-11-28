@@ -8,11 +8,13 @@ import requests
 from .models import AssistantSession, AssistantMessage, ChatMessage, DifyConfig
 from .views_config import _validate_dify_url
 from .serializers import (
-    AssistantSessionSerializer, 
+    AssistantSessionSerializer,
     AssistantSessionCreateSerializer,
     AssistantMessageSerializer,
-    ChatMessageSerializer
+    ChatMessageSerializer,
+    ChatSendMessageSerializer,
 )
+from .throttles import AssistantMessageRateThrottle
 
 
 class AssistantSessionViewSet(viewsets.ModelViewSet):
@@ -33,7 +35,7 @@ class AssistantSessionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], throttle_classes=[AssistantMessageRateThrottle])
     def add_message(self, request, pk=None):
         """添加消息到会话"""
         session = self.get_object()
@@ -57,20 +59,14 @@ class ChatViewSet(viewsets.ViewSet):
     """聊天功能ViewSet"""
     permission_classes = [permissions.IsAuthenticated]
     
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['post'], throttle_classes=[AssistantMessageRateThrottle])
     def send_message(self, request):
         """发送消息到Dify API"""
-        session_id = request.data.get('session_id')
-        message = request.data.get('message')
-        
-        if not isinstance(session_id, str) or not session_id.strip() or not isinstance(message, str) or not message.strip():
-            return Response(
-                {'error': 'session_id和message都是必填项'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if len(session_id) > 200:
-            return Response({'error': 'session_id 长度不能超过 200'}, status=status.HTTP_400_BAD_REQUEST)
-        
+        serializer = ChatSendMessageSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        session_id = serializer.validated_data['session_id']
+        message = serializer.validated_data['message']
         session = AssistantSession.objects.filter(
             session_id=session_id,
             user=request.user

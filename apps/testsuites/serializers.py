@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from apps.projects.models import Project
-from apps.users.serializers import UserSimpleSerializer
+from apps.users.serializers import UserDirectorySerializer
 from apps.testcases.models import TestCase
 
 from .models import TestSuite, TestSuiteCase
@@ -50,7 +50,7 @@ class TestSuiteCaseSerializer(serializers.ModelSerializer):
 
 class TestSuiteSerializer(serializers.ModelSerializer):
     project = ProjectSummarySerializer(read_only=True)
-    author = UserSimpleSerializer(read_only=True)
+    author = UserDirectorySerializer(read_only=True)
     suite_cases = TestSuiteCaseSerializer(
         source='testsuitecase_set', many=True, read_only=True
     )

@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import patch
 from rest_framework.test import APIClient
 
 from apps.projects.models import Project
@@ -91,3 +92,52 @@ def test_test_case_external_ref_is_stable_and_project_scoped():
     )
     assert allowed_in_other_project.status_code == 201, allowed_in_other_project.data
     assert allowed_in_other_project.data['external_ref'] == 'checkout.login'
+
+
+@pytest.mark.django_db
+def test_revision_failure_rolls_back_case_change_and_keeps_revision_sequence():
+    user = User.objects.create_user(username='revision-rollback-owner', password='pass')
+    project = Project.objects.create(name='Revision rollback', owner=user)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    client.raise_request_exception = False
+
+    with patch(
+        'apps.testcases.revisions.TestCaseRevision.objects.create',
+        side_effect=RuntimeError('simulated revision failure'),
+    ):
+        failed_create = client.post('/api/testcases/', {
+            'project_id': project.pk, 'title': 'Must roll back', 'expected_result': 'ok',
+        }, format='json')
+    assert failed_create.status_code == 500
+    assert not CaseModel.objects.filter(project=project, title='Must roll back').exists()
+    assert RevisionModel.objects.count() == 0
+
+    created = client.post('/api/testcases/', {
+        'project_id': project.pk, 'title': 'Stable case', 'expected_result': 'ok',
+    }, format='json')
+    assert created.status_code == 201
+    testcase = CaseModel.objects.get(pk=created.data['id'])
+    assert RevisionModel.objects.filter(test_case=testcase).values_list(
+        'revision', flat=True,
+    ).get() == 1
+
+    with patch(
+        'apps.testcases.revisions.TestCaseRevision.objects.create',
+        side_effect=RuntimeError('simulated revision failure'),
+    ):
+        failed_update = client.patch(
+            f'/api/testcases/{testcase.pk}/', {'title': 'Must roll back'}, format='json',
+        )
+    assert failed_update.status_code == 500
+    testcase.refresh_from_db()
+    assert testcase.title == 'Stable case'
+    assert list(RevisionModel.objects.filter(test_case=testcase).values_list('revision', flat=True)) == [1]
+
+    recovered = client.patch(
+        f'/api/testcases/{testcase.pk}/', {'title': 'Recovered update'}, format='json',
+    )
+    assert recovered.status_code == 200
+    testcase.refresh_from_db()
+    assert testcase.title == 'Recovered update'
+    assert list(RevisionModel.objects.filter(test_case=testcase).values_list('revision', flat=True)) == [2, 1]

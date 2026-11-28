@@ -17,9 +17,9 @@
         <el-table-column prop="last_commit_sha" :label="$t('testcase.sync.lastCommit')" />
         <el-table-column :label="$t('testcase.sync.actions')" width="220">
           <template #default="scope">
-            <el-button link type="primary" :loading="syncing === scope.row.id" @click="sync(scope.row)">{{ $t('testcase.sync.sync') }}</el-button>
-            <el-button link @click="edit(scope.row)">{{ $t('common.edit') }}</el-button>
-            <el-button link type="danger" @click="remove(scope.row)">{{ $t('common.delete') }}</el-button>
+            <el-button link type="primary" :loading="syncing === scope.row.id" :disabled="syncing !== null && syncing !== scope.row.id" @click="sync(scope.row)">{{ $t('testcase.sync.sync') }}</el-button>
+            <el-button link :disabled="['queued', 'running'].includes(scope.row.sync_status)" @click="edit(scope.row)">{{ $t('common.edit') }}</el-button>
+            <el-button link type="danger" :disabled="syncing === scope.row.id || ['queued', 'running'].includes(scope.row.sync_status)" @click="remove(scope.row)">{{ $t('common.delete') }}</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -56,6 +56,7 @@
     </el-dialog>
 
     <el-dialog v-model="resultVisible" :title="$t('testcase.sync.result')" width="720px">
+      <el-alert v-if="syncFeedback" class="sync-feedback" :title="syncFeedback" :type="syncFeedbackType" :closable="false" />
       <el-descriptions v-if="result" :column="2" border>
         <el-descriptions-item :label="$t('testcase.sync.commit')">{{ result.commit || '-' }}</el-descriptions-item>
         <el-descriptions-item :label="$t('testcase.sync.files')">{{ result.files }}</el-descriptions-item>
@@ -72,16 +73,19 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   createTestCaseSyncProfile,
   deleteTestCaseSyncProfile,
+  getTestCaseSyncProfile,
   listTestCaseSyncProfiles,
   syncTestCaseSyncProfile,
   updateTestCaseSyncProfile,
 } from '@/api/testcase-sync'
 
+const { t } = useI18n()
 const profiles = ref([])
 const loading = ref(false)
 const currentPage = ref(1)
@@ -94,6 +98,22 @@ const visible = ref(false)
 const resultVisible = ref(false)
 const editing = ref(null)
 const result = ref(null)
+const syncStatus = ref('')
+const syncError = ref('')
+const syncFeedback = computed(() => ({
+  queued: t('testcase.sync.queued'),
+  running: t('testcase.sync.running'),
+  failed: syncError.value || t('testcase.sync.failed'),
+  unavailable: syncError.value || t('testcase.sync.unavailable'),
+  changed: t('testcase.sync.changed'),
+  pending: t('testcase.sync.pending'),
+}[syncStatus.value] || ''))
+const syncFeedbackType = computed(() => syncStatus.value === 'failed' ? 'error'
+  : ['unavailable', 'changed', 'pending'].includes(syncStatus.value) ? 'warning' : 'info')
+let disposed = false
+let syncRequestId = 0
+let syncTimer = null
+let pollController = null
 const form = ref({ name: '', project: null, provider: 'github', repository_url: '', api_base_url: '', branch: 'main', path: '', token_env_ref: '', enabled: true })
 
 const load = async () => {
@@ -104,14 +124,14 @@ const load = async () => {
       page: currentPage.value,
       page_size: pageSize.value,
     })
-    if (requestId !== latestLoadRequest) return
+    if (disposed || requestId !== latestLoadRequest) return
     const data = response.data
     profiles.value = Array.isArray(data) ? data : data?.results || []
     total.value = Array.isArray(data) ? data.length : data?.count ?? profiles.value.length
   } catch (error) {
-    if (requestId === latestLoadRequest) ElMessage.error(error.response?.data?.detail || '加载同步配置失败')
+    if (!disposed && requestId === latestLoadRequest) ElMessage.error(error.response?.data?.detail || t('testcase.sync.loadFailed'))
   } finally {
-    if (requestId === latestLoadRequest) loading.value = false
+    if (!disposed && requestId === latestLoadRequest) loading.value = false
   }
 }
 const handlePageChange = page => { currentPage.value = page; load() }
@@ -130,25 +150,118 @@ const save = async () => {
     }
     visible.value = false
     await load()
-    ElMessage.success('保存成功')
-  } catch (error) { ElMessage.error(error.response?.data?.detail || '保存失败') } finally { saving.value = false }
+    ElMessage.success(t('testcase.sync.saveSucceeded'))
+  } catch (error) { ElMessage.error(error.response?.data?.detail || t('testcase.sync.saveFailed')) } finally { saving.value = false }
+}
+const stopPolling = () => {
+  if (syncTimer !== null) clearTimeout(syncTimer)
+  syncTimer = null
+  pollController?.abort()
+  pollController = null
+}
+const isCurrentSync = requestId => !disposed && requestId === syncRequestId
+const finishPolling = (requestId, status, error = '') => {
+  if (!isCurrentSync(requestId)) return
+  stopPolling()
+  syncStatus.value = status
+  syncError.value = error
+  syncing.value = null
+}
+const pollSync = async (profileId, taskId, requestId, deadline) => {
+  if (!isCurrentSync(requestId)) return
+  if (Date.now() >= deadline) {
+    finishPolling(requestId, 'pending')
+    return
+  }
+  const controller = new AbortController()
+  pollController = controller
+  try {
+    const response = await getTestCaseSyncProfile(profileId, { signal: controller.signal })
+    if (!isCurrentSync(requestId)) return
+    pollController = null
+    const profile = response.data
+    profiles.value = profiles.value.map(row => row.id === profileId ? { ...row, ...profile } : row)
+    if (profile.sync_task_id !== taskId) {
+      finishPolling(requestId, 'changed')
+      return
+    }
+    if (profile.sync_status === 'completed') {
+      result.value = profile.sync_result
+      finishPolling(requestId, 'completed')
+      await load()
+      if (isCurrentSync(requestId)) ElMessage.success(t('testcase.sync.completed'))
+      return
+    }
+    if (profile.sync_status === 'failed') {
+      finishPolling(requestId, 'failed', profile.sync_error)
+      return
+    }
+    if (!['queued', 'running'].includes(profile.sync_status)) {
+      finishPolling(requestId, 'unavailable')
+      return
+    }
+    syncStatus.value = profile.sync_status
+    syncTimer = setTimeout(() => {
+      syncTimer = null
+      pollSync(profileId, taskId, requestId, deadline)
+    }, 1500)
+  } catch (error) {
+    if (isCurrentSync(requestId)) finishPolling(requestId, 'unavailable', error.response?.data?.detail)
+  }
 }
 const sync = async row => {
+  if (syncing.value !== null || disposed) return
+  const requestId = ++syncRequestId
+  stopPolling()
   syncing.value = row.id
+  syncStatus.value = ''
+  syncError.value = ''
+  result.value = null
   try {
     const response = await syncTestCaseSyncProfile(row.id)
-    result.value = response.data
+    if (!isCurrentSync(requestId)) return
+    const data = response.data
     resultVisible.value = true
-    await load()
-  } catch (error) { ElMessage.error(error.response?.data?.error || '同步失败') } finally { syncing.value = null }
+    if (['queued', 'running'].includes(data.status) && data.task_id) {
+      syncStatus.value = data.status
+      await pollSync(row.id, data.task_id, requestId, Date.now() + 5 * 60 * 1000)
+    } else if (data.files !== undefined) {
+      result.value = data
+      finishPolling(requestId, 'completed')
+      await load()
+    } else {
+      finishPolling(requestId, 'unavailable')
+    }
+  } catch (error) {
+    if (isCurrentSync(requestId)) {
+      finishPolling(requestId, 'failed', error.response?.data?.error)
+      ElMessage.error(syncError.value || t('testcase.sync.failed'))
+    }
+  }
 }
 const remove = async row => {
-  await ElMessageBox.confirm(`确定删除同步配置 ${row.name} 吗？`, '确认')
-  await deleteTestCaseSyncProfile(row.id)
-  if (currentPage.value > 1 && profiles.value.length === 1) currentPage.value -= 1
-  await load()
+  if (syncing.value === row.id || ['queued', 'running'].includes(row.sync_status)) {
+    ElMessage.warning(t('testcase.sync.deleteBlocked'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('testcase.sync.deleteConfirm', { name: row.name }), t('common.confirm'))
+    await deleteTestCaseSyncProfile(row.id)
+    if (currentPage.value > 1 && profiles.value.length === 1) currentPage.value -= 1
+    await load()
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error.response?.data?.detail || t('testcase.sync.deleteFailed'))
+  }
 }
 onMounted(load)
+onBeforeUnmount(() => {
+  disposed = true
+  latestLoadRequest += 1
+  syncRequestId += 1
+  stopPolling()
+  syncing.value = null
+})
 </script>
 
 <style scoped>
@@ -157,5 +270,6 @@ onMounted(load)
 .page-header h1 { margin: 0; font-size: 24px; }
 .page-header p { color: var(--el-text-color-secondary); }
 .pagination-container { display: flex; justify-content: flex-end; padding-top: 16px; }
+.sync-feedback { margin-bottom: 16px; }
 .warnings { margin-top: 18px; }
 </style>

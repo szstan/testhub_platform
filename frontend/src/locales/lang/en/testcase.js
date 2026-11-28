@@ -179,7 +179,20 @@ export default {
       updated: 'Updated',
       skipped: 'Skipped',
       conflicts: 'Conflicts',
-      empty: 'No sync profiles'
+      empty: 'No sync profiles',
+      queued: 'Sync submitted; waiting to start',
+      running: 'Syncing test cases from the repository',
+      failed: 'Sync failed',
+      unavailable: 'Sync status is temporarily unavailable. Refresh later to view the result.',
+      changed: 'The sync task has been resubmitted. Refresh to view the latest status.',
+      pending: 'The task is still queued or running. Refresh later to view the result.',
+      loadFailed: 'Failed to load sync profiles',
+      saveSucceeded: 'Sync profile saved',
+      saveFailed: 'Failed to save sync profile',
+      completed: 'Sync completed',
+      deleteBlocked: 'A sync is in progress. The sync profile cannot be deleted.',
+      deleteConfirm: 'Delete sync profile {name}?',
+      deleteFailed: 'Failed to delete sync profile'
     },
     importStatusMap: {
       pending: 'Pending',

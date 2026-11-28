@@ -15,7 +15,14 @@ if sys.platform == 'win32':
             stream.reconfigure(encoding='utf-8', errors='replace')
 
 # 导入数据工厂的工具类
-from apps.data_factory.tools.random_tools import RandomTools
+from apps.data_factory.tools.random_tools import (
+    MAX_RANDOM_COUNT,
+    MAX_RANDOM_LENGTH,
+    MAX_RANDOM_TOTAL_OUTPUT,
+    RandomTools,
+    _strftime_output_length,
+    validate_generation_budget,
+)
 from apps.data_factory.tools.test_data_tools import TestDataTools
 from apps.data_factory.tools.string_tools import StringTools
 from apps.data_factory.tools.encoding_tools import EncodingTools
@@ -24,11 +31,221 @@ from apps.data_factory.tools.crontab_tools import CrontabTools
 from apps.data_factory.tools.image_tools import ImageTools
 
 
+_COUNT_ARGUMENTS = {
+    'random_int': 2, 'random_float': 3, 'random_string': 2,
+    'random_digits': 1, 'random_letters': 1, 'random_chinese': 1,
+    'random_uuid': 1, 'random_guid': 1, 'random_mac': 1, 'random_mac_address': 1,
+    'random_ip': 1, 'random_ip_address': 1, 'random_date': 2,
+    'random_boolean': 0, 'random_color': 1, 'random_password': 1, 'random_sequence': 1,
+    'random_phone': 0, 'random_email': 0, 'random_id_card': 0,
+    'random_name': 1, 'random_company': 0, 'random_address': 0,
+    'generate_chinese_name': 1, 'generate_chinese_phone': 0,
+    'generate_chinese_email': 0, 'generate_chinese_address': 1,
+    'generate_id_card': 0, 'generate_company_name': 0, 'generate_bank_card': 0,
+    'generate_hk_id_card': 0, 'generate_business_license': 0,
+    'generate_user_profile': 0, 'generate_coordinates': 0,
+    'get_next_runs': 1,
+}
+_LENGTH_ARGUMENTS = {
+    'random_string': (0, 8), 'random_digits': (0, 6), 'random_letters': (0, 8),
+    'random_chinese': (0, 2), 'random_password': (0, 12),
+}
+
+_STRING_COUNT_FUNCTIONS = {
+    'random_string', 'random_digits', 'random_letters', 'random_chinese',
+    'random_uuid', 'random_guid', 'random_mac', 'random_mac_address',
+    'random_ip', 'random_ip_address', 'random_date', 'random_color',
+    'random_password', 'random_sequence', 'random_phone', 'random_email',
+    'random_id_card', 'random_name', 'random_company', 'random_address',
+    'generate_chinese_name', 'generate_chinese_phone', 'generate_chinese_email',
+    'generate_chinese_address', 'generate_id_card', 'generate_company_name',
+    'generate_bank_card', 'generate_hk_id_card', 'generate_business_license',
+    'get_next_runs',
+}
+_STRUCTURED_COUNT_FUNCTIONS = {'generate_user_profile', 'generate_coordinates'}
+
+
+class ResolutionBudget:
+    """Cumulative generation limits for one complete variable-resolution pass."""
+
+    def __init__(self, max_count=None, max_output=None):
+        self.max_count = MAX_RANDOM_COUNT if max_count is None else max_count
+        self.max_output = MAX_RANDOM_TOTAL_OUTPUT if max_output is None else max_output
+        self.count = 0
+        self.output = 0
+
+    def ensure_expression_capacity(self, expression_count):
+        if self.count + expression_count > self.max_count:
+            raise ValueError(f'动态函数数量超过累计上限 {self.max_count}')
+
+    def reserve(self, count, output_size):
+        if self.count + count > self.max_count:
+            raise ValueError(f'动态函数数量超过累计上限 {self.max_count}')
+        if self.output + output_size > self.max_output:
+            raise ValueError(f'动态函数渲染结果超过累计上限 {self.max_output}')
+        self.count += count
+        self.output += output_size
+
+    def reconcile_output(self, reserved, actual):
+        actual_total = self.output - reserved + actual
+        if actual_total > self.max_output:
+            raise ValueError(f'动态函数渲染结果超过累计上限 {self.max_output}')
+        self.output = actual_total
+
+
+def _value_text_length(value):
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, bool):
+        return 5 if value else 4
+    if isinstance(value, int):
+        bits = value.bit_length()
+        return max(1, (bits * 30103 + 99999) // 100000) + (value < 0)
+    if isinstance(value, float):
+        return len(str(value))
+    if value is None:
+        return 4
+    if isinstance(value, (list, tuple)):
+        size = 2
+        for item in value:
+            size += _value_text_length(item) + 2
+            if size > MAX_RANDOM_TOTAL_OUTPUT:
+                return MAX_RANDOM_TOTAL_OUTPUT + 1
+        return size
+    if isinstance(value, dict):
+        size = 2
+        for key, item in value.items():
+            size += _value_text_length(key) + _value_text_length(item) + 4
+            if size > MAX_RANDOM_TOTAL_OUTPUT:
+                return MAX_RANDOM_TOTAL_OUTPUT + 1
+        return size
+    return MAX_RANDOM_LENGTH
+
+
+def _count_output_estimate(func_name, args, count):
+    item_length = {
+        'random_boolean': 5,
+        'random_uuid': 36,
+        'random_guid': 36,
+        'random_phone': 32,
+        'generate_chinese_phone': 32,
+        'random_email': 320,
+        'generate_chinese_email': 320,
+        'random_id_card': 32,
+        'generate_id_card': 32,
+        'random_name': 64,
+        'generate_chinese_name': 64,
+        'random_company': 256,
+        'generate_company_name': 256,
+        'random_address': 512,
+        'generate_chinese_address': 512,
+        'generate_bank_card': 32,
+        'generate_hk_id_card': 16,
+        'generate_business_license': 32,
+        'generate_user_profile': 2048,
+        'generate_coordinates': 256,
+        'get_next_runs': 21,
+    }.get(func_name)
+
+    if func_name == 'random_string':
+        item_length = args[0] if args else 8
+    elif func_name == 'random_digits':
+        item_length = args[0] if args else 6
+    elif func_name == 'random_letters':
+        item_length = args[0] if args else 8
+    elif func_name == 'random_chinese':
+        item_length = args[0] if args else 2
+    elif func_name == 'random_password':
+        item_length = args[0] if args else 12
+    elif func_name == 'random_int':
+        bounds = [args[0] if args else 0, args[1] if len(args) > 1 else 100]
+        item_length = max(_value_text_length(value) for value in bounds)
+    elif func_name == 'random_float':
+        bounds = [args[0] if args else 0.0, args[1] if len(args) > 1 else 1.0]
+        precision = args[2] if len(args) > 2 else 2
+        item_length = max(_value_text_length(value) for value in bounds) + abs(precision) + 2
+    elif func_name in {'random_mac', 'random_mac_address'}:
+        separator = args[0] if args and isinstance(args[0], str) else ':'
+        item_length = 12 + 5 * len(separator)
+    elif func_name in {'random_ip', 'random_ip_address'}:
+        item_length = 39 if args and args[0] == 6 else 15
+    elif func_name == 'random_color':
+        item_length = {'hex': 7, 'rgb': 24, 'rgba': 32}.get(args[0] if args else 'hex', 32)
+    elif func_name == 'random_date':
+        date_format = args[3] if len(args) > 3 else '%Y-%m-%d'
+        item_length = _strftime_output_length(date_format)
+    elif func_name == 'random_sequence':
+        item_length = MAX_RANDOM_LENGTH
+
+    if item_length is None:
+        item_length = MAX_RANDOM_LENGTH
+    if isinstance(item_length, bool) or not isinstance(item_length, int) or item_length < 0:
+        item_length = MAX_RANDOM_LENGTH + 1
+
+    if count == 1:
+        return item_length
+    if func_name in _STRUCTURED_COUNT_FUNCTIONS:
+        return count * (item_length + 2) + 2
+    if func_name in _STRING_COUNT_FUNCTIONS:
+        return count * (2 * item_length + 4) + 2
+    return count * item_length + 2 * (count - 1) + 2
+
+
+def _expression_output_estimate(func_name, args):
+    def text_length(index, default=''):
+        return _value_text_length(args[index] if len(args) > index else default)
+
+    if func_name in {'timestamp', 'timestamp_sec', 'datetime', 'date', 'time', 'date_offset'}:
+        return 64
+    if func_name == 'random_boolean':
+        return 5
+    if func_name == 'remove_whitespace':
+        return text_length(0)
+    if func_name == 'case_convert':
+        return 3 * text_length(0)
+    if func_name == 'replace_string':
+        text = args[0] if args and isinstance(args[0], str) else ''
+        old = args[1] if len(args) > 1 and isinstance(args[1], str) else ''
+        new = args[2] if len(args) > 2 and isinstance(args[2], str) else ''
+        replacements = len(text) + 1 if not old else text.count(old)
+        return len(text) + max(0, replacements * (len(new) - len(old)))
+    if func_name in {'word_count', 'regex_test', 'color_convert', 'validate_expression'}:
+        return 4096
+    if func_name in {'md5', 'md5_hash'}:
+        return 32
+    if func_name in {'sha1', 'sha1_hash'}:
+        return 40
+    if func_name in {'sha256', 'sha256_hash'}:
+        return 64
+    if func_name == 'sha512_hash':
+        return 128
+    if func_name in {'base64', 'base64_encode'}:
+        # Text codecs such as unicode_escape use ten bytes per code point;
+        # reserve their Base64 expansion before invoking the encoding tool.
+        return 16 * text_length(0) + 64
+    if func_name in {'base64_decode', 'url_decode'}:
+        return text_length(0) + 64
+    if func_name in {'url_encode', 'unicode_convert', 'ascii_convert'}:
+        return 12 * text_length(0) + 64
+    if func_name == 'base_convert':
+        return 6 * text_length(0) + 64
+    if func_name in {'aes_encrypt', 'aes_decrypt', 'hash_comparison'}:
+        return 2 * text_length(0) + 256
+    if func_name == 'generate_expression':
+        return sum(text_length(index) for index in range(min(5, len(args)))) + 8
+    if func_name == 'parse_expression':
+        return text_length(0) + 256
+    if func_name in {'generate_barcode', 'generate_qrcode', 'decode_qrcode', 'image_to_base64', 'base64_to_image'}:
+        return 12 * max((text_length(index) for index in range(len(args))), default=0) + 4096
+    return MAX_RANDOM_LENGTH
+
+
 class VariableResolver:
     """统一变量解析器 - 使用数据工厂工具"""
     
-    def __init__(self):
-        # 注册所有内置函数，映射到数据工厂的工具
+    def __init__(self, on_value=None, budget=None):
+        self.on_value = on_value
+        self.budget = budget if budget is not None else ResolutionBudget()
         self.functions = {
             # 随机工具
             'random_int': self._call_random_tool,
@@ -119,6 +336,35 @@ class VariableResolver:
             'date_offset': self._date_offset,
         }
     
+    def _validate_function_budget(self, func_name, args):
+        count_index = _COUNT_ARGUMENTS.get(func_name)
+        count = args[count_index] if count_index is not None and len(args) > count_index else 1
+        length = None
+        if func_name in _LENGTH_ARGUMENTS:
+            index, default = _LENGTH_ARGUMENTS[func_name]
+            length = args[index] if len(args) > index else default
+        elif func_name == 'random_float':
+            precision = args[2] if len(args) > 2 else 2
+            length = (
+                max(1, abs(precision))
+                if isinstance(precision, int) and not isinstance(precision, bool)
+                else precision
+            )
+        elif func_name == 'random_date':
+            date_format = args[3] if len(args) > 3 else '%Y-%m-%d'
+            length = _strftime_output_length(date_format)
+        elif func_name == 'random_color':
+            color_format = args[0] if args else 'hex'
+            length = {'hex': 7, 'rgb': 24, 'rgba': 32}.get(color_format, 32)
+        elif func_name in {'random_ip', 'random_ip_address'}:
+            length = 39 if args and args[0] == 6 else 15
+        elif func_name in {'random_uuid', 'random_guid'}:
+            length = 36
+        elif func_name in {'random_boolean'}:
+            length = 5
+        validate_generation_budget(count=count, length=length)
+        return count
+
     def resolve(self, text):
         """解析文本中的动态函数占位符
         
@@ -130,14 +376,17 @@ class VariableResolver:
         """
         if not isinstance(text, str):
             return text
-        
-        # 匹配 ${function_name(args)} 模式
+
         pattern = r'\$\{([^}]+)\}'
+        expression_count = sum(1 for _ in re.finditer(pattern, text))
+        if expression_count:
+            validate_generation_budget(count=expression_count, length=None)
+            self.budget.ensure_expression_capacity(expression_count)
         
         def replace_func(match):
             expression = match.group(1)
             try:
-                return str(self._evaluate_expression(expression))
+                return self._evaluate_expression(expression)
             except Exception as e:
                 if isinstance(e, UnicodeEncodeError):
                     return match.group(0)
@@ -158,22 +407,32 @@ class VariableResolver:
         Returns:
             函数执行结果
         """
-        # 解析函数名和参数
         match = re.match(r'(\w+)\((.*)\)', expression.strip())
         if not match:
-            # 无参数函数
             func_name = expression.strip()
             args = []
         else:
             func_name = match.group(1)
-            args_str = match.group(2)
-            args = self._parse_args(args_str)
-        
-        # 调用对应函数
-        if func_name in self.functions:
-            return self.functions[func_name](func_name, args)
-        else:
+            args = self._parse_args(match.group(2))
+
+        count = self._validate_function_budget(func_name, args)
+        if func_name not in self.functions:
             raise ValueError(f"未知函数: {func_name}")
+
+        output_estimate = (
+            _count_output_estimate(func_name, args, count)
+            if func_name in _COUNT_ARGUMENTS
+            else _expression_output_estimate(func_name, args)
+        )
+        self.budget.reserve(count, output_estimate)
+        result = self.functions[func_name](func_name, args)
+        rendered = str(result)
+        self.budget.reconcile_output(output_estimate, len(rendered))
+        if self.on_value is not None:
+            self.on_value(result)
+            if not isinstance(result, str):
+                self.on_value(rendered)
+        return rendered
     
     def _parse_args(self, args_str):
         """解析函数参数

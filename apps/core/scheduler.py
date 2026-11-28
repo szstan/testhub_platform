@@ -39,6 +39,7 @@ def claim_due_task(
     active_status: str = "ACTIVE",
     token_field: str = "scheduler_lease_token",
     expires_field: str = "scheduler_lease_expires_at",
+    allow_null_due: bool = False,
     now=None,
 ):
     """Atomically claim one due task.
@@ -56,7 +57,7 @@ def claim_due_task(
         if task is None or getattr(task, status_field) != active_status:
             return None
         due_at = getattr(task, due_field)
-        if due_at is None or due_at > now:
+        if (due_at is None and not allow_null_due) or (due_at is not None and due_at > now):
             return None
         current_token = getattr(task, token_field, "")
         current_expiry = getattr(task, expires_field, None)
@@ -120,10 +121,15 @@ class ScheduleLeaseHeartbeat:
     authoritative.
     """
 
-    def __init__(self, model, task_id, token: str, *, lease_seconds: int = 300):
+    def __init__(
+        self, model, task_id, token: str, *, lease_seconds: int = 300,
+        status_field: str = 'status', active_status='ACTIVE',
+    ):
         self.model = model
         self.task_id = task_id
         self.token = token
+        self.status_field = status_field
+        self.active_status = active_status
         self.lease_seconds = max(int(lease_seconds), 1)
         self.interval_seconds = min(self.lease_seconds / 3, 60)
         self._stop = Event()
@@ -158,7 +164,10 @@ class ScheduleLeaseHeartbeat:
         try:
             # A successor may replace the claim between heartbeat ticks. Check
             # the authoritative row before each new source operation as well.
-            load_claimed_task(self.model, self.task_id, self.token, require_active=True)
+            load_claimed_task(
+                self.model, self.task_id, self.token, require_active=True,
+                status_field=self.status_field, active_status=self.active_status,
+            )
         except Exception:
             self._lost.set()
             raise
@@ -172,6 +181,8 @@ class ScheduleLeaseHeartbeat:
                     self.task_id,
                     self.token,
                     lease_seconds=self.lease_seconds,
+                    status_field=self.status_field,
+                    active_status=self.active_status,
                 )
                 self._deadline = time.monotonic() + self.lease_seconds
             except ScheduleClaimLost:
@@ -195,6 +206,8 @@ def load_claimed_task(
     token_field: str = "scheduler_lease_token",
     expires_field: str = "scheduler_lease_expires_at",
     require_active: bool = False,
+    status_field: str = 'status',
+    active_status='ACTIVE',
 ):
     """Load a claimed task under a row lock and enforce its fencing token."""
 
@@ -204,7 +217,7 @@ def load_claimed_task(
         task = model.objects.select_for_update().filter(pk=task_id).first()
         if task is None:
             raise ScheduleClaimLost("scheduled task no longer exists")
-        if require_active and getattr(task, "status", None) != "ACTIVE":
+        if require_active and getattr(task, status_field, None) != active_status:
             raise ScheduleClaimLost("scheduled task is no longer active")
         if getattr(task, token_field, "") != token:
             raise ScheduleClaimLost("scheduler lease token was superseded")

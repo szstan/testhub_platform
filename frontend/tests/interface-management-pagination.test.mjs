@@ -13,8 +13,10 @@ async function setup(get, apiMethods = {}) {
     ['Plus', 'Folder', 'Document', 'MagicStick', 'Search', 'Close', 'CopyDocument', 'Delete']
       .map(name => [name, {}])
   )
+  const navigation = []
   const instance = await loadSfcSetup('src/views/api-testing/InterfaceManagement.vue', {
     '@/utils/api': { default: { get, ...apiMethods } },
+    '@/router': { default: { push: location => navigation.push(plain(location)) } },
     '@/utils/safe-html': { escapeHtml: value => value },
     './components/KeyValueEditor.vue': { default: {} },
     '@/components/DataFactorySelector.vue': { default: {} },
@@ -34,8 +36,33 @@ async function setup(get, apiMethods = {}) {
     { id: 4, name: 'Frontend', type: 'collection', children: [] },
     { id: 5, name: 'Backend', type: 'collection', children: [] },
   ]
-  return instance
+  return { ...instance, navigation }
 }
+
+test('creates an API case from a saved HTTP request without saving or copying the interface', async () => {
+  const instance = await setup(async () => ({ data: [] }))
+  instance.state.flatCollections.value = [{ id: 4, project: 7 }]
+  instance.state.selectedRequest.value = { id: 42, collection: 4, request_type: 'HTTP' }
+  assert.equal(instance.state.createTestCaseFromRequest(), true)
+  assert.deepEqual(instance.navigation, [{
+    path: '/api-testing/test-cases/create', query: { request_id: '42', project: '7' }
+  }])
+})
+
+test('case creation rejects drafts, WebSocket and requests outside the selected project', async () => {
+  const instance = await setup(async () => ({ data: [] }))
+  instance.state.flatCollections.value = [{ id: 4, project: 7 }, { id: 8, project: 8 }]
+  for (const value of [
+    { collection: 4 },
+    { id: 1, collection: null },
+    { id: 1, collection: 4, request_type: 'WEBSOCKET' },
+    { id: 1, collection: 8, request_type: 'HTTP' }
+  ]) {
+    instance.state.selectedRequest.value = value
+    assert.equal(instance.state.createTestCaseFromRequest(), false)
+  }
+  assert.deepEqual(instance.navigation, [])
+})
 
 test('loads every project page, deduplicates requests and preserves collection grouping', async () => {
   const calls = []

@@ -6,8 +6,6 @@ DefaultRouter + ModelViewSet + FlexiblePageNumberPagination + IsAuthenticated。
 这里所有"会真的打流量"的入口（execute/debug/run-now）都必须先过 preflight，
 它是平台唯一的护栏：并发上限、时长上限、禁压主机、并发执行数都在那里卡。
 """
-import csv
-import io
 import json
 import logging
 import math
@@ -21,6 +19,7 @@ from django.db import models as db_models
 from django.db import transaction
 from django.db.models.functions import TruncDate
 from django.http import FileResponse, HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -49,10 +48,51 @@ from .serializers import (PerfBaselineSerializer, PerfDataFileSerializer,
                           PerfScheduledTaskSerializer)
 from .services import cleanup as cleanup_service
 from .services import executor, reporter
+from .services.csv_inspect import inspect_csv_stream
 from .services.url_rewrite import (collapse_redundant_slashes, normalize_base_url_token,
                                    rewrite_base_url_token)
 
 logger = logging.getLogger(__name__)
+
+MAX_METRIC_POINTS = 5000
+MAX_RUN_LOG_TAIL_BYTES = 1024 * 1024
+
+
+def _read_run_log_tail(path, line_count, max_bytes=MAX_RUN_LOG_TAIL_BYTES):
+    """Read a bounded byte window from the end of a run log."""
+    chunk_size = 64 * 1024
+    chunks = []
+    bytes_read = 0
+    newline_count = 0
+    with open(path, 'rb') as stream:
+        position = stream.seek(0, os.SEEK_END)
+        while position > 0 and bytes_read < max_bytes:
+            amount = min(chunk_size, max_bytes - bytes_read, position)
+            position -= amount
+            stream.seek(position)
+            chunk = stream.read(amount)
+            chunks.insert(0, chunk)
+            bytes_read += len(chunk)
+            newline_count += chunk.count(b'\n')
+            if position == 0 or newline_count >= line_count + 1:
+                break
+
+    raw = b''.join(chunks)
+    if position > 0:
+        first_newline = raw.find(b'\n')
+        if first_newline >= 0:
+            raw = raw[first_newline + 1:]
+
+    text = None
+    for encoding in ('utf-8-sig', 'utf-8', 'gb18030'):
+        try:
+            text = raw.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        text = raw.decode('utf-8', errors='replace')
+    return ''.join(text.splitlines(keepends=True)[-line_count:])
 
 
 def resolve_script_ref(scenario, raw):
@@ -377,10 +417,49 @@ class PerfScenarioViewSet(viewsets.ModelViewSet):
             base_url_mode = 'keep'
         base_url = (request.data.get('base_url') or '').strip()
 
-        from apps.api_testing.models import ApiRequest
+        from apps.api_testing.models import ApiProject, ApiRequest
 
+        raw_request_ids = request.data.get('request_ids')
+        if not isinstance(raw_request_ids, list) or not raw_request_ids:
+            return Response({'error': '请选择要导入的接口用例'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            request_ids = []
+            for value in raw_request_ids:
+                if isinstance(value, bool):
+                    raise ValueError
+                if isinstance(value, int):
+                    request_id = value
+                elif isinstance(value, str) and value.isdecimal():
+                    request_id = int(value)
+                else:
+                    raise ValueError
+                if request_id <= 0:
+                    raise ValueError
+                if request_id not in request_ids:
+                    request_ids.append(request_id)
+        except (TypeError, ValueError):
+            return Response({'error': 'request_ids 必须是正整数 ID 数组'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        selected_http_ids = set(ApiRequest.objects.filter(
+            id__in=request_ids, request_type='HTTP').values_list('id', flat=True))
+        if request.user.is_staff or request.user.is_superuser:
+            api_projects = ApiProject.objects.all()
+        else:
+            api_projects = ApiProject.objects.filter(
+                db_models.Q(owner=request.user) | db_models.Q(members=request.user)
+            ).distinct()
         api_requests = list(ApiRequest.objects.filter(
-            id__in=request_ids, request_type='HTTP'))
+            id__in=request_ids,
+            request_type='HTTP',
+            collection__project__in=api_projects,
+        ).select_related('collection'))
+        accessible_http_ids = {api.id for api in api_requests}
+        if selected_http_ids - accessible_http_ids:
+            return Response({'error': '部分接口用例不存在或无权使用'},
+                            status=status.HTTP_404_NOT_FOUND)
+        api_requests.sort(key=lambda api: request_ids.index(api.id))
         if not api_requests:
             return Response({'error': '未找到可导入的 HTTP 接口用例（WebSocket 用例不支持压测）'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -694,14 +773,21 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
     def samples(self, request, pk=None):
         """全量时序采样点（图表用，自动降采样避免前端卡死）。"""
         execution = self.get_object()
-        max_points = min(int(request.query_params.get('max_points') or 1000), 5000)
-        qs = PerfMetricSample.objects.filter(execution=execution).order_by('ts_offset')
+        raw_max_points = request.query_params.get('max_points')
+        try:
+            max_points = 1000 if raw_max_points in (None, '') else int(raw_max_points)
+        except (TypeError, ValueError):
+            return Response({'error': 'max_points 必须是正整数'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if max_points <= 0:
+            return Response({'error': 'max_points 必须是正整数'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        max_points = min(max_points, MAX_METRIC_POINTS)
+        qs = PerfMetricSample.objects.filter(execution=execution).order_by('ts_offset', 'pk')
         total = qs.count()
-        if total <= max_points:
-            data = PerfMetricSampleSerializer(qs, many=True).data
-        else:
-            from .services.metrics import downsample
-            data = downsample(PerfMetricSampleSerializer(qs, many=True).data, max_points)
+        from .services.metrics import query_downsampled_points
+        points = query_downsampled_points(qs, total, max_points)
+        data = PerfMetricSampleSerializer(points, many=True).data
         return Response({'total': total, 'returned': len(data), 'samples': data})
 
     @action(detail=True, methods=['get'], url_path='request-stats')
@@ -868,27 +954,27 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
         abs_path = os.path.join(executor.abs_artifact_dir(execution), 'run.log')
         if not os.path.isfile(abs_path):
             return Response({'content': '', 'exists': False})
-        tail = min(int(request.query_params.get('lines') or 500), 5000)
-        # 兼容历史日志编码：新子进程强制 UTF-8 写入，但旧日志可能是
-        # Windows 下的 GBK/cp936，逐编码尝试避免乱码。
-        raw = open(abs_path, 'rb').read()
-        text = None
-        for enc in ('utf-8-sig', 'utf-8', 'gb18030'):
-            try:
-                text = raw.decode(enc)
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-        if text is None:
-            text = raw.decode('utf-8', errors='replace')
-        lines = text.splitlines(keepends=True)[-tail:]
-        return Response({'content': ''.join(lines), 'exists': True})
+        raw_tail = request.query_params.get('lines')
+        try:
+            tail = 500 if raw_tail in (None, '') else int(raw_tail)
+        except (TypeError, ValueError):
+            return Response({'error': 'lines 必须是正整数'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if tail <= 0:
+            return Response({'error': 'lines 必须是正整数'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        tail = min(tail, 5000)
+        return Response({
+            'content': _read_run_log_tail(abs_path, tail),
+            'exists': True,
+        })
 
     @action(detail=False, methods=['get'])
     def compare(self, request):
         """多执行对比：?ids=1,2,3。返回汇总差异 + 各自时序曲线。"""
         raw_ids = (request.query_params.get('ids') or '').strip()
-        ids = [int(i) for i in raw_ids.split(',') if i.strip().isdigit()]
+        ids = list(dict.fromkeys(
+            int(value) for value in raw_ids.split(',') if value.strip().isdigit()))
         if len(ids) < 2:
             return Response({'error': '至少选择 2 次执行进行对比'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -899,8 +985,12 @@ class PerfExecutionViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewS
         executions = list(scope_by_project(
             PerfExecution.objects.filter(id__in=ids), request.user, 'project'
         ).select_related('scenario'))
-        if len(executions) < 2:
-            return Response({'error': '所选执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+        if len(executions) < len(ids):
+            return Response({'error': '所选执行记录不存在或无权访问'},
+                            status=status.HTTP_404_NOT_FOUND)
+        if len({execution.project_id for execution in executions}) != 1:
+            return Response({'error': '只能对比同一压测项目中的执行记录'},
+                            status=status.HTTP_400_BAD_REQUEST)
         # 保持用户传入的顺序，第一条作为对比基准
         executions.sort(key=lambda e: ids.index(e.id))
 
@@ -1169,6 +1259,11 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'name']
 
     MAX_SIZE = 20 * 1024 * 1024  # 20MB：再大就该走数据库参数化了
+    MAX_CSV_RECORDS = 100_000  # Empty records consume the same parsing work budget.
+    MAX_CSV_COLUMNS = 256
+    MAX_CSV_CELL_CHARS = 32_768
+    MAX_CSV_RECORD_CHARS = 65_536
+    MAX_CSV_PHYSICAL_LINES = 200_000
 
     def get_queryset(self):
         return scope_by_project(super().get_queryset(), self.request.user, 'project')
@@ -1191,40 +1286,140 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             return self._create_upload(request)
         return self._create_csv(request)
 
-    # ------------------------------------------------------------------ #
-    def _create_jmx(self, request):
-        """JMeter 脚本上传：先静态解析确认是可执行的测试计划，再落盘。
-
-        不做「先存后校验」——一个坏脚本留在磁盘上，下次压测才在 prepare 阶段炸，
-        用户看到的是执行失败而不是上传失败，排查成本高一个数量级。
-        """
-        from .services import jmx_inspect
-
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
         upload = request.FILES.get('file')
+        requested_type = request.data.get('file_type')
+
+        # Validate the immutable upload without holding the global admission lock.
+        # Fetch again inside the transaction: permissions and file type may change
+        # while another request is parsing its replacement.
+        initial = self.get_object()
+        file_type = str(requested_type or initial.file_type).upper()
+        if file_type not in dict(PerfDataFile.FILE_TYPE_CHOICES):
+            return Response({'error': f'不支持的文件类型：{file_type}'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not upload and file_type != initial.file_type:
+            return Response({'error': '修改文件类型时必须同时上传经过校验的新文件'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if upload and file_type == 'JMX' and not (
+                request.user.is_staff or request.user.is_superuser):
+            raise PermissionDenied('仅管理员可以上传 JMeter 脚本')
+        attrs = {}
+        details = None
+        if upload:
+            attrs, error, details = self._inspect_upload(file_type, upload)
+            if error:
+                return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            if upload:
+                # File replacement and PENDING reservations share this lock.
+                executor.lock_execution_admission()
+            # Lock only this row, then repeat the scoped lookup under that lock.
+            # Locking the distinct project-membership join is not portable.
+            get_object_or_404(PerfDataFile.objects.select_for_update(), pk=initial.pk)
+            instance = self.get_object()
+            if initial.file_type != instance.file_type:
+                return Response({'error': '文件类型已改变，请刷新后重试'},
+                                status=status.HTTP_409_CONFLICT)
+            if not upload and file_type != instance.file_type:
+                return Response({'error': '修改文件类型时必须同时上传经过校验的新文件'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if upload:
+                if instance.file_type == 'JMX' and PerfExecution.objects.filter(
+                        project_id=instance.project_id,
+                        status__in=PerfExecution.ACTIVE_STATUSES,
+                        script_ref__data_file_id=instance.id).exists():
+                    raise ValidationError('该脚本正被执行中的压测使用，无法替换')
+
+            data = request.data.copy()
+            if requested_type:
+                data['file_type'] = file_type
+            old_storage = instance.file.storage
+            old_name = instance.file.name
+            serializer = self.get_serializer(instance, data=data, partial=partial)
+            serializer.is_valid(raise_exception=True)
+            updated = serializer.save(**attrs)
+            if upload and old_name and old_name != updated.file.name:
+                def delete_old_file():
+                    try:
+                        with transaction.atomic():
+                            executor.lock_execution_admission()
+                            current_name = PerfDataFile.objects.filter(pk=updated.pk).values_list(
+                                'file', flat=True).first()
+                            if current_name != old_name:
+                                old_storage.delete(old_name)
+                    except Exception as exc:  # noqa: BLE001 - cleanup cannot undo the update
+                        logger.warning('删除替换前的压测数据文件失败 #%s: %s', updated.pk, exc)
+                transaction.on_commit(delete_old_file)
+            if file_type == 'JMX' and details:
+                log_operation('UPDATE', 'DATAFILE', updated.id, updated.name, request.user,
+                              description=f'替换 JMeter 脚本，采样器 {details.get("sampler_count")} 个')
+            return Response(self.get_serializer(updated).data)
+
+    # ------------------------------------------------------------------ #
+    def _inspect_upload(self, file_type, upload):
+        """Apply the same size/type/parser checks before either create or replace."""
         if not upload:
-            return Response({'error': '请选择要上传的 .jmx 文件'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if not upload.name.lower().endswith('.jmx'):
-            return Response({'error': '脚本模式仅支持 JMeter .jmx 文件'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if upload.size > jmx_inspect.MAX_JMX_SIZE:
-            return Response(
-                {'error': f'.jmx 不能超过 {jmx_inspect.MAX_JMX_SIZE // 1024 // 1024}MB'},
-                status=status.HTTP_400_BAD_REQUEST)
+            label = '.jmx 文件' if file_type == 'JMX' else '文件'
+            return None, f'请选择要上传的{label}', None
+
+        if file_type == 'JMX':
+            from .services import jmx_inspect
+
+            if not upload.name.lower().endswith('.jmx'):
+                return None, '脚本模式仅支持 JMeter .jmx 文件', None
+            if upload.size > jmx_inspect.MAX_JMX_SIZE:
+                return None, f'.jmx 不能超过 {jmx_inspect.MAX_JMX_SIZE // 1024 // 1024}MB', None
+            try:
+                raw = upload.read()
+                meta = jmx_inspect.inspect_jmx_bytes(raw)
+            except Exception as exc:  # noqa: BLE001
+                return None, f'.jmx 解析失败：{exc}', None
+            finally:
+                upload.seek(0)
+            if not meta.get('valid'):
+                return None, meta.get('error') or '.jmx 解析失败', None
+            if not meta.get('sampler_count'):
+                return None, '.jmx 中没有任何采样器（Sampler），执行后不会产生任何请求', None
+            return {
+                'columns': [], 'row_count': 0,
+                'meta': jmx_inspect.summarize(meta),
+            }, None, meta
+
+        if upload.size > self.MAX_SIZE:
+            return None, f'文件不能超过 {self.MAX_SIZE // 1024 // 1024}MB', None
+        if file_type == 'UPLOAD':
+            return {
+                'columns': [], 'row_count': 0,
+                'meta': {'size': upload.size,
+                         'content_type': upload.content_type or 'application/octet-stream'},
+            }, None, None
+        if not upload.name.lower().endswith('.csv'):
+            return None, '仅支持 CSV 文件', None
 
         try:
-            raw = upload.read()
-        finally:
-            upload.seek(0)
+            metadata = self._inspect_csv_stream(upload.file)
+        except Exception as exc:  # noqa: BLE001
+            return None, f'CSV 解析失败：{exc}', None
+        return {
+            'columns': metadata['columns'], 'row_count': metadata['row_count'], 'meta': {},
+        }, None, None
 
-        meta = jmx_inspect.inspect_jmx_bytes(raw)
-        if not meta.get('valid'):
-            return Response({'error': meta.get('error') or '.jmx 解析失败'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if not meta.get('sampler_count'):
-            return Response({'error': '.jmx 中没有任何采样器（Sampler），执行后不会产生任何请求'},
-                            status=status.HTTP_400_BAD_REQUEST)
+    def _inspect_csv_stream(self, stream, preview_limit=0):
+        return inspect_csv_stream(
+            stream, max_records=self.MAX_CSV_RECORDS, max_columns=self.MAX_CSV_COLUMNS,
+            max_cell_chars=self.MAX_CSV_CELL_CHARS,
+            max_record_chars=self.MAX_CSV_RECORD_CHARS,
+            max_physical_lines=self.MAX_CSV_PHYSICAL_LINES, preview_limit=preview_limit,
+        )
 
+    def _create_jmx(self, request):
+        upload = request.FILES.get('file')
+        attrs, error, jmx_meta = self._inspect_upload('JMX', upload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
         serializer = self.get_serializer(data={
             'project': request.data.get('project'),
             'name': request.data.get('name') or upload.name,
@@ -1232,30 +1427,19 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             'file': upload,
         })
         serializer.is_valid(raise_exception=True)
-        instance = serializer.save(uploaded_by=request.user,
-                                   columns=[], row_count=0,
-                                   meta=jmx_inspect.summarize(meta))
+        instance = serializer.save(uploaded_by=request.user, **attrs)
         log_operation('CREATE', 'DATAFILE', instance.id, instance.name, request.user,
                       description=f'上传 JMeter 脚本，线程组 '
-                                  f'{len(meta.get("thread_groups") or [])} 个 / '
-                                  f'采样器 {meta.get("sampler_count")} 个')
+                                  f'{len(jmx_meta.get("thread_groups") or [])} 个 / '
+                                  f'采样器 {jmx_meta.get("sampler_count")} 个')
         return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
 
     # ------------------------------------------------------------------ #
     def _create_upload(self, request):
-        """请求体上传文件：供压测步骤的 multipart/form-data 文件字段引用。
-
-        不限扩展名（业务接口可能要求任意类型），只做大小限制；
-        原始文件名与 Content-Type 记入 meta，引擎发送时用它还原 multipart 头。
-        """
         upload = request.FILES.get('file')
-        if not upload:
-            return Response({'error': '请选择要上传的文件'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if upload.size > self.MAX_SIZE:
-            return Response({'error': f'文件不能超过 {self.MAX_SIZE // 1024 // 1024}MB'},
-                            status=status.HTTP_400_BAD_REQUEST)
-
+        attrs, error, _details = self._inspect_upload('UPLOAD', upload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
         serializer = self.get_serializer(data={
             'project': request.data.get('project'),
             'name': request.data.get('name') or upload.name,
@@ -1263,10 +1447,7 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             'file': upload,
         })
         serializer.is_valid(raise_exception=True)
-        instance = serializer.save(
-            uploaded_by=request.user, columns=[], row_count=0,
-            meta={'size': upload.size,
-                  'content_type': upload.content_type or 'application/octet-stream'})
+        instance = serializer.save(uploaded_by=request.user, **attrs)
         log_operation('CREATE', 'DATAFILE', instance.id, instance.name, request.user,
                       description=f'上传请求文件（{upload.size // 1024}KB）')
         return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
@@ -1274,41 +1455,9 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
     # ------------------------------------------------------------------ #
     def _create_csv(self, request):
         upload = request.FILES.get('file')
-        if not upload:
-            return Response({'error': '请选择要上传的 CSV 文件'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if not upload.name.lower().endswith('.csv'):
-            return Response({'error': '仅支持 CSV 文件'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if upload.size > self.MAX_SIZE:
-            return Response({'error': f'文件不能超过 {self.MAX_SIZE // 1024 // 1024}MB'},
-                            status=status.HTTP_400_BAD_REQUEST)
-
-        # 先解析再落库：格式不对就别浪费磁盘
-        try:
-            raw = upload.read()
-            try:
-                text = raw.decode('utf-8-sig')
-            except UnicodeDecodeError:
-                text = raw.decode('gbk', errors='replace')
-            rows = list(csv.reader(io.StringIO(text)))
-        except Exception as exc:  # noqa: BLE001
-            return Response({'error': f'CSV 解析失败：{exc}'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        finally:
-            upload.seek(0)
-
-        if not rows:
-            return Response({'error': 'CSV 文件为空'}, status=status.HTTP_400_BAD_REQUEST)
-        columns = [c.strip() for c in rows[0]]
-        if not any(columns):
-            return Response({'error': 'CSV 首行必须是列名'},
-                            status=status.HTTP_400_BAD_REQUEST)
-        data_rows = [r for r in rows[1:] if any((c or '').strip() for c in r)]
-        if not data_rows:
-            return Response({'error': 'CSV 除表头外没有数据行'},
-                            status=status.HTTP_400_BAD_REQUEST)
-
+        attrs, error, _details = self._inspect_upload('CSV', upload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
         serializer = self.get_serializer(data={
             'project': request.data.get('project'),
             'name': request.data.get('name') or upload.name,
@@ -1316,8 +1465,7 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             'file': upload,
         })
         serializer.is_valid(raise_exception=True)
-        instance = serializer.save(uploaded_by=request.user, columns=columns,
-                                   row_count=len(data_rows), meta={})
+        instance = serializer.save(uploaded_by=request.user, **attrs)
         return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'])
@@ -1328,23 +1476,21 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             return self._preview_jmx(data_file, request)
         if data_file.file_type == 'UPLOAD':
             return Response({'file_type': 'UPLOAD', 'meta': data_file.meta or {}})
-        limit = min(int(request.query_params.get('limit') or 10), 100)
+        try:
+            limit = max(0, min(int(request.query_params.get('limit') or 10), 100))
+        except (TypeError, ValueError):
+            return Response({'error': '预览行数必须为整数'}, status=status.HTTP_400_BAD_REQUEST)
         try:
             with data_file.file.open('rb') as fh:
-                raw = fh.read()
-            try:
-                text = raw.decode('utf-8-sig')
-            except UnicodeDecodeError:
-                text = raw.decode('gbk', errors='replace')
-            rows = list(csv.reader(io.StringIO(text)))
+                metadata = self._inspect_csv_stream(fh.file, preview_limit=limit)
         except Exception as exc:  # noqa: BLE001
             return Response({'error': f'读取文件失败：{exc}'},
                             status=status.HTTP_400_BAD_REQUEST)
         return Response({
             'file_type': 'CSV',
-            'columns': rows[0] if rows else [],
-            'rows': rows[1:limit + 1],
-            'total_rows': max(len(rows) - 1, 0),
+            'columns': metadata['columns'],
+            'rows': metadata['rows'],
+            'total_rows': metadata['total_rows'],
         })
 
     def _preview_jmx(self, data_file, request):
@@ -1368,30 +1514,45 @@ class PerfDataFileViewSet(viewsets.ModelViewSet):
             'head': '\n'.join(text.splitlines()[:head_lines]),
         })
 
+    @transaction.atomic
     def perform_destroy(self, instance):
-        # 被场景变量引用中的文件不允许删，否则下次压测直接崩在准备阶段
+        executor.lock_execution_admission()
+        current = PerfDataFile.objects.select_for_update().filter(pk=instance.pk).first()
+        if current is None or not can_access_project(self.request.user, current.project):
+            from rest_framework.exceptions import NotFound
+            raise NotFound()
+        # References and PENDING admission are checked while replacement/start
+        # hold the same lock, so no execution can retain a disappearing script.
         used_by = []
-        for scenario in PerfScenario.objects.filter(project=instance.project):
+        for scenario in PerfScenario.objects.filter(project=current.project):
             for var in scenario.variables or []:
-                if str(var.get('data_file_id')) == str(instance.id):
+                if str(var.get('data_file_id')) == str(current.id):
                     used_by.append(scenario.name)
                     break
         if used_by:
             raise ValidationError(
                 f'文件被以下场景引用，无法删除：{"、".join(used_by[:5])}')
-        # 正在执行中的压测若引用了该脚本，删掉会让 JMeter 中途读不到文件
-        if instance.file_type == 'JMX':
-            running = PerfExecution.objects.filter(
-                project=instance.project,
-                status__in=PerfExecution.ACTIVE_STATUSES,
-                script_ref__data_file_id=instance.id).exists()
-            if running:
-                raise ValidationError('该脚本正被执行中的压测使用，无法删除')
-        try:
-            instance.file.delete(save=False)
-        except Exception:  # noqa: BLE001 - 文件可能已不在
-            pass
-        instance.delete()
+        if current.file_type == 'JMX' and PerfExecution.objects.filter(
+            project=current.project,
+            status__in=PerfExecution.ACTIVE_STATUSES,
+            script_ref__data_file_id=current.id,
+        ).exists():
+            raise ValidationError('该脚本正被执行中的压测使用，无法删除')
+        storage, old_name = current.file.storage, current.file.name
+        current.delete()
+
+        def delete_committed_file():
+            if not old_name:
+                return
+            try:
+                with transaction.atomic():
+                    executor.lock_execution_admission()
+                    if not PerfDataFile.objects.filter(file=old_name).exists():
+                        storage.delete(old_name)
+            except Exception as exc:
+                logger.warning('压测文件清理失败 error_type=%s', type(exc).__name__)
+
+        transaction.on_commit(delete_committed_file)
 
 
 # ====================================================================== #
@@ -1607,7 +1768,11 @@ class PerfComparisonReportViewSet(viewsets.ViewSet):
         ).select_related('scenario'))
 
         if len(executions) < len(ids):
-            return Response({'error': '所选执行记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': '所选执行记录不存在或无权访问'},
+                            status=status.HTTP_404_NOT_FOUND)
+        if len({execution.project_id for execution in executions}) != 1:
+            return Response({'error': '只能对比同一压测项目中的执行记录'},
+                            status=status.HTTP_400_BAD_REQUEST)
         if project_id and any(str(e.project_id) != str(project_id) for e in executions):
             return Response({'error': '存在不属于该项目的执行记录'},
                             status=status.HTTP_400_BAD_REQUEST)

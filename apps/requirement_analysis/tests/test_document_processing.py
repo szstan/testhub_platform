@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
+import zipfile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -7,6 +8,7 @@ from rest_framework.test import APIClient
 
 from apps.requirement_analysis import services
 from apps.requirement_analysis.models import RequirementDocument
+from apps.requirement_analysis.pdf_worker import PdfWorkerFailure, extract_pdf_text
 from apps.requirement_analysis.services import DocumentExtractionError, DocumentProcessor
 from apps.users.models import User
 
@@ -25,39 +27,31 @@ def test_pdf_without_parser_dependency_fails_explicitly(monkeypatch, tmp_path):
         DocumentProcessor.extract_text_from_pdf(str(tmp_path / 'unused.pdf'))
 
 
-def test_empty_or_scanned_pdf_pages_fail_without_stringifying_none(monkeypatch, tmp_path):
-    path = tmp_path / 'empty.pdf'
-    path.write_bytes(b'%PDF-test')
-
+def test_empty_or_scanned_pdf_pages_fail_without_stringifying_none():
     class EmptyPage:
         def extract_text(self):
             return None
 
     class EmptyPdf:
-        def __init__(self, _file):
+        def __init__(self, _source):
             self.pages = [EmptyPage()]
 
-    monkeypatch.setattr(services, 'PdfReader', EmptyPdf)
-
-    with pytest.raises(DocumentExtractionError, match='没有可提取的文本'):
-        DocumentProcessor.extract_text(make_document(path, 'pdf'))
+    with pytest.raises(PdfWorkerFailure, match='empty'):
+        extract_pdf_text(EmptyPdf, None, max_pages=10, max_text_chars=100)
 
 
-def test_pdf_legacy_reader_extract_method_remains_supported(monkeypatch, tmp_path):
-    path = tmp_path / 'legacy.pdf'
-    path.write_bytes(b'%PDF-test')
-
+def test_pdf_legacy_reader_extract_method_remains_supported():
     class LegacyPage:
         def extractText(self):
             return 'Legacy PDF requirement'
 
     class LegacyPdf:
-        def __init__(self, _file):
+        def __init__(self, _source):
             self.pages = [LegacyPage()]
 
-    monkeypatch.setattr(services, 'PdfReader', LegacyPdf)
-
-    assert DocumentProcessor.extract_text(make_document(path, 'pdf')) == 'Legacy PDF requirement'
+    assert extract_pdf_text(
+        LegacyPdf, None, max_pages=10, max_text_chars=100,
+    ) == 'Legacy PDF requirement'
 
 
 def test_corrupt_pdf_and_docx_fail_explicitly(monkeypatch, tmp_path):
@@ -65,11 +59,6 @@ def test_corrupt_pdf_and_docx_fail_explicitly(monkeypatch, tmp_path):
     path = tmp_path / 'broken.pdf'
     path.write_bytes(b'not a pdf')
 
-    class BrokenPdf:
-        def __init__(self, _file):
-            raise ValueError('bad structure')
-
-    monkeypatch.setattr(services, 'PdfReader', BrokenPdf)
     with pytest.raises(DocumentExtractionError, match='PDF文件损坏'):
         DocumentProcessor.extract_text(make_document(path, 'pdf'))
 
@@ -94,8 +83,11 @@ def test_docx_extracts_paragraph_and_table_content(monkeypatch, tmp_path):
         tables=[table],
     )
     monkeypatch.setattr(services, 'docx', SimpleNamespace(Document=Mock(return_value=document)))
+    archive_path = tmp_path / 'requirements.docx'
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        archive.writestr('word/document.xml', '<document/>')
 
-    text = DocumentProcessor.extract_text_from_docx(str(tmp_path / 'requirements.docx'))
+    text = DocumentProcessor.extract_text_from_docx(str(archive_path))
 
     assert text == 'User login requirement\nField | Required'
 

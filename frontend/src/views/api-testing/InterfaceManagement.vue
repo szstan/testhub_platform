@@ -205,6 +205,15 @@
                 <el-button size="small" @click="saveRequest" :loading="saving" ref="saveButtonRef">
                   {{ $t('apiTesting.common.save') }}
                 </el-button>
+                <el-button
+                  v-if="selectedRequest.request_type !== 'WEBSOCKET'"
+                  size="small"
+                  type="primary"
+                  plain
+                  :disabled="!canCreateTestCase"
+                  :title="$t('apiTesting.cases.fromSavedRequest')"
+                  @click="createTestCaseFromRequest"
+                >{{ $t('apiTesting.cases.createFromRequest') }}</el-button>
                 <el-dropdown split-button type="default" size="small" @click="importCurl">
                   {{ $t('apiTesting.common.import') }}
                   <template #dropdown>
@@ -318,6 +327,7 @@
             <!-- HTTP接口专用标签页 -->
             <template v-if="!selectedRequest || selectedRequest.request_type !== 'WEBSOCKET'">
               <el-tab-pane label="Pre-request Script" name="pre-script">
+                <el-alert :title="$t('apiTesting.cases.scriptUnsupported')" type="info" :closable="false" show-icon style="margin-bottom: 12px" />
                 <div class="script-editor-container">
                   <el-input
                     v-model="selectedRequest.pre_request_script"
@@ -349,6 +359,7 @@
               </el-tab-pane>
 
               <el-tab-pane label="Tests" name="tests">
+                <el-alert :title="$t('apiTesting.cases.scriptUnsupported')" type="info" :closable="false" show-icon style="margin-bottom: 12px" />
                 <div class="script-editor-container">
                   <el-input
                     v-model="selectedRequest.post_request_script"
@@ -975,6 +986,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'v
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Folder, Document, MagicStick, Search, Close, CopyDocument, Delete } from '@element-plus/icons-vue'
 import api from '@/utils/api'
+import router from '@/router'
 import { escapeHtml } from '@/utils/safe-html'
 import KeyValueEditor from './components/KeyValueEditor.vue'
 import DataFactorySelector from '@/components/DataFactorySelector.vue'
@@ -1942,6 +1954,26 @@ const onHeadersUpdate = (headers) => {
     currentHeaders.value = headers
     selectedRequest.value.headers = headers
   }
+}
+
+const canCreateTestCase = computed(() => {
+  const request = selectedRequest.value
+  if (!request?.id || !request.collection || request.request_type === 'WEBSOCKET') return false
+  return flatCollections.value.some(collection =>
+    collection.id === request.collection && Number(collection.project) === Number(selectedProject.value)
+  )
+})
+
+const createTestCaseFromRequest = () => {
+  if (!canCreateTestCase.value) {
+    ElMessage.warning(t('apiTesting.cases.fromSavedRequest'))
+    return false
+  }
+  router.push({
+    path: '/api-testing/test-cases/create',
+    query: { request_id: String(selectedRequest.value.id), project: String(selectedProject.value) }
+  })
+  return true
 }
 
 const saveRequest = async () => {

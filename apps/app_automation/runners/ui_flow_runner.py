@@ -18,6 +18,7 @@ import regex as bounded_regex
 from django.conf import settings
 from django.db import transaction
 from ..runtime_config import validate_base_url
+from ..constants import APP_API_REQUEST_MAX_TIMEOUT_SECONDS
 from .. import appium_locator, device_actions, native_locator, secret_input
 from ..appium_runtime import AppiumOutcomeUnknown
 from ..bounded_inference import BoundedInference, InferenceBusy, InferenceTimeout
@@ -2892,6 +2893,16 @@ class UiFlowRunner:
         json_data = step.get('json', {})
         data = step.get('data', {})
         timeout = step.get('timeout', 10)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or not 0 < timeout <= APP_API_REQUEST_MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f'api_request timeout must be greater than 0 and at most '
+                f'{APP_API_REQUEST_MAX_TIMEOUT_SECONDS:g} seconds'
+            )
         save_as = step.get('save_as', '')
         scope = step.get('scope', 'local')
         response_type = step.get('response_type', 'auto')
@@ -2904,7 +2915,7 @@ class UiFlowRunner:
         if base_url and not urlsplit(url).scheme and not url.startswith('//'):
             url = urljoin(base_url.rstrip('/') + '/', url)
         try:
-            url = validate_outbound_url(url, allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)))
+            url = validate_outbound_url(url, allow_private=False)
         except UnsafeOutboundURL:
             raise ValueError('api_request URL is invalid or disallowed') from None
         
@@ -2922,7 +2933,7 @@ class UiFlowRunner:
             response = guarded_request(
                 method=method,
                 url=url,
-                allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
+                allow_private=False,
                 headers=headers,
                 params=params,
                 json=json_data if json_data else None,

@@ -1,23 +1,20 @@
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
-from apps.projects.models import ProjectMember
+from apps.projects.access import (
+    WRITABLE_PROJECT_ROLES, user_can_write_project, writable_projects,
+)
 from apps.requirement_analysis.models import TestCaseGenerationTask
 
 
-WRITABLE_PROJECT_ROLES = ('owner', 'admin', 'developer', 'tester')
 READ_ONLY_TASK_ACTIONS = {'issue_stream_ticket', 'submission'}
 
 
-def user_can_write_project(user, project):
-    if not user or not getattr(user, 'is_authenticated', False) or project is None:
+def user_can_write_document(user, document):
+    if not user or not getattr(user, 'is_authenticated', False):
         return False
-    if user.is_staff or user.is_superuser or project.owner_id == user.pk:
-        return True
-    return ProjectMember.objects.filter(
-        project_id=project.pk,
-        user_id=user.pk,
-        role__in=WRITABLE_PROJECT_ROLES,
-    ).exists()
+    if document.project_id:
+        return user_can_write_project(user, document.project)
+    return user.is_staff or user.is_superuser or document.uploaded_by_id == user.pk
 
 
 def user_can_write_generation_task(user, task):

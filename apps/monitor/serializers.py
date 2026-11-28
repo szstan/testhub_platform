@@ -55,7 +55,7 @@ def merge_config(existing, incoming):
 class MonitorTargetSerializer(serializers.ModelSerializer):
     class Meta:
         model = MonitorTarget
-        fields = '__all__'
+        exclude = ('scheduler_lease_token', 'scheduler_lease_expires_at')
         read_only_fields = (
             'status', 'last_check_at', 'consecutive_failures',
             'next_check_at', 'created_at', 'updated_at', 'created_by',

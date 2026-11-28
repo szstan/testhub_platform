@@ -183,6 +183,18 @@ class AnalysisTask(models.Model):
                                  verbose_name='关联文档')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
     progress = models.PositiveIntegerField(default=0, verbose_name='进度百分比')
+    retry_attempt = models.PositiveIntegerField(default=0, verbose_name='重试次数')
+    worker_invocation_nonce = models.CharField(max_length=64, blank=True, default='')
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    worker_lease_expires_at = models.DateTimeField(null=True, blank=True)
+    dispatch_state = models.CharField(
+        max_length=16,
+        choices=[('unpublished', '未发布'), ('publishing', '发布中'), ('published', '已确认')],
+        default='unpublished',
+    )
+    dispatch_nonce = models.CharField(max_length=64, blank=True, default='')
+    dispatch_lease_expires_at = models.DateTimeField(null=True, blank=True)
+    dispatch_acknowledged_at = models.DateTimeField(null=True, blank=True)
     result = models.JSONField(verbose_name='任务结果', null=True, blank=True)
     error_message = models.TextField(verbose_name='错误信息', blank=True)
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')

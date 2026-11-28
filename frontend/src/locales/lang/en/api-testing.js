@@ -1,7 +1,10 @@
 /**
  * API Testing Module English Translations
  */
+import cases from './api-test-cases.js'
+
 export default {
+  cases,
   // Navigation Menu
   nav: {
     title: 'API Testing',
@@ -78,7 +81,7 @@ export default {
       },
       automationTesting: {
         title: 'Automation Testing',
-        description: 'Visual test flow orchestration with assertions, variable extraction, pre/post scripts and more.'
+        description: 'Organize multi-step API cases with parameter overrides, response assertions and variable extraction.'
       },
       scheduledTask: {
         title: 'Scheduled Tasks',

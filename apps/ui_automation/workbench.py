@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from collections import defaultdict
+from datetime import timedelta
 
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .models import (
@@ -22,6 +25,12 @@ SUPPORTED_BROWSERS = {
     'playwright': {'chrome', 'edge', 'firefox'},
     'selenium': {'chrome', 'edge', 'firefox'},
 }
+WORKBENCH_DISPATCH_LEASE_SECONDS = 30
+WORKBENCH_WORKER_LOST_MESSAGE = (
+    'UI worker heartbeat expired; external effects are unknown. '
+    'Execution was interrupted and will not be replayed.'
+)
+logger = logging.getLogger(__name__)
 
 
 class SubmissionValidationError(ValueError):
@@ -314,8 +323,206 @@ def acceptance_payload(kind, execution, *, replayed=False, accepted=True, failur
     return payload
 
 
-def dispatch_execution(kind, execution):
+def _dispatch_model(kind):
+    if kind == 'case':
+        return TestCaseExecution, 'pending'
+    if kind == 'suite':
+        return TestExecution, 'PENDING'
+    raise ValueError(f'unsupported workbench execution kind: {kind}')
+
+
+def dispatch_execution(kind, execution, *, now=None):
+    """Publish once per persisted delivery lease; workers still fence execution by claim."""
     from .tasks import execute_workbench_case, execute_workbench_suite
 
+    model, pending_status = _dispatch_model(kind)
+    if not execution.dispatch_claim:
+        return False
+
+    now = now or timezone.now()
+    lease_token = uuid.uuid4()
+    lease_expiry = now + timedelta(seconds=WORKBENCH_DISPATCH_LEASE_SECONDS)
+    lease_available = (
+        Q(dispatch_delivery_token__isnull=True)
+        | Q(dispatch_delivery_expires_at__isnull=True)
+        | Q(dispatch_delivery_expires_at__lte=now)
+    )
+    reserved = model.objects.filter(
+        pk=execution.pk,
+        dispatch_claim=execution.dispatch_claim,
+        status=pending_status,
+        cancel_requested_at__isnull=True,
+        dispatch_enqueued_at__isnull=True,
+    ).filter(lease_available).update(
+        dispatch_delivery_token=lease_token,
+        dispatch_delivery_expires_at=lease_expiry,
+    )
+    if not reserved:
+        return False
+
     task = execute_workbench_case if kind == 'case' else execute_workbench_suite
-    task.apply_async(args=(execution.pk, str(execution.dispatch_claim)))
+    task.apply_async(args=(execution.pk, str(execution.dispatch_claim)), retry=False)
+    model.objects.filter(
+        pk=execution.pk,
+        dispatch_claim=execution.dispatch_claim,
+        dispatch_delivery_token=lease_token,
+        dispatch_enqueued_at__isnull=True,
+    ).update(
+        dispatch_enqueued_at=timezone.now(),
+        dispatch_delivery_token=None,
+        dispatch_delivery_expires_at=None,
+    )
+    return True
+
+
+def reconcile_stale_workbench_executions(limit=20, now=None) -> int:
+    """Terminalize expired workbench workers without replaying external actions."""
+    limit = max(int(limit), 0)
+    if not limit:
+        return 0
+
+    query_time = now or timezone.now()
+    candidates = []
+    for kind, (model, running_status) in (
+        ('case', (TestCaseExecution, 'running')),
+        ('suite', (TestExecution, 'RUNNING')),
+    ):
+        rows = model.objects.filter(
+            status=running_status,
+            dispatch_claim__isnull=False,
+            worker_nonce__isnull=False,
+            worker_lease_expires_at__lte=query_time,
+        ).order_by('worker_lease_expires_at', 'pk').values(
+            'pk', 'dispatch_claim', 'worker_nonce', 'worker_lease_expires_at',
+        )[:limit]
+        candidates.extend((kind, row) for row in rows)
+
+    candidates.sort(key=lambda item: (item[1]['worker_lease_expires_at'], item[1]['pk'], item[0]))
+    recovered = 0
+    for kind, candidate in candidates[:limit]:
+        model, _pending_status = _dispatch_model(kind)
+        running_status = 'running' if kind == 'case' else 'RUNNING'
+        try:
+            with transaction.atomic():
+                current = model.objects.select_for_update().filter(pk=candidate['pk']).first()
+                if (
+                    current is None
+                    or current.status != running_status
+                    or current.dispatch_claim != candidate['dispatch_claim']
+                    or current.worker_nonce != candidate['worker_nonce']
+                    or current.worker_lease_expires_at is None
+                    or current.worker_lease_expires_at > query_time
+                ):
+                    continue
+
+                fields = {
+                    'status': 'aborted' if kind == 'case' else 'ABORTED',
+                    'cancel_requested_at': query_time,
+                    'finished_at': query_time,
+                    'error_message': WORKBENCH_WORKER_LOST_MESSAGE,
+                    'failure_stage': 'worker_lost',
+                    'worker_heartbeat_at': None,
+                    'worker_lease_expires_at': None,
+                }
+                if kind == 'case':
+                    fields['execution_logs'] = WORKBENCH_WORKER_LOST_MESSAGE
+                    fields['execution_time'] = max(
+                        0.0,
+                        (query_time - current.started_at).total_seconds() if current.started_at else 0.0,
+                    )
+                else:
+                    fields['duration'] = max(
+                        0.0,
+                        (query_time - current.started_at).total_seconds() if current.started_at else 0.0,
+                    )
+                    data = current.result_data if isinstance(current.result_data, dict) else {}
+                    summary = data.get('summary') if isinstance(data.get('summary'), dict) else {}
+                    fields['result_data'] = {
+                        **data,
+                        'summary': {
+                            **summary,
+                            'message': WORKBENCH_WORKER_LOST_MESSAGE,
+                            'interrupted': True,
+                            'external_effects_unknown': True,
+                        },
+                    }
+
+                updated = model.objects.filter(
+                    pk=current.pk,
+                    dispatch_claim=candidate['dispatch_claim'],
+                    worker_nonce=candidate['worker_nonce'],
+                    status=running_status,
+                    worker_lease_expires_at__lte=query_time,
+                ).update(**fields)
+                if not updated:
+                    continue
+                if kind == 'suite':
+                    TestCaseExecution.objects.filter(
+                        parent_execution_id=current.pk,
+                        worker_nonce=candidate['worker_nonce'],
+                        status__in=['pending', 'running'],
+                    ).update(
+                        status='aborted',
+                        cancel_requested_at=query_time,
+                        finished_at=query_time,
+                        error_message=WORKBENCH_WORKER_LOST_MESSAGE,
+                        execution_logs=WORKBENCH_WORKER_LOST_MESSAGE,
+                        failure_stage='worker_lost',
+                        worker_heartbeat_at=None,
+                        worker_lease_expires_at=None,
+                    )
+                    if current.test_suite_id:
+                        from .models import TestSuite
+
+                        TestSuite.objects.filter(pk=current.test_suite_id).update(
+                            execution_status='failed',
+                            updated_at=query_time,
+                        )
+                recovered += 1
+        except Exception:  # noqa: BLE001 - each candidate is isolated for the next poll
+            logger.exception(
+                'UI workbench stale worker reconciliation failed kind=%s execution_id=%s',
+                kind, candidate['pk'],
+            )
+    return recovered
+
+
+def reconcile_pending_submissions(limit=20, now=None) -> int:
+    """Re-publish a bounded number of unacknowledged, pending submissions."""
+    limit = max(int(limit), 0)
+    if not limit:
+        return 0
+
+    query_time = now or timezone.now()
+    lease_available = (
+        Q(dispatch_delivery_token__isnull=True)
+        | Q(dispatch_delivery_expires_at__isnull=True)
+        | Q(dispatch_delivery_expires_at__lte=query_time)
+    )
+    candidates = []
+    for kind, (model, pending_status) in (
+        ('case', _dispatch_model('case')),
+        ('suite', _dispatch_model('suite')),
+    ):
+        rows = model.objects.filter(
+            status=pending_status,
+            dispatch_claim__isnull=False,
+            cancel_requested_at__isnull=True,
+            dispatch_enqueued_at__isnull=True,
+        ).filter(lease_available).order_by('created_at', 'pk')[:limit]
+        candidates.extend((kind, execution) for execution in rows)
+
+    candidates.sort(key=lambda item: (item[1].created_at, item[1].pk, item[0]))
+    enqueued = 0
+    for kind, execution in candidates[:limit]:
+        try:
+            reservation_time = now or timezone.now()
+            if dispatch_execution(kind, execution, now=reservation_time):
+                enqueued += 1
+        except Exception:  # noqa: BLE001 - stop on broker failure; next poll can retry after lease expiry
+            logger.exception(
+                'UI workbench dispatch reconciliation failed kind=%s execution_id=%s',
+                kind, execution.pk,
+            )
+            break
+    return enqueued

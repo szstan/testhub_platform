@@ -98,7 +98,9 @@ _URL_RE = re.compile(
 def _normalize_key(key: Any) -> str:
     """Return a comparison form without changing the caller's key."""
 
-    return re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(key).strip())
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
 def is_sensitive_key(key: Any) -> bool:

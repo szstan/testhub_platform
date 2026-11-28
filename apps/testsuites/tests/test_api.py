@@ -248,3 +248,40 @@ def test_delete_suite_is_limited_to_accessible_projects(api_client, users, proje
     response = api_client.delete(f'/api/testsuites/{suite.id}/')
     assert response.status_code == status.HTTP_204_NO_CONTENT
     assert not ManualTestSuite.objects.filter(pk=suite.id).exists()
+
+
+def test_viewer_can_read_but_cannot_mutate_suite_or_case_members(api_client, users, project_data):
+    owner, _, _ = users
+    project = project_data['project']
+    case_one = project_data['case_one']
+    case_two = project_data['case_two']
+    viewer = User.objects.create_user(username='suite-viewer')
+    ProjectMember.objects.create(project=project, user=viewer, role='viewer')
+    suite = ManualTestSuite.objects.create(project=project, name='Read-only suite', author=owner)
+    association = ManualTestSuiteCase.objects.create(testsuite=suite, testcase=case_one, order=3)
+    authenticate(api_client, viewer)
+
+    assert api_client.get(f'/api/testsuites/{suite.pk}/').status_code == 200
+    assert api_client.get(f'/api/testsuites/{suite.pk}/test_cases/').status_code == 200
+    assert api_client.patch(
+        f'/api/testsuites/{suite.pk}/', {'name': 'Denied'}, format='json',
+    ).status_code == 403
+    assert api_client.delete(f'/api/testsuites/{suite.pk}/').status_code == 403
+
+    mutation_requests = [
+        ('post', f'/api/testsuites/{suite.pk}/add_test_case/', {'test_case_id': case_two.pk}),
+        ('post', f'/api/testsuites/{suite.pk}/add_test_cases/', {'test_case_ids': [case_two.pk]}),
+        ('post', f'/api/testsuites/{suite.pk}/test_cases/', {'test_case_id': case_two.pk}),
+        ('post', f'/api/testsuites/{suite.pk}/remove_test_case/', {'test_case_id': case_one.pk}),
+        ('post', f'/api/testsuites/{suite.pk}/update_test_case_order/', {
+            'test_case_orders': [{'test_case_id': case_one.pk, 'order': 0}],
+        }),
+        ('delete', f'/api/testsuites/{suite.pk}/testcases/{case_one.pk}/', None),
+    ]
+    for method, url, data in mutation_requests:
+        response = getattr(api_client, method)(url, data, format='json') if data is not None else getattr(api_client, method)(url)
+        assert response.status_code == 403, (method, url, response.data)
+
+    association.refresh_from_db()
+    assert association.order == 3
+    assert list(suite.testcases.values_list('pk', flat=True)) == [case_one.pk]

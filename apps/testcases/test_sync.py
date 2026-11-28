@@ -1,3 +1,5 @@
+import json
+from contextlib import asynccontextmanager
 from unittest.mock import Mock, patch
 
 import pytest
@@ -7,6 +9,26 @@ from apps.projects.models import Project
 from apps.testcases.models import TestCase, TestCaseSourceBinding, TestCaseSyncProfile
 from apps.testcases.sync import TestCaseSyncError, _gitlab_files, _token, sync_profile
 from apps.users.models import User
+
+
+def streamed_response(content, status=200):
+    response = Mock(status_code=status, content=content)
+    async def aiter_bytes(**_kwargs):
+        yield content
+    response.aiter_bytes = aiter_bytes
+    return response
+
+
+def json_response(data):
+    return streamed_response(json.dumps(data).encode('utf-8'))
+
+
+@asynccontextmanager
+async def stream_context(response):
+    try:
+        yield response
+    finally:
+        response.close()
 
 
 @pytest.mark.django_db
@@ -22,16 +44,19 @@ def test_github_tests_as_code_sync_is_idempotent_and_records_source():
         path='tests',
         created_by=user,
     )
-    commit = Mock(status_code=200)
-    commit.json.return_value = {'sha': 'a' * 40}
-    tree = Mock(status_code=200)
-    tree.json.return_value = {
+    commit = json_response({'sha': 'a' * 40})
+    tree_data = {
         'sha': 'b' * 40,
         'tree': [{'type': 'blob', 'path': 'tests/login.yml', 'sha': 'blob-1'}],
     }
-    raw = Mock(status_code=200, content=b'id: checkout.login\ntitle: Login\ntype: api\nexpected_result: ok\n')
+    tree = json_response(tree_data)
+    raw = streamed_response(b'id: checkout.login\ntitle: Login\ntype: api\nexpected_result: ok\n')
 
-    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree, raw]):
+    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch(
+        'apps.testcases.sync._stream_get', side_effect=[
+            stream_context(commit), stream_context(tree), stream_context(raw),
+        ],
+    ):
         summary = sync_profile(profile)
 
     assert summary.created == 1
@@ -41,10 +66,14 @@ def test_github_tests_as_code_sync_is_idempotent_and_records_source():
     assert binding.source_path == 'tests/login.yml'
     assert binding.source_commit == 'a' * 40
 
-    tree_again = Mock(status_code=200)
-    tree_again.json.return_value = tree.json.return_value
-    raw_again = Mock(status_code=200, content=raw.content)
-    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree_again, raw_again]):
+    tree_again = json_response(tree_data)
+    raw_again = streamed_response(raw.content)
+    commit_again = json_response({'sha': 'a' * 40})
+    with patch('apps.testcases.sync.validate_outbound_url', side_effect=lambda url, allow_private=False: url), patch(
+        'apps.testcases.sync._stream_get', side_effect=[
+            stream_context(commit_again), stream_context(tree_again), stream_context(raw_again),
+        ],
+    ):
         repeated = sync_profile(profile)
 
     assert repeated.created == 0
@@ -104,14 +133,13 @@ def test_gitlab_sync_keeps_same_provider_api_base():
         api_base_url='https://gitlab.com/api/v4',
         created_by=user,
     )
-    commit = Mock(status_code=200)
-    commit.json.return_value = {'id': 'a' * 40}
-    tree = Mock(status_code=200)
-    tree.json.return_value = [{'type': 'blob', 'path': 'tests/login.yml', 'id': 'blob-1'}]
     with patch(
         'apps.testcases.sync.validate_outbound_url',
         side_effect=lambda url, allow_private=False: url,
-    ), patch('apps.testcases.sync.guarded_get', side_effect=[commit, tree]) as request:
+    ), patch('apps.testcases.sync._stream_get', side_effect=[
+        stream_context(json_response({'id': 'a' * 40})),
+        stream_context(json_response([{'type': 'blob', 'path': 'tests/login.yml', 'id': 'blob-1'}])),
+    ]) as request:
         _, files = _gitlab_files(profile, 'gitlab-secret')
 
     assert files[0][2].startswith('https://gitlab.com/api/v4/')

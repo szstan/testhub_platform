@@ -1,5 +1,9 @@
+from django.conf import settings
 from rest_framework import serializers
 from .models import AssistantSession, AssistantMessage, DifyConfig, ChatMessage
+
+
+ASSISTANT_MESSAGE_MAX_LENGTH = getattr(settings, 'ASSISTANT_MESSAGE_MAX_LENGTH', 16000)
 
 
 class DifyConfigSerializer(serializers.ModelSerializer):
@@ -18,7 +22,24 @@ class ChatMessageSerializer(serializers.ModelSerializer):
         read_only_fields = ['conversation_id', 'message_id', 'created_at']
 
 
+class ChatSendMessageSerializer(serializers.Serializer):
+    session_id = serializers.CharField(max_length=200, trim_whitespace=False)
+    message = serializers.CharField(max_length=ASSISTANT_MESSAGE_MAX_LENGTH, trim_whitespace=False)
+
+    def validate_session_id(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('session_id is required')
+        return value
+
+    def validate_message(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('message is required')
+        return value
+
+
 class AssistantMessageSerializer(serializers.ModelSerializer):
+    content = serializers.CharField(max_length=ASSISTANT_MESSAGE_MAX_LENGTH)
+
     class Meta:
         model = AssistantMessage
         fields = ['id', 'message_type', 'content', 'created_at']

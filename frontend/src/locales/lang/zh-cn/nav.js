@@ -45,6 +45,9 @@ export default {
     // 接口测试
     dashboard: '数据看板',
     interfaceManagement: '接口管理',
+    apiTestCases: '用例管理',
+    apiCaseCreate: '编写用例',
+    apiCaseEdit: '编辑用例',
     openapiContracts: 'OpenAPI 契约',
     automationTesting: '自动化测试',
     requestHistory: '请求历史',

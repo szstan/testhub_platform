@@ -1,10 +1,20 @@
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
 from apps.users.models import User
 from apps.versions.models import Version
+
+
+class DefectCodeSequence(models.Model):
+    """Serialize daily defect number allocation across projects."""
+
+    day = models.DateField(primary_key=True)
+    last_number = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = 'defect_code_sequences'
 
 
 class Defect(models.Model):
@@ -120,18 +130,31 @@ class Defect(models.Model):
     def __str__(self):
         return f'{self.code} {self.title}' if self.code else self.title
 
+    @transaction.atomic
     def save(self, *args, **kwargs):
         if not self.code:
-            today = timezone.localdate().strftime('%Y%m%d')
-            prefix = f'BUG-{today}-'
-            last_defect = Defect.objects.filter(code__startswith=prefix).order_by('-code').first()
-            next_number = 1
-            if last_defect and last_defect.code:
-                try:
-                    next_number = int(last_defect.code.rsplit('-', 1)[1]) + 1
-                except (IndexError, ValueError):
-                    next_number = 1
-            self.code = f'{prefix}{next_number:04d}'
+            today = timezone.localdate()
+            prefix = f'BUG-{today:%Y%m%d}-'
+            DefectCodeSequence.objects.bulk_create(
+                [DefectCodeSequence(day=today)], ignore_conflicts=True,
+            )
+            sequence = DefectCodeSequence.objects.select_for_update().get(day=today)
+
+            next_number = sequence.last_number + 1
+            if sequence.last_number == 0 or Defect.objects.filter(code=f'{prefix}{next_number:04d}').exists():
+                # Seed legacy data once, or recover a manually inserted collision.
+                # Normal allocation must not rescan every defect created today.
+                for existing_code in Defect.objects.filter(code__startswith=prefix).values_list('code', flat=True).iterator():
+                    try:
+                        next_number = max(next_number, int(existing_code.rsplit('-', 1)[1]) + 1)
+                    except (IndexError, ValueError):
+                        continue
+            sequence.last_number = next_number
+            sequence.save(update_fields=['last_number'])
+            self.code = f'{prefix}{sequence.last_number:04d}'
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = set(update_fields) | {'code'}
         super().save(*args, **kwargs)
 
     class Meta:

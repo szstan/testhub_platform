@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.projects.models import Project
+from apps.projects.access import user_can_write_project, writable_projects
 from apps.testcases.models import TestCase
 
 from .models import TestSuite, TestSuiteCase
@@ -19,7 +20,8 @@ from .serializers import (
 
 def get_user_accessible_projects(user):
     """Return projects the user owns or has joined."""
-
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
     return Project.objects.filter(
         models.Q(owner=user) | models.Q(members=user)
     ).distinct()
@@ -144,11 +146,9 @@ class TestSuiteListCreateView(generics.ListCreateAPIView):
         if project_id is None:
             raise ValidationError({'project_id': '请提供项目 ID'})
         project_id = _parse_id(project_id, 'project_id')
-        project = get_user_accessible_projects(self.request.user).filter(
-            pk=project_id
-        ).first()
+        project = writable_projects(self.request.user).filter(pk=project_id).first()
         if project is None:
-            raise PermissionDenied('项目不存在或无权限访问')
+            raise PermissionDenied('项目不存在或无写入权限')
 
         requested_case_ids = None
         if any(name in self.request.data for name in ('test_case_ids', 'testcase_ids', 'testcases')):
@@ -190,15 +190,17 @@ class TestSuiteDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_update(self, serializer):
         suite = serializer.instance
+        if not user_can_write_project(self.request.user, suite.project):
+            raise PermissionDenied('没有权限修改该项目的测试套件')
         project = suite.project
         requested_project_id = _project_id_from_request(self.request.data)
         if requested_project_id is not None:
             requested_project_id = _parse_id(requested_project_id, 'project_id')
-            project = get_user_accessible_projects(self.request.user).filter(
+            project = writable_projects(self.request.user).filter(
                 pk=requested_project_id
             ).first()
             if project is None:
-                raise PermissionDenied('项目不存在或无权限访问')
+                raise PermissionDenied('目标项目不存在或无写入权限')
 
         requested_case_ids = None
         if any(name in self.request.data for name in ('test_case_ids', 'testcase_ids', 'testcases')):
@@ -233,6 +235,11 @@ class TestSuiteDetailView(generics.RetrieveUpdateDestroyAPIView):
                     for index, testcase_id in enumerate(requested_case_ids)
                 ])
 
+    def perform_destroy(self, instance):
+        if not user_can_write_project(self.request.user, instance.project):
+            raise PermissionDenied('没有权限删除该项目的测试套件')
+        instance.delete()
+
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
@@ -254,7 +261,12 @@ class SuiteCasesMixin:
             raise NotFound('测试套件不存在')
         return suite
 
+    def _require_write(self, suite):
+        if not user_can_write_project(self.request.user, suite.project):
+            raise PermissionDenied('没有权限修改该项目的测试套件')
+
     def _add_case(self, request, suite, testcase_id=None, order=None):
+        self._require_write(suite)
         if testcase_id is None:
             testcase_id = _case_id_from_request(request.data)
         testcase_id = _parse_id(testcase_id, 'test_case_id')
@@ -302,6 +314,7 @@ class TestSuiteAddCaseView(SuiteCasesMixin, APIView):
 class TestSuiteAddCasesView(SuiteCasesMixin, APIView):
     def post(self, request, pk):
         suite = self.get_suite(pk)
+        self._require_write(suite)
         testcase_ids = _case_ids_from_request(request.data)
         cases = _validate_cases_for_suite(suite, testcase_ids)
         existing_ids = set(suite.testsuitecase_set.values_list('testcase_id', flat=True))
@@ -332,6 +345,7 @@ class TestSuiteAddCasesView(SuiteCasesMixin, APIView):
 class TestSuiteRemoveCaseView(SuiteCasesMixin, APIView):
     def _remove(self, request, pk, testcase_id=None):
         suite = self.get_suite(pk, request=request)
+        self._require_write(suite)
         if testcase_id is None:
             testcase_id = _case_id_from_request(request.data)
         testcase_id = _parse_id(testcase_id, 'test_case_id')
@@ -351,6 +365,7 @@ class TestSuiteRemoveCaseView(SuiteCasesMixin, APIView):
 class TestSuiteReorderCasesView(SuiteCasesMixin, APIView):
     def post(self, request, pk):
         suite = self.get_suite(pk)
+        self._require_write(suite)
         items = request.data.get('test_case_orders', request.data.get('testcase_orders'))
         if items is None:
             raise ValidationError({'test_case_orders': '请提供用例顺序列表'})
@@ -403,6 +418,7 @@ class TestSuiteCaseDetailView(SuiteCasesMixin, APIView):
 
     def delete(self, request, pk, testcase_id):
         suite = self.get_suite(pk)
+        self._require_write(suite)
         association = suite.testsuitecase_set.filter(testcase_id=testcase_id).first()
         if association is None:
             raise NotFound('用例不在该套件中')

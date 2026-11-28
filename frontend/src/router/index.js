@@ -229,6 +229,21 @@ const routes = [
                 component: () => import('@/views/api-testing/ProjectManagement.vue')
             },
             {
+                path: 'test-cases',
+                name: 'ApiTestCases',
+                component: () => import('@/views/api-testing/ApiTestCaseList.vue')
+            },
+            {
+                path: 'test-cases/create',
+                name: 'ApiTestCaseCreate',
+                component: () => import('@/views/api-testing/ApiTestCaseEditor.vue')
+            },
+            {
+                path: 'test-cases/:id/edit',
+                name: 'ApiTestCaseEdit',
+                component: () => import('@/views/api-testing/ApiTestCaseEditor.vue')
+            },
+            {
                 path: 'interfaces',
                 name: 'ApiInterfaces',
                 component: () => import('@/views/api-testing/InterfaceManagement.vue')

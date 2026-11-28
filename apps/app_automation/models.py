@@ -590,8 +590,8 @@ class AppTestCase(models.Model):
     name = models.CharField(max_length=200, verbose_name='用例名称')
     description = models.TextField(blank=True, default='', verbose_name='用例描述')
     app_package = models.ForeignKey(
-        AppPackage, 
-        on_delete=models.CASCADE, 
+        AppPackage,
+        on_delete=models.PROTECT,
         related_name='test_cases',
         null=True,
         blank=True,
@@ -837,7 +837,7 @@ class AppScheduledTask(models.Model):
         related_name='scheduled_tasks', verbose_name='执行设备'
     )
     app_package = models.ForeignKey(
-        AppPackage, on_delete=models.SET_NULL, null=True, blank=True,
+        AppPackage, on_delete=models.PROTECT, null=True, blank=True,
         related_name='scheduled_tasks', verbose_name='应用包名'
     )
     test_suite = models.ForeignKey(

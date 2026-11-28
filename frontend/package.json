@@ -13,6 +13,8 @@
     "test:requirement-generation": "node --test tests/requirement-generation-errors.test.mjs tests/requirement-generation-workflow.test.mjs tests/generated-case-adoption.test.mjs",
     "test:execution-workflows": "node --test tests/execution-workflows.test.mjs tests/openapi-workflow.test.mjs tests/dataset-options.test.mjs tests/requirement-generation-errors.test.mjs",
     "test:interface-management-pagination": "node --test tests/interface-management-pagination.test.mjs",
+    "test:api-cases": "node --test tests/api-test-cases.test.mjs tests/api-test-suites.test.mjs tests/interface-management-pagination.test.mjs",
+    "lint:api-cases": "eslint src/views/api-testing src/api/api-test-cases.js src/utils/api-test-case-pagination.mjs src/router/index.js src/layout/index.vue src/locales/lang/zh-cn/api-testing.js src/locales/lang/en/api-testing.js src/locales/lang/zh-cn/api-test-cases.js src/locales/lang/en/api-test-cases.js src/locales/lang/zh-cn/nav.js src/locales/lang/en/nav.js tests/api-test-cases.test.mjs tests/api-test-suites.test.mjs tests/interface-management-pagination.test.mjs --ext .vue,.js,.mjs",
     "test:app-screenshot-diagnostics": "node --test tests/app-screenshot-diagnostics.test.mjs",
     "test:ui-project-base-url": "node --test tests/ui-project-base-url.test.mjs",
     "test:ui-workbench": "node --test \"tests/ui-workbench*.test.mjs\""

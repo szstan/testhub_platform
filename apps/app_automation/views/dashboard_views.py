@@ -55,8 +55,14 @@ class AppDashboardViewSet(viewsets.ViewSet):
             )
             
             total_executions = executions.count()
-            success_executions = executions.filter(status='success').count()
-            failed_executions = executions.filter(status='failed').count()
+            success_executions = executions.filter(
+                Q(status='success') | Q(status='completed', result='passed')
+            ).count()
+            failed_executions = executions.filter(
+                Q(status='failed')
+                | Q(status='error')
+                | Q(status='completed', result='failed')
+            ).count()
             
             pass_rate = round((success_executions / total_executions * 100) if total_executions > 0 else 0, 2)
             

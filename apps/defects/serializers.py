@@ -3,8 +3,9 @@ from rest_framework import serializers
 from apps.projects.models import Project
 from apps.testcases.models import TestCase
 from apps.users.models import User
-from apps.users.serializers import UserSimpleSerializer
+from apps.users.serializers import UserDirectorySerializer
 from apps.versions.models import Version
+
 from .models import Defect, DefectAttachment, DefectComment, DefectTransition
 
 
@@ -27,8 +28,8 @@ class TestCaseSimpleSerializer(serializers.ModelSerializer):
 
 
 class DefectTransitionSerializer(serializers.ModelSerializer):
-    operator = UserSimpleSerializer(read_only=True, allow_null=True)
-    target_user = UserSimpleSerializer(read_only=True)
+    operator = UserDirectorySerializer(read_only=True, allow_null=True)
+    target_user = UserDirectorySerializer(read_only=True)
 
     class Meta:
         model = DefectTransition
@@ -37,7 +38,7 @@ class DefectTransitionSerializer(serializers.ModelSerializer):
 
 
 class DefectCommentSerializer(serializers.ModelSerializer):
-    author = UserSimpleSerializer(read_only=True)
+    author = UserDirectorySerializer(read_only=True)
 
     class Meta:
         model = DefectComment
@@ -46,7 +47,7 @@ class DefectCommentSerializer(serializers.ModelSerializer):
 
 
 class DefectAttachmentSerializer(serializers.ModelSerializer):
-    uploaded_by = UserSimpleSerializer(read_only=True)
+    uploaded_by = UserDirectorySerializer(read_only=True)
 
     class Meta:
         model = DefectAttachment
@@ -57,10 +58,10 @@ class DefectAttachmentSerializer(serializers.ModelSerializer):
 class DefectListSerializer(serializers.ModelSerializer):
     project = ProjectSimpleSerializer(read_only=True)
     version = VersionSimpleSerializer(read_only=True)
-    reporter = UserSimpleSerializer(read_only=True)
-    assignee = UserSimpleSerializer(read_only=True)
-    verifier = UserSimpleSerializer(read_only=True)
-    resolver = UserSimpleSerializer(read_only=True)
+    reporter = UserDirectorySerializer(read_only=True)
+    assignee = UserDirectorySerializer(read_only=True)
+    verifier = UserDirectorySerializer(read_only=True)
+    resolver = UserDirectorySerializer(read_only=True)
     related_testcase = TestCaseSimpleSerializer(read_only=True)
 
     class Meta:
@@ -216,6 +217,10 @@ class DefectWriteSerializer(serializers.ModelSerializer):
             'related_testcase_id',
         ):
             validated_data.pop(field_name, None)
+
+
+class DefectTrendQuerySerializer(serializers.Serializer):
+    days = serializers.IntegerField(required=False, default=7, min_value=1, max_value=365)
 
 
 class DefectActionSerializer(serializers.Serializer):

@@ -9,12 +9,32 @@
 字符处理工具
 """
 import re
+import regex as bounded_regex
 import json
 import difflib
 import logging
 from typing import Dict, List, Any
 
+from .regex_limits import (
+    RegexBudgetError, compile_bounded_pattern, expand_bounded_replacement,
+    replacement_template,
+)
+
 logger = logging.getLogger(__name__)
+REGEX_TIMEOUT_SECONDS = 0.05
+MAX_REGEX_PATTERN_LENGTH = 2048
+MAX_REGEX_TEXT_LENGTH = 64_000
+MAX_REGEX_MATCHES = 1000
+MAX_REGEX_GROUPS = 32
+MAX_REGEX_OUTPUT_LENGTH = 1_000_000
+
+
+def _regex_input_error(pattern, text):
+    if not isinstance(pattern, str) or not isinstance(text, str):
+        return '正则表达式和文本必须是字符串'
+    if len(pattern) > MAX_REGEX_PATTERN_LENGTH or len(text) > MAX_REGEX_TEXT_LENGTH:
+        return '正则表达式或文本超过长度上限'
+    return None
 
 
 class StringTools:
@@ -31,23 +51,42 @@ class StringTools:
 
     @staticmethod
     def replace_string(text: str, old_str: str, new_str: str, is_regex: bool = False) -> Dict[str, Any]:
-        """字符串替换"""
-        if is_regex:
-            try:
-                result = re.sub(old_str, new_str, text)
-                return {
-                    'result': result,
-                    'replacements': text.count(old_str) if old_str in text else 0
-                }
-            except re.error as e:
-                logger.error(f'正则表达式错误: {str(e)}')
-                return {'error': f'正则表达式错误: {str(e)}'}
-        else:
-            result = text.replace(old_str, new_str)
-            return {
-                'result': result,
-                'replacements': text.count(old_str)
-            }
+        """Replace text under the same bounded policy as regex testing."""
+        error = _regex_input_error(old_str, text)
+        if error or not isinstance(new_str, str) or len(new_str) > MAX_REGEX_TEXT_LENGTH:
+            return {'error': error or '替换文本超过长度上限或类型无效'}
+        if not is_regex:
+            replacements = text.count(old_str)
+            if len(text) + replacements * (len(new_str) - len(old_str)) > MAX_REGEX_OUTPUT_LENGTH:
+                return {'error': '替换结果超过大小上限'}
+            return {'result': text.replace(old_str, new_str), 'replacements': replacements}
+        try:
+            pattern = compile_bounded_pattern(old_str, max_groups=MAX_REGEX_GROUPS)
+            template = replacement_template(new_str, pattern)
+            replacements = 0
+            output_size = 0
+            last_end = 0
+
+            def replacement(match):
+                nonlocal replacements, output_size, last_end
+                replacements += 1
+                if replacements > MAX_REGEX_MATCHES:
+                    raise ValueError('匹配数量超过上限')
+                gap = match.start() - last_end
+                available = MAX_REGEX_OUTPUT_LENGTH - output_size - gap - (len(text) - match.end())
+                expanded = expand_bounded_replacement(match, template, available)
+                output_size += gap + len(expanded)
+                last_end = match.end()
+                return expanded
+
+            result = pattern.sub(replacement, text, timeout=REGEX_TIMEOUT_SECONDS)
+            return {'result': result, 'replacements': replacements}
+        except TimeoutError:
+            return {'error': '正则表达式执行超时'}
+        except RegexBudgetError as exc:
+            return {'error': str(exc)}
+        except (bounded_regex.error, re.error, ValueError, IndexError, RecursionError):
+            return {'error': '正则表达式、替换内容无效或结果超过上限'}
 
     @staticmethod
     def escape_string(text: str, escape_type: str = 'json') -> Dict[str, Any]:
@@ -159,45 +198,52 @@ class StringTools:
 
     @staticmethod
     def regex_test(pattern: str, text: str, flags: str = '') -> Dict[str, Any]:
-        """正则表达式测试"""
+        """Test an untrusted regex with bounded input, time, and output."""
+        error = _regex_input_error(pattern, text)
+        if error or not isinstance(flags, str) or len(flags) > 16:
+            return {'error': error or '正则标志无效', 'is_valid': False}
         try:
-            # 解析正则标志
             flag_mapping = {
-                'i': re.IGNORECASE,
-                'm': re.MULTILINE,
-                's': re.DOTALL,
-                'u': re.UNICODE,
-                'x': re.VERBOSE
+                'i': (bounded_regex.IGNORECASE, re.IGNORECASE),
+                'm': (bounded_regex.MULTILINE, re.MULTILINE),
+                's': (bounded_regex.DOTALL, re.DOTALL),
+                'u': (bounded_regex.UNICODE, re.UNICODE),
+                'x': (bounded_regex.VERBOSE, re.VERBOSE),
             }
             regex_flags = 0
+            stdlib_flags = 0
             for flag in flags:
                 if flag in flag_mapping:
-                    regex_flags |= flag_mapping[flag]
-
-            # 编译正则表达式
-            regex = re.compile(pattern, regex_flags)
-
-            # 查找所有匹配
-            matches = regex.findall(text)
-            # 查找第一个匹配的位置
-            match = regex.search(text)
-            groups = match.groups() if match else []
-            groupdict = match.groupdict() if match else {}
-
+                    regex_flag, stdlib_flag = flag_mapping[flag]
+                    regex_flags |= regex_flag
+                    stdlib_flags |= stdlib_flag
+            compiled = compile_bounded_pattern(
+                pattern, regex_flags, stdlib_flags=stdlib_flags, max_groups=MAX_REGEX_GROUPS,
+            )
+            matches = []
+            first = None
+            output_size = 0
+            for match in compiled.finditer(text, timeout=REGEX_TIMEOUT_SECONDS):
+                if len(matches) >= MAX_REGEX_MATCHES:
+                    return {'error': '匹配数量超过上限', 'is_valid': True}
+                if first is None:
+                    first = match
+                groups = match.groups(default='')
+                output_size += sum(map(len, groups)) if groups else len(match.group())
+                if output_size > MAX_REGEX_OUTPUT_LENGTH:
+                    return {'error': '匹配结果超过大小上限', 'is_valid': True}
+                matches.append(groups[0] if len(groups) == 1 else groups if groups else match.group())
             return {
-                'result': True,
-                'matches': matches,
-                'match_count': len(matches),
-                'groups': groups,
-                'groupdict': groupdict,
-                'is_valid': True
+                'result': True, 'matches': matches, 'match_count': len(matches),
+                'groups': first.groups() if first else [],
+                'groupdict': first.groupdict() if first else {}, 'is_valid': True,
             }
-        except re.error as e:
-            logger.error(f'正则表达式错误: {str(e)}')
-            return {
-                'error': f'正则表达式错误: {str(e)}',
-                'is_valid': False
-            }
+        except TimeoutError:
+            return {'error': '正则表达式执行超时', 'is_valid': True}
+        except RegexBudgetError as exc:
+            return {'error': str(exc), 'is_valid': True}
+        except (bounded_regex.error, re.error, RecursionError, ValueError):
+            return {'error': '正则表达式无效', 'is_valid': False}
 
     @staticmethod
     def case_convert(text: str, convert_type: str) -> Dict[str, Any]:

@@ -8,13 +8,16 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db import transaction
+from django.db.models import Q
+from django.db.models.deletion import ProtectedError
 from django.http import Http404
+from rest_framework.exceptions import PermissionDenied
 from apps.quality_intelligence.services.redaction import redact_text
 import logging
 import re
 
-from ..models import AppDataSet, AppPackage, AppTestCase, AppDevice, AppTestExecution
-from ..access import project_accessible, scope_test_cases
+from ..models import AppDataSet, AppPackage, AppProject, AppTestCase, AppDevice, AppTestExecution
+from ..access import accessible_projects, is_app_admin, project_accessible, scope_test_cases
 from ..device_pool import DeviceLeaseError
 from ..execution_admission import DeviceExecutionBusy
 from ..execution_dispatch import (
@@ -60,9 +63,45 @@ class AppPackageViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     pagination_class = AppPagination
     search_fields = ['name', 'package_name']
-    
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = super().get_queryset()
+        if is_app_admin(user):
+            return queryset
+        projects = accessible_projects(user)
+        project_members = AppProject.objects.filter(
+            pk__in=projects.values('pk')
+        ).values('members__pk')
+        return queryset.filter(
+            Q(created_by=user)
+            | Q(created_by__isnull=True)
+            | Q(created_by_id__in=projects.values('owner_id'))
+            | Q(created_by_id__in=project_members)
+        ).distinct()
+
+    def _require_package_owner(self, package):
+        if not is_app_admin(self.request.user) and package.created_by_id != self.request.user.pk:
+            raise PermissionDenied('仅应用包创建者或管理员可以修改')
+
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        self._require_package_owner(serializer.instance)
+        serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        package = self.get_object()
+        self._require_package_owner(package)
+        try:
+            self.perform_destroy(package)
+        except ProtectedError:
+            return Response(
+                {'detail': '应用包仍被测试用例或定时任务引用，不能删除'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class AppTestCaseViewSet(viewsets.ModelViewSet):

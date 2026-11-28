@@ -1,12 +1,14 @@
+from django.db.models import Q
 from rest_framework import serializers
 from .models import Version
-from apps.users.serializers import UserSerializer
+from apps.users.serializers import UserDirectorySerializer
+from apps.projects.models import Project
 from apps.projects.serializers import ProjectSimpleSerializer
 
 class VersionSerializer(serializers.ModelSerializer):
     """版本序列化器"""
-    created_by = UserSerializer(read_only=True)
-    projects = ProjectSimpleSerializer(many=True, read_only=True)
+    created_by = UserDirectorySerializer(read_only=True)
+    projects = serializers.SerializerMethodField()
     testcases_count = serializers.SerializerMethodField()
     
     class Meta:
@@ -14,8 +16,28 @@ class VersionSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'description', 'is_baseline', 'projects', 'created_by', 'created_at', 'testcases_count']
         read_only_fields = ['id', 'created_at', 'updated_at']
     
+    def _visible_projects(self, obj):
+        projects = obj.projects.all()
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not getattr(user, 'is_authenticated', False):
+            return projects.none()
+        if user.is_staff or user.is_superuser:
+            return projects
+        visible_ids = Project.objects.filter(
+            Q(owner=user) | Q(members=user)
+        ).values('pk')
+        return projects.filter(pk__in=visible_ids).distinct()
+
+    def get_projects(self, obj):
+        return ProjectSimpleSerializer(
+            self._visible_projects(obj), many=True, context=self.context,
+        ).data
+
     def get_testcases_count(self, obj):
-        return obj.testcases.count()
+        return obj.testcases.filter(
+            project__in=self._visible_projects(obj).values('pk')
+        ).count()
 
 class VersionCreateSerializer(serializers.ModelSerializer):
     """版本创建序列化器"""
@@ -23,13 +45,17 @@ class VersionCreateSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Version
-        fields = ['name', 'description', 'is_baseline', 'project_ids']
+        fields = ['id', 'name', 'description', 'is_baseline', 'project_ids']
+        read_only_fields = ['id']
     
     def validate_project_ids(self, value):
         from apps.projects.models import Project
         if not value:
             raise serializers.ValidationError("至少需要关联一个项目")
         
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError('项目不能重复')
+
         # 检查所有项目是否存在
         existing_projects = Project.objects.filter(id__in=value)
         if existing_projects.count() != len(value):

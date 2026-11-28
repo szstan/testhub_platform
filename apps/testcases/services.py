@@ -12,10 +12,12 @@ from django.utils import timezone
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from apps.projects.access import user_can_write_project
 from apps.users.models import User
 from apps.versions.models import Version
 
 from .models import TestCase, TestCaseImportRecord
+from .revisions import record_test_case_revision
 
 
 TEMPLATE_VERSION = 'v1'
@@ -159,6 +161,8 @@ class TestCaseExcelImportService:
 
     @classmethod
     def import_record(cls, record: TestCaseImportRecord) -> ImportSummary:
+        if not user_can_write_project(record.created_by, record.project):
+            raise PermissionError('项目写入权限已撤销')
         workbook = load_workbook(record.import_file.path)
         if TEMPLATE_SHEET_NAME not in workbook.sheetnames:
             raise ValueError(f'Excel 中缺少工作表: {TEMPLATE_SHEET_NAME}')
@@ -231,6 +235,7 @@ class TestCaseExcelImportService:
                 testcase = TestCase.objects.create(**create_values)
                 if version_names:
                     testcase.versions.set([version_map[name].id for name in version_names])
+                record_test_case_revision(testcase, record.created_by)
 
             success_count += 1
             record.progress = int(success_count / total_rows * 100) if total_rows else 100

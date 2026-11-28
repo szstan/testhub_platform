@@ -1,28 +1,79 @@
-from rest_framework import generics, status, permissions
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
-from rest_framework.exceptions import AuthenticationFailed, ValidationError
-from rest_framework.response import Response
+import hashlib
+import re
+import secrets
+
+import redis
 from django.conf import settings
 from django.contrib.auth import logout
-from django.views.decorators.csrf import csrf_exempt
 from django.core.cache import cache
 from django.utils.decorators import method_decorator
-from .models import User
-from .serializers import (
-    UserSerializer,
-    user_session_data,
-    UserCreateSerializer,
-    UserDirectorySerializer,
-    UserSelfUpdateSerializer,
-    LoginSerializer,
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework import generics, permissions, status
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
 )
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
+from rest_framework.response import Response
+from rest_framework_simplejwt.exceptions import TokenError
 
 # JWT 相关导入
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from .captcha import create_captcha
+from .models import User
+from .redis_client import get_redis
+from .serializers import (
+    LoginSerializer,
+    UserCreateSerializer,
+    UserDirectorySerializer,
+    UserSelfUpdateSerializer,
+    UserSerializer,
+    user_session_data,
+)
+from .sms import send_register_verify_code, validate_verify_code
+
 REFRESH_COOKIE_NAME = 'testhub_refresh'
+
+
+def _positive_setting(name, default, maximum):
+    try:
+        value = int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, 1), maximum)
+
+
+def _rate_limit_allows(key, limit, window):
+    if cache.add(key, 1, timeout=window):
+        return True
+    try:
+        attempts = cache.incr(key)
+    except ValueError:
+        if cache.add(key, 1, timeout=window):
+            return True
+        attempts = cache.incr(key)
+    return attempts <= limit
+
+
+_EXCHANGE_GETDEL_LUA = """
+local value = redis.call('GET', KEYS[1])
+if value then redis.call('DEL', KEYS[1]) end
+return value
+"""
+
+
+def _consume_redis_key(redis_client, key):
+    getdel = getattr(redis_client, 'getdel', None)
+    if callable(getdel):
+        try:
+            return getdel(key)
+        except redis.ResponseError as exc:
+            if 'unknown command' not in str(exc).lower():
+                raise
+    return redis_client.eval(_EXCHANGE_GETDEL_LUA, 1, key)
 
 
 def _set_refresh_cookie(response, refresh_token):
@@ -68,13 +119,6 @@ class CookieTokenRefreshView(TokenRefreshView):
 
 
 
-from .captcha import create_captcha
-from .sms import send_register_verify_code, validate_verify_code
-from .redis_client import get_redis
-import redis
-import re
-import uuid
-
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_current_user(request):
@@ -87,6 +131,31 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
     
     def create(self, request, *args, **kwargs):
+        phone = request.data.get('phone')
+        if phone not in (None, ''):
+            if not isinstance(phone, str) or len(phone) > 11:
+                return Response({'error': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+            phone = phone.strip()
+            if phone:
+                if not re.fullmatch(r'1[3-9]\d{9}', phone):
+                    return Response({'error': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+                verify_code = request.data.get('verify_code')
+                verify_code_token = request.data.get('verify_code_token')
+                if (
+                    not isinstance(verify_code, str)
+                    or not verify_code
+                    or len(verify_code) > 6
+                    or not isinstance(verify_code_token, str)
+                    or not verify_code_token
+                    or len(verify_code_token) > 128
+                ):
+                    return Response({'error': '请输入短信验证码'}, status=status.HTTP_400_BAD_REQUEST)
+                valid, error = validate_verify_code(
+                    phone, verify_code_token.strip(), verify_code.strip()
+                )
+                if not valid:
+                    return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
@@ -211,37 +280,35 @@ def get_captcha(request):
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
 def send_register_code(request):
-    """发送短信验证码（注册/登录通用）"""
-    phone = request.data.get('phone', '').strip()
-    captcha_token = request.data.get('captcha_token', '')
-    captcha_code = request.data.get('captcha_code', '')
-    mode = request.data.get('mode', 'register')  # 'register' 或 'login'
+    """Send a captcha-verified SMS code without exposing account registration state."""
+    phone = request.data.get('phone')
+    captcha_token = request.data.get('captcha_token')
+    captcha_code = request.data.get('captcha_code')
+    mode = request.data.get('mode', 'register')
 
-    if not phone:
+    if not isinstance(phone, str) or not phone.strip():
         return Response({'success': False, 'error': '请输入手机号'}, status=status.HTTP_400_BAD_REQUEST)
-    if not captcha_token or not captcha_code:
+    phone = phone.strip()
+    if len(phone) > 11 or not re.fullmatch(r'1[3-9]\d{9}', phone):
+        return Response({'success': False, 'error': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(mode, str) or len(mode) > 16 or mode not in {'register', 'login'}:
+        return Response({'success': False, 'error': '无效的验证码用途'}, status=status.HTTP_400_BAD_REQUEST)
+    if (
+        not isinstance(captcha_token, str)
+        or not captcha_token
+        or len(captcha_token) > 128
+        or not isinstance(captcha_code, str)
+        or not captcha_code
+        or len(captcha_code) > 16
+    ):
         return Response({'success': False, 'error': '请输入图形验证码'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # 登录模式：手机号必须唯一，以免短信验证码无法确定账号
-    if mode == 'login':
-        matching_users = User.objects.filter(phone=phone)
-        user_count = matching_users.count()
-        if not user_count:
-            return Response({'success': False, 'error': '该手机号未注册，请先注册'}, status=status.HTTP_400_BAD_REQUEST)
-        if user_count > 1:
-            return Response({'success': False, 'error': '该手机号关联多个账号，请联系管理员处理'}, status=status.HTTP_409_CONFLICT)
-
-    # 注册模式：校验手机号未被注册
-    if mode == 'register':
-        if User.objects.filter(phone=phone).exists():
-            return Response({'success': False, 'error': '该手机号已被注册'}, status=status.HTTP_400_BAD_REQUEST)
-
+    # SMS issuance must not distinguish registered from unregistered phone numbers.
     result = send_register_verify_code(phone, captcha_token, captcha_code)
-
-    if result.get('success'):
-        return Response(result)
-    else:
-        return Response(result, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        result,
+        status=status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST,
+    )
 
 
 @api_view(['POST'])
@@ -249,19 +316,29 @@ def send_register_code(request):
 @csrf_exempt
 def sms_login_view(request):
     """短信验证码登录：校验短信码 → 返回 JWT（未注册提示用户先注册）"""
-    phone = request.data.get('phone', '').strip()
-    verify_code = request.data.get('verify_code', '').strip()
-    verify_code_token = request.data.get('verify_code_token', '').strip()
+    phone = request.data.get('phone')
+    verify_code = request.data.get('verify_code')
+    verify_code_token = request.data.get('verify_code_token')
 
-    # 校验手机号
+    if not isinstance(phone, str) or len(phone) > 11:
+        return Response({'error': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+    phone = phone.strip()
     if not phone:
         return Response({'error': '请输入手机号'}, status=status.HTTP_400_BAD_REQUEST)
-    if not re.match(r'^1[3-9]\d{9}$', phone):
+    if not re.fullmatch(r'1[3-9]\d{9}', phone):
         return Response({'error': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # 校验短信验证码
-    if not verify_code or not verify_code_token:
+    if (
+        not isinstance(verify_code, str)
+        or not verify_code
+        or len(verify_code) > 6
+        or not isinstance(verify_code_token, str)
+        or not verify_code_token
+        or len(verify_code_token) > 128
+    ):
         return Response({'error': '请输入短信验证码'}, status=status.HTTP_400_BAD_REQUEST)
+    verify_code = verify_code.strip()
+    verify_code_token = verify_code_token.strip()
 
     valid, error = validate_verify_code(phone, verify_code_token, verify_code)
     if not valid:
@@ -348,40 +425,69 @@ def websocket_ticket_view(request):
 @permission_classes([permissions.AllowAny])
 @csrf_exempt
 def exchange_token_view(request):
-    """
-    一次性授权码交换
-    action=create:  用当前 JWT 换取一次性 code（需登录），60 秒有效
-    action=redeem:  用 code 换取 JWT（无需登录），一次性使用
-    """
+    """Exchange a short-lived, one-time SSO code for a browser JWT."""
     action = request.data.get('action', '')
-    redis_client = get_redis()
-
+    if not isinstance(action, str) or len(action) > 16:
+        return Response({'error': '无效的 action'}, status=status.HTTP_400_BAD_REQUEST)
     if action == 'create':
         if not request.user.is_authenticated:
             return Response({'error': '未登录'}, status=status.HTTP_401_UNAUTHORIZED)
-        code = str(uuid.uuid4()).replace('-', '')[:8]
-        redis_client.setex(f"exchange:{code}", 60, request.user.id)
-        return Response({'code': code})
+        limit = _positive_setting('EXCHANGE_TOKEN_CREATE_RATE_LIMIT', 10, 1000)
+        window = _positive_setting('EXCHANGE_TOKEN_RATE_WINDOW_SECONDS', 60, 3600)
+        try:
+            allowed = _rate_limit_allows(
+                f'auth:exchange:create:user:{request.user.pk}', limit, window
+            )
+        except (redis.RedisError, OSError):
+            return Response({'error': '服务暂时不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        if not allowed:
+            return Response({'error': '授权码请求过于频繁'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
-    elif action == 'redeem':
-        code = request.data.get('code', '').strip()
-        if not code:
-            return Response({'error': '缺少授权码'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            redis_client = get_redis()
+            for _ in range(3):
+                code = secrets.token_urlsafe(32)
+                if redis_client.set(f'exchange:{code}', request.user.pk, ex=60, nx=True):
+                    return Response({'code': code})
+        except (redis.RedisError, OSError):
+            return Response({'error': '授权码服务暂时不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({'error': '授权码服务暂时不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        user_id = redis_client.get(f"exchange:{code}")
+    if action == 'redeem':
+        code = request.data.get('code')
+        if not isinstance(code, str) or not code.strip() or len(code) > 128:
+            return Response({'error': '授权码无效或已过期'}, status=status.HTTP_400_BAD_REQUEST)
+        code = code.strip()
+
+        limit = _positive_setting('EXCHANGE_TOKEN_REDEEM_RATE_LIMIT', 30, 1000)
+        window = _positive_setting('EXCHANGE_TOKEN_RATE_WINDOW_SECONDS', 300, 3600)
+        remote_addr = str(request.META.get('REMOTE_ADDR', 'unknown'))[:128]
+        address_key = hashlib.sha256(remote_addr.encode('utf-8')).hexdigest()
+        try:
+            allowed = _rate_limit_allows(
+                f'auth:exchange:redeem:ip:{address_key}', limit, window
+            )
+        except (redis.RedisError, OSError):
+            return Response({'error': '服务暂时不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        if not allowed:
+            return Response({'error': '授权码兑换请求过于频繁'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        try:
+            user_id = _consume_redis_key(get_redis(), f'exchange:{code}')
+        except (redis.RedisError, OSError):
+            return Response({'error': '授权码服务暂时不可用'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         if user_id is None:
             return Response({'error': '授权码无效或已过期'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 立即删除，保证一次性使用
-        redis_client.delete(f"exchange:{code}")
-
         try:
-            user = User.objects.get(id=int(user_id))
-        except User.DoesNotExist:
-            return Response({'error': '用户不存在'}, status=status.HTTP_400_BAD_REQUEST)
+            if isinstance(user_id, bytes):
+                user_id = user_id.decode('ascii')
+            user = User.objects.get(pk=int(user_id))
+        except (User.DoesNotExist, TypeError, ValueError, UnicodeDecodeError):
+            return Response({'error': '授权码无效或已过期'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not user.is_active:
-            return Response({'error': '用户已被禁用'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': '授权码无效或已过期'}, status=status.HTTP_400_BAD_REQUEST)
 
         refresh = RefreshToken.for_user(user)
         response = Response({
@@ -391,5 +497,4 @@ def exchange_token_view(request):
         _set_refresh_cookie(response, str(refresh))
         return response
 
-    else:
-        return Response({'error': '无效的 action'}, status=status.HTTP_400_BAD_REQUEST)
+    return Response({'error': '无效的 action'}, status=status.HTTP_400_BAD_REQUEST)

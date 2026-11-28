@@ -23,30 +23,61 @@ def _compute_deltas(base_summary, summary):
 
 
 def build_snapshot(executions, reference_execution_id=None):
-    """构建对照快照。
+    """Build a comparison snapshot with bounded, batched sample/stat queries."""
+    from collections import defaultdict
+    from django.db.models import Count
 
-    :param executions: 已按用户顺序排列的 PerfExecution 列表（≥2）
-    :param reference_execution_id: 基准执行 id；缺省用第一条
-    :return: dict（JSON 可序列化，created_at 已转 ISO 字符串）
-    """
     from ..models import PerfMetricSample, PerfRequestStat
     from ..serializers import PerfMetricSampleSerializer
-    from .metrics import downsample
+    from .metrics import query_downsampled_points_by_partition
+
+    executions = list(executions)
+    if not executions:
+        return {
+            'baseline_execution_no': '',
+            'reference_execution_id': None,
+            'metric_keys': METRIC_KEYS,
+            'executions': [],
+            'step_comparison': [],
+        }
 
     reference = executions[0]
     if reference_execution_id:
-        for e in executions:
-            if e.id == reference_execution_id:
-                reference = e
+        for execution in executions:
+            if execution.id == reference_execution_id:
+                reference = execution
                 break
+
+    execution_ids = [execution.id for execution in executions]
+    sample_queryset = PerfMetricSample.objects.filter(
+        execution_id__in=execution_ids).order_by()
+    sample_totals = dict(sample_queryset.values('execution_id').annotate(
+        total=Count('pk')).values_list('execution_id', 'total'))
+    sampled_rows = query_downsampled_points_by_partition(
+        sample_queryset, sample_totals, 300, 'execution_id')
+    samples_by_execution = defaultdict(list)
+    for sample in sampled_rows:
+        samples_by_execution[sample.execution_id].append(sample)
+
+    stats_by_execution = defaultdict(list)
+    stats_by_key = {}
+    step_names = []
+    for stat in PerfRequestStat.objects.filter(
+            execution_id__in=execution_ids).order_by('pk'):
+        stats_by_execution[stat.execution_id].append(stat)
+        key = (stat.execution_id, stat.step_name)
+        stats_by_key.setdefault(key, stat)
+    for execution in executions:
+        for stat in stats_by_execution[execution.id]:
+            if stat.step_name not in step_names:
+                step_names.append(stat.step_name)
 
     base_summary = reference.summary or {}
     items = []
     for execution in executions:
         summary = execution.summary or {}
         samples = PerfMetricSampleSerializer(
-            PerfMetricSample.objects.filter(execution=execution).order_by('ts_offset'),
-            many=True).data
+            samples_by_execution[execution.id], many=True).data
         items.append({
             'id': execution.id,
             'execution_no': execution.execution_no,
@@ -57,31 +88,27 @@ def build_snapshot(executions, reference_execution_id=None):
             'duration': execution.duration,
             'load_snapshot': execution.load_snapshot,
             'is_reference': execution.id == reference.id,
-            'summary': {k: summary.get(k) for k in METRIC_KEYS},
+            'summary': {key: summary.get(key) for key in METRIC_KEYS},
             'delta_pct': _compute_deltas(base_summary, summary),
-            'samples': downsample(samples, 300),
+            'samples': samples,
         })
 
-    # 接口级对比：按步骤名对齐
-    step_names = []
-    for execution in executions:
-        for stat in PerfRequestStat.objects.filter(execution=execution):
-            if stat.step_name not in step_names:
-                step_names.append(stat.step_name)
     step_rows = []
     for name in step_names:
-        row = {'step_name': name, 'values': []}
+        values = []
         for execution in executions:
-            stat = PerfRequestStat.objects.filter(
-                execution=execution, step_name=name).first()
-            row['values'].append({
-                'execution_no': execution.execution_no,
-                'tps': stat.tps if stat else None,
-                'avg_rt': stat.avg_rt if stat else None,
-                'p95_rt': stat.p95_rt if stat else None,
-                'error_rate': stat.error_rate if stat else None,
-            } if stat else {'execution_no': execution.execution_no})
-        step_rows.append(row)
+            stat = stats_by_key.get((execution.id, name))
+            if stat:
+                values.append({
+                    'execution_no': execution.execution_no,
+                    'tps': stat.tps,
+                    'avg_rt': stat.avg_rt,
+                    'p95_rt': stat.p95_rt,
+                    'error_rate': stat.error_rate,
+                })
+            else:
+                values.append({'execution_no': execution.execution_no})
+        step_rows.append({'step_name': name, 'values': values})
 
     return {
         'baseline_execution_no': reference.execution_no,

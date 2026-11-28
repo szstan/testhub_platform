@@ -8,6 +8,9 @@
 """
 import bisect
 
+from django.db.models import F, Q, Window
+from django.db.models.functions import RowNumber
+
 #: 桶上界（毫秒）。超出最大边界的样本落入溢出桶。
 BUCKET_BOUNDS = [
     1, 2, 3, 5, 8, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500,
@@ -302,6 +305,60 @@ class MetricsCollector:
 
     def build_request_stats(self, duration_seconds):
         return [s.to_stat(duration_seconds) for s in self.steps.values()]
+
+
+def _sample_row_numbers(total, target):
+    if total <= 0 or target <= 0:
+        return []
+    if total <= target:
+        return list(range(1, total + 1))
+    if target == 1:
+        return [total]
+    step = (total - 1) / (target - 1)
+    return sorted({int(round(index * step)) + 1 for index in range(target)})
+
+
+def query_downsampled_points(queryset, total, target):
+    """Fetch at most ``target`` ordered sample rows without materializing the full series."""
+    positions = _sample_row_numbers(total, target)
+    if not positions:
+        return []
+    ordering = ['ts_offset', 'pk']
+    if total <= target:
+        return list(queryset.order_by(*ordering))
+    return list(queryset.annotate(
+        _perf_sample_row=Window(
+            expression=RowNumber(),
+            order_by=[F('ts_offset').asc(), F('pk').asc()],
+        ),
+    ).filter(_perf_sample_row__in=positions).order_by(*ordering))
+
+
+def query_downsampled_points_by_partition(queryset, totals, target, partition_field):
+    """Fetch at most ``target`` ordered points per partition using SQL row numbers."""
+    selection = Q()
+    any_rows = False
+    for partition, total in totals.items():
+        positions = _sample_row_numbers(total, target)
+        if not positions:
+            continue
+        any_rows = True
+        selection |= Q(**{
+            partition_field: partition,
+            '_perf_sample_row__in': positions,
+        })
+    if not any_rows:
+        return []
+
+    if all(total <= target for total in totals.values()):
+        return list(queryset.order_by(partition_field, 'ts_offset', 'pk'))
+    return list(queryset.annotate(
+        _perf_sample_row=Window(
+            expression=RowNumber(),
+            partition_by=[F(partition_field)],
+            order_by=[F('ts_offset').asc(), F('pk').asc()],
+        ),
+    ).filter(selection).order_by(partition_field, 'ts_offset', 'pk'))
 
 
 def downsample(points, target):

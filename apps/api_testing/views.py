@@ -8,6 +8,8 @@ from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models, transaction
+from django.db.models.deletion import ProtectedError
+from copy import copy
 from apps.core.http_transport import guarded_post, guarded_request
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
 from apps.quality_intelligence.services.redaction import redact_payload
@@ -33,6 +35,7 @@ from .models import (
     RequestHistory, TestSuite, TestExecution, TestSuiteRequest,
     ScheduledTask, TaskExecutionLog, NotificationLog,
     TaskNotificationSetting, OperationLog, AIServiceConfig,
+    ApiTestCase, ApiTestCaseStep, TestSuiteCase,
 )
 
 from .serializers import (
@@ -47,7 +50,12 @@ from .serializers import (
 
 logger = logging.getLogger(__name__)
 
-from .utils import can_access_api_project, can_use_environment, execute_assertions, redact_response_data
+from .utils import (
+    can_access_api_project, can_use_environment, execute_assertions, redact_response_data,
+    execute_api_request, execute_test_suite,
+)
+from .case_views import Conflict, TestSuiteCaseActionsMixin, accessible_api_projects
+from .case_serializers import ApiTestCaseStepSerializer
 from .operation_logger import log_operation
 from .variable_resolver import VariableResolver
 from .serializers import (
@@ -69,6 +77,20 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 1000
 
 
+def _destroy_api_object(instance, resource_type, user):
+    """Delete atomically and translate referenced request definitions into a conflict."""
+    resource_id, resource_name = instance.pk, instance.name
+    try:
+        with transaction.atomic():
+            instance.delete()
+            log_operation(
+                operation_type='delete', resource_type=resource_type,
+                resource_id=resource_id, resource_name=resource_name, user=user,
+            )
+    except ProtectedError as exc:
+        raise Conflict('该资源中的接口已被测试用例引用，请先解除步骤引用') from exc
+
+
 class ApiProjectViewSet(viewsets.ModelViewSet):
     queryset = ApiProject.objects.all()
     serializer_class = ApiProjectSerializer
@@ -80,10 +102,7 @@ class ApiProjectViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
     
     def get_queryset(self):
-        user = self.request.user
-        return ApiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        return accessible_api_projects(self.request.user)
     
     def perform_create(self, serializer):
         """创建项目时记录日志"""
@@ -113,14 +132,7 @@ class ApiProjectViewSet(viewsets.ModelViewSet):
         """仅 owner/admin 可删除项目。"""
         if not (self.request.user.is_staff or self.request.user.is_superuser or instance.owner_id == self.request.user.id):
             raise PermissionDenied('只有项目负责人或管理员可以删除项目')
-        log_operation(
-            operation_type='delete',
-            resource_type='project',
-            resource_id=instance.id,
-            resource_name=instance.name,
-            user=self.request.user
-        )
-        instance.delete()
+        _destroy_api_object(instance, 'project', self.request.user)
     
     @action(detail=False, methods=['post'], url_path='create-sample')
     def create_sample_project(self, request):
@@ -249,9 +261,7 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         return ApiCollection.objects.filter(
-            project__in=ApiProject.objects.filter(
-                models.Q(owner=user) | models.Q(members=user)
-            )
+            project__in=accessible_api_projects(user)
         ).distinct()
 
     def perform_create(self, serializer):
@@ -280,7 +290,7 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
             instance = ApiCollection.objects.select_for_update().filter(pk=initial_instance.pk).first()
             if instance is None:
                 raise Http404
-            if not can_access_api_project(instance.project, user, allow_admin=False):
+            if not can_access_api_project(instance.project, user):
                 raise Http404
             if instance.project_id != initial_instance.project_id:
                 raise ValidationError({'project': '集合所属项目已变更，请刷新后重试'})
@@ -293,9 +303,12 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied('父集合必须属于同一项目')
             if (
                 project.pk != instance.project_id
-                and TestSuiteRequest.objects.filter(request__collection_id=instance.pk).exists()
+                and (
+                    TestSuiteRequest.objects.filter(request__collection_id=instance.pk).exists()
+                    or ApiTestCaseStep.objects.filter(request__collection_id=instance.pk).exists()
+                )
             ):
-                raise ValidationError({'project': '集合中的请求已关联测试套件，不能跨项目迁移'})
+                raise ValidationError({'project': '集合中的请求已关联测试套件或用例，不能跨项目迁移'})
 
             serializer.instance = instance
             if 'project' in serializer.validated_data:
@@ -311,15 +324,8 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
         )
 
     def perform_destroy(self, instance):
-        """删除集合时记录日志"""
-        log_operation(
-            operation_type='delete',
-            resource_type='collection',
-            resource_id=instance.id,
-            resource_name=instance.name,
-            user=self.request.user
-        )
-        instance.delete()
+        """Delete only when none of the collection's request definitions are protected."""
+        _destroy_api_object(instance, 'collection', self.request.user)
 
 
 class ApiRequestViewSet(viewsets.ModelViewSet):
@@ -333,9 +339,7 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         # 获取用户有权限的项目
-        accessible_projects = ApiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        )
+        accessible_projects = accessible_api_projects(user)
 
         # 查询两种接口：
         # 1. 关联到集合的接口（集合所属项目是用户有权限的）
@@ -410,7 +414,7 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
 
             source_collection = collections.get(instance.collection_id)
             if source_collection and not can_access_api_project(
-                source_collection.project, user, allow_admin=False,
+                source_collection.project, user,
             ):
                 raise Http404
             if source_collection is None and instance.created_by_id != user.pk:
@@ -426,9 +430,12 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             target_project_id = target_collection.project_id if target_collection else None
             if (
                 source_project_id != target_project_id
-                and TestSuiteRequest.objects.filter(request_id=instance.pk).exists()
+                and (
+                    TestSuiteRequest.objects.filter(request_id=instance.pk).exists()
+                    or ApiTestCaseStep.objects.filter(request_id=instance.pk).exists()
+                )
             ):
-                raise ValidationError({'collection': '已关联测试套件的请求不能跨项目迁移'})
+                raise ValidationError({'collection': '已关联测试套件或用例的请求不能跨项目迁移'})
 
             serializer.instance = instance
             if 'collection' in serializer.validated_data:
@@ -444,189 +451,70 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
         )
 
     def perform_destroy(self, instance):
-        """删除接口时记录日志"""
-        log_operation(
-            operation_type='delete',
-            resource_type='request',
-            resource_id=instance.id,
-            resource_name=instance.name,
-            user=self.request.user
-        )
-        instance.delete()
-    
+        """Reject deleting request definitions referenced by reusable case steps."""
+        if instance.case_steps.exists():
+            raise Conflict('接口已被测试用例引用，请先解除步骤引用')
+        resource_id, resource_name = instance.pk, instance.name
+        try:
+            with transaction.atomic():
+                instance.delete()
+                log_operation(
+                    operation_type='delete', resource_type='request',
+                    resource_id=resource_id, resource_name=resource_name, user=self.request.user,
+                )
+        except ProtectedError as exc:
+            raise Conflict('接口已被测试用例引用，请先解除步骤引用') from exc
+
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
-        """执行API请求"""
+        """Preview one saved request through the shared guarded HTTP runner."""
         api_request = self.get_object()
+        environment = None
         environment_id = request.data.get('environment_id')
-        
-        try:
-            # 创建变量解析器
-            resolver = VariableResolver()
-
-            # 解析环境变量
-            variables = {}
-            if environment_id:
-                env = Environment.objects.filter(id=environment_id).first()
-                request_project = getattr(getattr(api_request, 'collection', None), 'project', None)
-                if env is None or not can_use_environment(env, request.user, project=request_project):
-                    return Response({'error': '环境不存在或无权限'}, status=status.HTTP_403_FORBIDDEN)
-                variables.update(env.variables)
-            
-            # 使用前端发送的更新后的数据，如果没有则使用数据库中的数据
-            request_params = request.data.get('params', api_request.params)
-            request_headers = request.data.get('headers', api_request.headers)
-            request_body = request.data.get('body', api_request.body)
-            request_method = request.data.get('method', api_request.method)
-            request_url = request.data.get('url', api_request.url)
-
-            # 替换URL中的变量（先解析动态函数，再替换环境变量）
-            url = self._replace_variables(request_url or '', variables)
-            url = resolver.resolve(url)
+        if environment_id is not None:
             try:
-                url = validate_outbound_url(
-                    url,
-                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-                )
-            except UnsafeOutboundURL as exc:
-                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-            headers = {}
-            if isinstance(request_headers, list):
-                for header_item in request_headers:
-                    if header_item.get('enabled', True) and header_item.get('key'):
-                        key = header_item['key']
-                        value = self._replace_variables(str(header_item.get('value', '')), variables)
-                        value = resolver.resolve(value)
-                        headers[key] = value
-            else:
-                headers = request_headers.copy() if request_headers else {}
-                for key, value in headers.items():
-                    headers[key] = self._replace_variables(str(value), variables)
-                    headers[key] = resolver.resolve(headers[key])
+                environment = Environment.objects.filter(pk=environment_id).first()
+            except (ValueError, TypeError, OverflowError):
+                return Response({'error': '执行环境无效'}, status=status.HTTP_400_BAD_REQUEST)
+            project = getattr(getattr(api_request, 'collection', None), 'project', None)
+            if environment is None or not can_use_environment(environment, request.user, project=project):
+                return Response({'error': '环境不存在或无权限'}, status=status.HTTP_403_FORBIDDEN)
 
-            # 准备请求参数
-            params = request_params.copy() if request_params else {}
-            for key, value in params.items():
-                params[key] = self._replace_variables(str(value), variables)
-                params[key] = resolver.resolve(params[key])
-
-            # 准备请求体
-            body_data = None
-            body_type = 'none'
-            if request_body and request_method in ['POST', 'PUT', 'PATCH']:
-                body_type = request_body.get('type', 'none')
-                body_content = request_body.get('data')
-
-                if body_type == 'json':
-                    if isinstance(body_content, dict):
-                        body_data = self._replace_variables_in_dict(body_content, variables)
-                        body_data = self._resolve_variables_in_dict(body_data, resolver)
-                    else:
-                        body_data = body_content
-                elif body_type == 'raw':
-                    if isinstance(body_content, str):
-                        body_data = self._replace_variables(body_content, variables)
-                        body_data = resolver.resolve(body_data)
-                    else:
-                        body_data = body_content
-                elif body_type in ['form-data', 'x-www-form-urlencoded']:
-                    if isinstance(body_content, list):
-                        body_data = self._replace_variables_in_dict(body_content, variables)
-                        body_data = self._resolve_variables_in_dict(body_data, resolver)
-                    else:
-                        body_data = body_content
-                else:
-                    body_data = body_content
-            
-            # 执行请求
-            start_time = time.time()
-
-            # 根据请求体类型决定使用 data 还是 json 参数
-            if body_type == 'raw':
-                # raw 类型使用 data 参数，发送原始字符串
-                response = guarded_request(
-                    method=request_method,
-                    url=url,
-                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-                    headers=headers,
-                    params=params,
-                    data=body_data,
-                    timeout=30,
-                    allow_redirects=False,
-                )
-            else:
-                # json 类型使用 json 参数，自动序列化
-                response = guarded_request(
-                    method=request_method,
-                    url=url,
-                    allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-                    headers=headers,
-                    params=params,
-                    json=body_data,
-                    timeout=30,
-                    allow_redirects=False,
-                )
-            end_time = time.time()
-            
-            response_time = (end_time - start_time) * 1000  # 转换为毫秒
-            
-            # 执行断言验证
-            assertions = request.data.get('assertions', api_request.assertions) or []
-            for assertion in assertions:
-                if assertion.get('type') == 'response_time':
-                    assertion['actual_time'] = response_time
-            assertions_results = execute_assertions(response, assertions)
-            
-            # 保存请求历史
-            history = RequestHistory.objects.create(
-                request=api_request,
-                environment_id=environment_id,
-                request_data={
-                    'url': redact_payload(url),
-                    'method': request_method,
-                    'headers': redact_payload(headers),
-                    'params': redact_payload(params),
-                    'body': redact_payload(body_data)
-                },
-                response_data=redact_response_data(response),
-                status_code=response.status_code,
-                response_time=response_time,
-                assertions_results=assertions_results,
-                executed_by=request.user
+        fields = ('params', 'headers', 'body', 'method', 'url', 'assertions')
+        payload = {field: request.data[field] for field in fields if field in request.data}
+        serializer = ApiRequestSerializer(api_request, data=payload, partial=True, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        preview = copy(api_request)
+        for field, value in serializer.validated_data.items():
+            setattr(preview, field, value)
+        if not isinstance(preview.params, dict) or not isinstance(preview.headers, (dict, list)) or not isinstance(preview.body, dict):
+            raise ValidationError('参数、请求头或请求体格式无效')
+        ApiTestCaseStepSerializer().validate_assertions(preview.assertions)
+        result = execute_api_request(preview, environment, request.user)
+        history_id = result.get('history_id')
+        if history_id:
+            history = RequestHistory.objects.get(pk=history_id, executed_by=request.user)
+            data = RequestHistorySerializer(history).data
+            data['passed'] = bool(result.get('success')) and all(
+                item.get('passed', False) for item in result.get('assertions_results') or []
             )
-            
-            # 记录执行操作
             log_operation(
-                operation_type='execute',
-                resource_type='request',
-                resource_id=api_request.id,
-                resource_name=api_request.name,
-                user=request.user
+                operation_type='execute', resource_type='request', resource_id=api_request.pk,
+                resource_name=api_request.name, user=request.user,
             )
-            
-            # 返回包含断言结果的数据
-            history_data = RequestHistorySerializer(history).data
-            history_data['assertions_results'] = assertions_results
-            
-            return Response(history_data)
-            
-        except Exception as e:
-            # 保存错误历史
-            history = RequestHistory.objects.create(
-                request=api_request,
-                environment_id=environment_id,
-                request_data={
-                    'url': api_request.url,
-                    'method': api_request.method,
-                    'headers': api_request.headers,
-                    'params': api_request.params,
-                    'body': api_request.body
-                },
-                error_message=str(e),
-                executed_by=request.user
-            )
-            
-            return Response(RequestHistorySerializer(history).data, status=status.HTTP_400_BAD_REQUEST)
+            return Response(data)
+        error = redact_payload(result.get('error') or '请求执行失败')
+        history = RequestHistory.objects.create(
+            request=api_request, environment=environment, executed_by=request.user,
+            request_data=redact_payload({
+                'url': preview.url, 'method': preview.method, 'headers': preview.headers,
+                'params': preview.params, 'body': preview.body,
+            }),
+            error_message=error,
+        )
+        data = RequestHistorySerializer(history).data
+        data.update({'error': error, 'passed': False})
+        return Response(data, status=status.HTTP_400_BAD_REQUEST)
     
     def _replace_variables(self, text, variables):
         """替换文本中的变量"""
@@ -768,9 +656,7 @@ class RequestHistoryViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         return RequestHistory.objects.filter(
-            request__collection__project__in=ApiProject.objects.filter(
-                models.Q(owner=user) | models.Q(members=user)
-            )
+            request__collection__project__in=accessible_api_projects(user)
         ).select_related(
             'request', 'environment', 'executed_by',
             'request__created_by', 'environment__created_by', 'environment__project'
@@ -794,7 +680,7 @@ class RequestHistoryViewSet(viewsets.ModelViewSet):
         return Response({'message': f'成功删除 {deleted_count} 条记录'})
 
 
-class TestSuiteViewSet(viewsets.ModelViewSet):
+class TestSuiteViewSet(TestSuiteCaseActionsMixin, viewsets.ModelViewSet):
     queryset = TestSuite.objects.all()
     serializer_class = TestSuiteSerializer
     permission_classes = [IsAuthenticated]
@@ -804,216 +690,25 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         return TestSuite.objects.filter(
-            project__in=ApiProject.objects.filter(
-                models.Q(owner=user) | models.Q(members=user)
-            )
+            project__in=accessible_api_projects(user)
         ).distinct()
 
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
-        """执行测试套件"""
-        initial_suite = self.get_object()
-        execution = None
-
-        try:
-            with transaction.atomic():
-                test_suite = TestSuite.objects.select_for_update().filter(pk=initial_suite.pk).first()
-                if test_suite is None:
-                    raise Http404
-                if not can_access_api_project(test_suite.project, request.user, allow_admin=False):
-                    raise Http404
-                if not can_use_environment(test_suite.environment, request.user, project=test_suite.project):
-                    return Response({'error': '无权使用该执行环境'}, status=status.HTTP_403_FORBIDDEN)
-
-                execution = TestExecution.objects.create(
-                    test_suite=test_suite,
-                    status='RUNNING',
-                    start_time=timezone.now(),
-                    executed_by=request.user
-                )
-                suite_requests = list(
-                    TestSuiteRequest.objects.filter(
-                        test_suite=test_suite,
-                        enabled=True
-                    ).select_related('request').order_by('order')
-                )
-                execution.total_requests = len(suite_requests)
-                execution.save(update_fields=['total_requests'])
-
-            results = []
-            passed_count = 0
-            failed_count = 0
-            
-            # 创建变量解析器
-            resolver = VariableResolver()
-
-            # 执行每个请求
-            for suite_request in suite_requests:
-                api_request = suite_request.request
-                
-                try:
-                    # 解析环境变量
-                    variables = {}
-                    if test_suite.environment:
-                        variables.update(test_suite.environment.variables)
-                    
-                    # 替换URL中的变量（先解析动态函数，再替换环境变量）
-                    url = self._replace_variables(api_request.url, variables)
-                    url = resolver.resolve(url)
-                    try:
-                        url = validate_outbound_url(
-                            url,
-                            allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-                        )
-                    except UnsafeOutboundURL as exc:
-                        raise ValueError(str(exc)) from exc
-                    headers = {}
-                    # 支持新的数组格式和旧的对象格式
-                    if isinstance(api_request.headers, list):
-                        # 新的数组格式 [{"key": "Authorization", "value": "Bearer {{token}}", "enabled": true, "description": "..."}]
-                        for header_item in api_request.headers:
-                            if header_item.get('enabled', True) and header_item.get('key'):
-                                key = header_item['key']
-                                value = self._replace_variables(str(header_item.get('value', '')), variables)
-                                value = resolver.resolve(value)
-                                headers[key] = value
-                    else:
-                        # 旧的对象格式 {"Authorization": "Bearer {{token}}"}
-                        headers = api_request.headers.copy()
-                        for key, value in headers.items():
-                            headers[key] = self._replace_variables(str(value), variables)
-                            headers[key] = resolver.resolve(headers[key])
-
-                    params = api_request.params.copy()
-                    for key, value in params.items():
-                        params[key] = self._replace_variables(str(value), variables)
-                        params[key] = resolver.resolve(params[key])
-
-                    body_data = None
-                    if api_request.body and api_request.method in ['POST', 'PUT', 'PATCH']:
-                        if api_request.body.get('type') == 'json':
-                            body_data = api_request.body.get('data', {})
-                            body_data = self._replace_variables_in_dict(body_data, variables)
-                            body_data = self._resolve_variables_in_dict(body_data, resolver)
-
-                    # 执行请求
-                    start_time = time.time()
-                    response = guarded_request(
-                        method=api_request.method,
-                        url=url,
-                        allow_private=bool(getattr(settings, 'PERF_ALLOW_PRIVATE_TARGETS', False)),
-                        headers=headers,
-                        params=params,
-                        json=body_data,
-                        timeout=30,
-                        allow_redirects=False,
-                    )
-                    end_time = time.time()
-                    response_time = (end_time - start_time) * 1000
-                    
-                    # 执行断言验证
-                    assertions = api_request.assertions or []
-                    # 添加响应时间到断言中
-                    for assertion in assertions:
-                        if assertion.get('type') == 'response_time':
-                            assertion['actual_time'] = response_time
-                    
-                    # 使用共享的断言执行方法
-                    assertions_results = execute_assertions(response, assertions)
-                    
-                    # 检查所有断言是否通过
-                    passed = True
-                    error_message = ''
-                    
-                    # 检查套件请求的断言
-                    for assertion in suite_request.assertions:
-                        # 简单的状态码断言
-                        if assertion.get('type') == 'status_code':
-                            expected = assertion.get('value')
-                            if response.status_code != expected:
-                                passed = False
-                                error_message = f'状态码断言失败: 期望 {expected}, 实际 {response.status_code}'
-                                break
-                    
-                    # 检查接口自身的断言
-                    if passed and assertions_results:
-                        for assertion_result in assertions_results:
-                            if not assertion_result.get('passed', True):
-                                passed = False
-                                error_message = f"断言失败: {assertion_result.get('name', '未命名断言')} - {assertion_result.get('error', '断言不通过')}"
-                                break
-                    
-                    if passed:
-                        passed_count += 1
-                    else:
-                        failed_count += 1
-                    
-                    results.append({
-                        'name': api_request.name,
-                        'method': api_request.method,
-                        'url': url,
-                        'status_code': response.status_code,
-                        'response_time': response_time,
-                        'passed': passed,
-                        'error': error_message,
-                        'assertions_results': assertions_results
-                    })
-                    
-                    # 保存请求历史
-                    RequestHistory.objects.create(
-                        request=api_request,
-                        environment=test_suite.environment,
-                        request_data={
-                            'url': redact_payload(url),
-                            'method': api_request.method,
-                            'headers': redact_payload(headers),
-                            'params': redact_payload(params),
-                            'body': redact_payload(body_data)
-                        },
-                        response_data=redact_response_data(response),
-                        status_code=response.status_code,
-                        response_time=response_time,
-                        assertions_results=assertions_results,
-                        executed_by=request.user
-                    )
-                    
-                except Exception as e:
-                    failed_count += 1
-                    results.append({
-                        'name': api_request.name,
-                        'method': api_request.method,
-                        'url': api_request.url,
-                        'passed': False,
-                        'error': str(e)
-                    })
-            
-            # 更新执行结果
-            execution.end_time = timezone.now()
-            execution.passed_requests = passed_count
-            execution.failed_requests = failed_count
-            execution.status = 'COMPLETED' if failed_count == 0 else 'FAILED'
-            execution.results = results
-            execution.save()
-            
-            # 记录执行操作
-            log_operation(
-                operation_type='execute',
-                resource_type='suite',
-                resource_id=test_suite.id,
-                resource_name=test_suite.name,
-                user=request.user
-            )
-            
-            return Response(TestExecutionSerializer(execution).data)
-            
-        except Http404:
-            raise
-        except Exception as e:
-            if execution is not None:
-                execution.status = 'FAILED'
-                execution.end_time = timezone.now()
-                execution.save()
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        """Use the same mixed-suite execution path as workers and scheduled tasks."""
+        test_suite = self.get_object()
+        if not can_use_environment(test_suite.environment, request.user, project=test_suite.project):
+            return Response({'error': '无权使用该执行环境'}, status=status.HTTP_403_FORBIDDEN)
+        result = execute_test_suite(test_suite, test_suite.environment, request.user)
+        execution_id = result.get('execution_id')
+        if not execution_id:
+            return Response({'error': result.get('error') or '套件执行失败'}, status=status.HTTP_400_BAD_REQUEST)
+        execution = TestExecution.objects.get(pk=execution_id, test_suite=test_suite)
+        log_operation(
+            operation_type='execute', resource_type='suite', resource_id=test_suite.pk,
+            resource_name=test_suite.name, user=request.user,
+        )
+        return Response(TestExecutionSerializer(execution).data)
 
     def perform_create(self, serializer):
         """创建测试套件时记录日志并校验项目/环境归属。"""
@@ -1041,7 +736,7 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
             instance = TestSuite.objects.select_for_update().filter(pk=initial_instance.pk).first()
             if instance is None:
                 raise Http404
-            if not can_access_api_project(instance.project, user, allow_admin=False):
+            if not can_access_api_project(instance.project, user):
                 raise Http404
             if instance.project_id != initial_instance.project_id:
                 raise ValidationError({'project': '测试套件所属项目已变更，请刷新后重试'})
@@ -1051,8 +746,8 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied('无权使用该项目')
             if instance.testsuiterequest_set.exclude(
                 request__collection__project_id=project.pk
-            ).exists():
-                raise ValidationError({'project': '测试套件中的所有请求必须属于目标项目'})
+            ).exists() or instance.suite_cases.exclude(test_case__project_id=project.pk).exists():
+                raise ValidationError({'project': '测试套件中的所有请求和用例必须属于目标项目'})
             if project.pk != instance.project_id and instance.executions.exists():
                 raise ValidationError({'project': '已有执行记录的测试套件不能迁移项目'})
 
@@ -1100,8 +795,10 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                 test_suite = TestSuite.objects.select_for_update().filter(pk=initial_suite.pk).first()
                 if test_suite is None:
                     raise Http404
-                if not can_access_api_project(test_suite.project, user, allow_admin=False):
+                if not can_access_api_project(test_suite.project, user):
                     raise Http404
+                if test_suite.executions.filter(status='RUNNING').exists():
+                    raise Conflict('测试套件正在执行，不能修改成员')
 
                 # Lock collections and requests in stable order after the suite row.
                 request_locations = dict(
@@ -1132,29 +829,32 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
                 if len(api_requests) != len(requested_ids):
                     raise ValueError('请求不存在、跨项目或无权限')
 
-                for request_id in request_ids:
+                existing_orders = [
+                    TestSuiteRequest.objects.filter(test_suite=test_suite).aggregate(value=models.Max('order'))['value'],
+                    TestSuiteCase.objects.filter(test_suite=test_suite).aggregate(value=models.Max('order'))['value'],
+                ]
+                next_order = max((value for value in existing_orders if value is not None), default=-1) + 1
+                for request_id in dict.fromkeys(request_ids):
                     api_request = api_requests[request_id]
                     collection = collections.get(api_request.collection_id)
                     if (
                         api_request.collection_id != request_locations[request_id]
                         or collection is None
                         or collection.project_id != test_suite.project_id
-                        or not can_access_api_project(collection.project, user, allow_admin=False)
+                        or not can_access_api_project(collection.project, user)
                     ):
                         raise ValueError('请求不存在、跨项目或无权限')
-                    TestSuiteRequest.objects.get_or_create(
+                    _, created = TestSuiteRequest.objects.get_or_create(
                         test_suite=test_suite,
                         request=api_request,
-                        defaults={
-                            'order': TestSuiteRequest.objects.filter(test_suite=test_suite).count(),
-                            'enabled': True,
-                            'assertions': []
-                        }
+                        defaults={'order': next_order, 'enabled': True, 'assertions': []},
                     )
+                    if created:
+                        next_order += 1
 
             return Response({'message': '添加成功'})
 
-        except Http404:
+        except (Http404, Conflict):
             raise
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -1202,14 +902,36 @@ class TestSuiteRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['test_suite', 'enabled']
+    http_method_names = ['get', 'put', 'patch', 'delete', 'head', 'options']
     
     def get_queryset(self):
         user = self.request.user
         return TestSuiteRequest.objects.filter(
-            test_suite__project__in=ApiProject.objects.filter(
-                models.Q(owner=user) | models.Q(members=user)
-            )
+            test_suite__project__in=accessible_api_projects(user)
         ).distinct()
+
+    def _lock_member(self, instance):
+        """Call only inside an atomic block; match the suite/member execution lock order."""
+        suite = TestSuite.objects.select_for_update().filter(pk=instance.test_suite_id).first()
+        if suite is None or not can_access_api_project(suite.project, self.request.user):
+            raise Http404
+        member = TestSuiteRequest.objects.select_for_update().filter(
+            pk=instance.pk, test_suite_id=suite.pk,
+        ).first()
+        if member is None:
+            raise Http404
+        if suite.executions.filter(status='RUNNING').exists():
+            raise Conflict('测试套件正在执行，不能修改成员')
+        return member
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            serializer.instance = self._lock_member(serializer.instance)
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            self._lock_member(instance).delete()
 
 
 class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1224,9 +946,7 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         user = self.request.user
         return TestExecution.objects.filter(
-            test_suite__project__in=ApiProject.objects.filter(
-                models.Q(owner=user) | models.Q(members=user)
-            )
+            test_suite__project__in=accessible_api_projects(user)
         ).distinct()
     
     @action(detail=True, methods=['get'], url_path='report')
@@ -2636,9 +2356,7 @@ class ApiDashboardViewSet(viewsets.ViewSet):
         user = request.user
         
         # 获取用户可访问的项目ID列表
-        accessible_projects = ApiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        accessible_projects = accessible_api_projects(user)
         project_ids = accessible_projects.values_list('id', flat=True)
 
         # 统计数据
@@ -2663,6 +2381,7 @@ class ApiDashboardViewSet(viewsets.ViewSet):
             'project_count': project_count,
             'interface_count': interface_count,
             'suite_count': suite_count,
+            'case_count': ApiTestCase.objects.filter(project_id__in=project_ids).count(),
             'history_count': history_count
         })
 

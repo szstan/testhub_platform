@@ -809,8 +809,10 @@ def test_recovery_floor_does_not_reclaim_a_live_provider_deadline(monkeypatch, s
 def test_documented_scheduler_invokes_generation_recovery(monkeypatch):
     command = ScheduledTasksCommand()
     recovery = Mock(return_value=0)
+    case_recovery = Mock(return_value=1)
     monkeypatch.setattr(command, 'consume_retry_outbox', lambda: 0)
     monkeypatch.setattr(command, 'recover_stale_generation_tasks', recovery)
+    monkeypatch.setattr(command, 'reconcile_stale_api_case_executions', case_recovery)
     monkeypatch.setattr(command, 'reconcile_execution_claims', lambda: 0)
     monkeypatch.setattr(command, 'dispatch_pending_notifications', lambda: 0)
     monkeypatch.setattr(command, 'reconcile_performance_callbacks', lambda: 0)
@@ -822,3 +824,4 @@ def test_documented_scheduler_invokes_generation_recovery(monkeypatch):
     command.handle(interval=1, lease_seconds=30, once=True)
 
     recovery.assert_called_once()
+    case_recovery.assert_called_once()

@@ -6,6 +6,7 @@ from rest_framework import filters
 from django.db import models
 from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import PermissionDenied
+from apps.projects.access import user_can_write_project
 from .models import Project, ProjectMember, ProjectEnvironment
 from .serializers import ProjectSerializer, ProjectCreateSerializer, ProjectMemberSerializer, ProjectEnvironmentSerializer
 
@@ -32,11 +33,7 @@ class ProjectListCreateView(generics.ListCreateAPIView):
         return ProjectSerializer
     
     def get_queryset(self):
-        # 默认只显示用户参与的项目或自己创建的项目
-        user = self.request.user
-        return Project.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        return accessible_projects(self.request.user)
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
@@ -149,4 +146,6 @@ class ProjectEnvironmentListCreateView(generics.ListCreateAPIView):
     
     def perform_create(self, serializer):
         project = get_object_or_404(accessible_projects(self.request.user), pk=self.kwargs['project_id'])
+        if not user_can_write_project(self.request.user, project):
+            raise PermissionDenied('没有权限修改该项目')
         serializer.save(project=project)

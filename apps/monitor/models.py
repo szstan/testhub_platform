@@ -12,7 +12,7 @@ calculate_next_run() / created_at / updated_at），保证调度器兼容、团�
 import time
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from datetime import timedelta
 
@@ -110,6 +110,8 @@ class MonitorTarget(models.Model):
     last_check_at = models.DateTimeField(null=True, blank=True, verbose_name='最近检测时间', db_comment='最近检测时间')
     consecutive_failures = models.IntegerField(default=0, verbose_name='连续失败次数', db_comment='连续失败次数')
     next_check_at = models.DateTimeField(null=True, blank=True, verbose_name='下次检测时间', db_comment='下次检测时间')
+    scheduler_lease_token = models.CharField(max_length=32, blank=True, default='', editable=False)
+    scheduler_lease_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
     primary_channels = models.ManyToManyField(
         'NotificationChannel', blank=True,
         related_name='primary_targets', verbose_name='一级通道(主)',
@@ -152,7 +154,7 @@ class MonitorTarget(models.Model):
     def get_decrypted_check_config(self):
         return decrypt_secrets(self.check_config or {})
 
-    def run_check(self, manual=False):
+    def run_check(self, manual=False, scheduler_token=None):
         """执行一次探测：跑探针 → 落 CheckLog → 回写状态/延迟/连续失败/下次时间。
 
         manual=True 表示来自「立即检测」手动触发（默认 False，来自定时调度）。
@@ -169,6 +171,23 @@ class MonitorTarget(models.Model):
             result = run_probe(self, cfg)
         except Exception as exc:  # 探针本身不应抛，但兜底防崩溃
             result = ProbeResult(False, f"探测异常: {exc}")
+
+        if scheduler_token:
+            # Network I/O happens outside the transaction. A late response from
+            # an expired worker cannot change a successor's status or alerts.
+            from apps.core.scheduler import load_claimed_task
+            with transaction.atomic():
+                current = load_claimed_task(
+                    type(self), self.pk, scheduler_token, require_active=True,
+                    status_field='enabled', active_status=True,
+                )
+                return current._record_probe_result(result, manual=manual)
+        with transaction.atomic():
+            current = type(self).objects.select_for_update().get(pk=self.pk)
+            return current._record_probe_result(result, manual=manual)
+
+    def _record_probe_result(self, result, *, manual):
+        from .utils.probes import redact_probe_detail, redact_probe_message
 
         status = TargetStatus.UP if result.ok else TargetStatus.DOWN
         self.status = status

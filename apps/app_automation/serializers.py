@@ -14,6 +14,7 @@ from .constants import (
     ElementType,
     ExecutionEngine,
     NATIVE_ELEMENT_STRATEGIES,
+    APP_TEST_CASE_MAX_TIMEOUT_SECONDS,
 )
 from .access import (
     accessible_projects,
@@ -384,7 +385,7 @@ class AppPackageSerializer(serializers.ModelSerializer):
     class Meta:
         model = AppPackage
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at')
+        read_only_fields = ('created_by', 'created_at', 'updated_at')
 
     def get_created_by_name(self, obj) -> Optional[str]:
         return obj.created_by.username if obj.created_by else None
@@ -399,6 +400,17 @@ class AppTestCaseSerializer(serializers.ModelSerializer):
         model = AppTestCase
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
+    def validate_timeout(self, value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= APP_TEST_CASE_MAX_TIMEOUT_SECONDS
+        ):
+            raise serializers.ValidationError(
+                f'timeout 必须是 1 到 {APP_TEST_CASE_MAX_TIMEOUT_SECONDS} 秒之间的整数'
+            )
+        return value
 
     def validate_variables(self, value):
         _validate_sensitive_variables(value)
@@ -548,7 +560,7 @@ class AppTestExecutionSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = (
             'created_at', 'updated_at', 'started_at', 'finished_at', 'duration',
-            'stop_requested', 'release_device_lease_on_stop', 'engine',
+            'stop_requested', 'release_device_lease_on_stop', 'engine', 'user',
         )
 
 

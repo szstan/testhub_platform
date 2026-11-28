@@ -1,4 +1,7 @@
+from django.db import transaction
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+from .document_limits import DocumentExtractionError, validate_document_upload
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
@@ -28,6 +31,14 @@ class RequirementDocumentSerializer(serializers.ModelSerializer):
         immutable = {'project', 'document_type', 'status', 'uploaded_by', 'file_size', 'extracted_text'}
         if self.instance is not None and immutable.intersection(attrs):
             raise serializers.ValidationError('需求文档的项目、类型和状态不可直接修改')
+        if 'file' in attrs and self.instance is not None:
+            has_analysis = RequirementAnalysis.objects.filter(document_id=self.instance.pk).exists()
+            has_pending_analysis = AnalysisTask.objects.filter(
+                document_id=self.instance.pk, task_type='requirement_analysis',
+                status__in=['pending', 'running'],
+            ).exists()
+            if self.instance.status in {'analyzing', 'analyzed'} or has_analysis or has_pending_analysis:
+                raise serializers.ValidationError({'file': '存在待处理分析或已分析的文档不可替换文件'})
         return attrs
 
     def validate_project(self, value):
@@ -37,10 +48,39 @@ class RequirementDocumentSerializer(serializers.ModelSerializer):
         user = getattr(request, 'user', None)
         if not user or not user.is_authenticated:
             raise serializers.ValidationError('必须登录后操作需求文档')
-        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+        if user_can_write_project(user, value):
             return value
-        raise serializers.ValidationError('无权使用该项目')
+        raise PermissionDenied('无权写入该项目')
     
+    def validate_file(self, value):
+        try:
+            validate_document_upload(value)
+        except DocumentExtractionError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        if self.instance is not None:
+            suffix = str(value.name).rsplit('.', 1)[-1].lower()
+            if suffix != self.instance.document_type:
+                raise serializers.ValidationError('替换文件必须保持文档类型一致')
+        return value
+
+    def update(self, instance, validated_data):
+        old_name = instance.file.name if 'file' in validated_data and instance.file else ''
+        storage = instance.file.storage if old_name else None
+        if 'file' in validated_data:
+            validated_data['file_size'] = validated_data['file'].size
+            validated_data['extracted_text'] = ''
+        updated = super().update(instance, validated_data)
+        new_name = updated.file.name if updated.file else ''
+        if old_name and old_name != new_name:
+            from .services import cleanup_document_file_if_unreferenced
+
+            transaction.on_commit(
+                lambda name=old_name, file_storage=storage: cleanup_document_file_if_unreferenced(
+                    name, storage=file_storage,
+                )
+            )
+        return updated
+
     def get_file_url(self, obj):
         if obj.file:
             return obj.file.url
@@ -123,21 +163,19 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'uploaded_by', 'file_size', 'extracted_text']
 
     def validate_file(self, value):
-        if getattr(value, 'size', 0) > 10 * 1024 * 1024:
-            raise serializers.ValidationError('文件大小不能超过 10MB')
-        name = (getattr(value, 'name', '') or '').lower()
-        if not name.endswith(('.pdf', '.docx', '.txt', '.md')):
-            raise serializers.ValidationError('仅支持 PDF、DOCX、TXT 或 Markdown 文件')
-        return value
+        try:
+            return validate_document_upload(value)
+        except DocumentExtractionError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
     def validate_project(self, value):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
         if not user or not user.is_authenticated:
             raise serializers.ValidationError('必须登录后上传需求文档')
-        if user.is_staff or user.is_superuser or value.owner_id == user.id or value.members.filter(pk=user.pk).exists():
+        if user_can_write_project(user, value):
             return value
-        raise serializers.ValidationError('无权使用该项目')
+        raise PermissionDenied('无权写入该项目')
 
     def create(self, validated_data):
         user = self.context['request'].user

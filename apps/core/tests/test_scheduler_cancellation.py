@@ -184,7 +184,7 @@ def test_ui_cancellation_stops_before_next_step(engine):
         if lost['value']:
             raise ScheduleClaimLost('UI claim lost')
 
-    executor = TestExecutor(object(), engine=engine, cancel_check=check)
+    executor = TestExecutor(object(), engine=engine, cancel_check=check, base_url='')
     step = Mock()
 
     def first_action(*args):
@@ -207,7 +207,7 @@ def test_ui_step_rejects_cancelled_scope_before_browser_calls(engine):
     from apps.ui_automation.test_executor import TestExecutor
 
     check = Mock(side_effect=ScheduleClaimLost('lost before action'))
-    executor = TestExecutor(object(), engine=engine, cancel_check=check)
+    executor = TestExecutor(object(), engine=engine, cancel_check=check, base_url='')
     page = Mock()
     executor.current_page = page
     with pytest.raises(ScheduleClaimLost):
@@ -251,7 +251,7 @@ def test_ui_runner_propagates_cancellation_and_closes_reused_browser():
         if state['lost']:
             raise ScheduleClaimLost('lost during UI suite')
 
-    executor = TestExecutor(object(), engine='selenium', cancel_check=check)
+    executor = TestExecutor(object(), engine='selenium', cancel_check=check, base_url='')
     driver = Mock()
 
     def run_suite():

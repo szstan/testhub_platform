@@ -1,8 +1,8 @@
 from datetime import datetime, time, timedelta
 from unittest.mock import patch
 
-from django.urls import reverse
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase

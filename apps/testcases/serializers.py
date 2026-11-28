@@ -1,8 +1,7 @@
 from rest_framework import serializers
-from django.db.models import Q
-from apps.projects.models import Project
+from apps.projects.access import user_can_write_project
 from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
-from apps.users.serializers import UserSerializer
+from apps.users.serializers import UserDirectorySerializer
 from apps.versions.serializers import VersionSimpleSerializer
 from .sync import TestCaseSyncError, _resolve_secret_alias
 
@@ -12,14 +11,14 @@ class TestCaseStepSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class TestCaseAttachmentSerializer(serializers.ModelSerializer):
-    uploaded_by = UserSerializer(read_only=True)
+    uploaded_by = UserDirectorySerializer(read_only=True)
     
     class Meta:
         model = TestCaseAttachment
         fields = '__all__'
 
 class TestCaseCommentSerializer(serializers.ModelSerializer):
-    author = UserSerializer(read_only=True)
+    author = UserDirectorySerializer(read_only=True)
     
     class Meta:
         model = TestCaseComment
@@ -30,10 +29,10 @@ class ProjectSimpleSerializer(serializers.Serializer):
     name = serializers.CharField()
 
 class TestCaseSerializer(serializers.ModelSerializer):
-    author = UserSerializer(read_only=True)
-    assignee = UserSerializer(read_only=True)
+    author = UserDirectorySerializer(read_only=True)
+    assignee = UserDirectorySerializer(read_only=True)
     project = ProjectSimpleSerializer(read_only=True)
-    versions = VersionSimpleSerializer(many=True, read_only=True)
+    versions = serializers.SerializerMethodField()
     step_details = TestCaseStepSerializer(many=True, read_only=True)
     attachments = TestCaseAttachmentSerializer(many=True, read_only=True)
     comments = TestCaseCommentSerializer(many=True, read_only=True)
@@ -42,6 +41,10 @@ class TestCaseSerializer(serializers.ModelSerializer):
         model = TestCase
         fields = '__all__'
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_versions(self, obj):
+        versions = obj.versions.filter(projects__id=obj.project_id).distinct()
+        return VersionSimpleSerializer(versions, many=True, context=self.context).data
 
 class TestCaseListSerializer(serializers.ModelSerializer):
     author = serializers.SerializerMethodField()
@@ -68,12 +71,15 @@ class TestCaseListSerializer(serializers.ModelSerializer):
         return {'id': obj.project.id, 'name': obj.project.name} if obj.project else None
     
     def get_versions(self, obj):
-        return [{'id': v.id, 'name': v.name, 'is_baseline': v.is_baseline} for v in obj.versions.all()]
+        return [
+            {'id': version.id, 'name': version.name, 'is_baseline': version.is_baseline}
+            for version in obj.versions.filter(projects__id=obj.project_id).distinct()
+        ]
 
 class TestCaseCreateSerializer(serializers.ModelSerializer):
     project_id = serializers.IntegerField(required=False, allow_null=True, help_text="项目ID，可选")
     version_ids = serializers.ListField(
-        child=serializers.IntegerField(), 
+        child=serializers.IntegerField(min_value=1),
         required=False, 
         allow_empty=True,
         help_text="关联版本ID列表"
@@ -82,7 +88,7 @@ class TestCaseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = TestCase
         fields = [
-            'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
+            'id', 'title', 'external_ref', 'description', 'preconditions', 'steps', 'expected_result',
             'priority', 'test_type', 'tags', 'project_id', 'version_ids'
         ]
     
@@ -108,7 +114,7 @@ class TestCaseCreateSerializer(serializers.ModelSerializer):
 class TestCaseUpdateSerializer(serializers.ModelSerializer):
     project_id = serializers.IntegerField(required=False, allow_null=True, help_text="项目ID，可选")
     version_ids = serializers.ListField(
-        child=serializers.IntegerField(), 
+        child=serializers.IntegerField(min_value=1),
         required=False, 
         allow_empty=True,
         help_text="关联版本ID列表"
@@ -170,22 +176,24 @@ class TestCaseImportRecordDetailSerializer(TestCaseImportRecordListSerializer):
 
 
 class TestCaseSyncProfileSerializer(serializers.ModelSerializer):
-    created_by = UserSerializer(read_only=True)
+    created_by = UserDirectorySerializer(read_only=True)
     secret_configured = serializers.SerializerMethodField()
 
     class Meta:
         model = TestCaseSyncProfile
         fields = '__all__'
-        read_only_fields = ('id', 'created_by', 'last_commit_sha', 'last_sync_at', 'created_at', 'updated_at', 'secret_configured')
+        read_only_fields = (
+            'id', 'created_by', 'last_commit_sha', 'last_sync_at', 'created_at',
+            'updated_at', 'secret_configured', 'sync_status', 'sync_task_id',
+            'sync_result', 'sync_error',
+        )
         extra_kwargs = {'token_env_ref': {'write_only': True}}
 
     def validate_project(self, value):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
-        if not user or not user.is_authenticated or not Project.objects.filter(
-            pk=value.pk,
-        ).filter(Q(owner=user) | Q(members=user)).exists():
-            raise serializers.ValidationError('项目不存在或无权限')
+        if not user or not getattr(user, 'is_authenticated', False) or not user_can_write_project(user, value):
+            raise serializers.ValidationError('项目不存在或无写入权限')
         return value
 
     def validate_token_env_ref(self, value):

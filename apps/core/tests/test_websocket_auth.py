@@ -78,7 +78,7 @@ def test_ticket_middleware_invalid_ticket_overrides_session_user():
     assert isinstance(captured[0]['user'], AnonymousUser)
 
 
-def test_ticket_middleware_preserves_session_without_ticket():
+def test_ticket_middleware_requires_ticket_despite_authenticated_session():
     user = User.objects.create_user(username='ws-session-preserved', password='pass')
     captured = []
 
@@ -89,7 +89,58 @@ def test_ticket_middleware_preserves_session_without_ticket():
     scope = {'type': 'websocket', 'path': '/ws/perf-testing/executions/25/', 'user': user}
     asyncio.run(middleware(scope, None, None))
 
-    assert captured[0]['user'] == user
+    assert isinstance(captured[0]['user'], AnonymousUser)
+
+
+@pytest.mark.parametrize('origin', [b'https://hostile.example.test', b'https://sibling.example.test', None])
+def test_asgi_rejects_untrusted_or_missing_origin_before_consuming_ticket(monkeypatch, origin):
+    from channels.security.websocket import OriginValidator
+    from channels.testing import WebsocketCommunicator
+    from backend.asgi import application
+
+    websocket_app = application.application_mapping['websocket']
+    assert isinstance(websocket_app, OriginValidator)
+    monkeypatch.setattr(websocket_app, 'allowed_origins', ['https://app.example.test'])
+    user = User.objects.create_user(username='ws-origin-owner')
+    path = '/ws/app-automation/executions/999/'
+    ticket, _ = issue_websocket_ticket(user=user, path=path)
+
+    async def connect():
+        headers = [] if origin is None else [(b'origin', origin)]
+        socket = WebsocketCommunicator(application, path + '?' + urlencode({'ticket': ticket}), headers=headers)
+        connected, _ = await socket.connect()
+        assert not connected
+        await socket.disconnect()
+
+    asyncio.run(connect())
+    assert consume_websocket_ticket(ticket, path) == user
+
+
+def test_asgi_accepts_trusted_origin_with_execution_ticket_once(monkeypatch):
+    from channels.testing import WebsocketCommunicator
+    from backend.asgi import application
+
+    monkeypatch.setattr(application.application_mapping['websocket'], 'allowed_origins', ['https://app.example.test'])
+    user = User.objects.create_user(username='ws-trusted-origin-owner')
+    project = AppProject.objects.create(name='Origin project', owner=user)
+    case = AppTestCase.objects.create(project=project, name='Origin case', created_by=user)
+    execution = AppTestExecution.objects.create(test_case=case, user=user)
+    path = f'/ws/app-automation/executions/{execution.pk}/'
+    ticket, _ = issue_websocket_ticket(user=user, path=path)
+
+    async def connect():
+        socket = WebsocketCommunicator(
+            application, path + '?' + urlencode({'ticket': ticket}),
+            headers=[(b'origin', b'https://app.example.test')],
+        )
+        connected, _ = await socket.connect()
+        assert connected
+        snapshot = await socket.receive_json_from()
+        assert snapshot['execution_id'] == execution.pk
+        await socket.disconnect()
+
+    asyncio.run(connect())
+    assert consume_websocket_ticket(ticket, path) is None
 
 
 def test_websocket_ticket_endpoint_requires_execution_access():

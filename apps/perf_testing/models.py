@@ -540,6 +540,10 @@ class PerfScheduledTask(models.Model):
     fail_count = models.IntegerField(default=0, verbose_name='失败次数', db_comment='失败次数')
     notify_channels = models.JSONField(default=list, blank=True, verbose_name='通知渠道',
                                        db_comment='通知渠道ID列表(复用monitor.NotificationChannel)')
+    notify_channels_set_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='configured_perf_notification_tasks', verbose_name='通知渠道配置人',
+        db_comment='最后配置通知渠道的用户(发送时复核所有权)')
     notify_on = models.CharField(max_length=20, choices=NOTIFY_ON_CHOICES, default='ON_SLA_FAIL',
                                  verbose_name='通知时机', db_comment='通知时机')
     last_error = models.TextField(blank=True, verbose_name='最后错误', db_comment='最后一次错误信息')
@@ -719,3 +723,17 @@ class PerfComparisonReport(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class PerfExecutionAdmission(models.Model):
+    """Database row used to serialize capacity reservations across workers."""
+
+    key = models.CharField(max_length=40, primary_key=True, default='global', editable=False,
+                           db_comment='全局压测准入锁键')
+    generation = models.PositiveBigIntegerField(default=0, db_comment='SQLite 写锁版本')
+
+    class Meta:
+        db_table = 'perf_execution_admission'
+        db_table_comment = '压测执行准入锁'
+        verbose_name = '压测执行准入锁'
+        verbose_name_plural = '压测执行准入锁'

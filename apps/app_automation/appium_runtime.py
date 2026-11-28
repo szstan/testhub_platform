@@ -6,12 +6,17 @@ import base64
 import binascii
 import ipaddress
 import json
+import math
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from io import BytesIO
 from urllib.parse import urlsplit
 
+import anyio
+import httpx
+from asgiref.sync import async_to_sync
 from django.conf import settings
 
 from .constants import NATIVE_ELEMENT_STRATEGIES
@@ -22,6 +27,7 @@ _ALLOWED_ENDPOINT_PATHS = {"", "/", "/wd/hub"}
 _MAX_TREE_BYTES = 2 * 1024 * 1024
 _MAX_TREE_NODES = 10_000
 _MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024
+_MAX_HTTP_RESPONSE_BYTES = 24 * 1024 * 1024
 _DEFAULT_SYSTEM_PORT_BASE = 8200
 _DEFAULT_COMMAND_TIMEOUT = 15
 _DEFAULT_NEW_SESSION_TIMEOUT = 45
@@ -55,6 +61,7 @@ class AppiumClientBindings:
     options_type: type
     client_config_type: type
     by: object
+    connection_type: object = None
 
 
 def _load_client() -> AppiumClientBindings:
@@ -64,11 +71,14 @@ def _load_client() -> AppiumClientBindings:
         from appium.options.android import UiAutomator2Options
         from appium.webdriver.client_config import AppiumClientConfig
         from appium.webdriver.common.appiumby import AppiumBy
+        from appium.webdriver.appium_connection import AppiumConnection
     except ImportError:
         raise AppiumClientUnavailable(
             "Appium support is not installed on this worker"
         ) from None
-    return AppiumClientBindings(webdriver, UiAutomator2Options, AppiumClientConfig, AppiumBy)
+    return AppiumClientBindings(
+        webdriver, UiAutomator2Options, AppiumClientConfig, AppiumBy, AppiumConnection,
+    )
 
 
 def _configured_endpoints():
@@ -202,22 +212,116 @@ def _client_config(bindings, endpoint, timeout):
     )
 
 
+def _bounded_connection(bindings, endpoint, client_config, *, deadline=None, cleanup_deadline=None):
+    connection_type = getattr(bindings, 'connection_type', None)
+    if not isinstance(connection_type, type):
+        raise AppiumClientUnavailable('Appium bounded transport is unavailable')
+    origin = urlsplit(validate_loopback_endpoint(endpoint))
+
+    class DeadlineConnection(connection_type):
+        def _request(self, method, url, body=None):
+            target = urlsplit(url)
+            prefix = origin.path.rstrip('/') + '/'
+            if (
+                (target.scheme.lower(), target.netloc.lower())
+                != (origin.scheme.lower(), origin.netloc.lower())
+                or not target.path.startswith(prefix)
+                or target.fragment
+            ):
+                raise AppiumConfigurationError('Appium request target changed')
+            relative_parts = target.path[len(prefix):].strip('/').split('/')
+            closing_session = method == 'DELETE' and len(relative_parts) == 2 and relative_parts[0] == 'session'
+            headers = self.get_remote_connection_headers(target, self._client_config.keep_alive)
+            get_auth = getattr(self._client_config, 'get_auth_header', None)
+            if callable(get_auth):
+                headers.update(get_auth() or {})
+            if method not in ('POST', 'PUT'):
+                body = None
+
+            async def request():
+                now = time.monotonic()
+                timeout = _command_timeout() if closing_session else float(client_config.timeout)
+                # Cleanup has its own budget even after a case deadline expires.
+                request_deadline = cleanup_deadline if closing_session else deadline
+                if request_deadline is not None:
+                    timeout = min(timeout, request_deadline - now)
+                if timeout <= 0:
+                    raise AppiumOutcomeUnknown('Appium operation deadline exceeded')
+                # This cancels a pending headers/body read even if bytes keep
+                # arriving. SDK/urllib3 socket timeouts alone only bound idle IO.
+                with anyio.fail_after(timeout):
+                    async with httpx.AsyncClient(
+                        timeout=timeout, trust_env=False, follow_redirects=False,
+                    ) as client:
+                        async with client.stream(method, url, content=body, headers=headers) as response:
+                            chunks = []
+                            size = 0
+                            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                                size += len(chunk)
+                                if size > _MAX_HTTP_RESPONSE_BYTES:
+                                    raise AppiumOutcomeUnknown('Appium response exceeds its size budget')
+                                chunks.append(chunk)
+                            return response.status_code, response.headers, b''.join(chunks)
+
+            try:
+                status, response_headers, raw = async_to_sync(request)()
+                text = raw.decode('utf-8')
+                if status == 401:
+                    return {'status': status, 'value': 'Authorization Required'}
+                if status >= 400:
+                    # Preserve Selenium's error-handler input so a trusted
+                    # InvalidSessionIdException still proves a closed session.
+                    return {'status': status, 'value': text.strip()}
+                if 300 <= status < 400:
+                    raise AppiumOutcomeUnknown('Appium redirects are not permitted')
+                if response_headers.get('Content-Type', '').startswith('image/png'):
+                    return {'status': 0, 'value': text}
+                try:
+                    result = json.loads(text.strip())
+                except ValueError:
+                    return {'status': 0 if 200 <= status < 300 else 13, 'value': text.strip()}
+                if not isinstance(result, dict):
+                    raise AppiumOutcomeUnknown('Appium returned an invalid response')
+                result.setdefault('value', None)
+                return result
+            except AppiumRuntimeError:
+                raise
+            except Exception:
+                raise AppiumOutcomeUnknown('Appium request outcome could not be confirmed') from None
+
+    return DeadlineConnection(client_config=client_config)
+
+
 def _trust_driver_close_target(driver, endpoint, session_id):
     driver._testhub_appium_endpoint = validate_loopback_endpoint(endpoint)
     driver._testhub_appium_session_id = session_id
     return driver
 
 
-def create_driver(device, package, *, system_port=None, auto_launch=True):
+def create_driver(device, package, *, system_port=None, auto_launch=True, deadline=None):
     """Create a new remote session; transport errors are conservatively uncertain."""
     endpoint = endpoint_for_device(device)
     capabilities = build_capabilities(device, package, system_port, auto_launch=auto_launch)
     bindings = _load_client()
     options = _options(bindings, capabilities)
-    client_config = _client_config(bindings, endpoint, _new_session_timeout())
+    timeout = _new_session_timeout()
+    if deadline is not None:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise AppiumInputError('Appium execution deadline is invalid')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AppiumInputError('Appium execution deadline has expired')
+        timeout = min(timeout, remaining)
+    client_config = _client_config(bindings, endpoint, timeout)
+    if deadline is not None:
+        # Retrying a new-session POST can both exceed the case budget and create
+        # a second remote session after an uncertain response.
+        client_config.init_args_for_pool_manager = {
+            'init_args_for_pool_manager': {'retries': False},
+        }
     try:
         driver = bindings.webdriver.Remote(
-            command_executor=endpoint,
+            command_executor=_bounded_connection(bindings, endpoint, client_config, deadline=deadline),
             options=options,
             client_config=client_config,
         )
@@ -232,8 +336,8 @@ def create_driver(device, package, *, system_port=None, auto_launch=True):
     return _trust_driver_close_target(driver, endpoint, driver.session_id)
 
 
-def attach_driver(session):
-    """Attach a fresh client to a persisted remote session without creating another."""
+def attach_driver(session, *, deadline=None):
+    """Attach to a persisted session with an optional absolute cleanup deadline."""
     endpoint = validate_loopback_endpoint(session.appium_endpoint)
     session_id = session.remote_session_id
     if not isinstance(session_id, str) or not session_id or len(session_id) > 255:
@@ -241,7 +345,15 @@ def attach_driver(session):
     capabilities = build_capabilities(session.device, session.package, session.system_port)
     bindings = _load_client()
     options = _options(bindings, capabilities)
-    client_config = _client_config(bindings, endpoint, _command_timeout())
+    timeout = _command_timeout()
+    if deadline is not None:
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise AppiumInputError('Appium cleanup deadline is invalid')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AppiumOutcomeUnknown('Appium cleanup deadline has expired')
+        timeout = min(timeout, remaining)
+    client_config = _client_config(bindings, endpoint, timeout)
     existing_caps = dict(getattr(session, "capabilities", None) or capabilities)
 
     class AttachedDriver(bindings.webdriver.Remote):
@@ -251,7 +363,9 @@ def attach_driver(session):
 
     try:
         driver = AttachedDriver(
-            command_executor=endpoint,
+            command_executor=_bounded_connection(
+                bindings, endpoint, client_config, deadline=deadline, cleanup_deadline=deadline,
+            ),
             options=options,
             client_config=client_config,
         )

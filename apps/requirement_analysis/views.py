@@ -13,6 +13,7 @@ from drf_spectacular.utils import extend_schema
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.exceptions import PermissionDenied, NotFound, ValidationError
 
 
 class PassThroughRenderer(BaseRenderer):
@@ -45,10 +46,16 @@ from .serializers import (
     AIModelConfigSerializer, PromptConfigSerializer, TestCaseGenerationTaskSerializer,
     TestCaseGenerationSubmissionLookupSerializer, GenerationConfigSerializer
 )
-from .services import RequirementAnalysisService, DocumentProcessor, DocumentExtractionError
+from .services import (
+    RequirementAnalysisService, DocumentProcessor, DocumentExtractionError,
+    cleanup_document_file_if_unreferenced,
+)
 from .ai_contracts import parse_generated_cases
 from .adoption import AdoptionError, adopt_cases, select_case_ids
-from .permissions import GenerationTaskPermission, user_can_write_project
+from .permissions import (
+    GenerationTaskPermission, user_can_write_project, user_can_write_document,
+)
+from .document_limits import document_limit
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,11 @@ def _accessible_documents(user):
         | models.Q(project__owner=user)
         | models.Q(project__members=user)
     ).distinct()
+
+
+def _require_document_write(user, document):
+    if not user_can_write_document(user, document):
+        raise PermissionDenied('无权修改该需求文档或发起分析')
 
 
 def _project_for_user(user, project_id):
@@ -141,111 +153,112 @@ class RequirementDocumentViewSet(viewsets.ModelViewSet):
             return DocumentUploadSerializer
         return RequirementDocumentSerializer
 
+    def _get_locked_document(self):
+        visible = self.get_object()
+        document = RequirementDocument.objects.select_for_update().filter(pk=visible.pk).first()
+        if document is None:
+            raise NotFound()
+        return document
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        document = self._get_locked_document()
+        serializer = self.get_serializer(document, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
+    def perform_update(self, serializer):
+        _require_document_write(self.request.user, serializer.instance)
+        serializer.save()
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        document = RequirementDocument.objects.select_for_update().filter(pk=instance.pk).first()
+        if document is None:
+            return
+        _require_document_write(self.request.user, document)
+        active_analysis = AnalysisTask.objects.select_for_update().filter(
+            document_id=document.pk,
+            task_type='requirement_analysis',
+            status__in=['pending', 'running'],
+        ).exists()
+        if document.status == 'analyzing' or active_analysis:
+            raise ValidationError({'detail': '正在分析的需求文档不能删除'})
+
+        file_name = document.file.name if document.file else ''
+        storage = document.file.storage if file_name else None
+        document.delete()
+        if file_name:
+            transaction.on_commit(
+                lambda name=file_name, file_storage=storage: cleanup_document_file_if_unreferenced(
+                    name, storage=file_storage,
+                )
+            )
+
     @action(detail=True, methods=['post'])
     def analyze(self, request, pk=None):
-        """分析需求文档"""
-        document = self.get_object()
-
-        if document.status == 'analyzing':
-            return Response(
-                {'error': '文档正在分析中，请稍后再试'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if document.status == 'analyzed':
-            return Response(
-                {'message': '文档已经分析过了', 'analysis_id': document.analysis.id},
-                status=status.HTTP_200_OK
-            )
+        """Claim the current document version before dispatching its analysis."""
+        with transaction.atomic():
+            document = self._get_locked_document()
+            _require_document_write(request.user, document)
+            existing_analysis = RequirementAnalysis.objects.filter(document_id=document.pk).first()
+            if existing_analysis is not None:
+                if document.status != 'analyzed':
+                    document.status = 'analyzed'
+                    document.save(update_fields=['status', 'updated_at'])
+                return Response(
+                    {'message': '文档已经分析过了', 'analysis_id': existing_analysis.pk},
+                    status=status.HTTP_200_OK,
+                )
+            analysis_task = AnalysisTask.objects.select_for_update().filter(
+                document=document, task_type='requirement_analysis',
+                status__in=['pending', 'running'],
+            ).first()
+            if document.status == 'analyzing' and analysis_task is None:
+                return Response(
+                    {'error': '文档正在分析中，请稍后再试'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if analysis_task is None:
+                analysis_task = RequirementAnalysisService.create_analysis_task(document, 'requirement_analysis')
+            document.status = 'analyzing'
+            document.save(update_fields=['status', 'updated_at'])
+            if analysis_task.status == 'running':
+                return Response({'error': '文档正在分析中，请稍后再试'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # 更新状态为分析中
-            document.status = 'analyzing'
-            document.save()
-
-            # 异步执行分析
-            def run_analysis():
-                try:
-                    # 简化版同步分析
-                    # 提取文档文本
-                    if not document.extracted_text:
-                        document.extracted_text = DocumentProcessor.extract_text(document)
-                        document.save()
-
-                    # 创建模拟分析结果
-                    analysis_result = {
-                        'analysis_report': f'对文档"{document.title}"的需求分析已完成。\n\n文档内容：{document.extracted_text[:200]}...\n\n识别到若干功能性需求。',
-                        'requirements_count': 2,
-                        'requirements': [
-                            {
-                                'requirement_id': 'REQ001',
-                                'requirement_name': '基础功能需求',
-                                'requirement_type': 'functional',
-                                'module': '核心模块',
-                                'requirement_level': 'high',
-                                'estimated_hours': 8,
-                                'description': '基于文档内容识别的功能需求',
-                                'acceptance_criteria': '功能正常运行，满足用户需求'
-                            },
-                            {
-                                'requirement_id': 'REQ002',
-                                'requirement_name': '用户交互需求',
-                                'requirement_type': 'usability',
-                                'module': '前端模块',
-                                'requirement_level': 'medium',
-                                'estimated_hours': 6,
-                                'description': '用户界面和交互相关需求',
-                                'acceptance_criteria': '界面友好，操作简单'
-                            }
-                        ]
-                    }
-
-                    # 创建分析记录
-                    analysis = RequirementAnalysis.objects.create(
-                        document=document,
-                        analysis_report=analysis_result['analysis_report'],
-                        requirements_count=analysis_result['requirements_count'],
-                        analysis_time=2.5
-                    )
-
-                    # 保存需求数据
-                    for req_data in analysis_result['requirements']:
-                        BusinessRequirement.objects.create(
-                            analysis=analysis,
-                            **req_data
-                        )
-
-                    # 更新文档状态
-                    document.status = 'analyzed'
-                    document.save()
-
-                    return analysis
-
-                except Exception as e:
-                    logger.error(f"分析失败: {e}")
-                    document.status = 'failed'
-                    document.save()
-                    raise e
-
-            from .tasks import process_requirement_document_task
-            task = process_requirement_document_task.delay(document.id)
+            from .tasks import dispatch_analysis_task
+            task = dispatch_analysis_task(analysis_task.pk)
+            if task is None:
+                current = AnalysisTask.objects.filter(pk=analysis_task.pk).first()
+                if current is not None and current.status in {'running', 'completed'}:
+                    return Response({
+                        'message': '分析任务已提交',
+                        'document_id': document.id,
+                        'task_id': current.task_id,
+                        'analysis_task_id': current.task_id,
+                    }, status=status.HTTP_202_ACCEPTED)
+                raise RuntimeError('分析任务当前不可发布')
             return Response({
                 'message': '分析任务已提交',
                 'document_id': document.id,
                 'task_id': task.id,
+                'analysis_task_id': analysis_task.task_id,
             }, status=status.HTTP_202_ACCEPTED)
-
-        except Exception as e:
-            logger.error(f"分析文档时出错: {e}")
+        except Exception as exc:
+            logger.error('文档分析派发失败: document_id=%s error_type=%s', document.pk, type(exc).__name__)
             return Response(
-                {'error': f'分析失败: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {'error': '分析任务提交失败，请稍后重试', 'analysis_task_id': analysis_task.task_id},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
     @action(detail=True, methods=['get'])
+    @transaction.atomic
     def extract_text(self, request, pk=None):
         """提取文档文本"""
-        document = self.get_object()
+        document = self._get_locked_document()
 
         try:
             cached_text = document.extracted_text.strip()
@@ -257,16 +270,21 @@ class RequirementDocumentViewSet(viewsets.ModelViewSet):
                 cached_text = ''
 
             if not cached_text:
+                _require_document_write(request.user, document)
                 text = DocumentProcessor.extract_text(document)
                 document.extracted_text = text
-                document.save()
+                document.save(update_fields=['extracted_text', 'updated_at'])
                 cached_text = text
+            if len(cached_text) > document_limit('REQUIREMENT_DOCUMENT_MAX_TEXT_CHARS'):
+                raise DocumentExtractionError('提取文本长度超过限制')
 
             return Response({
                 'extracted_text': cached_text,
                 'text_length': len(cached_text)
             }, status=status.HTTP_200_OK)
 
+        except PermissionDenied:
+            raise
         except DocumentExtractionError as exc:
             logger.info('文档文本提取失败: document_id=%s error=%s', document.pk, exc)
             return Response(
@@ -484,9 +502,13 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
                 try:
                     if len(requirement_ids) > 200:
                         raise ValueError('一次最多生成 200 个需求的测试用例')
-                    requirements = self.get_queryset().filter(id__in=requirement_ids)
-                    if requirements.count() != len(set(requirement_ids)):
-                        raise PermissionError('部分需求不存在或无权限')
+                    requirements = list(self.get_queryset().filter(
+                        id__in=requirement_ids,
+                    ).select_related('analysis__document__project'))
+                    if len(requirements) != len(set(requirement_ids)):
+                        raise PermissionDenied('部分需求不存在或无权限')
+                    for requirement in requirements:
+                        _require_document_write(request.user, requirement.analysis.document)
                     generated_test_cases = []
                     for requirement in requirements:
                         existing_count = GeneratedTestCase.objects.filter(requirement=requirement).count()
@@ -521,6 +543,8 @@ class BusinessRequirementViewSet(viewsets.ReadOnlyModelViewSet):
                 'test_cases': test_case_serializer.data
             }, status=status.HTTP_201_CREATED)
 
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"生成测试用例时出错: {e}")
             return Response(
@@ -576,6 +600,12 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    def perform_update(self, serializer):
+        _require_document_write(
+            self.request.user, serializer.instance.requirement.analysis.document,
+        )
+        serializer.save()
+
     @action(detail=False, methods=['post'])
     def review_test_cases(self, request):
         """评审测试用例"""
@@ -591,10 +621,14 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
             def run_review():
                 try:
                     # 获取测试用例
-                    test_cases = GeneratedTestCase.objects.filter(
+                    test_cases = list(GeneratedTestCase.objects.filter(
                         id__in=test_case_ids,
                         requirement__analysis__document__in=_accessible_documents(request.user),
-                    )
+                    ).select_related('requirement__analysis__document__project'))
+                    if len(test_cases) != len(set(test_case_ids)):
+                        raise PermissionDenied('部分测试用例不存在或无权限')
+                    for test_case in test_cases:
+                        _require_document_write(request.user, test_case.requirement.analysis.document)
 
                     passed_count = 0
                     reviewed_cases = []
@@ -643,6 +677,8 @@ class GeneratedTestCaseViewSet(viewsets.ModelViewSet):
                 'review_result': review_result
             }, status=status.HTTP_200_OK)
 
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"评审测试用例时出错: {e}")
             return Response(
@@ -688,11 +724,13 @@ def upload_and_analyze(request):
         if not serializer.is_valid():
             return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
-        document = serializer.save()
-
-        # 立即开始分析
-        document.status = 'analyzing'
-        document.save()
+        with transaction.atomic():
+            document = serializer.save()
+            document.status = 'analyzing'
+            document.save(update_fields=['status', 'updated_at'])
+            analysis_task = RequirementAnalysisService.create_analysis_task(
+                document, 'requirement_analysis',
+            )
 
         def run_analysis():
             try:
@@ -757,14 +795,19 @@ def upload_and_analyze(request):
                 document.save()
                 raise e
 
-        from .tasks import process_requirement_document_task
-        task = process_requirement_document_task.delay(document.id)
+        from .tasks import dispatch_analysis_task
+        task = dispatch_analysis_task(analysis_task.pk)
+        if task is None:
+            raise RuntimeError('分析任务当前不可发布')
         return Response({
             'message': '上传成功，分析任务已提交',
             'document_id': document.id,
             'task_id': task.id,
+            'analysis_task_id': analysis_task.task_id,
         }, status=status.HTTP_202_ACCEPTED)
 
+    except PermissionDenied:
+        raise
     except Exception as e:
         logger.error(f"上传并分析失败: {e}")
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -779,23 +822,28 @@ def analyze_text(request):
         description = request.data.get('description')
         project_id = request.data.get('project')
 
-        if not title or not description:
+        if not isinstance(title, str) or not title.strip() or not isinstance(description, str) or not description.strip():
             return Response({'error': '需求标题和描述不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(title) > 200 or len(description) > document_limit('REQUIREMENT_DOCUMENT_MAX_TEXT_CHARS'):
+            return Response({'error': '需求标题或文本长度超过限制'}, status=status.HTTP_400_BAD_REQUEST)
 
         project = _project_for_user(request.user, project_id)
-        if project_id and project is None:
-            return Response({'error': '无权使用该项目'}, status=status.HTTP_403_FORBIDDEN)
+        if project_id and (project is None or not user_can_write_project(request.user, project)):
+            return Response({'error': '无权写入该项目'}, status=status.HTTP_403_FORBIDDEN)
 
-        # 创建一个虚拟的需求文档记录
-        document = RequirementDocument.objects.create(
-            title=title,
-            file='',
-            document_type='txt',
-            status='analyzing',
-            uploaded_by=request.user,
-            project=project,
-            extracted_text=description
-        )
+        with transaction.atomic():
+            document = RequirementDocument.objects.create(
+                title=title,
+                file='',
+                document_type='txt',
+                status='analyzing',
+                uploaded_by=request.user,
+                project=project,
+                extracted_text=description
+            )
+            analysis_task = RequirementAnalysisService.create_analysis_task(
+                document, 'requirement_analysis',
+            )
 
         # 立即开始分析
         def run_analysis():
@@ -896,12 +944,15 @@ def analyze_text(request):
                 document.save()
                 raise e
 
-        from .tasks import process_requirement_document_task
-        task = process_requirement_document_task.delay(document.id)
+        from .tasks import dispatch_analysis_task
+        task = dispatch_analysis_task(analysis_task.pk)
+        if task is None:
+            raise RuntimeError('分析任务当前不可发布')
         return Response({
             'message': '文本分析任务已提交',
             'document_id': document.id,
             'task_id': task.id,
+            'analysis_task_id': analysis_task.task_id,
         }, status=status.HTTP_202_ACCEPTED)
 
     except Exception as e:

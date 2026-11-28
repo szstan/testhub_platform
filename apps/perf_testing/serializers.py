@@ -7,6 +7,7 @@
 """
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework import serializers
 
 from .models import (PerfBaseline, PerfDataFile, PerfExecution, PerfMetricSample,
@@ -680,14 +681,55 @@ class PerfScheduledTaskSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'scheduled_time': '单次执行时间不能为空'})
         return attrs
 
+    def validate_notify_channels(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('通知渠道必须是 ID 数组')
+
+        channel_ids = []
+        for item in value:
+            if isinstance(item, bool):
+                raise serializers.ValidationError('通知渠道 ID 必须是正整数')
+            if isinstance(item, int):
+                channel_id = item
+            elif isinstance(item, str) and item.isdecimal():
+                channel_id = int(item)
+            else:
+                raise serializers.ValidationError('通知渠道 ID 必须是正整数')
+            if channel_id <= 0:
+                raise serializers.ValidationError('通知渠道 ID 必须是正整数')
+            if channel_id not in channel_ids:
+                channel_ids.append(channel_id)
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        from apps.monitor.access import is_monitor_admin
+        from apps.monitor.models import NotificationChannel
+
+        is_admin = is_monitor_admin(user)
+        channels = NotificationChannel.objects.filter(pk__in=channel_ids)
+        if not is_admin:
+            channels = channels.filter(created_by_id=getattr(user, 'pk', None))
+        found_ids = set(channels.values_list('pk', flat=True))
+        if found_ids != set(channel_ids):
+            raise serializers.ValidationError('通知渠道不存在或无权使用')
+        return channel_ids
+
+    @transaction.atomic
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        request = self.context.get('request')
+        if 'notify_channels' in validated_data:
+            validated_data['notify_channels_set_by'] = request.user
+        validated_data['created_by'] = request.user
         task = super().create(validated_data)
         task.calculate_next_run()
         task.save(update_fields=['next_run_at'])
         return task
 
+    @transaction.atomic
     def update(self, instance, validated_data):
+        request = self.context.get('request')
+        if 'notify_channels' in validated_data:
+            validated_data['notify_channels_set_by'] = request.user
         task = super().update(instance, validated_data)
         task.calculate_next_run()
         task.save(update_fields=['next_run_at'])

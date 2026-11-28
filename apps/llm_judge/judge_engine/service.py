@@ -74,7 +74,10 @@ class JudgeService:
 
     # ---------- 核心评分 ----------
 
-    def score_single(self, req_data: dict, batch=None, created_by=None) -> dict:
+    def score_single(
+        self, req_data: dict, batch=None, created_by=None, *,
+        request_id: Optional[str] = None, checkpoint_callback=None,
+    ) -> dict:
         """单条评分（完整流程）。
 
         Args:
@@ -88,10 +91,11 @@ class JudgeService:
         t0 = time.time()
 
         # 1. 构造 ScoreRequest
-        rubric_id = req_data.get('rubric') or self.rubric_id
-        if rubric_id and rubric_id != self.rubric_id:
+        rubric_id = req_data['rubric'] if 'rubric' in req_data else self.rubric_id
+        if rubric_id != self.rubric_id:
             self.rubric_id = rubric_id
             self._rubric = None
+            self._rubric_orm_id = None
             self._rules = None
 
         gt_raw = req_data.get('ground_truth')
@@ -146,53 +150,64 @@ class JudgeService:
             set_cached(cache_key, _verdict_to_dict(verdict), timeout=cfg.cache_timeout)
 
         # 6. 合成最终分
-        request_id = _gen_request_id(req.question, req.answer)
+        request_id = request_id or _gen_request_id(req.question, req.answer)
         response = build_response(
             self.rubric, req, rule_report, verdict, request_id=request_id,
         )
 
         latency_ms = int((time.time() - t0) * 1000)
 
-        # 7. 落库 JudgeRecord
-        record = self._save_record(
+        # 7. Persist records directly, or let batch workers checkpoint the record
+        # together with the case result and progress under their ownership fence.
+        record_fields = self._record_fields(
             req, response, verdict, rule_report,
             request_id, latency_ms, cache_hit, batch, created_by,
         )
+        if checkpoint_callback:
+            result = _response_to_dict(response, None, latency_ms=latency_ms, cache_hit=cache_hit)
+            record = checkpoint_callback(record_fields, result)
+            if record is not None:
+                result['record_id'] = record.id
+            return result
+
+        record = self._save_record(record_fields)
 
         # 8. 返回 dict（给 View/前端用）
         return _response_to_dict(response, record, latency_ms=latency_ms, cache_hit=cache_hit)
 
-    def _save_record(self, req, response, verdict, rule_report,
-                     request_id, latency_ms, cache_hit, batch, created_by):
+    def _record_fields(self, req, response, verdict, rule_report,
+                       request_id, latency_ms, cache_hit, batch, created_by):
+        return {
+            'request_id': request_id,
+            'rubric_id': self._rubric_orm_id,
+            'batch': batch,
+            'question': req.question,
+            'answer': req.answer,
+            'ground_truth': req.ground_truth.model_dump() if req.ground_truth else None,
+            'context': req.context,
+            'auto_gt': req.auto_gt,
+            'rule_score': response.rule_report.rule_score,
+            'llm_score': response.llm_score,
+            'final_score': response.final_score,
+            'overall_label': response.overall_label,
+            'gate_zone': response.gate_zone,
+            'blocked': response.gate_zone == 'red',
+            'rule_findings': [f.model_dump() for f in rule_report.findings],
+            'vetoed': rule_report.vetoed,
+            'veto_reasons': rule_report.veto_reasons,
+            'verdict_reasoning': verdict.reasoning,
+            'verdict_dimensions': [d.model_dump() for d in verdict.dimensions],
+            'judge_model': verdict.model,
+            'latency_ms': latency_ms,
+            'cache_hit': cache_hit,
+            'created_by': created_by,
+        }
+
+    def _save_record(self, record_fields):
         """落库 JudgeRecord。"""
         try:
             from apps.llm_judge.models import JudgeRecord
-            record = JudgeRecord.objects.create(
-                request_id=request_id,
-                rubric_id=self._rubric_orm_id,
-                batch=batch,
-                question=req.question,
-                answer=req.answer,
-                ground_truth=req.ground_truth.model_dump() if req.ground_truth else None,
-                context=req.context,
-                auto_gt=req.auto_gt,
-                rule_score=response.rule_report.rule_score,
-                llm_score=response.llm_score,
-                final_score=response.final_score,
-                overall_label=response.overall_label,
-                gate_zone=response.gate_zone,
-                blocked=(response.gate_zone == 'red'),
-                rule_findings=[f.model_dump() for f in rule_report.findings],
-                vetoed=rule_report.vetoed,
-                veto_reasons=rule_report.veto_reasons,
-                verdict_reasoning=verdict.reasoning,
-                verdict_dimensions=[d.model_dump() for d in verdict.dimensions],
-                judge_model=verdict.model,
-                latency_ms=latency_ms,
-                cache_hit=cache_hit,
-                created_by=created_by,
-            )
-            return record
+            return JudgeRecord.objects.create(**record_fields)
         except Exception as e:
             logger.exception('[JudgeService] JudgeRecord 落库失败')
             raise RuntimeError('评分结果审计落库失败') from e

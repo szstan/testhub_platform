@@ -38,6 +38,15 @@ apps/*/migrations/*
 # Additive execution/device/report migrations are part of the reviewable change.
 !apps/users/migrations/0003_userphonewritelock.py
 !apps/defects/migrations/0003_preserve_transition_operator_history.py
+!apps/defects/migrations/0004_defect_code_sequence.py
+!apps/analytics/migrations/0001_initial.py
+!apps/monitor/migrations/0007_monitortarget_scheduler_lease_expires_at_and_more.py
+!apps/testcases/migrations/0005_testcasesyncprofile_sync_status.py
+!apps/llm_judge/migrations/0002_judgebatchcaseresult_and_more.py
+!apps/llm_judge/migrations/0003_judgebatch_worker_attempt_token.py
+!apps/llm_judge/migrations/0004_judgebatch_worker_heartbeat_at_and_more.py
+!apps/requirement_analysis/migrations/0006_analysistask_retry_attempt.py
+!apps/requirement_analysis/migrations/0007_analysistask_worker_lease_dispatch.py
 !apps/executions/migrations/
 !apps/executions/migrations/*.py
 !apps/api_testing/migrations/

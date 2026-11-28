@@ -663,7 +663,7 @@ def test_executor_natural_cancel_reaps_appium_session(appium_device, tmp_path, m
 
 
 @pytest.mark.django_db(transaction=True)
-def test_executor_forced_cancel_keeps_appium_recovery_fence(appium_device, tmp_path, monkeypatch):
+def test_executor_forced_cancel_closes_session_after_confirmed_process_reap(appium_device, tmp_path, monkeypatch):
     process = Mock()
     process.wait.side_effect = [
         subprocess.TimeoutExpired(cmd='pytest', timeout=4),
@@ -678,7 +678,28 @@ def test_executor_forced_cancel_keeps_appium_recovery_fence(appium_device, tmp_p
     session = AppiumSession.objects.get(execution=execution)
     execution.refresh_from_db()
     appium_device.device.refresh_from_db()
+    assert session.status == 'closed'
+    assert session.remote_session_id == ''
+    assert execution.device_action_pending is False
+    assert appium_device.device.device_action_pending is False
+    process.terminate.assert_called_once_with()
+    driver.quit.assert_called_once_with()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_executor_forced_cancel_retains_fence_when_remote_close_is_unknown(appium_device, tmp_path, monkeypatch):
+    process = Mock()
+    process.wait.side_effect = [subprocess.TimeoutExpired(cmd='pytest', timeout=4), -15]
+    process.poll.return_value = None
+    execution, driver, _process = _run_appium_executor_with_cancel(
+        appium_device, tmp_path, monkeypatch, process,
+        quit_error=appium_execution.AppiumOutcomeUnknown('remote close timed out'),
+    )
+    session = AppiumSession.objects.get(execution=execution)
+    execution.refresh_from_db()
+    appium_device.device.refresh_from_db()
     assert session.status == 'unknown'
+    assert session.failure_code == 'appium_close_outcome_unknown'
     assert execution.device_action_pending is True
     assert appium_device.device.device_action_pending is True
     process.terminate.assert_called_once_with()

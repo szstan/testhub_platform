@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import close_old_connections, connection
+from django.db import OperationalError, close_old_connections, connection, transaction
 from django.utils import timezone
 
 from apps.core.network import UnsafeOutboundURL, validate_outbound_url
@@ -539,9 +539,50 @@ def spawn_execution(execution):
     return execution
 
 
+def lock_execution_admission():
+    """Acquire the shared DB admission lock before checking or changing script use."""
+    from django.db.models import F
+    from ..models import PerfExecutionAdmission
+
+    if connection.vendor == 'sqlite':
+        # SQLite ignores SELECT FOR UPDATE; a write acquires its database lock
+        # before the capacity count, serializing concurrent admission attempts.
+        updated = PerfExecutionAdmission.objects.filter(pk='global').update(
+            generation=F('generation') + 1)
+        if not updated:
+            PerfExecutionAdmission.objects.get_or_create(pk='global')
+            updated = PerfExecutionAdmission.objects.filter(pk='global').update(
+                generation=F('generation') + 1)
+        if not updated:
+            raise RuntimeError('压测执行准入锁尚未初始化，请先执行数据库迁移')
+    else:
+        PerfExecutionAdmission.objects.select_for_update().get(pk='global')
+
+
+def _refresh_script_ref(scenario, script_ref):
+    """Rebuild a resolved script reference from its current database file row."""
+    if script_ref is None:
+        raw = None
+    elif not script_ref:
+        return {}, None
+    elif isinstance(script_ref, dict):
+        raw = dict(script_ref)
+        if raw.get('mode') == 'script':
+            raw = {'mode': 'script', 'data_file_id': raw.get('data_file_id')}
+    else:
+        raw = script_ref
+
+    # Keep path validation in the same place as the API boundary; callers never
+    # get to preserve a path resolved before acquiring the admission lock.
+    from ..views import resolve_script_ref
+    return resolve_script_ref(scenario, raw)
+
+
 def start_execution(scenario, user=None, trigger_type='MANUAL', skip_preflight=False,
                     scheduled_task=None, script_ref=None):
-    """一步到位：校验 → 建记录 → 起进程。返回 (execution, preflight_result)。"""
+    """Validate and reserve one execution under the shared admission lock."""
+    from ..models import PerfExecution, PerfScenario
+
     if user is not None and getattr(user, 'is_authenticated', False):
         from ..access import can_access_project
         if not can_access_project(user, scenario.project):
@@ -551,13 +592,69 @@ def start_execution(scenario, user=None, trigger_type='MANUAL', skip_preflight=F
                 'warnings': [],
                 'estimated': {},
             }
-    # script_ref 必须一起带进 preflight，否则脚本模式会被按场景规则误判为"没有步骤"
-    check = preflight(scenario, script_ref=script_ref)
-    if not skip_preflight and not check['passed']:
-        return None, check
-    execution = create_execution(scenario, user=user, trigger_type=trigger_type,
-                                 scheduled_task=scheduled_task, script_ref=script_ref)
-    spawn_execution(execution)
+
+    for attempt in range(100):
+        try:
+            with transaction.atomic():
+                lock_execution_admission()
+                current_scenario = PerfScenario.objects.select_related('project').get(pk=scenario.pk)
+                if user is not None and getattr(user, 'is_authenticated', False):
+                    from ..access import can_access_project
+                    if not can_access_project(user, current_scenario.project):
+                        return None, {
+                            'passed': False,
+                            'errors': ['无权执行该性能项目'],
+                            'warnings': [],
+                            'estimated': {},
+                        }
+
+                current_script_ref, script_error = _refresh_script_ref(
+                    current_scenario, script_ref)
+                if script_error:
+                    check = {
+                        'passed': False,
+                        'errors': [script_error],
+                        'warnings': [],
+                        'estimated': {},
+                    }
+                    return None, check
+
+                # Both the uploaded path and its JMeter preflight must reflect
+                # the data-file row protected by this same admission lock.
+                check = preflight(current_scenario, script_ref=current_script_ref)
+                if not skip_preflight and not check['passed']:
+                    return None, check
+
+                running = PerfExecution.objects.filter(
+                    status__in=PerfExecution.ACTIVE_STATUSES).count()
+                errors = []
+                if running >= settings.PERF_MAX_CONCURRENT_EXECUTIONS:
+                    errors.append(f'当前已有 {running} 个压测在执行，'
+                                  f'达到平台上限 {settings.PERF_MAX_CONCURRENT_EXECUTIONS}，请稍后再试')
+                if current_scenario.has_active_execution():
+                    errors.append('该场景已有正在执行的压测任务，请先停止或等待其结束')
+                if errors:
+                    check = dict(check)
+                    check['passed'] = False
+                    check['errors'] = list(check.get('errors') or []) + errors
+                    return None, check
+
+                # The committed PENDING execution is the reservation visible to
+                # all workers. Spawn after commit so the child can read its row.
+                execution = create_execution(
+                    current_scenario, user=user, trigger_type=trigger_type,
+                    scheduled_task=scheduled_task, script_ref=current_script_ref)
+            break
+        except OperationalError as exc:
+            locked_sqlite = connection.vendor == 'sqlite' and 'locked' in str(exc).lower()
+            if not locked_sqlite or attempt == 99:
+                raise
+            # Shared-cache SQLite reports SQLITE_LOCKED immediately rather than
+            # honoring busy_timeout. Retry the whole transaction after its peer
+            # commits; the next count then observes that peer's reservation.
+            time.sleep(0.01)
+
+    transaction.on_commit(lambda: spawn_execution(execution))
     return execution, check
 
 
@@ -1406,6 +1503,8 @@ def _notify_if_needed(execution):
         return
     try:
         from .notifier import send_execution_notification
-        send_execution_notification(execution, task.notify_channels)
+        send_execution_notification(
+            execution, task.notify_channels,
+            owner_id=task.notify_channels_set_by_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning('压测通知发送失败: %s', exc)

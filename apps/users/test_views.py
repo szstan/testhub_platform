@@ -1,11 +1,13 @@
+import json
+import re
+
+from django.contrib.auth import get_user_model
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-import json
-import re
-from django.contrib.auth import get_user_model
 
 User = get_user_model()
+__test__ = False
 
 
 def _validate_phone(phone):
@@ -30,32 +32,43 @@ def test_register(request):
                 'error': '用户名已存在'
             }, status=400)
 
-        # 手机号校验
-        phone = data.get('phone', '').strip()
+        # 手机号及短信证明必须有界且绑定为同一个号码。
+        phone = data.get('phone')
+        if not isinstance(phone, str) or len(phone) > 11:
+            return JsonResponse({'success': False, 'error': '手机号格式不正确'}, status=400)
+        phone = phone.strip()
         valid, error = _validate_phone(phone)
         if not valid:
             return JsonResponse({'success': False, 'error': error}, status=400)
 
-        # 检查手机号是否已被注册
-        if User.objects.filter(phone=phone).exists():
-            return JsonResponse({
-                'success': False,
-                'error': '该手机号已被注册'
-            }, status=400)
-
-        # 短信验证码校验
-        verify_code = data.get('verify_code', '').strip()
-        verify_code_token = data.get('verify_code_token', '').strip()
-        if not verify_code or not verify_code_token:
+        verify_code = data.get('verify_code')
+        verify_code_token = data.get('verify_code_token')
+        if (
+            not isinstance(verify_code, str)
+            or not verify_code
+            or len(verify_code) > 6
+            or not isinstance(verify_code_token, str)
+            or not verify_code_token
+            or len(verify_code_token) > 128
+        ):
             return JsonResponse({
                 'success': False,
                 'error': '请输入短信验证码'
             }, status=400)
 
         from .sms import validate_verify_code
-        valid, error = validate_verify_code(phone, verify_code_token, verify_code)
+        valid, error = validate_verify_code(
+            phone, verify_code_token.strip(), verify_code.strip()
+        )
         if not valid:
             return JsonResponse({'success': False, 'error': error}, status=400)
+
+        # Check phone availability only after phone ownership has been proven.
+        if User.objects.filter(phone=phone).exists():
+            return JsonResponse({
+                'success': False,
+                'error': '该手机号已被注册'
+            }, status=400)
 
         # 创建用户
         from .registration import DuplicatePhoneError, create_user_with_unique_phone

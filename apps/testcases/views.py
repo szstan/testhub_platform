@@ -1,12 +1,16 @@
 from django.http import FileResponse
+from datetime import timedelta
 from rest_framework import generics, permissions, status, pagination
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
-from django.db import models
+from django.db import models, transaction
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.views import APIView
+from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied, NotFound
+import uuid
 
 from .models import TestCase, TestCaseStep, TestCaseAttachment, TestCaseComment, TestCaseImportRecord, TestCaseSyncProfile
 from .serializers import (
@@ -14,10 +18,12 @@ from .serializers import (
     TestCaseImportRecordListSerializer, TestCaseImportRecordDetailSerializer, TestCaseSyncProfileSerializer
 )
 from apps.projects.models import Project
+from apps.projects.access import user_can_write_project, writable_projects
+from apps.versions.models import Version
 from .services import TestCaseImportTemplateService, TestCaseExcelImportService
-from .tasks import import_testcases_from_excel
-from apps.executions.models import TestCaseRevision
-from .sync import TestCaseSyncError, sync_profile
+from .tasks import import_testcases_from_excel, sync_testcase_profile
+from .revisions import record_test_case_revision
+from .sync import MAX_SYNC_SECONDS
 
 class TestCasePagination(pagination.PageNumberPagination):
     page_size = 10
@@ -42,9 +48,25 @@ def _ensure_external_ref_available(project, external_ref, *, exclude_id=None):
 
 
 def get_user_accessible_projects(user):
+    if user.is_staff or user.is_superuser:
+        return Project.objects.all()
     return Project.objects.filter(
         models.Q(owner=user) | models.Q(members=user)
     ).distinct()
+
+
+def _validate_versions_for_project(project, version_ids):
+    if version_ids is None:
+        return
+    requested_ids = set(version_ids)
+    if len(requested_ids) != len(version_ids):
+        raise ValidationError({'version_ids': '版本不能重复'})
+    allowed_ids = set(
+        Version.objects.filter(projects=project, pk__in=requested_ids)
+        .values_list('pk', flat=True)
+    )
+    if allowed_ids != requested_ids:
+        raise ValidationError({'version_ids': '所有版本必须属于所选项目'})
 
 class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -58,8 +80,8 @@ class TestCaseSyncProfileListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         project = serializer.validated_data.get('project')
-        if not get_user_accessible_projects(self.request.user).filter(pk=project.pk).exists():
-            raise ValidationError({'project': '项目不存在或无权限'})
+        if not user_can_write_project(self.request.user, project):
+            raise PermissionDenied('没有权限在该项目配置同步')
         serializer.save(created_by=self.request.user)
 
 
@@ -72,35 +94,94 @@ class TestCaseSyncProfileDetailView(generics.RetrieveUpdateDestroyAPIView):
             project__in=get_user_accessible_projects(self.request.user)
         ).select_related('project', 'created_by')
 
+    def _lock_profile(self, profile_id):
+        current = TestCaseSyncProfile.objects.select_for_update().filter(pk=profile_id).first()
+        if current is None:
+            raise NotFound()
+        return current
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        visible = self.get_object()
+        current = self._lock_profile(visible.pk)
+        serializer = self.get_serializer(current, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
     def perform_update(self, serializer):
-        serializer.save(project=serializer.instance.project)
+        profile = serializer.instance
+        if not user_can_write_project(self.request.user, profile.project):
+            raise PermissionDenied('没有权限修改该项目的同步配置')
+        if profile.sync_status in {'queued', 'running'}:
+            raise ValidationError('同步任务进行中，请等待完成或重新提交过期任务')
+        serializer.save(project=profile.project)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        current = self._lock_profile(instance.pk)
+        if not user_can_write_project(self.request.user, current.project):
+            raise PermissionDenied('没有权限删除该项目的同步配置')
+        if current.sync_status in {'queued', 'running'}:
+            raise ValidationError('同步任务进行中，不能删除同步配置')
+        current.delete()
 
 
 class TestCaseSyncProfileSyncView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk):
-        profile = TestCaseSyncProfile.objects.filter(
-            pk=pk,
-            project__in=get_user_accessible_projects(request.user),
-        ).first()
-        if profile is None:
-            return Response({'error': '同步配置不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
-        try:
-            summary = sync_profile(profile)
-        except TestCaseSyncError as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            profile = TestCaseSyncProfile.objects.select_for_update().filter(
+                pk=pk,
+                project__in=get_user_accessible_projects(request.user),
+            ).select_related('project').first()
+            if profile is None:
+                return Response({'error': '同步配置不存在或无权限'}, status=status.HTTP_404_NOT_FOUND)
+            if not user_can_write_project(request.user, profile.project):
+                raise PermissionDenied('没有权限同步该项目')
+            stale_before = timezone.now() - timedelta(seconds=MAX_SYNC_SECONDS + 60)
+            if profile.sync_status in {'queued', 'running'} and profile.updated_at > stale_before:
+                return Response({
+                    'profile_id': profile.pk,
+                    'task_id': profile.sync_task_id,
+                    'status': profile.sync_status,
+                }, status=status.HTTP_202_ACCEPTED)
+
+            task_id = uuid.uuid4().hex
+            profile.sync_status = 'queued'
+            profile.sync_task_id = task_id
+            profile.sync_result = {}
+            profile.sync_error = ''
+            profile.save(update_fields=[
+                'sync_status', 'sync_task_id', 'sync_result', 'sync_error', 'updated_at',
+            ])
+
+        publish_errors = []
+
+        def publish():
+            try:
+                sync_testcase_profile.apply_async(
+                    args=(profile.pk, request.user.pk), task_id=task_id, retry=False,
+                )
+            except Exception:
+                TestCaseSyncProfile.objects.filter(
+                    pk=profile.pk, sync_task_id=task_id, sync_status='queued',
+                ).update(
+                    sync_status='failed', sync_error='同步任务提交失败', updated_at=timezone.now(),
+                )
+                publish_errors.append(True)
+
+        transaction.on_commit(publish)
+        if publish_errors:
+            return Response({'error': '同步任务提交失败'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
         return Response({
-            'profile_id': summary.profile_id,
-            'provider': summary.provider,
-            'commit': summary.commit,
-            'files': summary.files,
-            'created': summary.created,
-            'updated': summary.updated,
-            'skipped': summary.skipped,
-            'conflicts': summary.conflicts,
-            'warnings': summary.warnings,
-        })
+            'profile_id': profile.pk,
+            'task_id': task_id,
+            'status': 'queued',
+        }, status=status.HTTP_202_ACCEPTED)
 
 
 class TestCaseListCreateView(generics.ListCreateAPIView):
@@ -142,66 +223,27 @@ class TestCaseListCreateView(generics.ListCreateAPIView):
     
     def perform_create(self, serializer):
         user = self.request.user
-        project_id = self.request.data.get('project_id')
-        
-        # 获取用户有权限的项目
-        accessible_projects = self.get_user_accessible_projects(user)
-        
-        if project_id:
-            # 检查指定的项目是否存在且用户有权限
-            try:
-                project = accessible_projects.get(id=project_id)
-            except Project.DoesNotExist:
-                # 如果指定项目不存在或无权限，使用第一个可访问的项目
-                project = accessible_projects.first()
-                if not project:
-                    # 如果用户没有任何项目，创建默认项目
+        project_id = serializer.validated_data.get('project_id')
+        with transaction.atomic():
+            if project_id is not None:
+                project = writable_projects(user).filter(pk=project_id).first()
+                if project is None:
+                    raise PermissionDenied('项目不存在或无写入权限')
+            else:
+                project = writable_projects(user).order_by('pk').first()
+                if project is None:
                     project = Project.objects.create(
-                        name="默认项目",
-                        owner=user,
-                        description='系统自动创建的默认项目'
+                        name='默认项目', owner=user, description='系统自动创建的默认项目'
                     )
-        else:
-            # 没有指定项目，使用第一个可访问的项目
-            project = accessible_projects.first()
-            if not project:
-                # 如果用户没有任何项目，创建默认项目
-                project = Project.objects.create(
-                    name="默认项目",
-                    owner=user,
-                    description='系统自动创建的默认项目'
-                )
-        
-        external_ref = serializer.validated_data.get('external_ref')
-        _ensure_external_ref_available(project, external_ref)
-        testcase = serializer.save(author=user, project=project)
-        _record_test_case_revision(testcase, user)
 
-def _test_case_snapshot(test_case):
-    return {
-        'title': test_case.title,
-        'external_ref': test_case.external_ref,
-        'description': test_case.description,
-        'preconditions': test_case.preconditions,
-        'steps': test_case.steps,
-        'expected_result': test_case.expected_result,
-        'priority': test_case.priority,
-        'status': test_case.status,
-        'test_type': test_case.test_type,
-        'tags': test_case.tags,
-        'project_id': test_case.project_id,
-        'version_ids': list(test_case.versions.values_list('id', flat=True)),
-    }
-
-
-def _record_test_case_revision(test_case, user):
-    latest = TestCaseRevision.objects.filter(test_case=test_case).order_by('-revision').values_list('revision', flat=True).first() or 0
-    TestCaseRevision.objects.create(
-        test_case=test_case,
-        revision=latest + 1,
-        snapshot=_test_case_snapshot(test_case),
-        changed_by=user,
-    )
+            _validate_versions_for_project(
+                project, serializer.validated_data.get('version_ids', []),
+            )
+            _ensure_external_ref_available(
+                project, serializer.validated_data.get('external_ref'),
+            )
+            testcase = serializer.save(author=user, project=project)
+            record_test_case_revision(testcase, user)
 
 
 class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -230,20 +272,46 @@ class TestCaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     
     def perform_update(self, serializer):
         user = self.request.user
-        project_id = self.request.data.get('project_id')
-        project = serializer.instance.project
+        with transaction.atomic():
+            testcase = TestCase.objects.select_for_update().filter(
+                pk=serializer.instance.pk,
+            ).first()
+            if testcase is None:
+                raise NotFound()
+            serializer.instance = testcase
+            if not user_can_write_project(user, testcase.project):
+                raise PermissionDenied('没有权限修改该项目的测试用例')
 
-        if project_id:
-            accessible_projects = self.get_user_accessible_projects(user)
-            try:
-                project = accessible_projects.get(id=project_id)
-            except Project.DoesNotExist:
-                project = serializer.instance.project
+            project_id = serializer.validated_data.get('project_id')
+            project = testcase.project
+            if project_id is not None:
+                project = writable_projects(user).filter(pk=project_id).first()
+                if project is None:
+                    raise PermissionDenied('目标项目不存在或无写入权限')
+            if not user_can_write_project(user, project):
+                raise PermissionDenied('没有权限修改目标项目')
+            if project.pk != testcase.project_id and (
+                testcase.testsuitecase_set.exists() or testcase.test_runs.exists()
+            ):
+                raise ValidationError({
+                    'project_id': '测试用例已关联测试套件或执行记录，不能移动项目',
+                })
 
-        external_ref = serializer.validated_data.get('external_ref', serializer.instance.external_ref)
-        _ensure_external_ref_available(project, external_ref, exclude_id=serializer.instance.pk)
-        updated = serializer.save(project=project)
-        _record_test_case_revision(updated, user)
+            version_ids = serializer.validated_data.get('version_ids')
+            if project.pk != testcase.project_id and version_ids is None:
+                version_ids = list(testcase.versions.values_list('pk', flat=True))
+            _validate_versions_for_project(project, version_ids)
+            external_ref = serializer.validated_data.get('external_ref', testcase.external_ref)
+            _ensure_external_ref_available(
+                project, external_ref, exclude_id=testcase.pk,
+            )
+            updated = serializer.save(project=project)
+            record_test_case_revision(updated, user)
+
+    def perform_destroy(self, instance):
+        if not user_can_write_project(self.request.user, instance.project):
+            raise PermissionDenied('没有权限删除该项目的测试用例')
+        instance.delete()
 
 
 class TestCaseImportTemplateDownloadView(APIView):
@@ -283,11 +351,10 @@ class TestCaseImportRecordListCreateView(generics.ListCreateAPIView):
         if not import_file.name.lower().endswith('.xlsx'):
             return Response({'error': '仅支持 .xlsx 格式文件'}, status=status.HTTP_400_BAD_REQUEST)
 
-        accessible_projects = get_user_accessible_projects(request.user)
-        try:
-            project = accessible_projects.get(id=project_id)
-        except Project.DoesNotExist:
-            return Response({'error': '项目不存在或无权限访问'}, status=status.HTTP_403_FORBIDDEN)
+        accessible_projects = writable_projects(request.user)
+        project = accessible_projects.filter(pk=project_id).first()
+        if project is None:
+            return Response({'error': '项目不存在或无写入权限'}, status=status.HTTP_403_FORBIDDEN)
 
         record = TestCaseImportRecord.objects.create(
             import_no=TestCaseExcelImportService.generate_import_no(),

@@ -45,6 +45,9 @@ export default {
     // API Testing
     dashboard: 'Dashboard',
     interfaceManagement: 'Interface Management',
+    apiTestCases: 'Test Case Management',
+    apiCaseCreate: 'Write Test Case',
+    apiCaseEdit: 'Edit Test Case',
     openapiContracts: 'OpenAPI Contracts',
     automationTesting: 'Automation Testing',
     requestHistory: 'Request History',

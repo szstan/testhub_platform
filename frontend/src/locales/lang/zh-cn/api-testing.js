@@ -1,7 +1,10 @@
 /**
  * API Testing 模块中文翻译
  */
+import cases from './api-test-cases.js'
+
 export default {
+  cases,
   // 导航菜单
   nav: {
     title: '接口测试',
@@ -78,7 +81,7 @@ export default {
       },
       automationTesting: {
         title: '自动化测试',
-        description: '可视化的测试流程编排，支持断言、提取变量、前置/后置脚本等高级功能。'
+        description: '按用例编排多步骤接口测试，支持参数覆盖、响应断言和变量提取。'
       },
       scheduledTask: {
         title: '定时任务',

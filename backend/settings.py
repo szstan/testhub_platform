@@ -415,6 +415,10 @@ CSRF_TRUSTED_ORIGINS = config(
     cast=parse_csv,
 )
 
+# WebSocket handshakes require a ticket and an explicit trusted browser origin.
+# Empty uses configured CORS origins plus concrete ALLOWED_HOSTS in ASGI.
+WEBSOCKET_ALLOWED_ORIGINS = config('WEBSOCKET_ALLOWED_ORIGINS', default='', cast=parse_csv)
+
 # Spectacular Settings
 SPECTACULAR_SETTINGS = {
     'TITLE': 'TestHub API',
@@ -471,6 +475,9 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_TASK_TRACK_STARTED = config('CELERY_TASK_TRACK_STARTED', default=True, cast=bool)
 CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
+API_CASE_EXECUTION_STALE_AFTER_SECONDS = config(
+    'API_CASE_EXECUTION_STALE_AFTER_SECONDS', default=300, cast=int,
+)
 # The documented Celery worker consumes the built-in ``celery`` queue.
 REQUIREMENT_GENERATION_QUEUE = 'celery'
 REQUIREMENT_GENERATION_WRITER_TIMEOUT_SECONDS = config(

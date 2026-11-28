@@ -25,7 +25,6 @@ from apps.users.serializers import (
     UserSerializer,
 )
 
-
 pytestmark = pytest.mark.django_db
 
 User = get_user_model()
@@ -157,7 +156,10 @@ def test_phone_registration_rechecks_duplicate_phone_after_serializer_validation
         )
         return create_user_with_unique_phone(**user_data)
 
-    with patch('apps.users.serializers.create_user_with_unique_phone', side_effect=create_racing_user):
+    with (
+        patch('apps.users.views.validate_verify_code', return_value=(True, '')),
+        patch('apps.users.serializers.create_user_with_unique_phone', side_effect=create_racing_user),
+    ):
         response = api_client.post(
             '/api/auth/register/',
             {
@@ -166,6 +168,8 @@ def test_phone_registration_rechecks_duplicate_phone_after_serializer_validation
                 'password': 'StrongPass123',
                 'password_confirm': 'StrongPass123',
                 'phone': phone,
+                'verify_code': '123456',
+                'verify_code_token': 'verified-token',
             },
             format='json',
         )
@@ -286,6 +290,7 @@ def test_phone_change_and_clear_release_numbers_for_registration():
 
 def test_registration_hashes_password_before_acquiring_phone_lock():
     from django.contrib.auth.hashers import make_password as real_make_password
+
     from apps.users import registration
 
     events = []
@@ -423,17 +428,20 @@ def test_public_registration_rejects_duplicate_phone_and_allows_legacy_blank_val
     User.objects.create_user(username='legacy-null-phone', password='StrongPass123', phone=None)
     User.objects.create_user(username='legacy-blank-phone', password='StrongPass123', phone='')
 
-    duplicate = api_client.post(
-        '/api/auth/register/',
-        {
-            'username': 'duplicate-phone-user',
-            'email': 'duplicate@example.com',
-            'password': 'StrongPass123',
-            'password_confirm': 'StrongPass123',
-            'phone': active_user.phone,
-        },
-        format='json',
-    )
+    with patch('apps.users.views.validate_verify_code', return_value=(True, '')):
+        duplicate = api_client.post(
+            '/api/auth/register/',
+            {
+                'username': 'duplicate-phone-user',
+                'email': 'duplicate@example.com',
+                'password': 'StrongPass123',
+                'password_confirm': 'StrongPass123',
+                'phone': active_user.phone,
+                'verify_code': '123456',
+                'verify_code_token': 'verified-token',
+            },
+            format='json',
+        )
     assert duplicate.status_code == status.HTTP_400_BAD_REQUEST
     assert '该手机号已被注册' in str(duplicate.json())
     assert User.objects.filter(phone=active_user.phone).count() == 1
@@ -467,13 +475,18 @@ def test_admin_user_update_allows_unchanged_legacy_duplicate_phone():
     assert user.first_name == 'Updated'
 
 
-def test_legacy_duplicate_phone_is_rejected_by_sms_code_and_login(api_client):
+def test_legacy_duplicate_phone_is_not_disclosed_by_sms_code_and_login(api_client):
     phone = '13900139000'
     User.objects.create_user(username='legacy-phone-one', password='StrongPass123', phone=phone)
     User.objects.create_user(username='legacy-phone-two', password='StrongPass123', phone=phone)
 
-    with patch('apps.users.views.send_register_verify_code') as send_code:
-        send_response = api_client.post(
+    success_payload = {
+        'success': True,
+        'verify_code_token': 'token',
+        'message': '验证码已发送',
+    }
+    with patch('apps.users.views.send_register_verify_code', return_value=success_payload) as send_code:
+        registered_response = api_client.post(
             '/api/auth/send-register-code/',
             {
                 'phone': phone,
@@ -483,9 +496,19 @@ def test_legacy_duplicate_phone_is_rejected_by_sms_code_and_login(api_client):
             },
             format='json',
         )
-    assert send_response.status_code == status.HTTP_409_CONFLICT
-    assert '多个账号' in send_response.json()['error']
-    send_code.assert_not_called()
+        unknown_response = api_client.post(
+            '/api/auth/send-register-code/',
+            {
+                'phone': '13900139001',
+                'captcha_token': 'captcha-token',
+                'captcha_code': 'ABCD',
+                'mode': 'login',
+            },
+            format='json',
+        )
+    assert registered_response.status_code == unknown_response.status_code == status.HTTP_200_OK
+    assert registered_response.json() == unknown_response.json() == success_payload
+    assert send_code.call_count == 2
 
     with patch('apps.users.views.validate_verify_code', return_value=(True, '')):
         login_response = api_client.post(
@@ -681,6 +704,7 @@ def test_refresh_clears_cookie_when_refresh_user_no_longer_exists(api_client, ac
 @pytest.mark.parametrize('failure', ['missing', 'malformed', 'expired', 'blacklisted', 'inactive'])
 def test_refresh_failures_are_401_and_always_clear_cookie(api_client, active_user, failure):
     from datetime import timedelta
+
     from django.utils import timezone
     from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -706,6 +730,7 @@ def test_refresh_failures_are_401_and_always_clear_cookie(api_client, active_use
 @pytest.mark.parametrize('authorization', [None, 'Bearer invalid.jwt', 'expired', 'inactive'])
 def test_logout_clears_cookie_even_without_valid_access(api_client, active_user, authorization):
     from datetime import timedelta
+
     from django.utils import timezone
     from rest_framework_simplejwt.exceptions import TokenError
     from rest_framework_simplejwt.tokens import RefreshToken

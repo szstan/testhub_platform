@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from .models import Project, ProjectMember, ProjectEnvironment
-from apps.users.serializers import UserSerializer
+from apps.users.serializers import UserDirectorySerializer
 
 class ProjectSimpleSerializer(serializers.ModelSerializer):
     class Meta:
@@ -11,9 +11,10 @@ class ProjectEnvironmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectEnvironment
         fields = '__all__'
+        read_only_fields = ['project']
 
 class ProjectMemberSerializer(serializers.ModelSerializer):
-    user = UserSerializer(read_only=True)
+    user = UserDirectorySerializer(read_only=True)
     user_id = serializers.IntegerField(write_only=True)
     
     class Meta:
@@ -21,7 +22,7 @@ class ProjectMemberSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'user_id', 'role', 'joined_at']
 
 class ProjectSerializer(serializers.ModelSerializer):
-    owner = UserSerializer(read_only=True)
+    owner = UserDirectorySerializer(read_only=True)
     members = ProjectMemberSerializer(source='projectmember_set', many=True, read_only=True)
     environments = ProjectEnvironmentSerializer(many=True, read_only=True)
     

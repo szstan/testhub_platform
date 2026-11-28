@@ -49,3 +49,5 @@ class ElementType:
 
 ANDROID_PACKAGE_NAME_PATTERN = r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+'
 NATIVE_ELEMENT_STRATEGIES = ('id', 'accessibility_id')
+APP_TEST_CASE_MAX_TIMEOUT_SECONDS = 3600
+APP_API_REQUEST_MAX_TIMEOUT_SECONDS = 60.0

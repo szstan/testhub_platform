@@ -1,4 +1,4 @@
-"""Run durable API/UI/APP/performance dispatches and generation recovery.
+"""Run durable API/UI/APP/performance/monitor dispatches and generation recovery.
 
 The command is intentionally a poller only. Every due row is claimed with a
 DB-backed lease before any external/Celery work is started; no process-local
@@ -7,11 +7,13 @@ thread is used as the delivery mechanism.
 
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 import time
 
 from django.core.management.base import BaseCommand
 from django.db import close_old_connections, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.core.scheduler import ScheduleClaimLost, clear_claim, claim_due_task, load_claimed_task
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = '运行所有模块的定时任务调度器（API测试 + UI自动化 + APP自动化 + 性能测试 + 用例生成恢复）'
+    help = '运行所有模块的定时任务调度器（API测试 + UI自动化 + APP自动化 + 性能测试 + 监控检查 + 用例生成恢复）'
 
     def add_arguments(self, parser):
         parser.add_argument('--interval', type=int, default=60, help='检查间隔（秒），默认60秒')
@@ -36,7 +38,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS('=' * 60))
         self.stdout.write(self.style.SUCCESS('启动统一定时任务调度器'))
         self.stdout.write(self.style.SUCCESS(f'检查间隔: {interval}秒'))
-        self.stdout.write(self.style.SUCCESS('调度模块: API测试 + UI自动化 + APP自动化 + 性能测试 + 用例生成恢复'))
+        self.stdout.write(self.style.SUCCESS('调度模块: API测试 + UI自动化 + APP自动化 + 性能测试 + 监控检查 + 用例生成恢复'))
         self.stdout.write(self.style.SUCCESS('=' * 60))
 
         while True:
@@ -47,6 +49,11 @@ class Command(BaseCommand):
                 device_lease_recovery_count = self.reap_expired_app_device_leases()
                 retry_count = self.consume_retry_outbox()
                 generation_recovery_count = self.recover_stale_generation_tasks()
+                api_case_recovery_count = self.reconcile_stale_api_case_executions()
+                ui_submission_recovery_count = self.reconcile_pending_ui_submissions()
+                ui_worker_recovery_count = self.reconcile_stale_ui_executions()
+                analysis_recovery_count = self.reconcile_analysis_tasks()
+                judge_batch_recovery_count = self.reconcile_stale_judge_batches()
                 self.reconcile_execution_claims()
                 self.dispatch_pending_notifications()
                 self.reconcile_performance_callbacks()
@@ -55,14 +62,25 @@ class Command(BaseCommand):
                     self.schedule_ui_tasks(),
                     self.schedule_app_tasks(),
                     self.schedule_perf_tasks(),
+                    self.schedule_monitor_tasks(),
                 )
-                total_count = sum(counts) + retry_count + generation_recovery_count + device_lease_recovery_count
+                total_count = (
+                    sum(counts) + retry_count + generation_recovery_count
+                    + device_lease_recovery_count + api_case_recovery_count
+                    + ui_submission_recovery_count + ui_worker_recovery_count
+                    + analysis_recovery_count + judge_batch_recovery_count
+                )
                 if total_count:
                     self.stdout.write(self.style.SUCCESS(
                         f'✓ 本次调度执行了 {total_count} 个任务 '
-                        f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, '
+                        f'(API: {counts[0]}, UI: {counts[1]}, APP: {counts[2]}, 性能: {counts[3]}, 监控: {counts[4]}, '
                         f'device leases recovered: {device_lease_recovery_count}, '
-                        f'retry: {retry_count}, generation recovery: {generation_recovery_count})'))
+                        f'retry: {retry_count}, generation recovery: {generation_recovery_count}, '
+                        f'API case executions recovered: {api_case_recovery_count}, '
+                        f'UI submissions recovered: {ui_submission_recovery_count}, '
+                        f'UI workers recovered: {ui_worker_recovery_count}, '
+                        f'document analyses recovered: {analysis_recovery_count}, '
+                        f'judge batches recovered: {judge_batch_recovery_count})'))
                 else:
                     self.stdout.write('  没有需要执行的任务')
                 if run_once:
@@ -109,6 +127,61 @@ class Command(BaseCommand):
             return 0
         except Exception:  # noqa: BLE001 - optional reconciliation cannot stop dispatch
             logger.exception('execution claim reconciliation failed')
+            return 0
+
+    def reconcile_stale_api_case_executions(self):
+        try:
+            from apps.api_testing.case_tasks import reconcile_stale_api_case_executions
+
+            return reconcile_stale_api_case_executions(limit=100)
+        except ImportError:
+            return 0
+        except Exception:  # noqa: BLE001 - recovery cannot stop other scheduling
+            logger.exception('API case execution recovery failed')
+            return 0
+
+    def reconcile_pending_ui_submissions(self):
+        try:
+            from apps.ui_automation.workbench import reconcile_pending_submissions
+
+            return reconcile_pending_submissions(limit=20)
+        except ImportError:
+            return 0
+        except Exception:
+            logger.exception('UI pending submission recovery failed')
+            return 0
+
+    def reconcile_stale_ui_executions(self):
+        try:
+            from apps.ui_automation.workbench import reconcile_stale_workbench_executions
+
+            return reconcile_stale_workbench_executions(limit=20)
+        except ImportError:
+            return 0
+        except Exception:  # noqa: BLE001 - one recovery must not block other queues
+            logger.exception('UI worker recovery failed')
+            return 0
+
+    def reconcile_analysis_tasks(self):
+        try:
+            from apps.requirement_analysis.tasks import reconcile_analysis_tasks
+
+            return reconcile_analysis_tasks(limit=10)
+        except ImportError:
+            return 0
+        except Exception:  # noqa: BLE001 - one recovery must not block other queues
+            logger.exception('document analysis recovery failed')
+            return 0
+
+    def reconcile_stale_judge_batches(self):
+        try:
+            from apps.llm_judge.tasks import reconcile_stale_batches
+
+            return reconcile_stale_batches(limit=10)
+        except ImportError:
+            return 0
+        except Exception:
+            logger.exception('LLM judge stale batch recovery failed')
             return 0
 
     def dispatch_pending_notifications(self):
@@ -358,6 +431,44 @@ class Command(BaseCommand):
         except Exception as exc:  # noqa: BLE001
             logger.error('调度APP任务时出错: %s', exc, exc_info=True)
             self.stdout.write(self.style.ERROR(f'[APP] 调度失败: {exc}'))
+            return 0
+
+    def schedule_monitor_tasks(self):
+        """Poll due targets without performing probes in the scheduler process."""
+        try:
+            from apps.monitor.models import MonitorTarget
+            from apps.monitor.tasks import execute_monitor_check
+            from apps.monitor.utils.scheduler_heartbeat import set_scheduler_beat
+
+            set_scheduler_beat()
+            now = timezone.now()
+            target_ids = list(MonitorTarget.objects.filter(enabled=True).filter(
+                Q(next_check_at__isnull=True) | Q(next_check_at__lte=now),
+            ).filter(
+                Q(scheduler_lease_expires_at__isnull=True) | Q(scheduler_lease_expires_at__lte=now),
+            ).order_by('next_check_at', 'pk').values_list('pk', flat=True)[:100])
+            count = 0
+            lease_seconds = getattr(self, 'lease_seconds', 300)
+            for target_id in target_ids:
+                claim = claim_due_task(
+                    MonitorTarget, target_id, due_field='next_check_at',
+                    status_field='enabled', active_status=True, allow_null_due=True,
+                    lease_seconds=lease_seconds,
+                )
+                if claim is None:
+                    continue
+                try:
+                    execute_monitor_check.delay(target_id, claim.token, lease_seconds)
+                    count += 1
+                except Exception as exc:
+                    MonitorTarget.objects.filter(pk=target_id, scheduler_lease_token=claim.token).update(
+                        scheduler_lease_token='', scheduler_lease_expires_at=None,
+                        next_check_at=timezone.now() + timedelta(seconds=60),
+                    )
+                    logger.error('monitor dispatch failed: target_id=%s error_type=%s', target_id, type(exc).__name__)
+            return count
+        except Exception:
+            logger.exception('monitor schedule polling failed')
             return 0
 
     def schedule_perf_tasks(self):

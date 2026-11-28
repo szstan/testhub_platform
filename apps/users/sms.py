@@ -3,16 +3,19 @@
 复用 zhiqiong 项目的短信通道配置
 包含发送频率限制（同一手机号 60 秒内只能发一次）
 """
-import json
-import hmac
-import hashlib
 import base64
+import hashlib
+import hmac
+import json
+import re
+import secrets
 import uuid
-import time
 from datetime import datetime
 from urllib.parse import quote
+
 import requests
 from django.conf import settings
+
 from .redis_client import get_redis
 
 
@@ -93,9 +96,8 @@ SMS_RATE_LIMIT_TTL = 60      # 同一手机号 60 秒内只能发一次
 
 
 def _generate_verify_code():
-    """生成 6 位数字验证码"""
-    import random
-    return ''.join([str(random.randint(0, 9)) for _ in range(VERIFY_CODE_LENGTH)])
+    """Generate an unpredictable six-digit SMS verification code."""
+    return ''.join(str(secrets.randbelow(10)) for _ in range(VERIFY_CODE_LENGTH))
 
 
 def check_rate_limit(phone_number):
@@ -108,37 +110,67 @@ def check_rate_limit(phone_number):
     return True, 0
 
 
+def _reserve_rate_limit(phone_number):
+    """Atomically reserve the per-phone cooldown before sending an SMS."""
+    redis_client = get_redis()
+    key = f"sms:limit:{phone_number}"
+    if redis_client.set(key, '1', ex=SMS_RATE_LIMIT_TTL, nx=True):
+        return True, 0
+    return False, max(redis_client.ttl(key), 1)
+
+
+_VERIFY_CODE_CONSUME_LUA = """
+local stored_code = redis.call('GET', KEYS[1])
+if not stored_code then return -1 end
+local attempts = redis.call('INCR', KEYS[3])
+if attempts == 1 then
+    redis.call('EXPIRE', KEYS[3], ARGV[3])
+end
+if attempts > tonumber(ARGV[4]) then
+    redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+    return -4
+end
+local stored_phone = redis.call('GET', KEYS[2])
+if not stored_phone then return -1 end
+if stored_code ~= ARGV[1] then return -2 end
+if stored_phone ~= ARGV[2] then return -3 end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+"""
+
+
 def send_register_verify_code(phone_number, captcha_token, captcha_code):
     """
-    发送注册验证码流程：
-    1. 校验图形验证码
-    2. 校验发送频率限制
-    3. 生成 6 位验证码存 Redis
-    4. 调用阿里云发送短信
+    Validate the captcha, apply the phone cooldown, and send a registration/login code.
     """
     from apps.users.captcha import validate_captcha
 
-    # 校验图形验证码
+    if (
+        not isinstance(phone_number, str)
+        or not re.fullmatch(r'1[3-9]\d{9}', phone_number)
+        or not isinstance(captcha_token, str)
+        or not captcha_token
+        or len(captcha_token) > 128
+        or not isinstance(captcha_code, str)
+        or not captcha_code
+        or len(captcha_code) > 16
+    ):
+        return {'success': False, 'error': '请求参数无效'}
+
     if not validate_captcha(captcha_token, captcha_code):
         return {'success': False, 'error': '图形验证码错误或已过期'}
 
-    # 校验发送频率
-    allowed, remaining = check_rate_limit(phone_number)
+    allowed, remaining = _reserve_rate_limit(phone_number)
     if not allowed:
         return {'success': False, 'error': f'发送过于频繁，请 {remaining} 秒后再试'}
 
-    # 生成验证码
     code = _generate_verify_code()
     token = str(uuid.uuid4())
 
-    # 存储到 Redis
     redis_client = get_redis()
     redis_client.setex(f"sms:verify_code:{token}", VERIFY_CODE_TTL, code)
-    redis_client.setex(f"sms:limit:{phone_number}", SMS_RATE_LIMIT_TTL, '1')
-    # 存储手机号，注册时需要校验手机号与验证码的对应关系
     redis_client.setex(f"sms:phone:{token}", VERIFY_CODE_TTL, phone_number)
 
-    # 发送短信
     success, result = send_sms(
         phone_number=phone_number,
         template_code=settings.SMS_REGISTER_TEMPLATE_CODE,
@@ -146,7 +178,6 @@ def send_register_verify_code(phone_number, captcha_token, captcha_code):
     )
 
     if not success:
-        # 发送失败时清理 Redis
         redis_client.delete(f"sms:verify_code:{token}")
         redis_client.delete(f"sms:limit:{phone_number}")
         redis_client.delete(f"sms:phone:{token}")
@@ -160,36 +191,35 @@ def send_register_verify_code(phone_number, captcha_token, captcha_code):
 
 
 def validate_verify_code(phone_number, verify_code_token, verify_code):
-    """校验短信验证码，返回 (valid: bool, error: str)"""
+    """Validate and atomically consume one phone-bound SMS verification code."""
+    if (
+        not isinstance(phone_number, str)
+        or len(phone_number) > 11
+        or not isinstance(verify_code_token, str)
+        or not verify_code_token
+        or len(verify_code_token) > 128
+        or not isinstance(verify_code, str)
+        or not verify_code
+        or len(verify_code) > VERIFY_CODE_LENGTH
+    ):
+        return False, '验证码错误或已过期，请重新获取'
+
     redis_client = get_redis()
-
-    code_key = f"sms:verify_code:{verify_code_token}"
-    attempt_key = f"sms:verify_attempts:{verify_code_token}"
-    attempts = redis_client.incr(attempt_key)
-    if attempts == 1:
-        redis_client.expire(attempt_key, VERIFY_CODE_TTL)
-    if attempts > VERIFY_MAX_ATTEMPTS:
-        redis_client.delete(code_key, f"sms:phone:{verify_code_token}", attempt_key)
-        return False, '验证码错误次数过多，请重新获取'
-
-    # 校验验证码
-    stored_code = redis_client.get(code_key)
-    if stored_code is None:
-        return False, '验证码已过期，请重新获取'
-
-    stored_code = stored_code.decode('utf-8') if isinstance(stored_code, bytes) else stored_code
-    if not hmac.compare_digest(str(stored_code), str(verify_code or '')):
-        return False, '验证码错误'
-
-    # 校验手机号是否匹配
-    phone_key = f"sms:phone:{verify_code_token}"
-    stored_phone = redis_client.get(phone_key)
-    stored_phone = stored_phone.decode('utf-8') if isinstance(stored_phone, bytes) else stored_phone
-    if stored_phone != phone_number:
-        return False, '手机号与验证码不匹配'
-
-    # 校验通过，清理验证码
-    redis_client.delete(code_key)
-    redis_client.delete(phone_key)
-
-    return True, ''
+    result = redis_client.eval(
+        _VERIFY_CODE_CONSUME_LUA,
+        3,
+        f"sms:verify_code:{verify_code_token}",
+        f"sms:phone:{verify_code_token}",
+        f"sms:verify_attempts:{verify_code_token}",
+        verify_code,
+        phone_number,
+        VERIFY_CODE_TTL,
+        VERIFY_MAX_ATTEMPTS,
+    )
+    errors = {
+        -1: '验证码已过期，请重新获取',
+        -2: '验证码错误',
+        -3: '手机号与验证码不匹配',
+        -4: '验证码错误次数过多，请重新获取',
+    }
+    return (True, '') if result == 1 else (False, errors.get(result, '验证码错误或已过期，请重新获取'))

@@ -6,6 +6,7 @@ ASGI config for backend project.
 import os
 import logging
 
+from django.conf import settings
 from django.core.asgi import get_asgi_application
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'backend.settings')
@@ -42,6 +43,7 @@ class _HttpRouter:
 try:
     from channels.auth import AuthMiddlewareStack
     from channels.routing import ProtocolTypeRouter, URLRouter
+    from channels.security.websocket import OriginValidator
     from apps.app_automation import routing as app_automation_routing
     from apps.perf_testing import routing as perf_testing_routing
     from apps.core.websocket_auth import WebSocketTicketAuthMiddleware
@@ -54,10 +56,18 @@ try:
 
     application = ProtocolTypeRouter({
         "http": _HttpRouter(django_asgi_app),
-        "websocket": AuthMiddlewareStack(
-            WebSocketTicketAuthMiddleware(
-                URLRouter(websocket_urlpatterns)
-            )
+        "websocket": OriginValidator(
+            AuthMiddlewareStack(
+                WebSocketTicketAuthMiddleware(
+                    URLRouter(websocket_urlpatterns)
+                )
+            ),
+            # Exact configured frontend origins plus this service's allowed hosts.
+            # Never propagate an ALLOWED_HOSTS wildcard into WebSocket origins.
+            getattr(settings, 'WEBSOCKET_ALLOWED_ORIGINS', None) or [
+                *getattr(settings, 'CORS_ALLOWED_ORIGINS', []),
+                *[host for host in settings.ALLOWED_HOSTS if host != '*'],
+            ],
         ),
     })
     logger.info("ASGI 已启用 WebSocket 支持 (需通过 Daphne 启动)")

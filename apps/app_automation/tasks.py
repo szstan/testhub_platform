@@ -7,6 +7,8 @@ from django.utils import timezone
 from django.db import transaction
 import logging
 import os
+import math
+import time
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from apps.core.cancellation import combine_cancel_checks
@@ -15,6 +17,35 @@ from apps.core.scheduler import ScheduleLeaseHeartbeat, load_claimed_task
 
 
 logger = logging.getLogger(__name__)
+
+
+def _app_case_deadline(test_case, execution, *, now=None, monotonic_now=None):
+    """Return a monotonic deadline derived from the durable execution start."""
+    from .constants import APP_TEST_CASE_MAX_TIMEOUT_SECONDS
+    from .executors.test_executor import AppTestWorkerError
+
+    timeout = getattr(test_case, 'timeout', None)
+    if (
+        type(timeout) is not int
+        or not 1 <= timeout <= APP_TEST_CASE_MAX_TIMEOUT_SECONDS
+    ):
+        raise AppTestWorkerError('APP test case timeout is invalid')
+
+    now = timezone.now() if now is None else now
+    monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
+    started_at = getattr(execution, 'started_at', None)
+    if started_at is None:
+        elapsed = 0.0
+    else:
+        try:
+            elapsed = (now - started_at).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            raise AppTestWorkerError('APP test case start time is invalid') from None
+        if not math.isfinite(elapsed):
+            raise AppTestWorkerError('APP test case start time is invalid')
+    remaining = max(0.0, timeout - max(0.0, elapsed))
+    return monotonic_now + remaining
+
 
 _DIAGNOSTIC_CASE_CHANGED_MESSAGE = '测试用例已变更，请重新提交单步诊断'
 _SAFE_UNDISPATCHED_MESSAGES = {
@@ -35,6 +66,7 @@ _SAFE_PROGRESS_MESSAGES = {
     '测试进程无法确认退出，设备占用已保留；请检查执行进程',
     '设备租约已失效，请重新获取租约后重试',
     'APP worker运行失败，请检查依赖、ADB和Allure配置后重试',
+    'APP测试用例超过执行时限，工作进程已停止',
     'APP执行失败，请检查设备状态和工作进程配置后重试',
     _DIAGNOSTIC_CASE_CHANGED_MESSAGE,
     'step complete',
@@ -46,7 +78,9 @@ def _safe_app_error_message(error):
         return error
 
     from .device_pool import DeviceLeaseError
-    from .executors.test_executor import AppTestProcessTerminationError, AppTestWorkerError
+    from .executors.test_executor import (
+        AppTestProcessTerminationError, AppTestTimeoutError, AppTestWorkerError,
+    )
     from .scene_execution import ScenePreparationError, SCENE_CASE_CHANGED_MESSAGE
 
     if (
@@ -56,6 +90,8 @@ def _safe_app_error_message(error):
         return SCENE_CASE_CHANGED_MESSAGE
     if isinstance(error, AppTestProcessTerminationError):
         return '测试进程无法确认退出，设备占用已保留；请检查执行进程'
+    if isinstance(error, AppTestTimeoutError):
+        return 'APP测试用例超过执行时限，工作进程已停止'
     if isinstance(error, DeviceLeaseError):
         return '设备租约已失效，请重新获取租约后重试'
     if isinstance(error, AppTestWorkerError):
@@ -166,6 +202,24 @@ def worker_io_completed_normally(report_result):
         and report_result.get('pytest_process_started') is False
         and report_result.get('pytest_process_completed') is False
     )
+
+
+def _clear_stopped_executor_action(executor, execution_id):
+    """Use the parent's cleanup receipt, preserving changed or uncertain leases."""
+    from .device_pool import DeviceLeaseError
+    from .execution_admission import clear_device_action_pending
+    from .models import AppTestExecution
+
+    if getattr(executor, '_device_io_stopped_safely', False) is not True:
+        return
+    if not AppTestExecution.objects.filter(
+        pk=execution_id, device_action_pending=True,
+    ).exists():
+        return
+    try:
+        clear_device_action_pending(execution_id)
+    except DeviceLeaseError:
+        logger.warning('APP cleanup lease fence changed; device action marker retained')
 
 
 def settle_undispatched_app_executions(
@@ -522,9 +576,12 @@ def execute_app_test_task(
         release_device_if_idle,
         settle_app_execution_failure,
     )
-    from .executors.test_executor import AppTestExecutor, AppTestProcessTerminationError
+    from .executors.test_executor import (
+        AppTestExecutor, AppTestProcessTerminationError, AppTestTimeoutError,
+    )
 
     execution = None
+    executor = None
     device = None
     bound_generation = lease_generation
     unified_cancel_check = cancel_check
@@ -532,6 +589,7 @@ def execute_app_test_task(
     device_heartbeat = None
     worker_claimed = False
     unsafe_termination = False
+    case_timed_out = False
     diagnostic_requested = step_index is not None or expected_case_updated_at is not None
     pre_dispatch_diagnostic_failure = False
     device_io_admitted = False
@@ -631,6 +689,7 @@ def execute_app_test_task(
             execution_id=execution_id,
             username=execution.user.username if execution.user else 'unknown',
             cancel_check=cancel_check,
+            deadline=_app_case_deadline(test_case, execution),
             before_device_io=admit_device_io,
             **({'engine': 'appium'} if getattr(execution, 'engine', 'legacy') == 'appium' else {}),
             **diagnostic_kwargs,
@@ -740,6 +799,7 @@ def execute_app_test_task(
         safe_error = _safe_app_error_message(e)
         logger.error("APP test execution failed (error_type=%s)", type(e).__name__)
         unsafe_termination = isinstance(e, AppTestProcessTerminationError)
+        case_timed_out = isinstance(e, AppTestTimeoutError)
         if unsafe_termination:
             os.chdir(original_worker_cwd)
             if execution:
@@ -748,6 +808,7 @@ def execute_app_test_task(
                 )
 
         if execution and not unsafe_termination:
+            _clear_stopped_executor_action(executor, execution.pk)
             settled_ids = settle_app_execution_failure(
                 [execution.pk], safe_error, include_running=worker_claimed
             )
@@ -762,11 +823,12 @@ def execute_app_test_task(
                     finished_at=execution.finished_at,
                     result=None,
                 )
-                try:
-                    executor = AppTestExecutor()
-                    executor._generate_allure_report(execution_id=execution_id)
-                except Exception:
-                    pass
+                if not case_timed_out:
+                    try:
+                        report_executor = AppTestExecutor()
+                        report_executor._generate_allure_report(execution_id=execution_id)
+                    except Exception:
+                        pass
 
         if scheduled_task_id and scheduler_lease_token and not unsafe_termination:
             try:
@@ -788,6 +850,8 @@ def execute_app_test_task(
             heartbeat.stop()
         if release_device_lease and not unsafe_termination and device and execution and execution.user:
             should_release = bool(scheduled_task_id) or (
+                case_timed_out and execution.release_device_lease_on_stop
+            ) or (
                 pre_dispatch_diagnostic_failure and execution.release_device_lease_on_stop
             ) or (
                 worker_claimed and AppTestExecution.objects.filter(
@@ -845,6 +909,7 @@ def execute_app_suite_task(
     from .executors.test_executor import (
         AppTestExecutor,
         AppTestProcessTerminationError,
+        AppTestTimeoutError,
         AppTestWorkerError,
     )
 
@@ -860,8 +925,10 @@ def execute_app_suite_task(
     heartbeat = None
     device_heartbeat = None
     executions = []
+    executor = None
     worker_claimed = False
     unsafe_termination = False
+    case_timed_out = False
     original_worker_cwd = os.getcwd()
 
     try:
@@ -962,6 +1029,7 @@ def execute_app_suite_task(
 
         batch_ids = [item.pk for item in executions]
         for idx, execution in enumerate(executions):
+            executor = None
             if idx:
                 if not start_next_app_execution(execution.pk, batch_ids):
                     execution.refresh_from_db()
@@ -1020,6 +1088,7 @@ def execute_app_suite_task(
                     execution_id=execution.id,
                     username=execution.user.username if execution.user else 'unknown',
                     cancel_check=case_cancel_check,
+                    deadline=_app_case_deadline(test_case, execution),
                     before_device_io=lambda: mark_device_action_pending(execution.pk),
                     **appium_options,
                 )
@@ -1095,6 +1164,8 @@ def execute_app_suite_task(
             except Exception as e:
                 if isinstance(e, AppTestProcessTerminationError):
                     raise
+                case_timed_out = case_timed_out or isinstance(e, AppTestTimeoutError)
+                _clear_stopped_executor_action(executor, execution.pk)
                 case_cancel_check()
                 safe_error = _safe_app_error_message(e)
                 logger.error(
@@ -1104,6 +1175,7 @@ def execute_app_suite_task(
                 settled = AppTestExecution.objects.filter(
                     pk=execution.pk,
                     status='running',
+                    stop_requested=False,
                 ).update(
                     status='error', result=None, error_message=safe_error,
                     finished_at=now, updated_at=now,
@@ -1214,6 +1286,8 @@ def execute_app_suite_task(
             heartbeat.stop()
         if release_device_lease and not unsafe_termination and device and user:
             should_release = bool(scheduled_task_id) or (
+                case_timed_out and any(item.release_device_lease_on_stop for item in executions)
+            ) or (
                 worker_claimed and AppTestExecution.objects.filter(
                     pk__in=[item.pk for item in executions], stop_requested=True
                 ).exists()

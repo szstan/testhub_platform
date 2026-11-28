@@ -7,7 +7,7 @@
           <img :src="logoImage" alt="TestHub" class="logo-img" />
         </div>
         <el-menu
-          :default-active="$route.path"
+          :default-active="activeMenuPath"
           router
           background-color="#001529"
           text-color="#fff"
@@ -95,6 +95,14 @@
             <el-menu-item index="/api-testing/interfaces">
               <el-icon><Link /></el-icon>
               <span>{{ $t('menu.interfaceManagement') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/api-testing/test-cases">
+              <el-icon><Document /></el-icon>
+              <span>{{ $t('menu.apiTestCases') }}</span>
+            </el-menu-item>
+            <el-menu-item index="/api-testing/test-cases/create">
+              <el-icon><Edit /></el-icon>
+              <span>{{ $t('menu.apiCaseCreate') }}</span>
             </el-menu-item>
             <el-menu-item index="/api-testing/openapi-contracts">
               <el-icon><DocumentCopy /></el-icon>
@@ -533,6 +541,8 @@ const handleLanguageChange = (lang) => {
   ElMessage.success(lang === 'zh-cn' ? '语言已切换为中文' : 'Language switched to English')
 }
 
+const activeMenuPath = computed(() => route.name === 'ApiTestCaseEdit' ? '/api-testing/test-cases' : route.path)
+
 const currentModule = computed(() => {
   if (route.path.startsWith('/ai-generation')) return 'ai-generation'
   if (route.path.startsWith('/api-testing')) return 'api-testing'
@@ -594,6 +604,8 @@ const breadcrumbTitle = computed(() => {
     '/api-testing/dashboard': t('menu.dashboard'),
     '/api-testing/projects': t('menu.projectManagement'),
     '/api-testing/interfaces': t('menu.interfaceManagement'),
+    '/api-testing/test-cases': t('menu.apiTestCases'),
+    '/api-testing/test-cases/create': t('menu.apiCaseCreate'),
     '/api-testing/openapi-contracts': t('menu.openapiContracts'),
     '/api-testing/automation': t('menu.automationTesting'),
     '/api-testing/history': t('menu.requestHistory'),
@@ -667,7 +679,7 @@ const breadcrumbTitle = computed(() => {
 
     '/profile': t('nav.profile')
   }
-  return routeMap[route.path] || route.meta.title || ''
+  return routeMap[route.path] || (route.name === 'ApiTestCaseEdit' ? t('menu.apiCaseEdit') : route.meta.title) || ''
 })
 
 const handleCommand = (command) => {

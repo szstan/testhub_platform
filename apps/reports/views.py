@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
-from django.db.models import Count, Sum, F, Avg
+from django.db.models import Count, Sum, F, Avg, Q
 from django.db.models.functions import TruncDate, Length
 from django.utils import timezone
 from datetime import timedelta, datetime
@@ -62,42 +62,41 @@ class TestReportViewSet(viewsets.ModelViewSet):
         total_plans = plans_qs.count()
         total_cases = cases_qs.count()
         
-        # 计算测试计划总进度
-        # 遍历所有活跃计划，计算其下所有TestRun的进度平均值
-        total_progress = 0
-        plan_count_for_progress = 0
-        
-        for plan in plans_qs:
-            runs = plan.test_runs.all()
-            if runs.exists():
-                # 计算该计划下所有Run的平均进度
-                run_progresses = [run.progress_stats['progress'] for run in runs]
-                plan_progress = sum(run_progresses) / len(run_progresses)
-                total_progress += plan_progress
-                plan_count_for_progress += 1
-        
-        avg_plan_progress = round(total_progress / plan_count_for_progress, 1) if plan_count_for_progress > 0 else 0
-        
-        # 计算整体通过率
-        recent_runs = TestRun.objects.filter(test_plan__in=plans_qs).order_by('-created_at')[:10]
-        total_executed = 0
-        total_passed = 0
-        
+        # One grouped query supplies progress for every visible run, rather
+        # than five or six count queries for each run in every plan.
+        runs_qs = TestRun.objects.filter(
+            test_plan__in=plans_qs,
+            project__in=get_accessible_projects(request.user),
+        )
+        if project_id:
+            runs_qs = runs_qs.filter(project_id=project_id)
+        annotated_runs = runs_qs.annotate(
+            case_total=Count('run_cases'),
+            case_tested=Count('run_cases', filter=Q(run_cases__status__in=['passed', 'failed', 'blocked', 'retest'])),
+            case_passed=Count('run_cases', filter=Q(run_cases__status='passed')),
+        )
+        plan_progresses = {}
+        for run in annotated_runs.values('test_plan_id', 'case_total', 'case_tested').iterator():
+            progress = round(100 * run['case_tested'] / run['case_total'], 1) if run['case_total'] else 0
+            aggregate = plan_progresses.setdefault(run['test_plan_id'], [0, 0])
+            aggregate[0] += progress
+            aggregate[1] += 1
+        avg_plan_progress = round(
+            sum(total / count for total, count in plan_progresses.values()) / len(plan_progresses), 1,
+        ) if plan_progresses else 0
+
+        recent_runs = annotated_runs.order_by('-created_at', '-pk').values('case_tested', 'case_passed')[:10]
+        total_executed = total_passed = 0
         for run in recent_runs:
-            stats = run.progress_stats
-            total_executed += stats['tested']
-            total_passed += stats['passed']
-            
-        pass_rate = round((total_passed / total_executed * 100), 1) if total_executed > 0 else 0
-        
-        # 统计缺陷总数 (基于 TestRunCase 的 defects 字段)
-        all_runs = TestRun.objects.filter(test_plan__in=plans_qs)
-        defects_count = 0
-        for run in all_runs:
-            run_cases_with_defects = run.run_cases.exclude(defects=[])
-            for rc in run_cases_with_defects:
-                if isinstance(rc.defects, list):
-                    defects_count += len(rc.defects)
+            total_executed += run['case_tested']
+            total_passed += run['case_passed']
+        pass_rate = round(100 * total_passed / total_executed, 1) if total_executed else 0
+
+        defects_count = sum(
+            len(defects) for defects in TestRunCase.objects.filter(test_run__in=runs_qs)
+            .exclude(defects=[]).values_list('defects', flat=True).iterator()
+            if isinstance(defects, list)
+        )
         
         return Response({
             'active_plans': total_plans,
@@ -184,7 +183,12 @@ class TestReportViewSet(viewsets.ModelViewSet):
     def execution_trend(self, request):
         """获取每日执行趋势"""
         project_id = request.query_params.get('project')
-        days = int(request.query_params.get('days', 7))
+        try:
+            days = int(request.query_params.get('days', 7))
+        except (TypeError, ValueError, OverflowError):
+            return Response({'days': '必须是 1 到 366 之间的整数'}, status=400)
+        if not 1 <= days <= 366:
+            return Response({'days': '必须是 1 到 366 之间的整数'}, status=400)
         
         # 获取当前时区的今天开始时间
         current_tz = timezone.get_current_timezone()
@@ -208,19 +212,29 @@ class TestReportViewSet(viewsets.ModelViewSet):
         if project_id:
             qs = qs.filter(test_run__project_id=project_id)
             
-        # 由于数据库聚合(TruncDate)在某些环境下返回None，改为Python内存聚合
-        # 获取所有符合条件的记录的执行时间
-        executions = qs.values_list('executed_at', flat=True)
-        
-        # 初始化日期映射
-        date_map = {}
-        
-        for executed_at in executions:
-            if executed_at:
-                # 转换为本地时间
-                local_time = executed_at.astimezone(current_tz)
-                date_str = local_time.date().strftime('%Y-%m-%d')
-                date_map[date_str] = date_map.get(date_str, 0) + 1
+        end_datetime = timezone.make_aware(
+            datetime.combine(today + timedelta(days=1), datetime.min.time()), current_tz,
+        )
+        qs = qs.filter(executed_at__lt=end_datetime)
+        daily_counts = list(qs.order_by().annotate(
+            day=TruncDate('executed_at', tzinfo=current_tz),
+        ).values('day').annotate(count=Count('pk')))
+        date_map = {row['day'].isoformat(): row['count'] for row in daily_counts if row['day'] is not None}
+        if any(row['day'] is None for row in daily_counts):
+            # MySQL installations without timezone tables cannot use CONVERT_TZ.
+            # Count bounded UTC windows in one SQL aggregate instead of loading
+            # every timestamp into Python or issuing a query per day.
+            windows = {}
+            for offset in range(days):
+                day = start_date + timedelta(days=offset)
+                begin = timezone.make_aware(datetime.combine(day, datetime.min.time()), current_tz)
+                end = timezone.make_aware(datetime.combine(day + timedelta(days=1), datetime.min.time()), current_tz)
+                windows[f'd{offset}'] = Count('pk', filter=Q(executed_at__gte=begin, executed_at__lt=end))
+            counts = qs.aggregate(**windows)
+            date_map = {
+                (start_date + timedelta(days=offset)).isoformat(): counts[f'd{offset}']
+                for offset in range(days)
+            }
         
         # 补全日期
         result = []

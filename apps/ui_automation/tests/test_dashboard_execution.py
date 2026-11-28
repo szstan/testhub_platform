@@ -253,18 +253,29 @@ def _allow_playwright(monkeypatch):
 
 
 def _immediate_thread(monkeypatch, *, start_error=None):
+    original_thread = threading.Thread
+
     class ImmediateThread:
-        def __init__(self, target, daemon=None):
+        def __init__(self, target, daemon=None, name=None):
             self.target = target
             self.daemon = daemon
+            self.worker_heartbeat = bool(name and name.startswith('ui-workbench-heartbeat-'))
+            self.delegate = (
+                original_thread(target=target, daemon=daemon, name=name)
+                if self.worker_heartbeat else None
+            )
 
         def start(self):
+            if self.delegate is not None:
+                self.delegate.start()
+                return
             if start_error:
                 raise start_error
             self.target()
 
-        def join(self):
-            return  # start() runs the target synchronously in these tests.
+        def join(self, timeout=None):
+            if self.delegate is not None:
+                self.delegate.join(timeout=timeout)
 
     monkeypatch.setattr(threading, 'Thread', ImmediateThread)
 
@@ -329,7 +340,7 @@ def test_suite_worker_exception_marks_aggregate_failed(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_suite_broker_dispatch_failure_marks_aggregate_failed(monkeypatch):
+def test_suite_broker_dispatch_failure_keeps_pending_for_recovery(monkeypatch):
     from apps.ui_automation import tasks
 
     user, _project, suite = _suite_run_fixture('suite-dispatch-error')
@@ -346,17 +357,18 @@ def test_suite_broker_dispatch_failure_marks_aggregate_failed(monkeypatch):
 
     assert response.status_code == 503
     execution = UiTestExecution.objects.get(pk=response.data['execution_id'])
-    assert execution.status == 'FAILED'
-    assert execution.finished_at is not None
-    assert execution.failure_stage == 'dispatch'
-    assert execution.error_message == response.data['message']
+    assert execution.status == 'PENDING'
+    assert execution.finished_at is None
+    assert execution.failure_stage == ''
+    assert execution.dispatch_delivery_token is not None
+    assert execution.dispatch_delivery_expires_at is not None
 
     replay = client.post(
         f'/api/ui-automation/test-suites/{suite.pk}/run_suite/',
         {'client_request_id': request_id},
         format='json',
     )
-    assert replay.status_code == 503
+    assert replay.status_code == 202
     assert replay.data['execution_id'] == execution.pk
     assert replay.data['replayed'] is True
     dispatch.assert_called_once()

@@ -4,8 +4,9 @@ import time
 import uuid
 import asyncio
 import logging
+import threading
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from PyPDF2 import PdfReader
@@ -21,14 +22,61 @@ except ImportError:
     docx = None
 from django.conf import settings
 from django.core.files.storage import default_storage
+from django.db import DatabaseError, transaction
+from django.utils import timezone
+from asgiref.sync import async_to_sync, sync_to_async
 
 from .models import RequirementDocument, RequirementAnalysis, BusinessRequirement, GeneratedTestCase, AnalysisTask
+from .document_limits import (
+    DocumentExtractionError, TextBudget, document_limit, pdf_processing_limits,
+    validate_document_path, validate_docx_archive,
+)
+from .pdf_worker import PdfWorkerFailure, execute_pdf_worker
 
 logger = logging.getLogger(__name__)
+MAX_ANALYSIS_ATTEMPTS = 3
+DEFAULT_ANALYSIS_WORKER_LEASE_SECONDS = 1800
 
 
-class DocumentExtractionError(ValueError):
-    """A document is invalid or cannot yield usable requirement text."""
+def analysis_worker_lease_seconds():
+    try:
+        configured = float(getattr(settings, 'REQUIREMENT_ANALYSIS_WORKER_LEASE_SECONDS', DEFAULT_ANALYSIS_WORKER_LEASE_SECONDS))
+    except (TypeError, ValueError):
+        configured = DEFAULT_ANALYSIS_WORKER_LEASE_SECONDS
+    return max(1.0, configured)
+
+
+def cleanup_document_file_if_unreferenced(file_name, storage=None):
+    """Delete an obsolete source key only after no document references it."""
+    if not file_name:
+        return False
+    storage = storage or default_storage
+    try:
+        if RequirementDocument.objects.filter(file=file_name).exists():
+            return False
+        storage.delete(file_name)
+        return True
+    except Exception:
+        logger.exception('Failed to remove unreferenced requirement document file')
+        return False
+
+
+class AnalysisClaimStateError(RuntimeError):
+    """A claim transaction may have committed before its acknowledgement was lost."""
+
+    def __init__(self, attempt, invocation_nonce):
+        self.attempt = attempt
+        self.invocation_nonce = invocation_nonce
+        super().__init__('Analysis claim outcome is unknown')
+
+
+class AnalysisRetryStateError(RuntimeError):
+    """Only the invocation owning a completed processing attempt may settle it."""
+
+    def __init__(self, attempt, invocation_nonce):
+        self.recovery_attempt = attempt
+        self.recovery_nonce = invocation_nonce
+        super().__init__('Analysis retry state could not be persisted')
 
 
 class DocumentProcessor:
@@ -36,31 +84,34 @@ class DocumentProcessor:
 
     @staticmethod
     def extract_text_from_pdf(file_path: str) -> str:
-        """从PDF文件提取文本"""
+        """Extract PDF text inside a resource-limited subprocess."""
         if PdfReader is None:
             raise DocumentExtractionError('PDF文本提取依赖未安装')
 
+        messages = {
+            'busy': 'PDF文本提取繁忙，请稍后重试',
+            'timeout': 'PDF文本提取超时',
+            'limits': 'PDF解析资源限制不可用',
+            'resource': 'PDF解析资源限制已触发',
+            'file_size': '文件大小超过限制（默认10MB）',
+            'page_limit': 'PDF页数超过限制',
+            'text_limit': '提取文本长度超过限制',
+            'empty': 'PDF中没有可提取的文本，可能是空文档或扫描版',
+            'dependency': 'PDF文本提取依赖未安装',
+            'invalid_pdf': 'PDF文件损坏或无法读取',
+            'worker': 'PDF文件损坏或无法读取',
+        }
         try:
-            with open(file_path, 'rb') as file:
-                pdf_reader = PdfReader(file)
-                pages_text = []
-                for page in pdf_reader.pages:
-                    extract_page_text = getattr(page, 'extract_text', None) or getattr(page, 'extractText', None)
-                    if extract_page_text is None:
-                        raise ValueError('PDF page text extraction is unavailable')
-                    page_text = extract_page_text()
-                    if page_text:
-                        pages_text.append(page_text)
-
-            text = '\n'.join(pages_text).strip()
-            if not text:
-                raise DocumentExtractionError('PDF中没有可提取的文本，可能是空文档或扫描版')
-            return text
+            validate_document_path(file_path)
+            return execute_pdf_worker(file_path, **pdf_processing_limits())
+        except PdfWorkerFailure as exc:
+            logger.warning('PDF文本提取worker失败: code=%s', exc.code)
+            raise DocumentExtractionError(messages.get(exc.code, messages['worker'])) from None
         except DocumentExtractionError:
             raise
-        except Exception as exc:
-            logger.exception('PDF文本提取失败')
-            raise DocumentExtractionError('PDF文件损坏或无法读取') from exc
+        except Exception:
+            logger.error('PDF文本提取worker启动或通信失败')
+            raise DocumentExtractionError('PDF文件损坏或无法读取') from None
 
     @staticmethod
     def extract_text_from_docx(file_path: str) -> str:
@@ -69,17 +120,19 @@ class DocumentProcessor:
             raise DocumentExtractionError('DOCX文本提取依赖未安装')
 
         try:
+            validate_document_path(file_path)
+            validate_docx_archive(file_path)
             document = docx.Document(file_path)
-            content = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+            budget = TextBudget()
+            for paragraph in document.paragraphs:
+                if paragraph.text.strip():
+                    budget.append(paragraph.text)
             for table in document.tables:
                 for row in table.rows:
                     cells = [cell.text.strip() for cell in row.cells]
                     if any(cells):
-                        content.append(' | '.join(cells))
-            text = '\n'.join(content).strip()
-            if not text:
-                raise DocumentExtractionError('DOCX文档中没有可提取的文本')
-            return text
+                        budget.append(' | '.join(cells))
+            return budget.finish('DOCX文档中没有可提取的文本')
         except DocumentExtractionError:
             raise
         except Exception as exc:
@@ -89,13 +142,15 @@ class DocumentProcessor:
     @staticmethod
     def extract_text_from_txt(file_path: str) -> str:
         """从文本文件提取文本"""
+        limit = document_limit('REQUIREMENT_DOCUMENT_MAX_TEXT_CHARS')
+        validate_document_path(file_path)
         try:
             with open(file_path, 'r', encoding='utf-8-sig') as file:
-                text = file.read()
+                text = file.read(limit + 1)
         except UnicodeDecodeError:
             try:
                 with open(file_path, 'r', encoding='gbk') as file:
-                    text = file.read()
+                    text = file.read(limit + 1)
             except UnicodeDecodeError as exc:
                 raise DocumentExtractionError('文本文件编码无法识别') from exc
             except OSError as exc:
@@ -103,10 +158,9 @@ class DocumentProcessor:
         except OSError as exc:
             raise DocumentExtractionError('文本文件无法读取') from exc
 
-        text = text.strip()
-        if not text:
-            raise DocumentExtractionError('文本文件为空')
-        return text
+        budget = TextBudget()
+        budget.append(text)
+        return budget.finish('文本文件为空')
 
     @classmethod
     def extract_text(cls, document: RequirementDocument) -> str:
@@ -379,7 +433,7 @@ class RequirementAnalysisService:
     @classmethod
     def create_analysis_task(cls, document: RequirementDocument, task_type: str) -> AnalysisTask:
         """创建分析任务"""
-        task_id = f"{task_type}_{uuid.uuid4().hex[:8]}"
+        task_id = f"{task_type}_{uuid.uuid4().hex}"
         
         task = AnalysisTask.objects.create(
             task_id=task_id,
@@ -389,82 +443,399 @@ class RequirementAnalysisService:
         )
         
         return task
-    
+
     @classmethod
-    async def process_document_analysis(cls, document: RequirementDocument) -> RequirementAnalysis:
-        """处理文档分析"""
-        # 创建分析任务
-        task = cls.create_analysis_task(document, 'requirement_analysis')
-        
-        try:
-            # 更新任务状态
-            task.status = 'running'
-            task.started_at = datetime.now()
-            task.progress = 10
-            task.save()
-            
-            # 提取文档文本
-            if not document.extracted_text:
-                document.extracted_text = DocumentProcessor.extract_text(document)
-                document.save()
-            
-            task.progress = 30
-            task.save()
-            
-            # 调用AI分析
-            start_time = time.time()
-            analysis_result = await AIService.analyze_requirements(
-                document.extracted_text, 
-                document.title
+    def get_or_create_analysis_task(cls, document_id):
+        """Persist a stable claim before a legacy document-only task can retry."""
+        with transaction.atomic():
+            document = RequirementDocument.objects.select_for_update().filter(pk=document_id).first()
+            if document is None or RequirementAnalysis.objects.filter(document_id=document_id).exists():
+                return None
+            task = AnalysisTask.objects.select_for_update().filter(
+                document_id=document_id,
+                task_type='requirement_analysis',
+                status__in=['pending', 'running'],
+            ).order_by('created_at', 'pk').first()
+            if task is not None:
+                return task
+            return cls.create_analysis_task(document, 'requirement_analysis')
+
+    @classmethod
+    async def process_document_analysis(
+        cls, document: RequirementDocument, analysis_task_id=None, attempt=0,
+        recover_attempt=None, recover_nonce=None, resume_attempt=None,
+        resume_nonce=None, invocation_nonce=None,
+    ) -> Optional[RequirementAnalysis]:
+        """Keep ORM transactions on a synchronous thread around the async AI call."""
+        invocation_nonce = invocation_nonce or uuid.uuid4().hex
+        return await sync_to_async(cls._process_document_analysis, thread_sensitive=True)(
+            document.pk, analysis_task_id, attempt, recover_attempt, recover_nonce,
+            resume_attempt, resume_nonce, invocation_nonce,
+        )
+
+    @classmethod
+    def _claim_analysis_task(
+        cls, document_id, analysis_task_id, attempt, invocation_nonce,
+        resume_attempt=None, resume_nonce=None,
+    ):
+        now = timezone.now()
+        lease_expires_at = now + timedelta(seconds=analysis_worker_lease_seconds())
+        with transaction.atomic():
+            document = RequirementDocument.objects.select_for_update().filter(pk=document_id).first()
+            if document is None:
+                return None, None, None
+            existing = RequirementAnalysis.objects.filter(document_id=document_id).first()
+            if existing is not None:
+                return document, None, existing
+
+            tasks = AnalysisTask.objects.select_for_update().filter(
+                document_id=document_id, task_type='requirement_analysis',
             )
-            analysis_time = time.time() - start_time
-            
-            task.progress = 70
-            task.save()
-            
-            # 创建分析记录
-            analysis = RequirementAnalysis.objects.create(
-                document=document,
-                analysis_report=analysis_result['analysis_report'],
-                requirements_count=analysis_result['requirements_count'],
-                analysis_time=analysis_time
-            )
-            
-            # 保存需求数据
-            for req_data in analysis_result['requirements']:
-                BusinessRequirement.objects.create(
-                    analysis=analysis,
-                    **req_data
+            if analysis_task_id is not None:
+                task = tasks.filter(task_id=analysis_task_id).first()
+            else:
+                task = tasks.filter(status__in=['pending', 'running']).first()
+                if task is None:
+                    task = cls.create_analysis_task(document, 'requirement_analysis')
+            if task is None:
+                return document, None, None
+
+            if task.status == 'running':
+                if not (
+                    resume_attempt == attempt
+                    and resume_nonce
+                    and task.retry_attempt == attempt
+                    and task.worker_invocation_nonce == resume_nonce
+                ):
+                    return document, None, None
+                claimed = AnalysisTask.objects.filter(
+                    pk=task.pk, status='running', retry_attempt=attempt,
+                    worker_invocation_nonce=resume_nonce,
+                ).update(
+                    worker_invocation_nonce=invocation_nonce,
+                    worker_heartbeat_at=now,
+                    worker_lease_expires_at=lease_expires_at,
+                    dispatch_state='published',
+                    dispatch_nonce='',
+                    dispatch_lease_expires_at=None,
+                    dispatch_acknowledged_at=task.dispatch_acknowledged_at or now,
                 )
-            
-            # 更新文档状态
-            document.status = 'analyzed'
-            document.save()
-            
-            # 完成任务
-            task.status = 'completed'
-            task.completed_at = datetime.now()
-            task.progress = 100
-            task.result = analysis_result
-            task.save()
-            
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"文档分析失败: {e}")
-            
-            # 更新任务状态
+            else:
+                if task.status != 'pending' or task.retry_attempt > attempt:
+                    return document, None, None
+                if tasks.exclude(pk=task.pk).filter(status='running').exists():
+                    return document, None, None
+                claimed = AnalysisTask.objects.filter(
+                    pk=task.pk, status='pending', retry_attempt__lte=attempt,
+                ).update(
+                    status='running',
+                    retry_attempt=attempt,
+                    started_at=now,
+                    progress=10,
+                    error_message='',
+                    worker_invocation_nonce=invocation_nonce,
+                    worker_heartbeat_at=now,
+                    worker_lease_expires_at=lease_expires_at,
+                    dispatch_state='published',
+                    dispatch_nonce='',
+                    dispatch_lease_expires_at=None,
+                    dispatch_acknowledged_at=task.dispatch_acknowledged_at or now,
+                )
+            if claimed != 1:
+                return document, None, None
+
+            document.status = 'analyzing'
+            document.save(update_fields=['status', 'updated_at'])
+            task.refresh_from_db()
+            return document, task, None
+
+    @classmethod
+    def heartbeat_analysis_task(cls, task_pk, attempt, invocation_nonce, now=None):
+        now = now or timezone.now()
+        lease_expires_at = now + timedelta(seconds=analysis_worker_lease_seconds())
+        return AnalysisTask.objects.filter(
+            pk=task_pk,
+            status='running',
+            retry_attempt=attempt,
+            worker_invocation_nonce=invocation_nonce,
+            worker_lease_expires_at__gt=now,
+        ).update(
+            worker_heartbeat_at=now,
+            worker_lease_expires_at=lease_expires_at,
+        ) == 1
+
+    @classmethod
+    def _heartbeat_loop(cls, stop_event, task_pk, attempt, invocation_nonce):
+        from django.db import close_old_connections
+
+        interval = max(1.0, analysis_worker_lease_seconds() / 3)
+        while not stop_event.wait(interval):
+            close_old_connections()
+            try:
+                if not cls.heartbeat_analysis_task(task_pk, attempt, invocation_nonce):
+                    return
+            except DatabaseError:
+                logger.warning('Analysis worker heartbeat failed: task_pk=%s', task_pk)
+            finally:
+                close_old_connections()
+
+    @classmethod
+    def _process_document_analysis(
+        cls, document_id, analysis_task_id=None, attempt=0, recover_attempt=None,
+        recover_nonce=None, resume_attempt=None, resume_nonce=None,
+        invocation_nonce=None,
+    ):
+        if type(attempt) is not int or attempt < 0:
+            return None
+        invocation_nonce = invocation_nonce or uuid.uuid4().hex
+
+        if recover_attempt is not None:
+            if (
+                type(recover_attempt) is not int
+                or not 0 <= recover_attempt < MAX_ANALYSIS_ATTEMPTS
+                or attempt != recover_attempt + 1
+                or not recover_nonce
+            ):
+                return None
+            task_pk = AnalysisTask.objects.filter(
+                document_id=document_id, task_id=analysis_task_id,
+                task_type='requirement_analysis',
+            ).values_list('pk', flat=True).first()
+            if task_pk is None:
+                return None
+            recovered = cls._persist_analysis_failure(
+                document_id, task_pk, recover_attempt,
+                invocation_nonce=recover_nonce, next_attempt=attempt,
+            )
+            if recovered is not None:
+                return recovered
+        if resume_attempt is not None and (
+            type(resume_attempt) is not int or resume_attempt != attempt or not resume_nonce
+        ):
+            return None
+        if attempt >= MAX_ANALYSIS_ATTEMPTS:
+            return None
+
+        try:
+            document, task, existing = cls._claim_analysis_task(
+                document_id, analysis_task_id, attempt, invocation_nonce,
+                resume_attempt=resume_attempt, resume_nonce=resume_nonce,
+            )
+        except DatabaseError as exc:
+            raise AnalysisClaimStateError(attempt, invocation_nonce) from exc
+        if existing is not None:
+            return existing
+        if document is None or task is None:
+            return None
+
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=cls._heartbeat_loop,
+            args=(heartbeat_stop, task.pk, attempt, invocation_nonce),
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            text = document.extracted_text or DocumentProcessor.extract_text(document)
+            now = timezone.now()
+            updated = AnalysisTask.objects.filter(
+                pk=task.pk,
+                status='running',
+                retry_attempt=attempt,
+                worker_invocation_nonce=invocation_nonce,
+                worker_lease_expires_at__gt=now,
+            ).update(
+                progress=30,
+                worker_heartbeat_at=now,
+                worker_lease_expires_at=now + timedelta(seconds=analysis_worker_lease_seconds()),
+            )
+            if updated != 1:
+                return None
+
+            start_time = time.time()
+            analysis_result = async_to_sync(AIService.analyze_requirements)(text, document.title)
+            analysis_time = time.time() - start_time
+
+            with transaction.atomic():
+                current = RequirementDocument.objects.select_for_update().filter(pk=document_id).first()
+                now = timezone.now()
+                current_task = AnalysisTask.objects.select_for_update().filter(
+                    pk=task.pk,
+                    document_id=document_id,
+                    status='running',
+                    retry_attempt=attempt,
+                    worker_invocation_nonce=invocation_nonce,
+                    worker_lease_expires_at__gt=now,
+                ).first()
+                if current is None or current_task is None:
+                    return None
+                analysis = RequirementAnalysis.objects.filter(document_id=document_id).first()
+                if analysis is None:
+                    analysis = RequirementAnalysis.objects.create(
+                        document=current,
+                        analysis_report=analysis_result['analysis_report'],
+                        requirements_count=analysis_result['requirements_count'],
+                        analysis_time=analysis_time,
+                    )
+                    for req_data in analysis_result['requirements']:
+                        BusinessRequirement.objects.create(analysis=analysis, **req_data)
+                current.status = 'analyzed'
+                current.extracted_text = text
+                current.save(update_fields=['status', 'extracted_text', 'updated_at'])
+                current_task.status = 'completed'
+                current_task.completed_at = now
+                current_task.progress = 100
+                current_task.result = analysis_result
+                current_task.worker_invocation_nonce = ''
+                current_task.worker_lease_expires_at = None
+                current_task.save(update_fields=[
+                    'status', 'completed_at', 'progress', 'result',
+                    'worker_invocation_nonce', 'worker_lease_expires_at',
+                ])
+                return analysis
+        except Exception as processing_exc:
+            logger.exception('文档分析失败: document_id=%s task_id=%s', document_id, task.task_id)
+            try:
+                recovered_analysis = cls._persist_analysis_failure(
+                    document_id, task.pk, attempt, invocation_nonce=invocation_nonce,
+                )
+            except DatabaseError as exc:
+                raise AnalysisRetryStateError(attempt, invocation_nonce) from exc
+            if recovered_analysis is not None:
+                return recovered_analysis
+            processing_exc._testhub_analysis_failure_settled = attempt
+            raise
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=2)
+
+    @classmethod
+    def _persist_analysis_failure(
+        cls, document_id, task_pk, attempt, invocation_nonce=None, next_attempt=None,
+    ):
+        if not invocation_nonce:
+            return None
+        next_attempt = attempt + 1 if next_attempt is None else next_attempt
+        with transaction.atomic():
+            current = RequirementDocument.objects.select_for_update().filter(pk=document_id).first()
+            current_task = AnalysisTask.objects.select_for_update().filter(
+                pk=task_pk,
+                document_id=document_id,
+                status='running',
+                retry_attempt=attempt,
+                worker_invocation_nonce=invocation_nonce,
+                worker_lease_expires_at__gt=timezone.now(),
+            ).first()
+            existing = RequirementAnalysis.objects.filter(document_id=document_id).first()
+            if existing is not None:
+                if current_task is not None:
+                    current_task.status = 'completed'
+                    current_task.completed_at = timezone.now()
+                    current_task.progress = 100
+                    current_task.worker_invocation_nonce = ''
+                    current_task.worker_lease_expires_at = None
+                    current_task.save(update_fields=[
+                        'status', 'completed_at', 'progress',
+                        'worker_invocation_nonce', 'worker_lease_expires_at',
+                    ])
+                return existing
+            if current_task is None:
+                return None
+            has_other_active_task = AnalysisTask.objects.filter(
+                document_id=document_id, task_type='requirement_analysis',
+                status__in=['pending', 'running'],
+            ).exclude(pk=current_task.pk).exists()
+            if next_attempt < MAX_ANALYSIS_ATTEMPTS:
+                current_task.status = 'pending'
+                current_task.retry_attempt = next_attempt
+                current_task.progress = 0
+                current_task.error_message = '文档分析失败'
+                current_task.started_at = None
+                current_task.completed_at = None
+                current_task.worker_invocation_nonce = ''
+                current_task.worker_lease_expires_at = None
+                current_task.dispatch_state = 'unpublished'
+                current_task.dispatch_nonce = ''
+                current_task.dispatch_lease_expires_at = None
+                current_task.dispatch_acknowledged_at = None
+                current_task.save(update_fields=[
+                    'status', 'retry_attempt', 'progress', 'error_message',
+                    'started_at', 'completed_at', 'worker_invocation_nonce',
+                    'worker_lease_expires_at', 'dispatch_state', 'dispatch_nonce',
+                    'dispatch_lease_expires_at', 'dispatch_acknowledged_at',
+                ])
+                if current is not None and not has_other_active_task:
+                    current.status = 'analyzing'
+                    current.save(update_fields=['status', 'updated_at'])
+            else:
+                current_task.status = 'failed'
+                current_task.error_message = '文档分析失败'
+                current_task.completed_at = timezone.now()
+                current_task.worker_invocation_nonce = ''
+                current_task.worker_lease_expires_at = None
+                current_task.save(update_fields=[
+                    'status', 'error_message', 'completed_at',
+                    'worker_invocation_nonce', 'worker_lease_expires_at',
+                ])
+                if current is not None and not has_other_active_task:
+                    current.status = 'failed'
+                    current.save(update_fields=['status', 'updated_at'])
+        return None
+
+    @classmethod
+    def settle_expired_analysis_task(cls, task_pk, now=None):
+        now = now or timezone.now()
+        cutoff = now - timedelta(seconds=analysis_worker_lease_seconds())
+        document_id = AnalysisTask.objects.filter(pk=task_pk).values_list('document_id', flat=True).first()
+        if document_id is None:
+            return False
+        with transaction.atomic():
+            document = RequirementDocument.objects.select_for_update().filter(pk=document_id).first()
+            task = AnalysisTask.objects.select_for_update().filter(pk=task_pk).first()
+            if task is None or task.document_id != document_id or task.status != 'running':
+                return False
+            lease_expired = (
+                task.worker_lease_expires_at <= now
+                if task.worker_lease_expires_at is not None
+                else (task.started_at or task.created_at) <= cutoff
+            )
+            if not lease_expired:
+                return False
+            existing = RequirementAnalysis.objects.filter(document_id=task.document_id).first()
+            if existing is not None:
+                task.status = 'completed'
+                task.progress = 100
+                task.completed_at = now
+                task.worker_invocation_nonce = ''
+                task.worker_lease_expires_at = None
+                task.save(update_fields=[
+                    'status', 'progress', 'completed_at',
+                    'worker_invocation_nonce', 'worker_lease_expires_at',
+                ])
+                if document is not None and document.status != 'analyzed':
+                    document.status = 'analyzed'
+                    document.save(update_fields=['status', 'updated_at'])
+                return True
+
             task.status = 'failed'
-            task.error_message = str(e)
-            task.completed_at = datetime.now()
-            task.save()
-            
-            # 更新文档状态
-            document.status = 'failed'
-            document.save()
-            
-            raise e
-    
+            task.completed_at = now
+            task.error_message = '分析工作进程租约过期，处理结果未知；请显式重试'
+            task.worker_invocation_nonce = ''
+            task.worker_lease_expires_at = None
+            task.save(update_fields=[
+                'status', 'completed_at', 'error_message',
+                'worker_invocation_nonce', 'worker_lease_expires_at',
+            ])
+            if document is not None and not AnalysisTask.objects.filter(
+                document_id=document.pk,
+                task_type='requirement_analysis',
+                status__in=['pending', 'running'],
+            ).exists():
+                document.status = 'failed'
+                document.save(update_fields=['status', 'updated_at'])
+            return True
+
+
     @classmethod
     async def generate_test_cases_for_requirements(cls, requirement_ids: List[int], test_level: str, test_priority: str, test_case_count: int) -> List[GeneratedTestCase]:
         """为需求生成测试用例"""

@@ -367,7 +367,12 @@ class TestExecutionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TestExecution
-        exclude = ('failure_summary', 'dispatch_claim', 'cancel_requested_at', 'request_snapshot')
+        exclude = (
+            'failure_summary', 'dispatch_claim', 'dispatch_delivery_token',
+            'dispatch_delivery_expires_at', 'dispatch_enqueued_at',
+            'worker_nonce', 'worker_heartbeat_at', 'worker_lease_expires_at',
+            'cancel_requested_at', 'request_snapshot',
+        )
         read_only_fields = (
             'created_at', 'started_at', 'finished_at', 'duration',
             'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',

@@ -164,4 +164,7 @@ def execute_scheduled_task(self, task_id, execution_log_id, scheduler_lease_toke
             heartbeat.stop()
 
 
-__all__ = ['execute_scheduled_task']
+
+from .case_tasks import execute_api_case_execution
+
+__all__ = ['execute_scheduled_task', 'execute_api_case_execution']

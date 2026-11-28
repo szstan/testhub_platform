@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 
 from celery import shared_task
 from django.db import transaction
@@ -10,22 +11,44 @@ from django.utils import timezone
 
 from apps.core.cancellation import execution_cancellation_scope
 from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear_claim, load_claimed_task
+from .worker_lease import WorkbenchClaimRecoveryUnavailable
 
 logger = logging.getLogger(__name__)
+WORKBENCH_CLAIM_RECOVERY_RETRY_SECONDS = 30
 
 
-@shared_task(name='apps.ui_automation.tasks.execute_workbench_case')
-def execute_workbench_case(execution_id, claim_token):
+@shared_task(
+    bind=True,
+    name='apps.ui_automation.tasks.execute_workbench_case',
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=None,
+)
+def execute_workbench_case(self, execution_id, claim_token):
     from .case_runner import execute_case_execution
 
-    return execute_case_execution(execution_id, claim_token)
+    worker_nonce = uuid.uuid4()
+    try:
+        return execute_case_execution(execution_id, claim_token, worker_nonce=worker_nonce)
+    except WorkbenchClaimRecoveryUnavailable as exc:
+        raise self.retry(exc=exc, countdown=WORKBENCH_CLAIM_RECOVERY_RETRY_SECONDS)
 
 
-@shared_task(name='apps.ui_automation.tasks.execute_workbench_suite')
-def execute_workbench_suite(execution_id, claim_token):
+@shared_task(
+    bind=True,
+    name='apps.ui_automation.tasks.execute_workbench_suite',
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=None,
+)
+def execute_workbench_suite(self, execution_id, claim_token):
     from .suite_runner import execute_suite_execution
 
-    return execute_suite_execution(execution_id, claim_token)
+    worker_nonce = uuid.uuid4()
+    try:
+        return execute_suite_execution(execution_id, claim_token, worker_nonce=worker_nonce)
+    except WorkbenchClaimRecoveryUnavailable as exc:
+        raise self.retry(exc=exc, countdown=WORKBENCH_CLAIM_RECOVERY_RETRY_SECONDS)
 
 
 def _load_task(task_id, scheduler_lease_token=''):

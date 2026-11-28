@@ -179,7 +179,20 @@ export default {
       updated: '更新',
       skipped: '跳过',
       conflicts: '冲突',
-      empty: '暂无同步配置'
+      empty: '暂无同步配置',
+      queued: '同步任务已提交，正在等待执行',
+      running: '正在同步仓库用例',
+      failed: '同步失败',
+      unavailable: '暂时无法获取同步状态，请稍后刷新查看结果',
+      changed: '同步任务已被重新提交，请刷新查看最新状态',
+      pending: '任务仍在排队或同步，请稍后刷新查看结果',
+      loadFailed: '加载同步配置失败',
+      saveSucceeded: '保存成功',
+      saveFailed: '保存失败',
+      completed: '同步完成',
+      deleteBlocked: '同步任务进行中，不能删除同步配置',
+      deleteConfirm: '确定删除同步配置 {name} 吗？',
+      deleteFailed: '删除同步配置失败'
     },
     importStatusMap: {
       pending: '等待中',

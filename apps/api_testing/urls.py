@@ -9,6 +9,7 @@ from .views import (
     ApiDashboardViewSet, AIServiceConfigViewSet
 )
 from .contracts_views import OpenApiContractSpecViewSet
+from .case_views import ApiCaseExecutionViewSet, ApiTestCaseViewSet, TestSuiteCaseViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', ApiDashboardViewSet, basename='dashboard')
@@ -18,6 +19,9 @@ router.register(r'requests', ApiRequestViewSet)
 router.register(r'environments', EnvironmentViewSet)
 router.register(r'histories', RequestHistoryViewSet)
 router.register(r'test-suites', TestSuiteViewSet)
+router.register(r'test-suite-cases', TestSuiteCaseViewSet, basename='test-suite-case')
+router.register(r'test-cases', ApiTestCaseViewSet, basename='api-test-case')
+router.register(r'case-executions', ApiCaseExecutionViewSet, basename='api-case-execution')
 router.register(r'test-suite-requests', TestSuiteRequestViewSet)
 router.register(r'test-executions', TestExecutionViewSet)
 router.register(r'users', UserViewSet)

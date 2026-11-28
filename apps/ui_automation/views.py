@@ -198,87 +198,46 @@ def _replay_workbench_submission(kind, resource, user, request_id, options, data
     return response
 
 
-def _mark_workbench_dispatch_failed(kind, execution):
-    message = '执行队列不可用，请检查Celery worker与broker后查询原执行记录。'
-    now = timezone.now()
-    if kind == 'case':
-        return TestCaseExecution.objects.filter(
-            pk=execution.pk,
-            dispatch_claim=execution.dispatch_claim,
-            status='pending',
-            cancel_requested_at__isnull=True,
-        ).update(
-            status='error',
-            error_message=message,
-            execution_logs=message,
-            execution_time=0,
-            finished_at=now,
-            failure_stage='dispatch',
-            failure_summary=build_failure_summary('error', message),
-        ) > 0
-
-    updated = TestExecution.objects.filter(
-        pk=execution.pk,
-        dispatch_claim=execution.dispatch_claim,
-        status='PENDING',
-        cancel_requested_at__isnull=True,
-    ).update(
-        status='FAILED',
-        error_message=message,
-        result_data={'test_cases': [], 'summary': {'message': message}},
-        finished_at=now,
-        failure_stage='dispatch',
-        failure_summary=build_failure_summary('FAILED', message, suite=True),
-    )
-    if updated:
-        TestSuite.objects.filter(pk=execution.test_suite_id).update(
-            execution_status='failed', updated_at=now,
-        )
-    return updated > 0
-
-
 def _dispatch_workbench_submission(kind, execution, *, replayed=False, resource_name='', user=None):
     from .workbench import acceptance_payload, dispatch_execution
 
-    if replayed:
-        if execution.failure_stage == 'dispatch' and execution.status in {'error', 'FAILED'}:
-            return Response(
-                acceptance_payload(kind, execution, replayed=True, accepted=False, failure_stage='dispatch'),
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        return Response(acceptance_payload(kind, execution, replayed=True), status=status.HTTP_202_ACCEPTED)
-
-    try:
-        dispatch_execution(kind, execution)
-    except Exception:
-        logger.warning('UI workbench dispatch unavailable kind=%s execution_id=%s', kind, execution.pk)
-        if _mark_workbench_dispatch_failed(kind, execution):
-            execution.refresh_from_db()
-            return Response(
-                acceptance_payload(kind, execution, accepted=False, failure_stage='dispatch'),
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        execution.refresh_from_db()
-        if execution.status not in {'pending', 'PENDING'}:
-            return Response(acceptance_payload(kind, execution), status=status.HTTP_202_ACCEPTED)
+    if replayed and execution.failure_stage == 'dispatch' and execution.status in {'error', 'FAILED'}:
         return Response(
-            {
-                'accepted': False,
-                'execution_id': execution.pk,
-                'status': execution.status,
-                'kind': kind,
-                'failure_stage': 'dispatch',
-                'message': '执行队列不可用，执行状态暂时无法更新；请通过原执行记录查询。',
-            },
+            acceptance_payload(kind, execution, replayed=True, accepted=False, failure_stage='dispatch'),
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    if user is not None:
+    try:
+        dispatched = dispatch_execution(kind, execution)
+    except Exception:
+        logger.warning('UI workbench dispatch unavailable kind=%s execution_id=%s', kind, execution.pk, exc_info=True)
+        execution.refresh_from_db()
+        if execution.status not in {'pending', 'PENDING'}:
+            return Response(
+                acceptance_payload(kind, execution, replayed=replayed),
+                status=status.HTTP_202_ACCEPTED,
+            )
+        payload = acceptance_payload(
+            kind, execution, replayed=replayed, accepted=False, failure_stage='dispatch',
+        )
+        payload['message'] = '执行队列暂不可用；已保留执行记录，将在租约到期后重试派发。'
+        return Response(payload, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    if dispatched and not replayed and user is not None:
         try:
-            log_operation('run', 'test_case' if kind == 'case' else 'suite', execution.test_case_id if kind == 'case' else execution.test_suite_id, resource_name, user)
+            log_operation(
+                'run', 'test_case' if kind == 'case' else 'suite',
+                execution.test_case_id if kind == 'case' else execution.test_suite_id,
+                resource_name, user,
+            )
         except Exception:
             logger.warning('UI workbench operation logging failed kind=%s execution_id=%s', kind, execution.pk)
-    return Response(acceptance_payload(kind, execution), status=status.HTTP_202_ACCEPTED)
+
+    execution.refresh_from_db()
+    return Response(
+        acceptance_payload(kind, execution, replayed=replayed),
+        status=status.HTTP_202_ACCEPTED,
+    )
 
 
 def _abort_suite_execution(execution_id):
@@ -308,6 +267,8 @@ def _abort_suite_execution(execution_id):
             finished_at=now,
             error_message=message,
             failure_stage='cancelled',
+            worker_heartbeat_at=None,
+            worker_lease_expires_at=None,
         )
         TestCaseExecution.objects.filter(
             parent_execution_id=execution.pk,
@@ -319,6 +280,8 @@ def _abort_suite_execution(execution_id):
             error_message=message,
             execution_logs=message,
             failure_stage='cancelled',
+            worker_heartbeat_at=None,
+            worker_lease_expires_at=None,
         )
         if execution.test_suite_id:
             TestSuite.objects.filter(pk=execution.test_suite_id).update(
@@ -356,6 +319,7 @@ def _abort_case_execution(execution_id):
             ).update(
                 status='aborted', cancel_requested_at=now, finished_at=now,
                 error_message=message, execution_logs=message, failure_stage='cancelled',
+                worker_heartbeat_at=None, worker_lease_expires_at=None,
             )
             return Response({'accepted': True, 'execution_id': execution.pk, 'kind': 'case', 'status': 'aborted'})
     # A savepoint may be nested in ATOMIC_REQUESTS and retain the child lock.
@@ -1809,6 +1773,12 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                 return Response({'error': '无法创建用例执行记录'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         execution_base_url = getattr(request, '_ui_base_url', None) or test_case.project.base_url
+        ownership_check = getattr(request, '_ui_cancel_check', None)
+
+        def check_worker_ownership():
+            if ownership_check is not None:
+                ownership_check()
+
         # 根据引擎类型导入对应的执行引擎
         try:
             if engine_type == 'selenium':
@@ -1816,6 +1786,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
                 # Selenium 引擎需要预先检查浏览器和驱动是否可用
                 browser_type = request.data.get('browser', 'chrome')
+                check_worker_ownership()
                 is_ready, error_msg = SeleniumTestEngine.check_execution_environment(browser_type)
                 if not is_ready:
                     # 浏览器环境不可用，立即返回错误
@@ -1867,6 +1838,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                 from .playwright_engine import PlaywrightTestEngine
 
                 browser_type = request.data.get('browser', 'chrome')
+                check_worker_ownership()
                 is_ready, error_msg = PlaywrightTestEngine.check_execution_environment_sync(browser_type)
                 if not is_ready:
                     logger.error(f"Playwright 执行环境检查失败: {error_msg}")
@@ -2022,6 +1994,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                     try:
                         # 启动浏览器
                         execution_logs.append("========== 初始化浏览器 ==========")
+                        check_worker_ownership()
                         try:
                             engine.start()
                             mode_text = "无头模式" if headless else "有头模式"
@@ -2048,6 +2021,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         # 导航到项目基础URL
                         if execution_base_url:
                             execution_logs.append("========== 导航到测试页面 ==========")
+                            check_worker_ownership()
                             success, nav_log = engine.navigate(execution_base_url)
                             execution_logs.append(nav_log)
                             execution_logs.append("")
@@ -2206,6 +2180,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         try:
                             # 启动浏览器
                             execution_logs.append("========== 初始化浏览器 ==========")
+                            check_worker_ownership()
                             await engine.start()
                             mode_text = "无头模式" if headless else "有头模式"
                             execution_logs.append(
@@ -2215,6 +2190,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             # 导航到项目基础URL
                             if execution_base_url:
                                 execution_logs.append("========== 导航到测试页面 ==========")
+                                check_worker_ownership()
                                 success, nav_log = await engine.navigate(execution_base_url)
                                 execution_logs.append(nav_log)
                                 execution_logs.append("")

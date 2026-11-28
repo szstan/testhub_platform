@@ -9,7 +9,7 @@ import logging
 
 from .test_case_views import AppPagination
 from ..models import AppProject
-from ..access import is_app_admin
+from ..access import accessible_projects, is_app_admin
 from ..serializers import (
     AppProjectSerializer,
     AppProjectCreateSerializer,
@@ -38,10 +38,10 @@ class AppProjectViewSet(viewsets.ModelViewSet):
         return AppProjectSerializer
 
     def get_queryset(self):
-        user = self.request.user
-        return AppProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        ).distinct()
+        return accessible_projects(self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
 
     def perform_update(self, serializer):
         if not is_app_admin(self.request.user) and serializer.instance.owner_id != self.request.user.id:

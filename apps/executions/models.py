@@ -117,6 +117,9 @@ class TestRunCaseHistory(models.Model):
     status = models.CharField(max_length=20, choices=TestRunCase.STATUS_CHOICES, verbose_name='执行状态')
     actual_result = models.TextField(blank=True, verbose_name='实际结果')
     comments = models.TextField(blank=True, verbose_name='备注')
+    # NULL preserves the unknown values of history recorded before these fields.
+    defects = models.JSONField(null=True, blank=True, verbose_name='关联缺陷')
+    elapsed_time = models.DurationField(null=True, blank=True, verbose_name='执行耗时')
     executed_by = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='执行者')
     executed_at = models.DateTimeField(default=timezone.now, verbose_name='执行时间')
     

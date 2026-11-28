@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import timedelta
 
 from django.db import models, transaction
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, OuterRef
 from django.db.models.functions import TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
@@ -19,11 +19,18 @@ from rest_framework.exceptions import NotFound
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
+from apps.projects.access import user_can_write_project
 from apps.projects.models import Project, ProjectMember
 from apps.users.models import User
 from apps.versions.models import Version
-from .models import Defect, DefectAttachment, DefectComment, DefectTransition, GitHubIssueIntegration
+
 from .integrations import ExternalIssueError, push_defect_to_github
+from .models import (
+    Defect,
+    DefectAttachment,
+    DefectTransition,
+    GitHubIssueIntegration,
+)
 from .serializers import (
     DefectActionSerializer,
     DefectAttachmentSerializer,
@@ -31,6 +38,7 @@ from .serializers import (
     DefectCommentSerializer,
     DefectDetailSerializer,
     DefectListSerializer,
+    DefectTrendQuerySerializer,
     DefectWriteSerializer,
 )
 
@@ -167,6 +175,7 @@ class DefectViewSet(viewsets.ModelViewSet):
         ).distinct()
         return self.apply_query_filters(queryset)
 
+    @transaction.atomic
     def perform_create(self, serializer):
         defect = serializer.save(reporter=self.request.user)
         DefectTransition.objects.create(
@@ -179,6 +188,8 @@ class DefectViewSet(viewsets.ModelViewSet):
         )
 
     def get_user_accessible_projects(self, user):
+        if user.is_staff or user.is_superuser:
+            return Project.objects.all()
         return Project.objects.filter(
             models.Q(owner=user) | models.Q(members=user)
         ).distinct()
@@ -220,6 +231,8 @@ class DefectViewSet(viewsets.ModelViewSet):
         return None
 
     def get_project_role(self, project, user):
+        if user.is_staff or user.is_superuser:
+            return 'admin'
         if project.owner_id == user.id:
             return 'owner'
         member = ProjectMember.objects.filter(project=project, user=user).first()
@@ -234,6 +247,18 @@ class DefectViewSet(viewsets.ModelViewSet):
     def ensure_defect_action_permission(self, defect, allowed_roles, self_roles=None):
         """流转/协作动作权限：项目成员按角色放行；否则若用户是该缺陷的处理人/提交人且该动作允许自我角色，也放行。"""
         user = self.request.user
+        if (
+            defect.project.owner_id != user.pk
+            and not user.is_staff
+            and not user.is_superuser
+            and ProjectMember.objects.filter(
+                project=defect.project, user=user, role='viewer',
+            ).exists()
+        ):
+            return Response(
+                {'error': '观察者角色不可修改缺陷'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         if self.get_project_role(defect.project, user) in allowed_roles:
             return None
         if self_roles:
@@ -249,9 +274,8 @@ class DefectViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        access_error = self.ensure_project_access(serializer.validated_data['project'])
-        if access_error:
-            return access_error
+        if not user_can_write_project(request.user, serializer.validated_data['project']):
+            return Response({'error': '无权操作该项目'}, status=status.HTTP_403_FORBIDDEN)
         role_error = self.ensure_project_role(
             serializer.validated_data['project'],
             {'owner', 'admin', 'developer', 'tester'},
@@ -279,10 +303,15 @@ class DefectViewSet(viewsets.ModelViewSet):
         instance = self.get_locked_defect()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
-        access_error = self.ensure_project_access(serializer.validated_data.get('project', instance.project))
-        if access_error:
-            return access_error
+        target_project = serializer.validated_data.get('project', instance.project)
+        if not user_can_write_project(request.user, instance.project) or not user_can_write_project(
+            request.user, target_project,
+        ):
+            return Response({'error': '无权操作源项目或目标项目'}, status=status.HTTP_403_FORBIDDEN)
         role_error = self.ensure_project_role(instance.project, {'owner', 'admin', 'developer', 'tester'})
+        if role_error:
+            return role_error
+        role_error = self.ensure_project_role(target_project, {'owner', 'admin', 'developer', 'tester'})
         if role_error:
             return role_error
         serializer.save()
@@ -475,7 +504,7 @@ class DefectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='push-github')
     def push_github(self, request, pk=None):
         defect = self.get_object()
-        if not (request.user.is_staff or request.user.is_superuser or defect.project.owner_id == request.user.id or defect.project.members.filter(pk=request.user.pk).exists()):
+        if not user_can_write_project(request.user, defect.project):
             return Response({'detail': '无权操作该项目'}, status=status.HTTP_403_FORBIDDEN)
         integration = GitHubIssueIntegration.objects.filter(project=defect.project, enabled=True).first()
         if integration is None:
@@ -515,7 +544,11 @@ class DefectViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def trend(self, request):
         queryset = self.get_queryset()
-        days = int(request.query_params.get('days', 7))
+        days_serializer = DefectTrendQuerySerializer(data={
+            'days': request.query_params.get('days', 7),
+        })
+        days_serializer.is_valid(raise_exception=True)
+        days = days_serializer.validated_data['days']
         end_date = timezone.localdate()
         start_date = end_date - timedelta(days=days - 1)
         date_range = (start_date, end_date)

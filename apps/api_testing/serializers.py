@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from datetime import datetime
 from typing import Optional
@@ -16,7 +16,7 @@ class NullableDateField(serializers.DateField):
         return super().to_internal_value(value)
 from .models import (
     ApiProject, ApiCollection, ApiRequest, Environment,
-    RequestHistory, TestSuite, TestExecution, TestSuiteRequest,
+    RequestHistory, TestSuite, TestExecution, TestSuiteRequest, TestSuiteCase,
     ScheduledTask, TaskExecutionLog, NotificationLog,
     TaskNotificationSetting, OperationLog, AIServiceConfig,
 )
@@ -185,18 +185,27 @@ class TestSuiteRequestSerializer(serializers.ModelSerializer):
         model = TestSuiteRequest
         fields = ['id', 'request', 'order', 'assertions', 'enabled']
 
+    def validate_assertions(self, value):
+        from .case_serializers import ApiTestCaseStepSerializer
+        return ApiTestCaseStepSerializer().validate_assertions(value)
+
 
 class TestSuiteSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
     suite_requests = TestSuiteRequestSerializer(source='testsuiterequest_set', many=True, read_only=True)
+    suite_cases = serializers.SerializerMethodField()
 
     class Meta:
         model = TestSuite
         fields = [
             'id', 'name', 'description', 'project', 'environment',
-            'suite_requests', 'created_by', 'created_at', 'updated_at'
+            'suite_requests', 'suite_cases', 'created_by', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def get_suite_cases(self, obj):
+        from .case_serializers import TestSuiteCaseSerializer
+        return TestSuiteCaseSerializer(obj.suite_cases.select_related('test_case').all(), many=True).data
 
     def validate(self, attrs):
         request = self.context.get('request')
@@ -209,9 +218,32 @@ class TestSuiteSerializer(serializers.ModelSerializer):
             request__collection__project_id=project.pk
         ).exists():
             raise serializers.ValidationError({'project': '测试套件中的所有请求必须属于目标项目'})
+        if self.instance and self.instance.suite_cases.exclude(
+            test_case__project_id=project.pk
+        ).exists():
+            raise serializers.ValidationError({'project': '测试套件中的所有接口用例必须属于目标项目'})
         if environment and not can_use_environment(environment, user, project=project):
             raise serializers.ValidationError({'environment': '无权使用该执行环境'})
         return attrs
+
+    def update(self, instance, validated_data):
+        with transaction.atomic():
+            suite = TestSuite.objects.select_for_update().get(pk=instance.pk)
+            project = validated_data.get('project', suite.project)
+            environment = validated_data.get('environment', suite.environment)
+            user = getattr(self.context.get('request'), 'user', None)
+            if not can_access_api_project(project, user):
+                raise serializers.ValidationError({'project': '无权使用目标项目'})
+            if suite.testsuiterequest_set.exclude(request__collection__project_id=project.pk).exists():
+                raise serializers.ValidationError({'project': '测试套件中的所有请求必须属于目标项目'})
+            if suite.suite_cases.exclude(test_case__project_id=project.pk).exists():
+                raise serializers.ValidationError({'project': '测试套件中的所有接口用例必须属于目标项目'})
+            if environment and not can_use_environment(environment, user, project=project):
+                raise serializers.ValidationError({'environment': '无权使用该执行环境'})
+            for key, value in validated_data.items():
+                setattr(suite, key, value)
+            suite.save()
+            return suite
 
     def create(self, validated_data):
         validated_data['created_by'] = self.context['request'].user

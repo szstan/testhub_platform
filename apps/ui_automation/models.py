@@ -546,6 +546,12 @@ class TestExecution(ExecutionFailureSummaryModel):
     browser = models.CharField(max_length=20, default='chrome', verbose_name='浏览器')
     headless = models.BooleanField(default=False, verbose_name='无头模式')
     dispatch_claim = models.UUIDField(null=True, blank=True, editable=False)
+    dispatch_delivery_token = models.UUIDField(null=True, blank=True, editable=False)
+    dispatch_delivery_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
+    dispatch_enqueued_at = models.DateTimeField(null=True, blank=True, editable=False)
+    worker_nonce = models.UUIDField(null=True, blank=True, editable=False)
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True, editable=False)
+    worker_lease_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
     cancel_requested_at = models.DateTimeField(null=True, blank=True, editable=False)
     failure_stage = models.CharField(max_length=20, blank=True, editable=False)
     request_snapshot = models.JSONField(default=dict, blank=True, editable=False)
@@ -566,6 +572,10 @@ class TestExecution(ExecutionFailureSummaryModel):
         verbose_name = 'UI测试执行记录'
         verbose_name_plural = 'UI测试执行记录'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['status', 'dispatch_enqueued_at', 'dispatch_delivery_expires_at'], name='ui_suite_dispatch_recon_idx'),
+            models.Index(fields=['status', 'worker_lease_expires_at'], name='ui_suite_worker_exp_idx'),
+        ]
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
         if self.dispatch_claim and not self._state.adding:
@@ -577,6 +587,14 @@ class TestExecution(ExecutionFailureSummaryModel):
                     or current.status not in {'PENDING', 'RUNNING'}
                     or (current.status == 'PENDING' and self.status != 'RUNNING')
                     or current.cancel_requested_at is not None
+                    or (
+                        current.worker_nonce is not None
+                        and (
+                            str(current.worker_nonce) != str(getattr(self, '_ui_worker_nonce', ''))
+                            or current.worker_lease_expires_at is None
+                            or current.worker_lease_expires_at <= timezone.now()
+                        )
+                    )
                 ):
                     return
                 return super().save(
@@ -775,6 +793,12 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
     dispatch_claim = models.UUIDField(null=True, blank=True, editable=False)
+    dispatch_delivery_token = models.UUIDField(null=True, blank=True, editable=False)
+    dispatch_delivery_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
+    dispatch_enqueued_at = models.DateTimeField(null=True, blank=True, editable=False)
+    worker_nonce = models.UUIDField(null=True, blank=True, editable=False)
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True, editable=False)
+    worker_lease_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
     cancel_requested_at = models.DateTimeField(null=True, blank=True, editable=False)
     failure_stage = models.CharField(max_length=20, blank=True, editable=False)
     request_snapshot = models.JSONField(default=dict, blank=True, editable=False)
@@ -786,6 +810,10 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
         verbose_name = 'UI测试用例执行记录'
         verbose_name_plural = 'UI测试用例执行记录'
         ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['status', 'dispatch_enqueued_at', 'dispatch_delivery_expires_at'], name='ui_case_dispatch_recon_idx'),
+            models.Index(fields=['status', 'worker_lease_expires_at'], name='ui_case_worker_exp_idx'),
+        ]
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
         database = using or self._state.db
@@ -796,6 +824,19 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
                 ).first()
                 if parent is None or parent.status != 'RUNNING' or parent.cancel_requested_at is not None:
                     return
+                if parent.worker_nonce is not None:
+                    expected_nonce = getattr(self, '_ui_worker_nonce', None)
+                    if self._state.adding:
+                        self.worker_nonce = parent.worker_nonce
+                        expected_nonce = parent.worker_nonce
+                        self._ui_worker_nonce = str(parent.worker_nonce)
+                    if (
+                        str(parent.worker_nonce) != str(expected_nonce or '')
+                        or str(self.worker_nonce or '') != str(parent.worker_nonce)
+                        or parent.worker_lease_expires_at is None
+                        or parent.worker_lease_expires_at <= timezone.now()
+                    ):
+                        return
                 return super().save(
                     force_insert=force_insert,
                     force_update=force_update,
@@ -811,6 +852,14 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
                     or current.status not in {'pending', 'running'}
                     or (current.status == 'pending' and self.status != 'running')
                     or current.cancel_requested_at is not None
+                    or (
+                        current.worker_nonce is not None
+                        and (
+                            str(current.worker_nonce) != str(getattr(self, '_ui_worker_nonce', ''))
+                            or current.worker_lease_expires_at is None
+                            or current.worker_lease_expires_at <= timezone.now()
+                        )
+                    )
                 ):
                     return
                 return super().save(

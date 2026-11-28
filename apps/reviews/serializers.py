@@ -1,198 +1,258 @@
+from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
-from .models import TestCaseReview, ReviewAssignment, TestCaseReviewComment, ReviewTemplate
+
+from apps.projects.models import Project
+from apps.testcases.models import TestCase
+from apps.users.models import User
+from apps.users.serializers import UserDirectorySerializer
+
+from .models import (
+    ReviewAssignment,
+    ReviewTemplate,
+    TestCaseReview,
+    TestCaseReviewComment,
+)
 
 
-# 简化的序列化器，避免循环导入
-class SimpleUserSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    username = serializers.CharField()
-    email = serializers.EmailField()
-    first_name = serializers.CharField()
-    last_name = serializers.CharField()
+class SimpleProjectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Project
+        fields = ('id', 'name', 'description')
 
 
-class SimpleProjectSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    name = serializers.CharField()
-    description = serializers.CharField()
+class SimpleTestCaseSerializer(serializers.ModelSerializer):
+    author = UserDirectorySerializer(read_only=True)
 
-
-class SimpleTestCaseSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    title = serializers.CharField()
-    test_type = serializers.CharField()
-    priority = serializers.CharField()
-    status = serializers.CharField()
-    author = SimpleUserSerializer()
+    class Meta:
+        model = TestCase
+        fields = ('id', 'title', 'test_type', 'priority', 'status', 'author')
 
 
 class ReviewAssignmentSerializer(serializers.ModelSerializer):
-    reviewer = SimpleUserSerializer(read_only=True)
-    
+    reviewer = UserDirectorySerializer(read_only=True)
+
     class Meta:
         model = ReviewAssignment
         fields = ['id', 'reviewer', 'status', 'comment', 'checklist_results', 'reviewed_at', 'assigned_at']
 
 
 class TestCaseReviewCommentSerializer(serializers.ModelSerializer):
-    author = SimpleUserSerializer(read_only=True)
+    author = UserDirectorySerializer(read_only=True)
     testcase = SimpleTestCaseSerializer(read_only=True)
-    
+
     class Meta:
         model = TestCaseReviewComment
-        fields = ['id', 'testcase', 'author', 'comment_type', 'content', 'step_number', 
-                 'is_resolved', 'created_at', 'updated_at']
+        fields = [
+            'id', 'testcase', 'author', 'comment_type', 'content', 'step_number',
+            'is_resolved', 'created_at', 'updated_at',
+        ]
 
 
 class TestCaseReviewCommentCreateSerializer(serializers.ModelSerializer):
+    review = serializers.PrimaryKeyRelatedField(queryset=TestCaseReview.objects.all())
+    testcase = serializers.PrimaryKeyRelatedField(
+        queryset=TestCase.objects.all(), required=False, allow_null=True,
+    )
+
     class Meta:
         model = TestCaseReviewComment
         fields = ['review', 'testcase', 'comment_type', 'content', 'step_number']
-        extra_kwargs = {
-            'testcase': {'required': False, 'allow_null': True}
-        }
 
 
 class ReviewTemplateSerializer(serializers.ModelSerializer):
-    creator = SimpleUserSerializer(read_only=True)
+    creator = UserDirectorySerializer(read_only=True)
     project = SimpleProjectSerializer(many=True, read_only=True)
-    default_reviewers = SimpleUserSerializer(many=True, read_only=True)
-    
+    default_reviewers = UserDirectorySerializer(many=True, read_only=True)
+
     class Meta:
         model = ReviewTemplate
-        fields = ['id', 'name', 'description', 'project', 'creator', 'checklist',
-                 'default_reviewers', 'is_active', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'description', 'project', 'creator', 'checklist',
+            'default_reviewers', 'is_active', 'created_at', 'updated_at',
+        ]
+
+
+def _reject_duplicate_ids(attrs, fields):
+    for field in fields:
+        values = attrs.get(field)
+        if values is None:
+            continue
+        ids = [value.pk for value in values]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError({field: '不能包含重复对象'})
 
 
 class TestCaseReviewSerializer(serializers.ModelSerializer):
-    creator = SimpleUserSerializer(read_only=True)
+    creator = UserDirectorySerializer(read_only=True)
     projects = SimpleProjectSerializer(many=True, read_only=True)
     testcases = SimpleTestCaseSerializer(many=True, read_only=True)
     template = ReviewTemplateSerializer(read_only=True)
     assignments = ReviewAssignmentSerializer(source='reviewassignment_set', many=True, read_only=True)
     comments = TestCaseReviewCommentSerializer(many=True, read_only=True)
-    
+
     class Meta:
         model = TestCaseReview
-        fields = ['id', 'title', 'description', 'projects', 'testcases', 'creator', 
-                 'template', 'status', 'priority', 'deadline', 'created_at', 'updated_at', 
-                 'completed_at', 'assignments', 'comments']
+        fields = [
+            'id', 'title', 'description', 'projects', 'testcases', 'creator',
+            'template', 'status', 'priority', 'deadline', 'created_at', 'updated_at',
+            'completed_at', 'assignments', 'comments',
+        ]
 
 
-# 创建和更新用的简化序列化器
 class TestCaseReviewCreateSerializer(serializers.ModelSerializer):
-    testcases = serializers.ListField(child=serializers.IntegerField(), write_only=True)
-    reviewers = serializers.ListField(child=serializers.IntegerField(), write_only=True)
-    projects = serializers.ListField(child=serializers.IntegerField(), write_only=True)
-    template = serializers.IntegerField(write_only=True, required=False, allow_null=True)
-    
+    testcases = serializers.PrimaryKeyRelatedField(
+        queryset=TestCase.objects.all(), many=True, write_only=True,
+    )
+    reviewers = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), many=True, write_only=True,
+    )
+    projects = serializers.PrimaryKeyRelatedField(
+        queryset=Project.objects.all(), many=True, allow_empty=False, write_only=True,
+    )
+    template = serializers.PrimaryKeyRelatedField(
+        queryset=ReviewTemplate.objects.all(), write_only=True, required=False, allow_null=True,
+    )
+
     class Meta:
         model = TestCaseReview
-        fields = ['title', 'description', 'projects', 'priority', 'deadline', 'testcases', 'reviewers', 'template']
-    
+        fields = [
+            'title', 'description', 'projects', 'priority', 'deadline',
+            'testcases', 'reviewers', 'template',
+        ]
+
+    def validate(self, attrs):
+        _reject_duplicate_ids(attrs, ('projects', 'testcases', 'reviewers'))
+        if self.instance and 'reviewers' in attrs:
+            desired = {reviewer.pk for reviewer in attrs['reviewers']}
+            current = set(self.instance.reviewers.values_list('pk', flat=True))
+            if desired != current and self.instance.status in ('approved', 'rejected', 'cancelled'):
+                raise serializers.ValidationError({
+                    'reviewers': '已完成或已取消的评审不能修改评审人员',
+                })
+        return attrs
+
+    @transaction.atomic
     def create(self, validated_data):
-        testcases_ids = validated_data.pop('testcases', [])
-        reviewers_ids = validated_data.pop('reviewers', [])
-        projects_ids = validated_data.pop('projects', [])
-        template_id = validated_data.pop('template', None)
-        
-        review = TestCaseReview.objects.create(**validated_data)
-        
-        # 添加项目关联
-        if projects_ids:
-            review.projects.set(projects_ids)
-        
-        # 添加模板关联
-        if template_id:
-            try:
-                from .models import ReviewTemplate
-                template = ReviewTemplate.objects.get(id=template_id)
-                review.template = template
-                review.save()
-            except ReviewTemplate.DoesNotExist:
-                pass
-        
-        # 添加测试用例
-        if testcases_ids:
-            review.testcases.set(testcases_ids)
-        
-        # 添加评审人员
-        if reviewers_ids:
-            from apps.users.models import User
-            for reviewer_id in reviewers_ids:
-                try:
-                    reviewer = User.objects.get(id=reviewer_id)
-                    ReviewAssignment.objects.create(review=review, reviewer=reviewer)
-                except User.DoesNotExist:
-                    continue
-        
+        testcases = validated_data.pop('testcases')
+        reviewers = validated_data.pop('reviewers')
+        projects = validated_data.pop('projects')
+        template = validated_data.pop('template', None)
+
+        review = TestCaseReview.objects.create(template=template, **validated_data)
+        review.projects.set(projects)
+        review.testcases.set(testcases)
+        ReviewAssignment.objects.bulk_create([
+            ReviewAssignment(review=review, reviewer=reviewer)
+            for reviewer in reviewers
+        ])
         return review
 
+    @transaction.atomic
     def update(self, instance, validated_data):
-        # 弹出关系字段（write_only 的 ListField / IntegerField），单独处理，
-        # 否则默认 update 会把 template 整数 id 直接赋给 FK（触发 ValueError），
-        # 也会把 testcases/projects/reviewers 当普通属性 set，无法正确更新 M2M。
-        testcases_ids = validated_data.pop('testcases', None)
-        reviewers_ids = validated_data.pop('reviewers', None)
-        projects_ids = validated_data.pop('projects', None)
-        template_id = validated_data.pop('template', None)
+        testcases = validated_data.pop('testcases', None)
+        reviewers = validated_data.pop('reviewers', None)
+        projects = validated_data.pop('projects', None)
+        template = validated_data.pop('template', serializers.empty)
 
-        # 普通字段交给默认逻辑（title/description/priority/deadline）
-        instance = super().update(instance, validated_data)
-
-        # 项目关联
-        if projects_ids is not None:
-            instance.projects.set(projects_ids)
-
-        # 模板关联（id -> ReviewTemplate 实例）
-        if template_id is not None:
-            try:
-                from .models import ReviewTemplate
-                instance.template = ReviewTemplate.objects.get(id=template_id)
-            except ReviewTemplate.DoesNotExist:
-                instance.template = None
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if validated_data:
             instance.save()
-        elif template_id is None and 'template' in self.initial_data:
-            # 显式传 null/0 时清空模板
-            instance.template = None
-            instance.save()
-
-        # 测试用例
-        if testcases_ids is not None:
-            instance.testcases.set(testcases_ids)
-
-        # 评审人员（through=ReviewAssignment，需重建）
-        if reviewers_ids is not None:
-            instance.reviewassignment_set.all().delete()
-            from apps.users.models import User
-            for reviewer_id in reviewers_ids:
-                try:
-                    reviewer = User.objects.get(id=reviewer_id)
-                    ReviewAssignment.objects.create(review=instance, reviewer=reviewer)
-                except User.DoesNotExist:
-                    continue
-
+        if projects is not None:
+            instance.projects.set(projects)
+        if testcases is not None:
+            instance.testcases.set(testcases)
+        if template is not serializers.empty:
+            instance.template = template
+            instance.save(update_fields=['template', 'updated_at'])
+        if reviewers is not None and {
+            reviewer.pk for reviewer in reviewers
+        } != set(instance.reviewers.values_list('pk', flat=True)):
+            desired_ids = {reviewer.pk for reviewer in reviewers}
+            instance.reviewassignment_set.exclude(reviewer_id__in=desired_ids).delete()
+            existing_ids = set(instance.reviewers.values_list('pk', flat=True))
+            ReviewAssignment.objects.bulk_create([
+                ReviewAssignment(review=instance, reviewer=reviewer)
+                for reviewer in reviewers if reviewer.pk not in existing_ids
+            ])
+            assignments = instance.reviewassignment_set.all()
+            if assignments.filter(status='pending').exists():
+                instance.status = 'in_progress' if assignments.exclude(status='pending').exists() else 'pending'
+                instance.completed_at = None
+            elif assignments.exists():
+                instance.status = 'rejected' if assignments.exclude(status='approved').exists() else 'approved'
+                instance.completed_at = timezone.now()
+            else:
+                instance.status = 'pending'
+                instance.completed_at = None
+            instance.save(update_fields=['status', 'completed_at', 'updated_at'])
         return instance
 
 
 class ReviewTemplateCreateSerializer(serializers.ModelSerializer):
-    default_reviewers = serializers.ListField(child=serializers.IntegerField(), write_only=True, required=False)
-    project = serializers.ListField(child=serializers.IntegerField(), write_only=True)
-    
+    default_reviewers = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), many=True, required=False, write_only=True,
+    )
+    project = serializers.PrimaryKeyRelatedField(
+        queryset=Project.objects.all(), many=True, allow_empty=False, write_only=True,
+    )
+
     class Meta:
         model = ReviewTemplate
-        fields = ['name', 'description', 'project', 'checklist', 'default_reviewers']
-    
+        fields = [
+            'name', 'description', 'project', 'checklist', 'default_reviewers', 'is_active',
+        ]
+
+    def validate(self, attrs):
+        _reject_duplicate_ids(attrs, ('project', 'default_reviewers'))
+        return attrs
+
+    @transaction.atomic
     def create(self, validated_data):
-        default_reviewers_ids = validated_data.pop('default_reviewers', [])
-        project_ids = validated_data.pop('project', [])
+        default_reviewers = validated_data.pop('default_reviewers', [])
+        projects = validated_data.pop('project')
         template = ReviewTemplate.objects.create(**validated_data)
-        
-        # 添加项目关联
-        if project_ids:
-            template.project.set(project_ids)
-        
-        if default_reviewers_ids:
-            template.default_reviewers.set(default_reviewers_ids)
-        
+        template.project.set(projects)
+        template.default_reviewers.set(default_reviewers)
         return template
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        default_reviewers = validated_data.pop('default_reviewers', None)
+        projects = validated_data.pop('project', None)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if validated_data:
+            instance.save()
+        if projects is not None:
+            instance.project.set(projects)
+        if default_reviewers is not None:
+            instance.default_reviewers.set(default_reviewers)
+        return instance
+
+
+class ReviewersAssignmentSerializer(serializers.Serializer):
+    reviewer_ids = serializers.ListField(
+        child=serializers.PrimaryKeyRelatedField(queryset=User.objects.all()),
+        allow_empty=False,
+    )
+
+    def validate_reviewer_ids(self, reviewers):
+        ids = [reviewer.pk for reviewer in reviewers]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError('不能重复分配同一评审人')
+        return reviewers
+
+
+class ReviewSubmissionSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=('approved', 'rejected', 'abstained'), required=False, default='approved',
+    )
+    comment = serializers.CharField(required=False, allow_blank=True, default='')
+    checklist_results = serializers.JSONField(required=False, default=dict)
+
+    def validate_checklist_results(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('检查清单结果必须为对象')
+        return value

@@ -167,6 +167,8 @@ class TestSuite(models.Model):
     name = models.CharField(max_length=200, verbose_name='套件名称')
     description = models.TextField(blank=True, verbose_name='套件描述')
     requests = models.ManyToManyField(ApiRequest, through='TestSuiteRequest', verbose_name='包含请求')
+    test_cases = models.ManyToManyField('ApiTestCase', through='TestSuiteCase', related_name='test_suites',
+                                        verbose_name='包含接口用例')
     environment = models.ForeignKey(Environment, on_delete=models.SET_NULL, null=True, blank=True,
                                     verbose_name='执行环境')
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='api_test_suites',
@@ -203,7 +205,133 @@ class TestSuiteRequest(models.Model):
         return f"{self.test_suite.name} - {self.request.name}"
 
 
+class ApiTestCase(models.Model):
+    """Project-scoped reusable API test case."""
+    PRIORITY_CHOICES = [('low', '低'), ('medium', '中'), ('high', '高'), ('critical', '紧急')]
+    STATUS_CHOICES = [('draft', '草稿'), ('active', '激活'), ('deprecated', '废弃')]
+
+    project = models.ForeignKey(ApiProject, on_delete=models.CASCADE, related_name='test_cases')
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True, default='')
+    preconditions = models.TextField(blank=True, default='')
+    expected_result = models.TextField(blank=True, default='')
+    priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='medium')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    tags = models.JSONField(default=list)
+    variables = models.JSONField(default=dict)
+    environment = models.ForeignKey(Environment, on_delete=models.SET_NULL, null=True, blank=True,
+                                    related_name='api_test_cases')
+    stop_on_failure = models.BooleanField(default=True)
+    linked_testcase = models.ForeignKey(
+        'testcases.TestCase', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='api_test_cases',
+    )
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_api_test_cases')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'api_test_cases'
+        ordering = ['-updated_at', '-pk']
+        indexes = [models.Index(fields=['project', 'status', 'priority'], name='api_case_proj_state_idx')]
+
+    def __str__(self):
+        return self.name
+
+
+class ApiTestCaseStep(models.Model):
+    """One ordered HTTP request step in an API test case."""
+    test_case = models.ForeignKey(ApiTestCase, on_delete=models.CASCADE, related_name='steps')
+    name = models.CharField(max_length=200)
+    order = models.PositiveIntegerField(default=0)
+    enabled = models.BooleanField(default=True)
+    request = models.ForeignKey(ApiRequest, on_delete=models.PROTECT, related_name='case_steps')
+    request_overrides = models.JSONField(default=dict, blank=True)
+    assertions = models.JSONField(null=True, blank=True)
+    extractors = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        db_table = 'api_test_case_steps'
+        ordering = ['order', 'pk']
+        constraints = [
+            models.UniqueConstraint(fields=['test_case', 'order'], name='api_case_step_order_uniq'),
+        ]
+
+    def __str__(self):
+        return f'{self.test_case.name} - {self.name}'
+
+
+class ApiCaseExecution(models.Model):
+    """Durable history for one asynchronous API test case run."""
+    STATUS_CHOICES = [
+        ('PENDING', '待执行'), ('RUNNING', '执行中'),
+        ('COMPLETED', '已完成'), ('FAILED', '失败'),
+    ]
+
+    project = models.ForeignKey(ApiProject, on_delete=models.CASCADE, related_name='case_executions')
+    test_case = models.ForeignKey(ApiTestCase, on_delete=models.SET_NULL, null=True, blank=True,
+                                  related_name='executions')
+    test_case_name = models.CharField(max_length=200)
+    environment = models.ForeignKey(Environment, on_delete=models.SET_NULL, null=True, blank=True)
+    executed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='api_case_executions')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    start_time = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    duration = models.FloatField(null=True, blank=True)
+    total_steps = models.PositiveIntegerField(default=0)
+    passed_steps = models.PositiveIntegerField(default=0)
+    failed_steps = models.PositiveIntegerField(default=0)
+    skipped_steps = models.PositiveIntegerField(default=0)
+    results = models.JSONField(default=list)
+    error_message = models.TextField(blank=True, default='')
+    idempotency_key = models.CharField(max_length=128, blank=True, null=True, default=None)
+    idempotency_payload_hash = models.CharField(max_length=64, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'api_case_executions'
+        ordering = ['-created_at', '-pk']
+        indexes = [
+            models.Index(fields=['project', 'created_at'], name='api_case_exec_proj_dt_idx'),
+            models.Index(fields=['status', 'heartbeat_at'], name='api_case_exec_state_hb_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project', 'executed_by', 'idempotency_key'],
+                name='api_case_exec_idempotency_uniq',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.start_time and self.end_time:
+            self.duration = (self.end_time - self.start_time).total_seconds()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.test_case_name} - {self.created_at}'
+
+
+class TestSuiteCase(models.Model):
+    """An API test case attached to a mixed API test suite."""
+    test_suite = models.ForeignKey(TestSuite, on_delete=models.CASCADE, related_name='suite_cases')
+    test_case = models.ForeignKey(ApiTestCase, on_delete=models.CASCADE, related_name='suite_memberships')
+    order = models.IntegerField(default=0)
+    enabled = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = 'api_test_suite_cases'
+        ordering = ['order', 'pk']
+        constraints = [
+            models.UniqueConstraint(fields=['test_suite', 'test_case'], name='api_suite_case_unique'),
+        ]
+
+    def __str__(self):
+        return f'{self.test_suite.name} - {self.test_case.name}'
+
+
 class TestExecution(models.Model):
+
     """测试执行模型"""
     EXECUTION_STATUS_CHOICES = [
         ('PENDING', '待执行'),

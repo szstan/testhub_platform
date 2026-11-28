@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import ipaddress
 import socket
 import sys
@@ -271,6 +272,47 @@ def guarded_post(url, *, allow_private=False, pinned_addresses=None, **kwargs):
     )
 
 
+@contextmanager
+def guarded_stream_request(method, url, *, allow_private=False, pinned_addresses=None, **kwargs):
+    """Yield a pinned streaming response while keeping its session alive.
+
+    Callers must enforce byte/time budgets while iterating the response. The
+    response and connection pools close even when the caller rejects a body.
+    Redirects are disabled unless the caller deliberately overrides the policy.
+    """
+    if kwargs.get('proxies') is not None:
+        raise ValueError('Guarded Requests do not allow explicit proxies')
+    parsed_host = httpx.URL(url).host
+    if pinned_addresses is not None:
+        if not pinned_addresses:
+            raise ValueError('pinned_addresses must contain at least one address')
+        parsed_host = _normalize_hostname(parsed_host)
+    kwargs['stream'] = True
+    kwargs.setdefault('allow_redirects', False)
+    with requests.Session() as session:
+        session.trust_env = False
+        adapter = _PinnedHTTPAdapter(
+            pinned_addresses=pinned_addresses,
+            pinned_host=parsed_host if pinned_addresses is not None else None,
+            allow_private=allow_private,
+        )
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        response = session.request(method, url, **kwargs)
+        try:
+            yield response
+        finally:
+            response.close()
+
+
+def guarded_stream_get(url, *, allow_private=False, pinned_addresses=None, **kwargs):
+    """GET variant of :func:`guarded_stream_request`."""
+    return guarded_stream_request(
+        'GET', url, allow_private=allow_private,
+        pinned_addresses=pinned_addresses, **kwargs,
+    )
+
+
 def outbound_httpx_options(allow_private, verify=True, http2=False, **options):
     """Return AsyncClient options for a DNS-pinned HTTPX transport."""
     if allow_private:
@@ -287,5 +329,7 @@ __all__ = [
     "guarded_get",
     "guarded_post",
     "guarded_request",
+    "guarded_stream_request",
+    "guarded_stream_get",
     "outbound_httpx_options",
 ]

@@ -115,10 +115,9 @@ def consume_websocket_ticket(ticket: str, path: str):
 class WebSocketTicketAuthMiddleware:
     """Resolve a short-lived ``?ticket=`` into ``scope['user']``.
 
-    Existing authenticated Django sessions continue to work when no ticket is
-    supplied.  A supplied but invalid ticket deliberately overrides the
-    session user with AnonymousUser so a stale/forged ticket cannot silently
-    fall back to a different session identity.
+    Every socket requires a one-time ticket, even if Django resolved an
+    authenticated session. Invalid or missing tickets must not fall back to a
+    session identity: browsers send those cookies across same-site origins.
     """
 
     def __init__(self, inner):
@@ -136,7 +135,8 @@ class WebSocketTicketAuthMiddleware:
         if isinstance(query_string, bytes):
             query_string = query_string.decode('utf-8', errors='replace')
         ticket = parse_qs(query_string, keep_blank_values=True).get('ticket', [None])[0]
-        if ticket is not None:
+        user = None
+        if ticket:
             try:
                 user = await database_sync_to_async(consume_websocket_ticket)(
                     ticket,
@@ -144,7 +144,6 @@ class WebSocketTicketAuthMiddleware:
                 )
             except Exception:  # noqa: BLE001
                 logger.warning('WebSocket ticket validation failed', exc_info=True)
-                user = None
-            scope = dict(scope)
-            scope['user'] = user or AnonymousUser()
+        scope = dict(scope)
+        scope['user'] = user or AnonymousUser()
         return await self.inner(scope, receive, send)

@@ -140,14 +140,28 @@ class TestExecutor:
         if claim:
             with transaction.atomic():
                 execution = TestExecution.objects.select_for_update().filter(pk=self.execution.pk).first()
+                expected_nonce = getattr(self.execution, '_ui_worker_nonce', None)
+                now = timezone.now()
                 if (
                     execution is None
                     or str(execution.dispatch_claim) != str(claim)
                     or execution.status != 'RUNNING'
                     or execution.cancel_requested_at is not None
+                    or (
+                        execution.worker_nonce is not None
+                        and (
+                            str(execution.worker_nonce) != str(expected_nonce or '')
+                            or execution.worker_lease_expires_at is None
+                            or execution.worker_lease_expires_at <= now
+                        )
+                    )
                 ):
                     return False
                 execution._ui_dispatch_claim = str(claim)
+                if execution.worker_nonce is not None:
+                    execution._ui_worker_nonce = str(expected_nonce)
+                    execution.worker_heartbeat_at = None
+                    execution.worker_lease_expires_at = None
                 execution.status = status
                 execution.passed_cases = passed
                 execution.failed_cases = failed
@@ -167,6 +181,15 @@ class TestExecutor:
                     }
                 }
                 execution.save()
+                stored = TestExecution.objects.filter(pk=execution.pk).values(
+                    'status', 'worker_nonce',
+                ).first()
+                if (
+                    stored is None
+                    or stored['status'] != status
+                    or str(stored['worker_nonce'] or '') != str(execution.worker_nonce or '')
+                ):
+                    return False
                 suite_status = 'passed' if failed == 0 and passed > 0 else 'failed'
                 TestSuite.objects.filter(pk=self.test_suite.pk).update(
                     passed_count=passed,
@@ -315,18 +338,6 @@ class TestExecutor:
                     error_msg=error_msg
                 )
 
-            # 更新所有用例状态为失败
-            for test_case in self.test_cases:
-                TestCaseExecution.objects.filter(
-                    test_case=test_case,
-                    test_suite=self.test_suite,
-                    status='pending'
-                ).update(
-                    status='failed',
-                    error_message=error_msg,
-                    finished_at=timezone.now()
-                )
-
             return
 
         from apps.ui_automation.playwright_engine import PlaywrightTestEngine
@@ -340,17 +351,6 @@ class TestExecutor:
                     status='FAILED',
                     failed=len(self.test_cases),
                     error_msg=error_msg
-                )
-
-            for test_case in self.test_cases:
-                TestCaseExecution.objects.filter(
-                    test_case=test_case,
-                    test_suite=self.test_suite,
-                    status='pending'
-                ).update(
-                    status='failed',
-                    error_message=error_msg,
-                    finished_at=timezone.now()
                 )
 
             return

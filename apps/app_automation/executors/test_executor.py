@@ -9,6 +9,9 @@ import glob
 import importlib
 import json
 import shutil
+import signal
+import time
+import math
 from pathlib import Path
 from typing import Optional, Dict, Any
 from django.conf import settings
@@ -23,6 +26,49 @@ class AppTestWorkerError(RuntimeError):
 
 class AppTestProcessTerminationError(AppTestWorkerError):
     """The child process could not be confirmed stopped; keep its device busy."""
+
+
+class AppTestTimeoutError(AppTestWorkerError):
+    """The APP test case exceeded its parent-enforced deadline."""
+
+
+def _check_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AppTestTimeoutError('APP test case execution deadline exceeded')
+
+
+def _signal_process_tree(process, *, force=False):
+    pid = getattr(process, 'pid', None)
+    if type(pid) is int and pid > 0:
+        if os.name == 'nt':
+            taskkill = shutil.which('taskkill')
+            if taskkill:
+                try:
+                    result = subprocess.run(
+                        [taskkill, '/PID', str(pid), '/T', '/F'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                    if result.returncode == 0:
+                        return
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        raise AppTestProcessTerminationError(
+            '无法确认测试进程树已退出，请检查设备和执行进程'
+        ) from None
+
+    method = process.kill if force else process.terminate
+    method()
 
 
 def _check_cancel(cancel_check):
@@ -93,6 +139,9 @@ class AppTestExecutor:
             raise ValueError("测试项目路径不存在")
         
         self._current_process: Optional[subprocess.Popen] = None
+        self._last_process_exit_confirmed = False
+        self._device_io_stopped_safely = False
+        self._case_deadline = None
         
         logger.info("初始化 AppTestExecutor")
     
@@ -110,6 +159,7 @@ class AppTestExecutor:
         engine='legacy',
         batch_dispatch_id=None,
         batch_execution_ids=None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         运行APP测试用例并生成报告
@@ -125,6 +175,12 @@ class AppTestExecutor:
             执行结果字典
         """
         logger.info("开始执行APP测试")
+        if deadline is not None and (
+            type(deadline) not in (int, float) or not math.isfinite(deadline)
+        ):
+            raise AppTestWorkerError('APP test case deadline is invalid')
+        self._case_deadline = deadline
+        self._device_io_stopped_safely = False
         diagnostic_requested = step_index is not None or expected_case_updated_at is not None
         if diagnostic_requested and (
             type(step_index) is not int
@@ -135,6 +191,7 @@ class AppTestExecutor:
         ):
             raise AppTestWorkerError('Invalid saved-step diagnostic selection')
         _check_cancel(cancel_check)
+        _check_deadline(deadline)
 
         # Fail before starting pytest so a broken worker is reported as an execution
         # error instead of a misleading completed/skipped test run.
@@ -151,6 +208,8 @@ class AppTestExecutor:
                     preflight_execution_session(execution_id, device_id, package_name)
                 except Exception:
                     raise AppTestWorkerError('Appium worker configuration or client is unavailable') from None
+        except AppTestTimeoutError:
+            raise
         except AppTestWorkerError as exc:
             logger.error(
                 "APP worker preflight failed (error_type=%s)", type(exc).__name__
@@ -163,6 +222,7 @@ class AppTestExecutor:
             raise AppTestWorkerError(
                 'APP worker preflight failed; check Python dependencies, ADB and Allure configuration'
             ) from None
+        _check_deadline(deadline)
         original_cwd = os.getcwd()
         device_io_admitted = False
         pytest_process_started = False
@@ -217,6 +277,7 @@ class AppTestExecutor:
                     raise AppTestWorkerError('Invalid device action fence callback')
                 before_device_io()
                 device_io_admitted = True
+            _check_deadline(deadline)
             if using_appium:
                 from ..appium_execution import start_execution_session
                 batch_context = {}
@@ -225,9 +286,24 @@ class AppTestExecutor:
                         'batch_dispatch_id': batch_dispatch_id,
                         'batch_execution_ids': batch_execution_ids,
                     }
-                owned_session = start_execution_session(execution_id, device_id, package_name, **batch_context)
+                if deadline is not None:
+                    batch_context['deadline'] = deadline
+                try:
+                    owned_session = start_execution_session(
+                        execution_id, device_id, package_name, **batch_context,
+                    )
+                except Exception:
+                    # Session startup persists its unknown-outcome recovery fence
+                    # before this parent classifies an expired case budget.
+                    _check_deadline(deadline)
+                    raise
                 env['APP_APPIUM_EXECUTION_SESSION'] = str(owned_session.id)
                 _check_cancel(cancel_check)
+                _check_deadline(deadline)
+            process_group_options = (
+                {'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)}
+                if os.name == 'nt' else {'start_new_session': True}
+            )
             process = subprocess.Popen(
                 pytest_args,
                 cwd=self.base_path,
@@ -237,8 +313,10 @@ class AppTestExecutor:
                 encoding='utf-8',
                 errors='ignore',
                 env=env,
+                **process_group_options,
             )
             pytest_process_started = True
+            self._last_process_exit_confirmed = False
             self._current_process = process
             while True:
                 try:
@@ -254,18 +332,29 @@ class AppTestExecutor:
                                 exit_code = None
                             if type(exit_code) is int:
                                 pytest_process_completed = True
+                                self._last_process_exit_confirmed = True
                                 self._current_process = None
                         else:
                             pytest_process_completed = True
+                            self._last_process_exit_confirmed = True
                             self._current_process = None
                     raise
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    pytest_process_completed = self.stop()
+                    raise AppTestTimeoutError(
+                        'APP test case execution deadline exceeded'
+                    )
+                wait_timeout = 0.25 if remaining is None else min(0.25, remaining)
                 try:
-                    exit_code = process.wait(timeout=0.25)
+                    exit_code = process.wait(timeout=wait_timeout)
                     pytest_process_completed = True
+                    self._last_process_exit_confirmed = True
                     break
                 except subprocess.TimeoutExpired:
                     continue
 
+            _check_deadline(deadline)
             self._current_process = None
             logger.info('pytest worker finished, exit_code=%s', exit_code)
             if owned_session is not None:
@@ -276,9 +365,12 @@ class AppTestExecutor:
                     raise RuntimeError('Appium session requires device recovery')
 
             _check_cancel(cancel_check)
+            _check_deadline(deadline)
             test_results = self._parse_allure_results(allure_results_dir)
             _check_cancel(cancel_check)
+            _check_deadline(deadline)
             report_path = self._generate_allure_report(execution_id)
+            _check_deadline(deadline)
             if not report_path:
                 if using_appium:
                     try:
@@ -316,10 +408,18 @@ class AppTestExecutor:
             raise AppTestProcessTerminationError(
                 '无法确认测试进程已退出，请检查设备和执行进程'
             ) from None
+        except AppTestTimeoutError:
+            raise
         except AppTestWorkerError as exc:
             logger.error("APP worker execution failed (error_type=%s)", type(exc).__name__)
             raise AppTestWorkerError(_safe_worker_error_message(exc)) from None
         except Exception as exc:
+            if type(exc) is RuntimeError and exc.args in (
+                ('device lease lost',),
+                ('APP执行已停止或不再处于运行状态',),
+                ('APP执行批次已停止或已结算',),
+            ):
+                raise
             if cancel_check is not None:
                 try:
                     _check_cancel(cancel_check)
@@ -349,12 +449,26 @@ class AppTestExecutor:
                 try:
                     if owned_session is not None:
                         from ..appium_execution import finish_execution_session
-                        finish_execution_session(
+                        appium_session_closed = finish_execution_session(
                             owned_session,
-                            child_exit_confirmed=pytest_process_completed or not pytest_process_started,
+                            child_exit_confirmed=not pytest_process_started or self._last_process_exit_confirmed,
                         )
+                    # A forced Appium worker stop can leave an in-flight remote
+                    # action. Only its confirmed session close permits reuse.
+                    self._device_io_stopped_safely = (
+                        appium_session_closed is True if using_appium else
+                        pytest_process_completed or (
+                            pytest_process_started and self._last_process_exit_confirmed
+                        )
+                    )
                 finally:
                     os.chdir(original_cwd)
+
+    def _subprocess_timeout(self, maximum):
+        _check_deadline(self._case_deadline)
+        if self._case_deadline is None:
+            return maximum
+        return max(0.001, min(maximum, self._case_deadline - time.monotonic()))
     
     def _build_pytest_args(self, allure_results_dir: str) -> list:
         """构建只执行 APP UI Flow 的 pytest 参数。"""
@@ -396,13 +510,14 @@ class AppTestExecutor:
                     [adb_path, 'version'],
                     capture_output=True,
                     text=True,
-                    timeout=5,
+                    timeout=self._subprocess_timeout(5),
                 )
                 if adb_result.returncode != 0:
                     failures.append(
                         f"ADB executable failed `adb version` (exit {adb_result.returncode})"
                     )
             except (OSError, subprocess.SubprocessError) as exc:
+                _check_deadline(self._case_deadline)
                 failures.append(
                     f"ADB executable could not run ({type(exc).__name__})"
                 )
@@ -421,7 +536,7 @@ class AppTestExecutor:
                     [allure_path, '--version'],
                     capture_output=True,
                     text=True,
-                    timeout=15,
+                    timeout=self._subprocess_timeout(15),
                 )
                 if allure_result.returncode != 0:
                     failures.append(
@@ -429,6 +544,7 @@ class AppTestExecutor:
                         f"(exit {allure_result.returncode})"
                     )
             except (OSError, subprocess.SubprocessError) as exc:
+                _check_deadline(self._case_deadline)
                 failures.append(
                     f"Allure command could not run ({type(exc).__name__})"
                 )
@@ -507,7 +623,7 @@ class AppTestExecutor:
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=self._subprocess_timeout(60),
             )
 
             if result.returncode == 0:
@@ -518,7 +634,10 @@ class AppTestExecutor:
             )
             return None
                 
+        except AppTestTimeoutError:
+            raise
         except subprocess.TimeoutExpired:
+            _check_deadline(self._case_deadline)
             logger.error("Allure 报告生成超时")
             return None
         except Exception as exc:
@@ -663,7 +782,7 @@ class AppTestExecutor:
             return 0
     
     def stop(self):
-        """Stop the child; return true only when it exited before parent termination."""
+        """Stop the worker process tree and report whether it exited naturally."""
         process = self._current_process
         if process is None:
             return False
@@ -673,6 +792,7 @@ class AppTestExecutor:
         except Exception:
             returncode = None
         if type(returncode) is int:
+            self._last_process_exit_confirmed = True
             self._current_process = None
             logger.info('pytest worker had already exited, exit_code=%s', returncode)
             return True
@@ -680,20 +800,25 @@ class AppTestExecutor:
         termination_requested = False
         try:
             try:
-                process.terminate()
+                _signal_process_tree(process)
                 termination_requested = True
                 process.wait(timeout=5)
+                if os.name != 'nt':
+                    _signal_process_tree(process, force=True)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _signal_process_tree(process, force=True)
                 process.wait(timeout=5)
                 logger.warning("测试执行被强制终止")
             else:
                 logger.info("测试执行已停止")
+            self._last_process_exit_confirmed = True
             self._current_process = None
             return False
+        except AppTestProcessTerminationError:
+            raise
         except Exception:
             try:
-                exited = process.poll() is not None
+                exited = type(process.poll()) is int
             except Exception:
                 exited = False
             if not exited:
@@ -701,5 +826,6 @@ class AppTestExecutor:
                 raise AppTestProcessTerminationError(
                     '无法确认测试进程已退出，请检查设备和执行进程'
                 ) from None
+            self._last_process_exit_confirmed = True
             self._current_process = None
             return not termination_requested

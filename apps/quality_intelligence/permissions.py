@@ -67,6 +67,47 @@ def accessible_project_ids(user: Any, source_type: Any, *, project_type: Any = N
         return set()
 
 
+def can_write_quality_project(
+    user: Any,
+    source_type: Any,
+    project_type: Any,
+    project_id: Any,
+) -> bool:
+    """Check write access against the explicit project namespace."""
+
+    if not getattr(user, "is_authenticated", False):
+        return False
+    source_key = str(getattr(source_type, "value", source_type) or "").upper()
+    if source_key not in _SOURCE_PROJECT_MODELS:
+        return False
+    domain = str(project_type or "").upper()
+    if domain == "PROJECT":
+        from apps.projects.access import user_can_write_project
+        from apps.projects.models import Project
+
+        project_model = Project
+    elif domain == source_key and source_key in _SOURCE_PROJECT_MODELS:
+        project_model = _source_model(source_key)
+    else:
+        return False
+    if project_model is None:
+        return False
+    try:
+        project = project_model.objects.filter(pk=project_id).first()
+    except Exception:
+        return False
+    if project is None:
+        return False
+    if domain == "PROJECT":
+        return user_can_write_project(user, project)
+    if is_privileged(user):
+        return True
+    try:
+        return project.owner_id == user.pk or project.members.filter(pk=user.pk).exists()
+    except Exception:
+        return False
+
+
 def quality_project_filter(queryset: Any, user: Any, *, source_field: str = "source_type"):
     """Filter a quality queryset by its source type/project snapshot."""
 
@@ -151,6 +192,7 @@ __all__ = [
     "QualityIntelligenceEnabledPermission",
     "accessible_project_ids",
     "can_access_source_execution",
+    "can_write_quality_project",
     "is_privileged",
     "quality_project_filter",
     "source_execution_queryset",

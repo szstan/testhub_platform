@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -76,7 +77,8 @@ def test_case_submission_persists_snapshot_before_dispatch_and_replays_by_actor_
     request_id = uuid.uuid4()
     dispatch = Mock()
 
-    def dispatch_after_persist(*, args):
+    def dispatch_after_persist(*, args, **options):
+        assert options.get('retry') is False
         execution_id, claim = args
         stored = UiTestCaseExecution.objects.get(pk=execution_id)
         assert stored.status == 'pending'
@@ -220,7 +222,8 @@ def test_suite_submission_is_persisted_idempotently_and_requires_uuid(monkeypatc
     request_id = uuid.uuid4()
     dispatch = Mock()
 
-    def dispatch_after_persist(*, args):
+    def dispatch_after_persist(*, args, **options):
+        assert options.get('retry') is False
         execution_id, claim = args
         stored = UiTestExecution.objects.get(pk=execution_id)
         assert stored.status == 'PENDING'
@@ -260,10 +263,10 @@ def test_suite_submission_is_persisted_idempotently_and_requires_uuid(monkeypatc
 
 
 @pytest.mark.django_db
-def test_broker_failure_is_terminal_and_same_uuid_is_not_dispatched_again(monkeypatch):
+def test_broker_failure_keeps_pending_submission_for_lease_recovery(monkeypatch):
     user, project, case = _context('case-dispatch-failure')
     request_id = uuid.uuid4()
-    dispatch = Mock(side_effect=RuntimeError('fake broker failure'))
+    dispatch = Mock(side_effect=[RuntimeError('fake broker failure'), None])
     monkeypatch.setattr(tasks.execute_workbench_case, 'apply_async', dispatch)
     client = _client(user)
     url = f'/api/ui-automation/test-cases/{case.pk}/run/'
@@ -272,15 +275,28 @@ def test_broker_failure_is_terminal_and_same_uuid_is_not_dispatched_again(monkey
     failed = client.post(url, payload, format='json')
     assert failed.status_code == 503
     execution = UiTestCaseExecution.objects.get(pk=failed.data['execution_id'])
-    assert execution.status == 'error'
-    assert execution.failure_stage == 'dispatch'
-    assert execution.finished_at is not None
+    assert execution.status == 'pending'
+    assert execution.failure_stage == ''
+    assert execution.finished_at is None
+    assert execution.dispatch_delivery_token is not None
+    assert execution.dispatch_delivery_expires_at > timezone.now()
 
     replay = client.post(url, payload, format='json')
-    assert replay.status_code == 503
+    assert replay.status_code == 202
     assert replay.data['execution_id'] == execution.pk
     assert replay.data['replayed'] is True
     dispatch.assert_called_once()
+
+    UiTestCaseExecution.objects.filter(pk=execution.pk).update(
+        dispatch_delivery_expires_at=timezone.now() - timedelta(seconds=1),
+    )
+    from apps.ui_automation.workbench import reconcile_pending_submissions
+    assert reconcile_pending_submissions(limit=1) == 1
+    execution.refresh_from_db()
+    assert execution.status == 'pending'
+    assert execution.dispatch_enqueued_at is not None
+    assert execution.dispatch_delivery_token is None
+    assert dispatch.call_count == 2
 
 
 @pytest.mark.django_db
@@ -300,7 +316,10 @@ def test_case_abort_route_fences_late_worker_saves_and_hides_control_snapshot():
 
     fetched = client.get(path)
     assert fetched.status_code == 200
-    assert not {'dispatch_claim', 'cancel_requested_at', 'request_snapshot'} & set(fetched.data)
+    assert not {
+        'dispatch_claim', 'dispatch_delivery_token', 'dispatch_delivery_expires_at',
+        'dispatch_enqueued_at', 'cancel_requested_at', 'request_snapshot',
+    } & set(fetched.data)
     patched = client.patch(path, {
         'dispatch_claim': str(uuid.uuid4()),
         'cancel_requested_at': timezone.now().isoformat(),

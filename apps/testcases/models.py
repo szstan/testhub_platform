@@ -176,6 +176,20 @@ class TestCaseSyncProfile(models.Model):
     enabled = models.BooleanField(default=True)
     last_commit_sha = models.CharField(max_length=128, blank=True, default='')
     last_sync_at = models.DateTimeField(null=True, blank=True)
+    sync_status = models.CharField(
+        max_length=16,
+        choices=(
+            ('idle', 'Idle'),
+            ('queued', 'Queued'),
+            ('running', 'Running'),
+            ('completed', 'Completed'),
+            ('failed', 'Failed'),
+        ),
+        default='idle',
+    )
+    sync_task_id = models.CharField(max_length=100, blank=True, default='')
+    sync_result = models.JSONField(default=dict, blank=True)
+    sync_error = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='testcase_sync_profiles_created')
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)

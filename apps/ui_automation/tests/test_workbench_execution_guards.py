@@ -103,7 +103,10 @@ def test_suite_abort_endpoint_cancels_parent_and_children_and_fences_finish():
 
     fetched = client.get(f'/api/ui-automation/test-executions/{execution.pk}/')
     assert fetched.status_code == 200
-    assert not {'dispatch_claim', 'cancel_requested_at', 'request_snapshot'} & set(fetched.data)
+    assert not {
+        'dispatch_claim', 'dispatch_delivery_token', 'dispatch_delivery_expires_at',
+        'dispatch_enqueued_at', 'cancel_requested_at', 'request_snapshot',
+    } & set(fetched.data)
     aborted = client.post(f'/api/ui-automation/test-executions/{execution.pk}/abort/')
 
     assert aborted.status_code == 200

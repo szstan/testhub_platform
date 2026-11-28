@@ -5,10 +5,19 @@
 - Rubric 配置化：维度、规则参数、权重、门禁阈值全部存 DB，支持多领域（金融/客服/通用问答/自定义）
 - JudgeRecord/JudgeBatch：评分历史全链路落库，替代原 SQLite log，便于前端查询和 Dashboard 聚合
 """
+from datetime import timedelta
+
 from django.db import models
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 
 User = get_user_model()
+
+BATCH_WORKER_LEASE_SECONDS = 120
+
+
+def default_batch_worker_lease_expires_at():
+    return timezone.now() + timedelta(seconds=BATCH_WORKER_LEASE_SECONDS)
 
 
 class Rubric(models.Model):
@@ -238,6 +247,13 @@ class JudgeBatch(models.Model):
 
     status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
     celery_task_id = models.CharField(max_length=100, blank=True, default='', verbose_name='Celery任务ID')
+    worker_attempt_token = models.CharField(max_length=32, blank=True, default='', verbose_name='工作进程尝试令牌')
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True, verbose_name='工作进程心跳时间')
+    worker_lease_expires_at = models.DateTimeField(
+        null=True, blank=True, default=default_batch_worker_lease_expires_at,
+        verbose_name='工作进程租约到期时间',
+    )
+    worker_recovery_attempts = models.PositiveSmallIntegerField(default=0, verbose_name='工作进程恢复尝试次数')
     error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
@@ -257,6 +273,31 @@ class JudgeBatch(models.Model):
 
     def __str__(self):
         return f'Batch#{self.pk} [{self.status}] {self.scored}/{self.total}'
+
+
+class JudgeBatchCaseResult(models.Model):
+    """Durable per-case checkpoint for a batch score or failure."""
+
+    batch = models.ForeignKey(
+        JudgeBatch, on_delete=models.CASCADE, related_name='case_results',
+    )
+    case_index = models.PositiveIntegerField()
+    result = models.JSONField(default=dict)
+    record = models.ForeignKey(
+        JudgeRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='batch_case_results',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'llm_judge_batch_case_result'
+        ordering = ['case_index']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['batch', 'case_index'],
+                name='llmjudge_batch_case_unique',
+            ),
+        ]
 
 
 # ============================================================

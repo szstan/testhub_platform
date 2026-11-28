@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError, NotFound
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from datetime import timedelta
@@ -14,6 +14,7 @@ from django.db import transaction
 from django.db.models import BigIntegerField, CharField, Count, Max, Min, Q, Sum, Value
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce
+from apps.projects.access import user_can_write_project, writable_projects
 from .models import (
     ExecutionArtifact,
     ExecutionAttempt,
@@ -491,11 +492,43 @@ class TestPlanViewSet(viewsets.ModelViewSet):
             raise ValidationError({'projects': '项目 ID 格式错误'})
 
         accessible_ids = set(
-            get_accessible_projects(self.request.user).values_list('id', flat=True)
+            writable_projects(self.request.user).filter(pk__in=requested_ids).values_list('id', flat=True)
         )
         if not requested_ids.issubset(accessible_ids):
-            raise PermissionDenied('没有权限访问部分项目')
+            raise PermissionDenied('没有权限修改部分项目')
         return requested_ids
+
+    def _validate_version(self, version, project_ids):
+        if version is None:
+            return
+        requested_ids = {int(project_id) for project_id in project_ids}
+        covered_ids = set(version.projects.filter(pk__in=requested_ids).values_list('pk', flat=True))
+        if not requested_ids or covered_ids != requested_ids:
+            raise ValidationError({'version': '版本必须关联全部所选项目'})
+
+    def _resolve_version(self, version_id):
+        if version_id in (None, ''):
+            return None
+        from apps.versions.models import Version
+        try:
+            return Version.objects.select_for_update().get(pk=version_id)
+        except (Version.DoesNotExist, TypeError, ValueError, OverflowError):
+            raise ValidationError({'version': '版本不存在或 ID 无效'})
+
+    def _ensure_current_plan_write(self, plan):
+        self._validate_project_ids(list(plan.projects.values_list('pk', flat=True)))
+
+    def _lock_current_plan(self, plan_id):
+        current = TestPlan.objects.select_for_update().filter(pk=plan_id).first()
+        if current is None:
+            raise NotFound()
+        return current
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        current = self._lock_current_plan(instance.pk)
+        self._ensure_current_plan_write(current)
+        current.delete()
 
     def _sync_test_runs(self, test_plan, project_ids, testcase_ids):
         if not project_ids:
@@ -563,21 +596,13 @@ class TestPlanViewSet(viewsets.ModelViewSet):
 
             test_run.testcases.set([testcase.id for testcase in run_testcases])
 
+    @transaction.atomic
     def perform_create(self, serializer):
-        # 在创建TestPlan时，设置creator并自动为每个项目创建TestRun和TestRunCase
         project_ids = self.request.data.get('projects', [])
         testcase_ids = self.request.data.get('testcases', [])
-        self._validate_project_ids(project_ids)
-
-        version_id = self.request.data.get('version')
-        version = None
-        if version_id:
-            from apps.versions.models import Version
-            try:
-                version = Version.objects.get(id=version_id)
-            except Version.DoesNotExist:
-                pass
-
+        project_ids = self._validate_project_ids(project_ids)
+        version = self._resolve_version(self.request.data.get('version'))
+        self._validate_version(version, project_ids)
         test_plan = serializer.save(creator=self.request.user, version=version)
         self._sync_test_runs(test_plan, project_ids, testcase_ids)
 
@@ -626,42 +651,29 @@ class TestPlanViewSet(viewsets.ModelViewSet):
                 'detail': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @transaction.atomic
     def perform_update(self, serializer):
-        # 在更新TestPlan时，保留未提交字段，避免普通 PATCH 清空关联项目/用例
-        current_plan = serializer.instance
-        if 'version' in self.request.data:
-            version_id = self.request.data.get('version')
-            version = None
-            if version_id:
-                from apps.versions.models import Version
-                try:
-                    version = Version.objects.get(id=version_id)
-                except Version.DoesNotExist:
-                    raise ValidationError({'version': '版本不存在'})
-        else:
-            version = current_plan.version
-
-        if 'projects' in self.request.data:
-            project_ids = self.request.data.get('projects') or []
-        else:
-            project_ids = list(current_plan.projects.values_list('id', flat=True))
-        if 'testcases' in self.request.data:
-            testcase_ids = self.request.data.get('testcases') or []
-        else:
-            testcase_ids = list(current_plan.test_runs.values_list(
-                'run_cases__testcase_id', flat=True
-            ).distinct())
-        self._validate_project_ids(project_ids)
-        if version is not None and not version.projects.filter(id__in=project_ids).exists():
-            raise ValidationError({'version': '版本不属于所选项目'})
-
-        with transaction.atomic():
-            test_plan = serializer.save(version=version)
-            self._sync_test_runs(test_plan, project_ids, testcase_ids)
-
-            if 'assignees' in self.request.data:
-                assignee_ids = self.request.data.get('assignees') or []
-                test_plan.assignees.set(assignee_ids)
+        # Lock before deriving retained relations or allocating child run changes.
+        current_plan = self._lock_current_plan(serializer.instance.pk)
+        self._ensure_current_plan_write(current_plan)
+        serializer.instance = current_plan
+        version = self._resolve_version(
+            self.request.data.get('version') if 'version' in self.request.data else current_plan.version_id
+        )
+        project_ids = (
+            self.request.data.get('projects') or [] if 'projects' in self.request.data
+            else list(current_plan.projects.values_list('id', flat=True))
+        )
+        testcase_ids = (
+            self.request.data.get('testcases') or [] if 'testcases' in self.request.data
+            else list(current_plan.test_runs.values_list('run_cases__testcase_id', flat=True).distinct())
+        )
+        project_ids = self._validate_project_ids(project_ids)
+        self._validate_version(version, project_ids)
+        test_plan = serializer.save(version=version)
+        self._sync_test_runs(test_plan, project_ids, testcase_ids)
+        if 'assignees' in self.request.data:
+            test_plan.assignees.set(self.request.data.get('assignees') or [])
 
 
 class TestRunViewSet(viewsets.ModelViewSet):
@@ -677,67 +689,92 @@ class TestRunViewSet(viewsets.ModelViewSet):
         ).distinct()
 
 class TestRunCaseViewSet(viewsets.ModelViewSet):
-    """
-    测试执行用例视图集
-    """
+    """Legacy run-case writes and their audit history commit together."""
     queryset = TestRunCase.objects.all()
     serializer_class = TestRunCaseSerializer
+    AUDITED_FIELDS = {'status', 'actual_result', 'comments', 'defects', 'elapsed_time'}
 
     def get_queryset(self):
-        return self.queryset.filter(
+        queryset = self.queryset.filter(
             test_run__project__in=get_accessible_projects(self.request.user)
         ).distinct()
+        if self.action in {'update', 'partial_update', 'update_status', 'destroy'}:
+            queryset = queryset.select_for_update()
+        return queryset
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
             return TestRunCaseDetailSerializer
         return TestRunCaseSerializer
 
-    @action(detail=True, methods=['patch'])
-    def update_status(self, request, pk=None):
-        """
-        更新单个用例的执行状态，并自动创建历史记录
-        """
-        run_case = self.get_object()
-        new_status = request.data.get('status')
-        actual_result = request.data.get('actual_result', '')
-        comments = request.data.get('comments', '')
-        
-        if not new_status:
-            return Response({'error': 'Status is required'}, status=status.HTTP_400_BAD_REQUEST)
-        valid_statuses = {value for value, _label in TestRunCase.STATUS_CHOICES}
-        if not isinstance(new_status, str) or new_status not in valid_statuses:
-            return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # 创建历史记录
-        TestRunCaseHistory.objects.create(
-            run_case=run_case,
-            status=new_status,
-            actual_result=actual_result,
-            comments=comments,
-            executed_by=request.user,
-            executed_at=timezone.now()
+    def _ensure_write(self, run_case):
+        if not user_can_write_project(self.request.user, run_case.test_run.project):
+            raise PermissionDenied('没有权限修改该执行任务用例')
+
+    def _record_history_snapshot(self, run_case):
+        return TestRunCaseHistory.objects.create(
+            run_case=run_case, status=run_case.status, actual_result=run_case.actual_result,
+            comments=run_case.comments, defects=run_case.defects, elapsed_time=run_case.elapsed_time,
+            executed_by=self.request.user, executed_at=run_case.executed_at,
         )
-        
-        # 更新执行用例状态
-        run_case.status = new_status
-        run_case.actual_result = actual_result
-        run_case.comments = comments
-        run_case.executed_by = request.user
-        run_case.executed_at = timezone.now()
-        run_case.save()
-        
+
+    def _save_with_history(self, serializer):
+        self._ensure_write(serializer.instance)
+        audited = bool(self.AUDITED_FIELDS.intersection(serializer.validated_data))
+        overrides = {'executed_by': self.request.user, 'executed_at': timezone.now()} if audited else {}
+        run_case = serializer.save(**overrides)
+        if audited:
+            self._record_history_snapshot(run_case)
+        return run_case
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        # Explicit execution results on POST need the same audit guarantees.
+        audited = (
+            serializer.validated_data.get('status', 'untested') != 'untested'
+            or ('elapsed_time' in serializer.validated_data and serializer.validated_data['elapsed_time'] is not None)
+            or any(serializer.validated_data.get(field) for field in self.AUDITED_FIELDS - {'status', 'elapsed_time'})
+        )
+        overrides = {'executed_by': self.request.user, 'executed_at': timezone.now()} if audited else {}
+        run_case = serializer.save(**overrides)
+        if audited:
+            self._record_history_snapshot(run_case)
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        self._save_with_history(serializer)
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    def perform_destroy(self, instance):
+        self._ensure_write(instance)
+        instance.delete()
+
+    @action(detail=True, methods=['patch'])
+    @transaction.atomic
+    def update_status(self, request, pk=None):
+        run_case = self.get_object()
+        if 'status' not in request.data:
+            raise ValidationError({'status': 'Status is required'})
+        serializer = self.get_serializer(run_case, data={
+            'status': request.data['status'],
+            'actual_result': request.data.get('actual_result', ''),
+            'comments': request.data.get('comments', ''),
+        }, partial=True)
+        serializer.is_valid(raise_exception=True)
+        run_case = self._save_with_history(serializer)
         return Response(TestRunCaseDetailSerializer(run_case).data)
 
     @action(detail=True, methods=['get'])
     def history(self, request, pk=None):
-        """
-        获取用例执行历史记录
-        """
         run_case = self.get_object()
         history = run_case.history.all().order_by('-executed_at')
-        serializer = TestRunCaseHistorySerializer(history, many=True)
-        return Response(serializer.data)
+        return Response(TestRunCaseHistorySerializer(history, many=True).data)
 
 class TestRunCaseHistoryViewSet(viewsets.ReadOnlyModelViewSet):
     """

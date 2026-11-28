@@ -1,7 +1,8 @@
 from django.contrib import admin
 from .models import (
     ApiProject, ApiCollection, ApiRequest, Environment, RequestHistory,
-    TestSuite, TestExecution, ScheduledTask, TaskExecutionLog, AIServiceConfig
+    TestSuite, TestSuiteCase, TestExecution, ScheduledTask, TaskExecutionLog, AIServiceConfig,
+    ApiTestCase, ApiTestCaseStep, ApiCaseExecution,
 )
 
 
@@ -39,6 +40,34 @@ class RequestHistoryAdmin(admin.ModelAdmin):
     list_display = ['request', 'status_code', 'response_time', 'executed_by', 'executed_at']
     list_filter = ['status_code', 'executed_at']
     search_fields = ['request__name']
+
+
+@admin.register(ApiTestCase)
+class ApiTestCaseAdmin(admin.ModelAdmin):
+    list_display = ['name', 'project', 'priority', 'status', 'created_by', 'created_at']
+    list_filter = ['priority', 'status', 'project']
+    search_fields = ['name', 'description']
+
+
+@admin.register(ApiTestCaseStep)
+class ApiTestCaseStepAdmin(admin.ModelAdmin):
+    list_display = ['name', 'test_case', 'order', 'enabled', 'request']
+    list_filter = ['enabled']
+    search_fields = ['name', 'test_case__name', 'request__name']
+
+
+@admin.register(ApiCaseExecution)
+class ApiCaseExecutionAdmin(admin.ModelAdmin):
+    list_display = ['test_case_name', 'project', 'status', 'total_steps', 'passed_steps', 'failed_steps', 'created_at']
+    list_filter = ['status', 'project', 'created_at']
+    search_fields = ['test_case_name', 'executed_by__username']
+    readonly_fields = ['created_at', 'start_time', 'end_time', 'duration', 'results']
+
+
+@admin.register(TestSuiteCase)
+class TestSuiteCaseAdmin(admin.ModelAdmin):
+    list_display = ['test_suite', 'test_case', 'order', 'enabled']
+    list_filter = ['enabled']
 
 
 @admin.register(TestSuite)

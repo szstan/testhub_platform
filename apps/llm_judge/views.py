@@ -48,6 +48,13 @@ class IsStaffOrReadOnly(BasePermission):
         return request.method in SAFE_METHODS or request.user.is_staff or request.user.is_superuser
 
 
+def _visible_rubrics(user):
+    queryset = Rubric.objects.filter(is_active=True)
+    if not (user.is_staff or user.is_superuser):
+        queryset = queryset.filter(is_default=True)
+    return queryset
+
+
 class RubricViewSet(viewsets.ModelViewSet):
     """评分标准 CRUD + 预设模板克隆。"""
     queryset = Rubric.objects.filter(is_active=True).prefetch_related('dimensions', 'rules')
@@ -108,14 +115,14 @@ class JudgeRecordViewSet(viewsets.ReadOnlyModelViewSet):
 
 class JudgeBatchViewSet(viewsets.ModelViewSet):
     """批量评分批次：创建即异步执行，list/retrieve 查状态和汇总。"""
-    queryset = JudgeBatch.objects.select_related('rubric').all()
+    queryset = JudgeBatch.objects.select_related('rubric').prefetch_related('case_results').all()
     serializer_class = JudgeBatchSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = StandardPagination
     http_method_names = ['get', 'post', 'head', 'options']
 
     def get_queryset(self):
-        qs = JudgeBatch.objects.select_related('rubric').all()
+        qs = JudgeBatch.objects.select_related('rubric').prefetch_related('case_results').all()
         if self.request.user.is_staff or self.request.user.is_superuser:
             return qs
         return qs.filter(created_by=self.request.user)
@@ -145,15 +152,20 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
             return Response({'error': '同时运行的批量评分任务已达到上限'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         rubric_id = data.get('rubric')
-        if rubric_id:
-            rubric_queryset = Rubric.objects.filter(is_active=True)
-            if not (request.user.is_staff or request.user.is_superuser):
-                rubric_queryset = rubric_queryset.filter(is_default=True)
-            rubric = rubric_queryset.filter(pk=rubric_id).first()
-            if rubric is None:
-                return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
-        else:
-            rubric = Rubric.objects.filter(is_default=True, is_active=True).first()
+        visible_rubrics = set(_visible_rubrics(request.user).values_list('pk', flat=True))
+        if rubric_id is not None and rubric_id not in visible_rubrics:
+            return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
+        for index, case in enumerate(cases):
+            case_rubric_id = case.get('rubric')
+            if case_rubric_id is not None and case_rubric_id not in visible_rubrics:
+                return Response(
+                    {'error': f'第 {index + 1} 条用例指定的 rubric 不存在或未启用'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        rubric = Rubric.objects.filter(pk=rubric_id).first() if rubric_id is not None else (
+            _visible_rubrics(request.user).filter(is_default=True).first()
+        )
 
         creator = None if isinstance(request.user, AnonymousUser) else request.user
         batch = JudgeBatch.objects.create(
@@ -169,14 +181,19 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
             started_at=timezone.now(),
         )
 
-        from .tasks import score_batch_task
+        from .tasks import score_batch_task, worker_lease_deadline, _mark_dispatch_acknowledged
         from celery import current_app as _celery_app
 
         sync_fallback_msg = None
         import uuid
         planned_task_id = f'judge-{uuid.uuid4().hex}'
+        publisher_lease_at = timezone.now()
         JudgeBatch.objects.filter(pk=batch.id, celery_task_id='').update(
-            celery_task_id=planned_task_id, status='running')
+            celery_task_id=planned_task_id,
+            status='running',
+            worker_heartbeat_at=None,
+            worker_lease_expires_at=worker_lease_deadline(publisher_lease_at),
+        )
         batch.celery_task_id = planned_task_id
         batch.status = 'running'
 
@@ -216,12 +233,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                     orig_fn(FakeS(), batch_id)
                 except Exception as sync_exc:
                     logger.exception(f'[JudgeBatch#{batch_id}] 后台线程执行失败')
-                    JudgeBatch.objects.filter(pk=batch_id).update(
-                        status='failed',
-                        error_message=f'后台执行失败: {sync_exc}',
-                        completed_at=timezone.now(),
-                        is_paused=False,
-                    )
+                    # score_batch_task persists failure only while its attempt token is current.
                 finally:
                     close_old_connections()
 
@@ -234,9 +246,13 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                 async_result = score_batch_task.apply_async(
                     (batch.id,), retry=False, ignore_result=False, task_id=planned_task_id,
                 )
-                batch.celery_task_id = async_result.id or planned_task_id
-                batch.status = 'running'
-                batch.save(update_fields=['celery_task_id', 'status'])
+                async_id = async_result.id or planned_task_id
+                _mark_dispatch_acknowledged(
+                    batch.id,
+                    planned_task_id,
+                    published_task_id=async_id,
+                )
+                batch.celery_task_id = async_id
             except Exception as delay_exc:
                 sync_fallback_msg = f'Celery 投递失败已切换后台执行: {delay_exc}'
                 _run_fallback_in_thread(batch.id, delay_err=str(delay_exc))
@@ -245,9 +261,15 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
             _run_fallback_in_thread(batch.id, delay_err='broker_unreachable')
 
         if sync_fallback_msg:
-            JudgeBatch.objects.filter(pk=batch.id).update(error_message=sync_fallback_msg)
+            JudgeBatch.objects.filter(
+                pk=batch.id,
+                celery_task_id=planned_task_id,
+                status='running',
+                worker_attempt_token='',
+            ).update(error_message=sync_fallback_msg)
             batch.error_message = sync_fallback_msg
 
+        batch.refresh_from_db()
         return Response(JudgeBatchSerializer(batch).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='progress')
@@ -315,19 +337,40 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                 return Response({'error': 'batch not found'}, status=status.HTTP_404_NOT_FOUND)
             if batch.total == 0:
                 return Response({'error': 'no cases in batch'}, status=status.HTTP_400_BAD_REQUEST)
-            if batch.status not in ('paused', 'partial', 'failed', 'pending'):
-                return Response({'error': f'status {batch.status} cannot be resumed (only paused/partial/failed/pending allowed)'},
+            running_lease_expired = False
+            if batch.status == 'running':
+                lease_expired = (
+                    batch.worker_lease_expires_at is not None
+                    and batch.worker_lease_expires_at <= timezone.now()
+                )
+                legacy_active_without_lease = (
+                    batch.worker_lease_expires_at is None
+                    and batch.worker_heartbeat_at is not None
+                )
+                running_lease_expired = lease_expired or legacy_active_without_lease
+            if batch.status == 'running' and not running_lease_expired:
+                return Response({'error': 'active worker lease prevents resume'}, status=status.HTTP_400_BAD_REQUEST)
+            if batch.status not in ('paused', 'partial', 'failed', 'pending', 'running'):
+                return Response({'error': f'status {batch.status} cannot be resumed (only paused/partial/failed/pending or stale running allowed)'},
                                 status=status.HTTP_400_BAD_REQUEST)
+            resume_now = timezone.now()
+            import uuid
+            planned_resume_task_id = f'judge-resume-{uuid.uuid4().hex}'
+            from .tasks import worker_lease_deadline, _mark_dispatch_acknowledged
             rows = JudgeBatch.objects.filter(
                 pk=batch.id,
-                status__in=('paused', 'partial', 'failed', 'pending'),
-            ).update(is_paused=False, status='running')
+                status__in=('paused', 'partial', 'failed', 'pending', 'running'),
+            ).update(
+                is_paused=False,
+                status='running',
+                celery_task_id=planned_resume_task_id,
+                worker_attempt_token='',
+                worker_heartbeat_at=None,
+                worker_lease_expires_at=worker_lease_deadline(resume_now),
+                worker_recovery_attempts=0,
+            )
             if rows == 1:
                 batch.refresh_from_db()
-                if batch.scored >= batch.total:
-                    JudgeBatch.objects.filter(pk=batch.id).update(status='completed', completed_at=timezone.now())
-                    batch.refresh_from_db()
-                    return Response(JudgeBatchSerializer(batch).data)
                 if batch.started_at is None:
                     JudgeBatch.objects.filter(pk=batch.id).update(started_at=timezone.now())
                     batch.refresh_from_db()
@@ -351,12 +394,7 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                             orig_fn(FakeS(), batch_id)
                         except Exception as sync_exc:
                             logger.exception(f'[JudgeBatch#{batch_id}] resume: 后台续跑失败')
-                            JudgeBatch.objects.filter(pk=batch_id).update(
-                                status='failed',
-                                error_message=f'后台续跑失败: {sync_exc}',
-                                completed_at=timezone.now(),
-                                is_paused=False,
-                            )
+                            # score_batch_task persists failure only while its attempt token is current.
                         finally:
                             _close_old_conn()
                     _th.Thread(target=_worker, daemon=True, name=f'judge-resume-{batch_id}').start()
@@ -376,24 +414,34 @@ class JudgeBatchViewSet(viewsets.ModelViewSet):
                     except Exception:
                         return False
 
-                import uuid
-                planned_resume_task_id = f'judge-resume-{uuid.uuid4().hex}'
-                JudgeBatch.objects.filter(pk=batch.id).update(
-                    celery_task_id=planned_resume_task_id, status='running')
-                batch.celery_task_id = planned_resume_task_id
                 if _broker_reachable(timeout=2.0):
                     try:
                         async_result = score_batch_task.apply_async(
                             (batch.id,), retry=False, task_id=planned_resume_task_id,
                         )
-                        JudgeBatch.objects.filter(pk=batch.id, celery_task_id=planned_resume_task_id).update(
-                            celery_task_id=async_result.id or planned_resume_task_id)
+                        async_id = async_result.id or planned_resume_task_id
+                        _mark_dispatch_acknowledged(
+                            batch.id,
+                            planned_resume_task_id,
+                            published_task_id=async_id,
+                        )
                     except Exception as delay_exc:
-                        JudgeBatch.objects.filter(pk=batch.id).update(error_message=f'resume: 投递失败已切换后台: {delay_exc}')
+                        JudgeBatch.objects.filter(
+                            pk=batch.id,
+                            celery_task_id=planned_resume_task_id,
+                            status='running',
+                            worker_attempt_token='',
+                        ).update(error_message=f'resume: 投递失败已切换后台: {delay_exc}')
                         _resume_fallback_thread(batch.id, delay_err=str(delay_exc))
                 else:
-                    JudgeBatch.objects.filter(pk=batch.id).update(error_message='resume: broker 不可达，已切换后台续跑')
+                    JudgeBatch.objects.filter(
+                        pk=batch.id,
+                        celery_task_id=planned_resume_task_id,
+                        status='running',
+                        worker_attempt_token='',
+                    ).update(error_message='resume: broker 不可达，已切换后台续跑')
                     _resume_fallback_thread(batch.id, delay_err='broker_unreachable')
+        batch.refresh_from_db()
         return Response(JudgeBatchSerializer(batch).data)
 
 
@@ -406,12 +454,8 @@ class JudgeSingleView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         rubric_id = data.get('rubric')
-        if rubric_id:
-            rubric_queryset = Rubric.objects.filter(is_active=True)
-            if not (request.user.is_staff or request.user.is_superuser):
-                rubric_queryset = rubric_queryset.filter(is_default=True)
-            if not rubric_queryset.filter(pk=rubric_id).exists():
-                return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
+        if rubric_id is not None and not _visible_rubrics(request.user).filter(pk=rubric_id).exists():
+            return Response({'error': '指定的 rubric 不存在或未启用'}, status=status.HTTP_400_BAD_REQUEST)
 
         from .service import JudgeService
         service = JudgeService()

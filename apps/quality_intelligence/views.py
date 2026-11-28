@@ -46,8 +46,8 @@ from apps.quality_intelligence.models import (
 )
 from apps.quality_intelligence.permissions import (
     QualityIntelligenceEnabledPermission,
-    accessible_project_ids,
     can_access_source_execution,
+    can_write_quality_project,
     is_privileged,
     quality_project_filter,
     source_execution_queryset,
@@ -177,11 +177,8 @@ def _paginate(view, queryset, serializer_class):
     return Response(serializer_class(queryset, many=True).data)
 
 
-def _parse_project_access(user, source_type: str, project_id: Any, project_type: str) -> bool:
-    if is_privileged(user):
-        return True
-    visible = accessible_project_ids(user, source_type, project_type=project_type)
-    return visible is not None and str(project_id) in visible
+def _parse_project_write_access(user, source_type: str, project_id: Any, project_type: str) -> bool:
+    return can_write_quality_project(user, source_type, project_type, project_id)
 
 
 def _choose_baseline(run: QualityRun, observation: QualityMetricObservation):
@@ -700,7 +697,7 @@ class BaselineViewSet(
 ):
     permission_classes = [QualityIntelligenceEnabledPermission, IsAuthenticated]
     pagination_class = QualityPagination
-    http_method_names = ["get", "post", "put", "patch", "head", "options"]
+    http_method_names = ["get", "post", "put", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         queryset = _baseline_queryset(self.request.user).select_related("profile", "source_run").order_by("-updated_at")
@@ -717,8 +714,8 @@ class BaselineViewSet(
             return _error("INVALID_BASELINE", "invalid baseline", status.HTTP_400_BAD_REQUEST, fields=serializer.errors)
         values = dict(serializer.validated_data)
         profile_id = values.pop("profile_id", None)
-        if not _parse_project_access(request.user, values["source_type"], values["project_id"], values["project_type"]):
-            return _error("PROJECT_FORBIDDEN", "project is not accessible", status.HTTP_404_NOT_FOUND)
+        if not _parse_project_write_access(request.user, values["source_type"], values["project_id"], values["project_type"]):
+            return _error("PROJECT_FORBIDDEN", "project is not writable", status.HTTP_404_NOT_FOUND)
         if profile_id is not None:
             profile = _profile_queryset(request.user).filter(
                 pk=profile_id,
@@ -739,6 +736,10 @@ class BaselineViewSet(
 
     def update(self, request, *args, **kwargs):
         baseline = self.get_object()
+        if not _parse_project_write_access(
+            request.user, baseline.source_type, baseline.project_id, baseline.project_type,
+        ):
+            return _error("PROJECT_FORBIDDEN", "project is not writable", status.HTTP_404_NOT_FOUND)
         serializer = self.get_serializer(baseline, data=request.data, partial=kwargs.pop("partial", False))
         if not serializer.is_valid():
             return _error("INVALID_BASELINE", "invalid baseline", status.HTTP_400_BAD_REQUEST, fields=serializer.errors)
@@ -748,9 +749,8 @@ class BaselineViewSet(
         source_type = values.get("source_type", baseline.source_type)
         project_type = values.get("project_type", baseline.project_type)
         project_id = values.get("project_id", baseline.project_id)
-        if any(key in values for key in ("project_id", "source_type", "project_type")):
-            if not _parse_project_access(request.user, source_type, project_id, project_type):
-                return _error("PROJECT_FORBIDDEN", "project is not accessible", status.HTTP_404_NOT_FOUND)
+        if not _parse_project_write_access(request.user, source_type, project_id, project_type):
+            return _error("PROJECT_FORBIDDEN", "project is not writable", status.HTTP_404_NOT_FOUND)
         if has_profile:
             if profile_id is None:
                 values["profile"] = None
@@ -775,6 +775,15 @@ class BaselineViewSet(
         baseline.updated_by = request.user
         baseline.save()
         return Response(QualityBaselineSerializer(baseline).data)
+
+    def destroy(self, request, *args, **kwargs):
+        baseline = self.get_object()
+        if not _parse_project_write_access(
+            request.user, baseline.source_type, baseline.project_id, baseline.project_type,
+        ):
+            return _error("PROJECT_FORBIDDEN", "project is not writable", status.HTTP_404_NOT_FOUND)
+        baseline.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ComparisonViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):

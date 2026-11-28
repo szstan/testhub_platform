@@ -1,6 +1,7 @@
 """智能评分器 DRF 序列化器。"""
 import json
 
+from django.db import transaction
 from rest_framework import serializers
 
 from .models import Rubric, RubricDimension, RubricRule, JudgeRecord, JudgeBatch
@@ -18,6 +19,24 @@ class RubricRuleSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class RubricDimensionCreateSerializer(serializers.ModelSerializer):
+    rubric = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = RubricDimension
+        fields = '__all__'
+        validators = []
+
+
+class RubricRuleCreateSerializer(serializers.ModelSerializer):
+    rubric = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = RubricRule
+        fields = '__all__'
+        validators = []
+
+
 class RubricSerializer(serializers.ModelSerializer):
     dimensions = RubricDimensionSerializer(many=True, read_only=True)
     rules = RubricRuleSerializer(many=True, read_only=True)
@@ -31,14 +50,15 @@ class RubricSerializer(serializers.ModelSerializer):
 
 class RubricCreateSerializer(serializers.ModelSerializer):
     """创建 Rubric：支持同时传入 dimensions 和 rules（嵌套创建/复制预设模板）。"""
-    dimensions = RubricDimensionSerializer(many=True, required=False)
-    rules = RubricRuleSerializer(many=True, required=False)
+    dimensions = RubricDimensionCreateSerializer(many=True, required=False)
+    rules = RubricRuleCreateSerializer(many=True, required=False)
     clone_from = serializers.IntegerField(required=False, write_only=True, help_text='从指定 Rubric ID 复制模板')
 
     class Meta:
         model = Rubric
         fields = '__all__'
 
+    @transaction.atomic
     def create(self, validated_data):
         dimensions_data = validated_data.pop('dimensions', [])
         rules_data = validated_data.pop('rules', [])
@@ -80,10 +100,23 @@ class JudgeRecordSerializer(serializers.ModelSerializer):
 class JudgeBatchSerializer(serializers.ModelSerializer):
     rubric_name = serializers.CharField(source='rubric.name', read_only=True, default='')
     records_count = serializers.IntegerField(source='records.count', read_only=True)
+    results_buffer = serializers.SerializerMethodField()
 
     class Meta:
         model = JudgeBatch
         fields = '__all__'
+        extra_kwargs = {
+            'worker_attempt_token': {'write_only': True},
+            'worker_heartbeat_at': {'write_only': True},
+            'worker_lease_expires_at': {'write_only': True},
+            'worker_recovery_attempts': {'write_only': True},
+        }
+
+    def get_results_buffer(self, obj):
+        rows = list(obj.case_results.all())
+        if rows:
+            return [row.result for row in rows]
+        return obj.results_buffer or []
 
 
 class JudgeSingleRequestSerializer(serializers.Serializer):
@@ -128,6 +161,7 @@ class JudgeBatchRequestSerializer(serializers.Serializer):
         except (TypeError, ValueError) as exc:
             raise serializers.ValidationError('批量评分数据无法序列化') from exc
 
+        normalized_cases = []
         for i, case in enumerate(cases):
             if not isinstance(case, dict):
                 raise serializers.ValidationError(f'第 {i+1} 条用例格式错误：应为 JSON 对象')
@@ -143,7 +177,12 @@ class JudgeBatchRequestSerializer(serializers.Serializer):
                 raise serializers.ValidationError(f'第 {i+1} 条用例 answer 必须是非空字符串')
             if len(question) > 20000 or len(answer) > 50000:
                 raise serializers.ValidationError(f'第 {i+1} 条用例文本过长')
-        return cases
+
+            normalized = dict(case)
+            if 'rubric' in single.validated_data:
+                normalized['rubric'] = single.validated_data['rubric']
+            normalized_cases.append(normalized)
+        return normalized_cases
 
 
 # ============================================================

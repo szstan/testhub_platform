@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -333,6 +334,7 @@ def start_execution_session(
     parent_pid=None,
     batch_dispatch_id=None,
     batch_execution_ids=None,
+    deadline=None,
 ):
     """Reserve, create, and persist a session before launching the pytest child."""
     parent_pid = os.getpid() if parent_pid is None else parent_pid
@@ -354,7 +356,10 @@ def start_execution_session(
     try:
         if endpoint_for_device(device) != endpoint:
             raise AppiumConfigurationError("The configured Appium endpoint changed")
-        driver = create_driver(device, execution.test_case.app_package, system_port=system_port, auto_launch=False)
+        driver = create_driver(
+            device, execution.test_case.app_package, system_port=system_port,
+            auto_launch=False, **({'deadline': deadline} if deadline is not None else {}),
+        )
     except (AppiumClientUnavailable, AppiumConfigurationError, AppiumInputError):
         _settle_known_start_failure(session.pk)
         raise AppiumExecutionError("Appium could not start on this worker") from None
@@ -495,16 +500,27 @@ def finish_execution_session(owned_session, *, child_exit_confirmed):
     ):
         _mark_session_unknown(session.pk, "child_cleanup_unproven")
         return False
-    try:
-        session, _execution = _execution_session_fence(owned_session.execution_id, owned_session.id, closing=True)
-        if session.status != "active":
-            raise AppiumExecutionError("The Appium execution session is not active")
-        driver = attach_driver(session)
-        quit_driver(driver)
-    except AppiumOutcomeUnknown:
-        _mark_session_unknown(session.pk, "appium_close_outcome_unknown")
-        return False
-    except Exception:
+    cleanup_deadline = time.monotonic() + 10.0
+    close_confirmed = False
+    for _attempt in range(2):
+        now = time.monotonic()
+        if now >= cleanup_deadline:
+            break
+        try:
+            session, _execution = _execution_session_fence(owned_session.execution_id, owned_session.id, closing=True)
+            if session.status != "active":
+                raise AppiumExecutionError("The Appium execution session is not active")
+            # Reattach to the same persisted session: DELETE is safe to retry,
+            # while a session-creation POST must never be retried after uncertainty.
+            driver = attach_driver(session, deadline=min(cleanup_deadline, now + 5.0))
+            quit_driver(driver)
+            close_confirmed = True
+            break
+        except AppiumOutcomeUnknown:
+            continue
+        except Exception:
+            break
+    if not close_confirmed:
         _mark_session_unknown(session.pk, "appium_close_outcome_unknown")
         return False
 
