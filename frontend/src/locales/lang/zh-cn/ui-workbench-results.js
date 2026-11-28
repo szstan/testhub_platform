@@ -15,10 +15,15 @@ export default {
   trackingTimedOut: '状态刷新已达到时限，当前显示最后已知状态。',
   openReport: '打开报告详情',
   resumeTracking: '恢复状态刷新',
+  abortExecution: '请求中止执行',
+  abortConfirm: '确定请求中止执行 #{id} 吗？执行节点可能需要一些时间才能停止。',
+  abortRequested: '已请求中止。执行节点停止后状态会更新。',
+  abortFailed: '无法请求中止此执行。',
+  rerunOrigin: '重跑来源：',
   failureSummary: '失败摘要',
   failedCase: '失败用例',
   failureStage: '失败阶段',
   firstFailedStep: '首个失败步骤',
   failureScreenshot: '失败截图',
-  openFailedCase: '打开失败用例详情'
+  openFailedCase: '在编辑器中打开失败用例以修复或重跑'
 }

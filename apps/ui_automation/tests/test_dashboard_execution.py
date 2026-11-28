@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import json
 import threading
+import uuid
 
 import pytest
 from django.apps import apps
@@ -284,11 +285,15 @@ def test_suite_runs_pass_precreated_execution_and_get_independent_ids(monkeypatc
 
     monkeypatch.setattr(test_executor.TestExecutor, 'run', run_with_existing_execution)
     client = _client_for(user)
-    first = client.post(f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {}, format='json')
-    second = client.post(f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {}, format='json')
+    first = client.post(f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {
+        'client_request_id': str(uuid.uuid4()),
+    }, format='json')
+    second = client.post(f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {
+        'client_request_id': str(uuid.uuid4()),
+    }, format='json')
 
-    assert first.status_code == 200
-    assert second.status_code == 200
+    assert first.status_code == 202
+    assert second.status_code == 202
     first_id = first.data['execution_id']
     second_id = second.data['execution_id']
     assert first_id != second_id
@@ -308,10 +313,12 @@ def test_suite_worker_exception_marks_aggregate_failed(monkeypatch):
 
     monkeypatch.setattr(test_executor.TestExecutor, 'run', fail_worker)
     response = _client_for(user).post(
-        f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {}, format='json'
+        f'/api/ui-automation/test-suites/{suite.pk}/run_suite/',
+        {'client_request_id': str(uuid.uuid4())},
+        format='json',
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     execution = UiTestExecution.objects.get(pk=response.data['execution_id'])
     assert execution.status == 'FAILED'
     assert execution.finished_at is not None
@@ -322,20 +329,37 @@ def test_suite_worker_exception_marks_aggregate_failed(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_suite_thread_launch_exception_marks_aggregate_failed(monkeypatch):
-    user, _project, suite = _suite_run_fixture('suite-launch-error')
-    _allow_playwright(monkeypatch)
-    _immediate_thread(monkeypatch, start_error=RuntimeError('thread start failed'))
+def test_suite_broker_dispatch_failure_marks_aggregate_failed(monkeypatch):
+    from apps.ui_automation import tasks
 
-    response = _client_for(user).post(
-        f'/api/ui-automation/test-suites/{suite.pk}/run_suite/', {}, format='json'
+    user, _project, suite = _suite_run_fixture('suite-dispatch-error')
+    dispatch = Mock(side_effect=RuntimeError('broker unavailable'))
+    monkeypatch.setattr(tasks.execute_workbench_suite, 'apply_async', dispatch)
+    request_id = str(uuid.uuid4())
+
+    client = _client_for(user)
+    response = client.post(
+        f'/api/ui-automation/test-suites/{suite.pk}/run_suite/',
+        {'client_request_id': request_id},
+        format='json',
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 503
     execution = UiTestExecution.objects.get(pk=response.data['execution_id'])
     assert execution.status == 'FAILED'
     assert execution.finished_at is not None
-    assert execution.error_message == response.data['error'] == INTERNAL_SUITE_EXECUTION_ERROR
+    assert execution.failure_stage == 'dispatch'
+    assert execution.error_message == response.data['message']
+
+    replay = client.post(
+        f'/api/ui-automation/test-suites/{suite.pk}/run_suite/',
+        {'client_request_id': request_id},
+        format='json',
+    )
+    assert replay.status_code == 503
+    assert replay.data['execution_id'] == execution.pk
+    assert replay.data['replayed'] is True
+    dispatch.assert_called_once()
 
 
 @pytest.mark.django_db

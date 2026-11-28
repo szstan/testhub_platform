@@ -7,7 +7,7 @@ import time
 import json
 from datetime import datetime
 from django.utils import timezone
-from django.db import connection
+from django.db import connection, transaction
 from apps.core.browser_proxy import GuardedBrowserProxy
 from apps.core.network import guard_playwright_route_sync
 from apps.core.scheduler import ScheduleClaimLost
@@ -43,14 +43,16 @@ class TestExecutor:
     """测试执行器基类"""
 
     def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None,
-                 cancel_check=None, execution=None):
+                 cancel_check=None, execution=None, case_snapshots=None, base_url=None):
         self.test_suite = test_suite
+        self.base_url = test_suite.project.base_url if base_url is None else base_url
         self.engine = engine
         self.browser = browser
         self.headless = headless
         self.executed_by = executed_by
         self.cancel_check = cancel_check
         self.execution = execution
+        self.case_snapshots = {item['id']: item for item in (case_snapshots or [])}
         self.test_cases = []
         self.results = []
         self._case_executions = {}
@@ -133,7 +135,48 @@ class TestExecutor:
         return self.execution
 
     def update_execution_result(self, status, passed=0, failed=0, skipped=0, duration=0, error_msg=''):
-        """更新执行结果"""
+        """Update the aggregate only while this worker still owns an active claim."""
+        claim = getattr(self.execution, '_ui_dispatch_claim', None) if self.execution else None
+        if claim:
+            with transaction.atomic():
+                execution = TestExecution.objects.select_for_update().filter(pk=self.execution.pk).first()
+                if (
+                    execution is None
+                    or str(execution.dispatch_claim) != str(claim)
+                    or execution.status != 'RUNNING'
+                    or execution.cancel_requested_at is not None
+                ):
+                    return False
+                execution._ui_dispatch_claim = str(claim)
+                execution.status = status
+                execution.passed_cases = passed
+                execution.failed_cases = failed
+                execution.skipped_cases = skipped
+                execution.total_cases = passed + failed + skipped
+                execution.duration = duration
+                execution.finished_at = timezone.now()
+                execution.error_message = error_msg
+                execution.result_data = {
+                    'test_cases': self.results,
+                    'summary': {
+                        'total': execution.total_cases,
+                        'passed': passed,
+                        'failed': failed,
+                        'skipped': skipped,
+                        'pass_rate': round((passed / execution.total_cases * 100) if execution.total_cases > 0 else 0, 2)
+                    }
+                }
+                execution.save()
+                suite_status = 'passed' if failed == 0 and passed > 0 else 'failed'
+                TestSuite.objects.filter(pk=self.test_suite.pk).update(
+                    passed_count=passed,
+                    failed_count=failed,
+                    execution_status=suite_status,
+                    updated_at=timezone.now(),
+                )
+                self.execution = execution
+                return True
+
         self.execution.status = status
         self.execution.passed_cases = passed
         self.execution.failed_cases = failed
@@ -160,9 +203,20 @@ class TestExecutor:
         self.test_suite.failed_count = failed
         self.test_suite.execution_status = 'passed' if failed == 0 and passed > 0 else 'failed'
         self.test_suite.save()
+        return True
 
     def get_test_cases(self):
         """获取测试套件中的所有测试用例"""
+        if self.case_snapshots:
+            case_ids = list(self.case_snapshots)
+            cases = {
+                case.pk: case for case in TestCase.objects.filter(pk__in=case_ids)
+            }
+            if len(cases) != len(case_ids):
+                raise ValueError('受理时的套件用例已发生变化，无法按快照执行')
+            self.test_cases = [cases[case_id] for case_id in case_ids]
+            return self.test_cases
+
         suite_test_cases = self.test_suite.suite_test_cases.select_related('test_case').order_by('order')
         self.test_cases = [stc.test_case for stc in suite_test_cases]
         print(f"从套件 '{self.test_suite.name}' 获取到 {len(self.test_cases)} 个测试用例")
@@ -304,6 +358,10 @@ class TestExecutor:
         # 预先获取所有测试用例的步骤数据，避免在Playwright上下文中访问ORM
         test_cases_data = []
         for test_case in self.test_cases:
+            snapshot = self.case_snapshots.get(test_case.id)
+            if snapshot is not None:
+                test_cases_data.append(snapshot)
+                continue
             case_data = {
                 'id': test_case.id,
                 'name': test_case.name,
@@ -346,6 +404,7 @@ class TestExecutor:
                 test_case_id=case_data['id'],
                 project_id=case_data['project_id'],
                 test_suite=self.test_suite,
+                parent_execution=self.execution,
                 execution_source='suite',
                 status='pending',  # 初始状态为 pending
                 engine=self.engine,
@@ -415,9 +474,9 @@ class TestExecutor:
                     self.current_page = self.context.new_page()
 
                     # 导航到项目基础URL
-                    if self.test_suite.project.base_url:
+                    if self.base_url:
                         try:
-                            print(f"正在导航到: {self.test_suite.project.base_url}")
+                            print(f"正在导航到: {self.base_url}")
 
                             # 检测是否在Linux服务器环境
                             import platform
@@ -425,7 +484,7 @@ class TestExecutor:
 
                             # Validate immediately before the browser request.
                             safe_base_url = validate_ui_outbound_url(
-                                self.test_suite.project.base_url,
+                                self.base_url,
                             )
                             self._check_cancelled()
                             self.current_page.goto(safe_base_url, wait_until='networkidle',
@@ -437,7 +496,7 @@ class TestExecutor:
                             time.sleep(extra_wait)
 
                             print(
-                                f"✓ 成功导航到: {self.test_suite.project.base_url} (已等待页面加载完成，额外{extra_wait}秒)")
+                                f"✓ 成功导航到: {self.base_url} (已等待页面加载完成，额外{extra_wait}秒)")
                         except Exception as e:
                             print(f"✗ 导航失败: {str(e)}")
                             # 导航失败，记录错误并继续下一个用例
@@ -1428,6 +1487,10 @@ class TestExecutor:
         # 预先获取所有测试用例的步骤数据，避免在Selenium上下文中访问ORM
         test_cases_data = []
         for test_case in self.test_cases:
+            snapshot = self.case_snapshots.get(test_case.id)
+            if snapshot is not None:
+                test_cases_data.append(snapshot)
+                continue
             case_data = {
                 'id': test_case.id,
                 'name': test_case.name,
@@ -1470,6 +1533,7 @@ class TestExecutor:
                 test_case_id=case_data['id'],
                 project_id=case_data['project_id'],
                 test_suite=self.test_suite,
+                parent_execution=self.execution,
                 execution_source='suite',
                 status='pending',  # 初始状态为 pending
                 engine=self.engine,
@@ -1600,9 +1664,9 @@ class TestExecutor:
                         pass  # 如果清理失败，继续执行
 
                 # 导航到项目基础URL
-                if self.test_suite.project.base_url:
+                if self.base_url:
                     try:
-                        print(f"正在导航到: {self.test_suite.project.base_url}")
+                        print(f"正在导航到: {self.base_url}")
 
                         # 检测是否在Linux服务器环境
                         import platform
@@ -1610,7 +1674,7 @@ class TestExecutor:
 
                         # Validate immediately before the browser request.
                         safe_base_url = validate_ui_outbound_url(
-                            self.test_suite.project.base_url,
+                            self.base_url,
                         )
                         self._check_cancelled()
                         driver.get(safe_base_url)
@@ -1631,7 +1695,7 @@ class TestExecutor:
                         time.sleep(extra_wait)
 
                         print(
-                            f"✓ 成功导航到: {self.test_suite.project.base_url} (已等待页面加载完成，额外{extra_wait}秒)")
+                            f"✓ 成功导航到: {self.base_url} (已等待页面加载完成，额外{extra_wait}秒)")
                     except Exception as e:
                         print(f"✗ 导航失败: {str(e)}")
                         # 导航失败，记录错误并继续下一个用例

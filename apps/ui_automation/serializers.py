@@ -94,6 +94,17 @@ class LocatorStrategySerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class ElementOptionSerializer(serializers.ModelSerializer):
+    """Scalar fields needed by the case editor, without relation traversal."""
+    project_id = serializers.IntegerField(read_only=True)
+    locator_strategy_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Element
+        fields = ('id', 'project_id', 'name', 'page', 'element_type', 'locator_strategy_id', 'locator_value')
+        read_only_fields = fields
+
+
 class ElementSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     locator_strategy = LocatorStrategySerializer(read_only=True)
@@ -106,7 +117,7 @@ class ElementSerializer(serializers.ModelSerializer):
     class Meta:
         model = Element
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at', 'created_by')
+        read_only_fields = ('created_at', 'updated_at', 'created_by', 'validation_status', 'validation_message', 'last_validated')
 
     def validate_project_id(self, value):
         project = _load_object(UiProject, value, 'project_id')
@@ -332,6 +343,13 @@ class TestSuiteWithScriptsSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+def _reject_worker_execution_update(instance):
+    if instance is not None and (
+        getattr(instance, 'dispatch_claim', None) or getattr(instance, 'parent_execution_id', None)
+    ):
+        raise serializers.ValidationError('工作台执行记录由执行器维护，请使用专用取消接口停止执行。')
+
+
 class TestExecutionSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     test_suite = TestSuiteSerializer(read_only=True)
@@ -349,10 +367,11 @@ class TestExecutionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TestExecution
-        exclude = ('failure_summary',)
+        exclude = ('failure_summary', 'dispatch_claim', 'cancel_requested_at', 'request_snapshot')
         read_only_fields = (
             'created_at', 'started_at', 'finished_at', 'duration',
-            'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases'
+            'total_cases', 'passed_cases', 'failed_cases', 'skipped_cases',
+            'rerun_of', 'rerun_kind', 'failure_stage',
         )
 
     def to_representation(self, instance):
@@ -362,6 +381,7 @@ class TestExecutionSerializer(serializers.ModelSerializer):
         return data
 
     def validate(self, attrs):
+        _reject_worker_execution_update(self.instance)
         project_id = attrs.pop('project_id', None)
         if project_id is not None:
             project = _load_object(UiProject, project_id, 'project_id')
@@ -534,7 +554,7 @@ class ElementEnhancedSerializer(serializers.ModelSerializer):
     class Meta:
         model = Element
         fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at', 'created_by', 'usage_count', 'last_validated')
+        read_only_fields = ('created_at', 'updated_at', 'created_by', 'usage_count', 'last_validated', 'validation_status', 'validation_message')
 
     def validate_project_id(self, value):
         project = _load_object(UiProject, value, 'project_id')
@@ -841,9 +861,19 @@ class ScriptAnalysisSerializer(serializers.Serializer):
 
 
 class ElementValidationSerializer(serializers.Serializer):
-    """元素验证结果序列化器"""
+    """元素定位器验证结果序列化器"""
     is_valid = serializers.BooleanField(read_only=True)
+    validation_status = serializers.ChoiceField(
+        choices=['VALID', 'INVALID', 'UNKNOWN'], read_only=True,
+    )
     validation_message = serializers.CharField(read_only=True)
+    validation_mode = serializers.CharField(read_only=True)
+    format_valid = serializers.BooleanField(read_only=True, allow_null=True, required=False)
+    match_count = serializers.IntegerField(read_only=True, required=False)
+    engine = serializers.CharField(read_only=True, required=False)
+    browser = serializers.CharField(read_only=True, required=False)
+    target_url = serializers.CharField(read_only=True, required=False)
+    checked_at = serializers.DateTimeField(read_only=True)
     suggestions = serializers.ListField(child=serializers.CharField(), read_only=True)
 
 
@@ -914,6 +944,7 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
     project_name = serializers.CharField(source='project.name', read_only=True)
     test_suite_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
+    rerun_of = serializers.SerializerMethodField()
 
     class Meta:
         model = TestCaseExecution
@@ -922,9 +953,10 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
             'test_suite', 'test_suite_name', 'execution_source', 'status',
             'engine', 'browser', 'headless', 'execution_logs', 'error_message',
             'screenshots', 'execution_time', 'started_at', 'finished_at',
+            'parent_execution', 'rerun_of', 'rerun_kind', 'failure_stage',
             'created_by', 'created_by_name', 'created_at'
         ]
-        read_only_fields = ['created_by']
+        read_only_fields = ['created_by', 'parent_execution', 'rerun_of', 'rerun_kind', 'failure_stage']
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -933,6 +965,7 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         return data
 
     def validate(self, attrs):
+        _reject_worker_execution_update(self.instance)
         project = _ensure_project_access(self, attrs.get('project', getattr(self.instance, 'project', None)))
         test_case = attrs.get('test_case', getattr(self.instance, 'test_case', None))
         if attrs.get('engine', getattr(self.instance, 'engine', 'playwright')) == 'selenium' and not selenium_compatibility_enabled(
@@ -948,6 +981,9 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
             if test_case is not None and not test_suite.suite_test_cases.filter(test_case=test_case).exists():
                 raise serializers.ValidationError({'test_suite': '测试套件不包含该测试用例'})
         return attrs
+
+    def get_rerun_of(self, obj):
+        return obj.rerun_origin_id if obj.rerun_origin_id is not None else obj.rerun_of_id
 
     def get_test_suite_name(self, obj):
         """获取测试套件名称"""

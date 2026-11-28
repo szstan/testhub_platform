@@ -258,8 +258,16 @@ export function runTestSuite(suiteId, data) {
     url: `/ui-automation/test-suites/${suiteId}/run_suite/`,
     method: 'post',
     data,
-    timeout: 600000  // 10分钟超时，因为套件可能包含多个测试用例
+    timeout: 30000
   })
+}
+
+export function getSuiteSubmission(suiteId, params) {
+  return request({ url: `/ui-automation/test-suites/${suiteId}/submission/`, method: 'get', params })
+}
+
+export function getExecutionReadiness(projectId, params) {
+  return request({ url: `/ui-automation/projects/${projectId}/execution-readiness/`, method: 'get', params })
 }
 
 // 测试执行相关API
@@ -400,10 +408,12 @@ export function getElementGroupTree(params) {
 }
 
 // 元素增强功能API
-export function validateElementLocator(id) {
+export function validateElementLocator(id, data = {}) {
   return request({
     url: `/ui-automation/elements/${id}/validate_locator/`,
-    method: 'post'
+    method: 'post',
+    data,
+    timeout: 60000
   })
 }
 
@@ -621,9 +631,17 @@ export function runTestCase(testCaseId, data) {
   return request({
     url: `/ui-automation/test-cases/${testCaseId}/run/`,
     method: 'post',
-    data,
-    timeout: 300000  // 5分钟超时，因为测试执行需要启动浏览器和执行多个步骤
+    data: { ...data, async: true },
+    timeout: 30000
   })
+}
+
+export function getTestCaseSubmission(testCaseId, params) {
+  return request({ url: `/ui-automation/test-cases/${testCaseId}/submission/`, method: 'get', params })
+}
+
+export function abortTestCaseExecution(executionId) {
+  return request({ url: `/ui-automation/test-case-executions/${executionId}/abort/`, method: 'post' })
 }
 
 // 复制测试用例

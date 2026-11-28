@@ -195,6 +195,39 @@
                   - {{ $t('uiAutomation.element.locatorTip.xpath') }}<br>
                   - {{ $t('uiAutomation.element.locatorTip.other') }}
                 </div>
+                <div class="locator-validation-controls">
+                  <el-radio-group v-model="locatorValidationMode" size="small" :aria-label="$t('uiAutomation.element.validationModeLabel')">
+                    <el-radio-button value="format">{{ $t('uiAutomation.element.validationFormat') }}</el-radio-button>
+                    <el-radio-button value="live">{{ $t('uiAutomation.element.validationLive') }}</el-radio-button>
+                  </el-radio-group>
+                  <el-input
+                    v-if="locatorValidationMode === 'live'"
+                    v-model="locatorValidationTargetUrl"
+                    type="url"
+                    size="small"
+                    :placeholder="selectedProjectBaseUrl || $t('uiAutomation.element.validationTargetUrlPlaceholder')"
+                    :aria-label="$t('uiAutomation.element.validationTargetUrl')"
+                  />
+                  <p class="validation-mode-note">{{ $t(locatorValidationMode === 'live' ? 'uiAutomation.element.validationLiveNote' : 'uiAutomation.element.validationFormatNote') }}</p>
+                  <p class="validation-mode-note">{{ $t('uiAutomation.element.validationSavedNote') }}</p>
+                  <el-button size="small" :loading="validating" :disabled="validating || !normalizeUiId(selectedElement.id) || !selectedElement.locator_value?.trim()" @click="validateElement">
+                    {{ $t('uiAutomation.element.validateElement') }}
+                  </el-button>
+                  <div v-if="locatorValidationResult" class="locator-validation-result" :class="`is-${locatorValidationResult.validation_status.toLowerCase()}`" role="status">
+                    <div class="validation-result-heading">
+                      <el-tag :type="locatorValidationTagType(locatorValidationResult.validation_status)">{{ $t(`uiAutomation.element.validationStatus.${locatorValidationResult.validation_status.toLowerCase()}`) }}</el-tag>
+                      <span>{{ $t(`uiAutomation.element.validationMode.${locatorValidationResult.validation_mode}`) }}</span>
+                    </div>
+                    <p>{{ locatorValidationResult.validation_message }}</p>
+                    <div class="validation-result-meta">
+                      <span>{{ $t('uiAutomation.element.matchCount') }}: {{ locatorValidationResult.match_count ?? '-' }}</span>
+                      <time v-if="locatorValidationResult.checked_at" :datetime="locatorValidationResult.checked_at">{{ formatLocatorValidationDate(locatorValidationResult.checked_at) }}</time>
+                    </div>
+                    <p v-if="locatorValidationResult.validation_status === 'UNKNOWN' && locatorValidationResult.validation_mode === 'live'" class="validation-live-help">
+                      {{ $t('uiAutomation.element.validationLiveUnknownHelp') }}
+                    </p>
+                  </div>
+                </div>
               </el-form-item>
 
               <el-form-item :label="$t('uiAutomation.common.description')">
@@ -311,7 +344,8 @@ let hideMenuTimeout = null
 let activeHideMenu = null
 
 const route = useRoute()
-const { projects, projectId: selectedProject, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
+const { projects, projectId: selectedProject, projectsLoading, projectsError, invalidProject, reloadProjects, userId } = useUiProjectContext()
+const selectedProjectBaseUrl = computed(() => projects.value.find(project => String(project.id) === String(selectedProject.value))?.base_url || '')
 const returnToCase = computed(() => {
   const caseId = normalizeUiId(route.query.caseId)
   if (!caseId || !selectedProject.value) return null
@@ -462,6 +496,10 @@ const editInputRef = ref(null)
 // 状态
 const saving = ref(false)
 const validating = ref(false)
+const locatorValidationMode = ref('format')
+const locatorValidationTargetUrl = ref('')
+const locatorValidationResult = ref(null)
+let locatorValidationRequest = 0
 const generating = ref(false)
 const suggestions = ref([])
 
@@ -501,6 +539,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   projectScope += 1
+  locatorValidationRequest += 1
   if (hideMenuTimeout) clearTimeout(hideMenuTimeout)
   if (activeHideMenu) document.removeEventListener('click', activeHideMenu)
   hideMenuTimeout = null
@@ -698,8 +737,11 @@ const loadElementTree = async () => {
   }
 }
 
-watch(selectedProject, async project => {
+watch([selectedProject, userId], async ([project]) => {
   const scope = ++projectScope
+  locatorValidationTargetUrl.value = selectedProjectBaseUrl.value
+  locatorValidationResult.value = null
+  validating.value = false
   selectedElement.value = null
   treeData.value = []
   pages.value = []
@@ -1051,27 +1093,91 @@ const saveElement = async () => {
   }
 }
 
-// 验证元素
 const validateElement = async () => {
-  if (!selectedElement.value) return
+  const element = selectedElement.value
+  const elementId = normalizeUiId(element?.id)
+  const project = normalizeUiId(selectedProject.value)
+  const actor = normalizeUiId(userId?.value ?? userId)
+  const locatorValue = String(element?.locator_value || '')
+  const locatorStrategyId = normalizeUiId(element?.locator_strategy_id)
+  if (!elementId || !project || !locatorValue.trim()) return
 
+  const request = ++locatorValidationRequest
+  const scope = projectScope
+  const mode = locatorValidationMode.value
+  const targetUrl = String(locatorValidationTargetUrl.value || selectedProjectBaseUrl.value || '').trim()
+  const isCurrent = () => request === locatorValidationRequest && scope === projectScope &&
+    normalizeUiId(selectedProject.value) === project &&
+    normalizeUiId(userId?.value ?? userId) === actor &&
+    normalizeUiId(selectedElement.value?.id) === elementId &&
+    selectedElement.value?.locator_value === locatorValue &&
+    normalizeUiId(selectedElement.value?.locator_strategy_id) === locatorStrategyId &&
+    locatorValidationMode.value === mode &&
+    (mode !== 'live' || String(locatorValidationTargetUrl.value || selectedProjectBaseUrl.value || '').trim() === targetUrl)
+
+  if (mode === 'live' && !targetUrl) {
+    locatorValidationResult.value = {
+      validation_status: 'UNKNOWN', validation_mode: mode,
+      validation_message: t('uiAutomation.element.validationTargetUrlRequired'),
+      match_count: null, checked_at: new Date().toISOString()
+    }
+    return
+  }
+
+  validating.value = true
+  locatorValidationResult.value = null
   try {
-    validating.value = true
-    const response = await validateElementLocator(selectedElement.value.id)
-    const result = response.data
-
-    if (result.is_valid) {
-      ElMessage.success(t('uiAutomation.element.messages.validateSuccess'))
-    } else {
-      ElMessage.error(`${t('uiAutomation.element.messages.validateFailed')}: ${result.validation_message}`)
+    const payload = { mode, engine: 'playwright', browser: 'chrome', expected_locator_value: locatorValue }
+    if (locatorStrategyId) payload.expected_locator_strategy_id = locatorStrategyId
+    if (mode === 'live') payload.target_url = targetUrl
+    const response = await validateElementLocator(elementId, payload)
+    if (!isCurrent()) return
+    const result = response?.data?.data ?? response?.data ?? response
+    const candidate = String(result?.validation_status || '').toUpperCase()
+    const validationStatus = ['VALID', 'INVALID', 'UNKNOWN'].includes(candidate) ? candidate : 'UNKNOWN'
+    const matchCount = result?.match_count !== undefined && result?.match_count !== null && Number.isFinite(Number(result.match_count))
+      ? Number(result.match_count)
+      : null
+    locatorValidationResult.value = {
+      validation_status: validationStatus,
+      validation_mode: result?.validation_mode === 'live' || result?.validation_mode === 'format' ? result.validation_mode : mode,
+      validation_message: result?.validation_message || t(validationStatus === 'UNKNOWN' ? 'uiAutomation.element.validationUnknown' : validationStatus === 'VALID' ? 'uiAutomation.element.validationPassed' : 'uiAutomation.element.validationFailed'),
+      match_count: matchCount,
+      checked_at: result?.checked_at || new Date().toISOString()
     }
   } catch (error) {
-    ElMessage.error(t('uiAutomation.element.messages.validateFailed'))
-    console.error('验证元素失败:', error)
+    if (!isCurrent()) return
+    const body = error.response?.data?.data ?? error.response?.data ?? {}
+    locatorValidationResult.value = {
+      validation_status: 'UNKNOWN',
+      validation_mode: mode,
+      validation_message: body.validation_message || body.message || body.error || body.detail || error.message || t('uiAutomation.element.validationUnknown'),
+      match_count: body.match_count ?? null,
+      checked_at: body.checked_at || new Date().toISOString()
+    }
   } finally {
-    validating.value = false
+    if (request === locatorValidationRequest) validating.value = false
   }
 }
+
+function locatorValidationTagType(status) {
+  return ({ VALID: 'success', INVALID: 'danger', UNKNOWN: 'info' })[status] || 'info'
+}
+
+function formatLocatorValidationDate(value) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
+}
+
+watch(selectedProjectBaseUrl, value => {
+  locatorValidationTargetUrl.value = value
+}, { immediate: true })
+
+watch([selectedProject, () => selectedElement.value?.id, () => selectedElement.value?.locator_value, () => selectedElement.value?.locator_strategy_id, locatorValidationMode, locatorValidationTargetUrl], () => {
+  locatorValidationRequest += 1
+  validating.value = false
+  locatorValidationResult.value = null
+}, { flush: 'sync' })
 
 // 生成建议
 const generateSuggestions = async () => {
@@ -1414,6 +1520,50 @@ const updatePage = async () => {
   font-size: 12px;
   color: #909399;
   margin-top: 5px;
+}
+
+.locator-validation-controls {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  max-width: 560px;
+  margin-top: 12px;
+}
+
+.validation-mode-note,
+.validation-live-help {
+  margin: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.locator-validation-result {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+}
+
+.locator-validation-result > p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.validation-result-heading,
+.validation-result-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.validation-result-meta {
+  justify-content: space-between;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 /* 右键菜单样式 */

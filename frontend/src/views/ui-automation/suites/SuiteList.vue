@@ -232,26 +232,53 @@
 
     <!-- 运行配置对话框 -->
     <el-dialog v-model="showRunDialog" :title="$t('uiAutomation.suite.runConfig')" width="600px" :close-on-click-modal="false">
+      <el-alert v-if="readinessLoading" :title="t('uiAutomation.suite.readinessLoading')" type="info" :closable="false" show-icon />
+      <el-alert v-else-if="readinessLoadError" :title="readinessLoadError" type="warning" :closable="false" show-icon />
+      <template v-else-if="readiness">
+        <el-alert
+          v-if="readiness.base_url_ready === false || readiness.base_url_message"
+          :title="readiness.base_url_message || t('uiAutomation.suite.baseUrlUnavailable')"
+          :type="readiness.base_url_ready === false ? 'warning' : 'info'"
+          :closable="false"
+          show-icon
+          class="readiness-alert"
+        />
+        <div class="readiness-options" role="status">
+          <div v-for="engine in readiness.engines || []" :key="engine.value" class="readiness-engine">
+            <strong>{{ engineLabel(engine.value) }}</strong>
+            <span>{{ engine.available ? t('uiAutomation.suite.capabilityAvailable') : engine.message || t('uiAutomation.suite.capabilityUnavailable') }}</span>
+            <ul v-if="engine.browsers?.length">
+              <li v-for="browser in engine.browsers" :key="browser.value">
+                {{ browserLabel(browser.value) }}: {{ browser.available ? t('uiAutomation.suite.capabilityAvailable') : browser.message || t('uiAutomation.suite.capabilityUnavailable') }}
+              </li>
+            </ul>
+          </div>
+        </div>
+      </template>
+      <el-alert v-if="submissionState === 'unknown'" :title="t('uiAutomation.suite.submissionUnknown')" type="warning" :closable="false" show-icon class="readiness-alert" />
       <el-form :model="runConfig" label-width="120px">
         <el-form-item :label="$t('uiAutomation.suite.testEngine')">
-          <el-select v-model="runConfig.engine" :placeholder="$t('uiAutomation.suite.testEngine')">
-            <el-option label="Playwright" value="playwright" />
-            <el-option label="Selenium" value="selenium" />
+          <el-select v-model="runConfig.engine" :placeholder="$t('uiAutomation.suite.testEngine')" :disabled="running || Boolean(currentSubmission) || readinessLoading || !readiness" @change="onRunEngineChange">
+            <el-option v-for="option in engineOptions" :key="option.value" :label="option.label" :value="option.value" :disabled="!option.available">
+              <span>{{ option.label }}</span>
+              <span v-if="option.message" class="option-reason">{{ option.message }}</span>
+            </el-option>
           </el-select>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.suite.browser')">
-          <el-select v-model="runConfig.browser" :placeholder="$t('uiAutomation.suite.browser')">
-            <el-option label="Chrome" value="chrome" />
-            <el-option label="Firefox" value="firefox" />
-            <el-option label="Safari" value="safari" />
-            <el-option label="Edge" value="edge" />
+          <el-select v-model="runConfig.browser" :placeholder="$t('uiAutomation.suite.browser')" :disabled="running || Boolean(currentSubmission) || readinessLoading || !readiness">
+            <el-option v-for="option in browserOptions" :key="option.value" :label="option.label" :value="option.value" :disabled="!option.available">
+              <span>{{ option.label }}</span>
+              <span v-if="option.message" class="option-reason">{{ option.message }}</span>
+            </el-option>
           </el-select>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.suite.executionMode')">
-          <el-radio-group v-model="runConfig.headless">
+          <el-radio-group v-model="runConfig.headless" :disabled="running || Boolean(currentSubmission)">
             <el-radio :label="false">{{ $t('uiAutomation.suite.headedMode') }}</el-radio>
             <el-radio :label="true">{{ $t('uiAutomation.suite.headlessMode') }}</el-radio>
           </el-radio-group>
+          <p class="headless-note">{{ t('uiAutomation.suite.headlessRecommended') }}</p>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -261,8 +288,9 @@
             type="primary"
             @click="confirmRunSuite"
             :loading="running"
+            :disabled="running || (!currentSubmission && (readinessLoading || !readiness || Boolean(readinessErrorMessage)))"
           >
-            {{ $t('uiAutomation.suite.startExecution') }}
+            {{ t(submissionState === 'unknown' ? 'uiAutomation.suite.retrySameRequest' : 'uiAutomation.suite.startExecution') }}
           </el-button>
         </span>
       </template>
@@ -286,11 +314,15 @@ import {
   getTestSuiteTestCases,
   addTestCaseToTestSuite,
   removeTestCaseFromTestSuite,
-  runTestSuite
+  runTestSuite,
+  getExecutionReadiness,
+  getSuiteSubmission
 } from '@/api/ui_automation'
 import { useRouter } from 'vue-router'
 import { useUiProjectContext } from '@/composables/useUiProjectContext'
 import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
+import { newUiSubmissionId, uiPendingRunKey, readUiPendingRun as readStoredSuiteRun, writeUiPendingRun as writeStoredSuiteRun, clearUiPendingRun as clearStoredSuiteRun } from '@/utils/ui-execution-submission.mjs'
+import { uiEngineOptions, uiBrowserOptions, uiReadinessError } from '@/utils/ui-execution-options.mjs'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -301,7 +333,8 @@ const {
   projectsLoading,
   projectsError,
   invalidProject,
-  reloadProjects
+  reloadProjects,
+  userId
 } = useUiProjectContext()
 
 // 响应式数据
@@ -311,6 +344,7 @@ const searchText = ref('')
 const total = ref(0)
 let projectScopeVersion = 0
 let suiteRequestVersion = 0
+let readinessRequestVersion = 0
 const pagination = reactive({
   currentPage: 1,
   pageSize: 20
@@ -345,9 +379,83 @@ const testCaseSearchText = ref('')
 const runConfig = reactive({
   engine: 'playwright',
   browser: 'chrome',
-  headless: false
+  headless: true
 })
 const currentRunningSuite = ref(null)
+const readiness = ref(null)
+const readinessLoading = ref(false)
+const readinessLoadError = ref('')
+const submissionState = ref('idle')
+const currentSubmission = ref(null)
+const pendingSuiteMemory = new Map()
+const readUiPendingRun = key => pendingSuiteMemory.get(key) || readStoredSuiteRun(key)
+const writeUiPendingRun = (key, record) => {
+  pendingSuiteMemory.set(key, { ...record })
+  writeStoredSuiteRun(key, record)
+}
+const clearUiPendingRun = key => {
+  pendingSuiteMemory.delete(key)
+  clearStoredSuiteRun(key)
+}
+const readinessErrorMessage = computed(() => {
+  if (currentSubmission.value || !readiness.value) return ''
+  try {
+    const result = uiReadinessError(readiness.value, runConfig.engine, runConfig.browser)
+    return typeof result === 'string' ? result : result?.message || ''
+  } catch {
+    return t('uiAutomation.suite.capabilityUnavailable')
+  }
+})
+
+function optionValue(option) {
+  return typeof option === 'string' ? option : option?.value || option?.engine || option?.browser || ''
+}
+
+function normalizeCapabilityOptions(options, capabilities) {
+  if (!Array.isArray(options)) return []
+  return options.map(option => {
+    const value = optionValue(option)
+    if (!value) return null
+    const capability = capabilities.find(item => String(item.value) === String(value))
+    return {
+      value,
+      label: typeof option === 'object' && option.label ? option.label : engineOrBrowserLabel(value),
+      available: capability?.available ?? (typeof option === 'object' ? option.available : undefined) ?? true,
+      message: capability?.message || (typeof option === 'object' ? option.message : '') || ''
+    }
+  }).filter(Boolean)
+}
+
+function engineOrBrowserLabel(value) {
+  return ({ playwright: 'Playwright', selenium: 'Selenium', chrome: 'Chrome', firefox: 'Firefox', edge: 'Edge', safari: 'Safari' })[value] || value
+}
+
+const engineOptions = computed(() => normalizeCapabilityOptions(
+  uiEngineOptions(readiness.value), readiness.value?.engines || []
+))
+const browserCapabilities = computed(() => readiness.value?.engines?.find(engine => String(engine.value) === String(runConfig.engine))?.browsers || [])
+const browserOptions = computed(() => normalizeCapabilityOptions(
+  uiBrowserOptions(readiness.value, runConfig.engine), browserCapabilities.value
+))
+
+function engineLabel(value) { return engineOrBrowserLabel(value) }
+function browserLabel(value) { return engineOrBrowserLabel(value) }
+
+function chooseAvailableRunOptions() {
+  const availableEngine = engineOptions.value.find(option => option.available) || engineOptions.value[0]
+  if (availableEngine && !engineOptions.value.find(option => option.value === runConfig.engine && option.available)) {
+    runConfig.engine = availableEngine.value
+  }
+  const availableBrowser = browserOptions.value.find(option => option.available) || browserOptions.value[0]
+  if (availableBrowser && !browserOptions.value.find(option => option.value === runConfig.browser && option.available)) {
+    runConfig.browser = availableBrowser.value
+  }
+}
+
+function onRunEngineChange() {
+  const availableBrowser = browserOptions.value.find(option => option.available) || browserOptions.value[0]
+  if (availableBrowser) runConfig.browser = availableBrowser.value
+}
 
 const isPositiveId = (value) => Boolean(normalizeUiId(value))
 
@@ -358,7 +466,17 @@ const responseList = (response) => {
   return null
 }
 
-const isSuiteSubmitting = (id) => submittingSuiteIds.value.has(String(id))
+const responseBody = response => response?.data?.data ?? response?.data ?? response
+const suitePendingKey = (suiteId, project = projectId.value) => uiPendingRunKey(
+  'suite', userId?.value ?? userId, project, suiteId
+)
+const currentSuitePendingKey = () => currentRunningSuite.value
+  ? suitePendingKey(currentRunningSuite.value.id)
+  : ''
+const submissionClientId = record => record?.client_request_id || record?.clientRequestId || ''
+const submissionExecutionId = record => normalizeUiId(record?.execution_id || record?.executionId || record?.execution?.id)
+
+const isSuiteSubmitting = (id) => submittingSuiteIds.value.has(`${normalizeUiId(projectId.value)}:${normalizeUiId(id)}`)
 
 // 计算属性 - 过滤后的可用测试用例
 const filteredAvailableTestCases = computed(() => {
@@ -577,13 +695,124 @@ const deleteSuite = async (id) => {
   }
 }
 
-// 运行套件
-const runSuite = (suite) => {
+function applyReadinessDefaults() {
+  if (currentSubmission.value) {
+    const saved = currentSubmission.value
+    if (saved.engine) runConfig.engine = saved.engine
+    if (saved.browser) runConfig.browser = saved.browser
+    if (typeof saved.headless === 'boolean') runConfig.headless = saved.headless
+    return
+  }
+  chooseAvailableRunOptions()
+  runConfig.headless = readiness.value?.recommended_headless !== false
+}
+
+function restorePendingSubmission(suite) {
+  let record = null
+  try {
+    record = readUiPendingRun(suitePendingKey(suite.id))
+  } catch {
+    readinessLoadError.value = t('uiAutomation.suite.pendingRequestLoadFailed')
+  }
+  if (!record || (record.suite_id && String(record.suite_id) !== String(suite.id))) {
+    currentSubmission.value = null
+    submissionState.value = 'idle'
+    return
+  }
+  currentSubmission.value = record
+  submissionState.value = 'unknown'
+}
+
+async function prepareRunDialog(suite) {
+  const requestedProject = String(projectId.value)
+  const requestedActor = normalizeUiId(userId?.value ?? userId)
+  const scope = projectScopeVersion
+  const request = ++readinessRequestVersion
+  const isCurrent = () => request === readinessRequestVersion &&
+    scope === projectScopeVersion &&
+    String(projectId.value) === requestedProject &&
+    normalizeUiId(userId?.value ?? userId) === requestedActor &&
+    currentRunningSuite.value?.id === suite.id
+  readiness.value = null
+  readinessLoading.value = true
+  readinessLoadError.value = ''
+  submissionState.value = 'idle'
+  restorePendingSubmission(suite)
+  try {
+    const response = await getExecutionReadiness(requestedProject)
+    if (!isCurrent()) return
+    const body = responseBody(response)
+    if (!body || typeof body !== 'object' || (body.project_id && String(body.project_id) !== requestedProject)) throw new Error('Invalid execution readiness response')
+    readiness.value = body
+    applyReadinessDefaults()
+  } catch (error) {
+    if (isCurrent()) {
+      readinessLoadError.value = error.response?.data?.message || error.message || t('uiAutomation.suite.readinessLoadFailed')
+    }
+  } finally {
+    if (isCurrent()) readinessLoading.value = false
+  }
+}
+
+function markSubmissionUnknown(key, record, requestId) {
+  const unknownRecord = { ...record, client_request_id: requestId, status: 'unknown' }
+  try { writeUiPendingRun(key, unknownRecord) } catch {}
+  currentSubmission.value = unknownRecord
+  submissionState.value = 'unknown'
+  ElMessage.warning(t('uiAutomation.suite.submissionUnknown'))
+}
+
+function persistLateSuiteAcceptance(key, record, requestId, executionId) {
+  const current = readUiPendingRun(key)
+  if (current && submissionClientId(current) !== requestId) return
+  try { writeUiPendingRun(key, { ...record, client_request_id: requestId, execution_id: executionId }) } catch {}
+}
+
+function readSubmissionExecutionId(response) {
+  const body = responseBody(response)
+  if (body?.accepted === false) return ''
+  return normalizeUiId(body?.execution_id || body?.execution?.id || body?.data?.execution_id)
+}
+
+async function lookupSuiteSubmission(suiteId, requestId, requestedProject, requestedActor, scope) {
+  const isCurrent = () => scope === projectScopeVersion &&
+    String(projectId.value) === requestedProject &&
+    normalizeUiId(userId?.value ?? userId) === requestedActor
+  try {
+    const response = await getSuiteSubmission(suiteId, { client_request_id: requestId })
+    const executionId = readSubmissionExecutionId(response)
+    if (!isCurrent()) return { stale: true, ...(executionId ? { executionId } : {}) }
+    return executionId ? { executionId } : { unknown: true }
+  } catch (error) {
+    if (!isCurrent()) return { stale: true }
+    if (Number(error.response?.status) === 404) return { notFound: true }
+    return { unknown: true }
+  }
+}
+
+async function openAcceptedSuiteExecution(executionId, key, requestedProject, requestedActor, scope) {
+  if (!isPositiveId(executionId) || scope !== projectScopeVersion || String(projectId.value) !== requestedProject || normalizeUiId(userId?.value ?? userId) !== requestedActor) return false
+  try { clearUiPendingRun(key) } catch {}
+  currentSubmission.value = null
+  submissionState.value = 'accepted'
+  ElMessage.success(t('uiAutomation.suite.messages.startSuccess'))
+  showRunDialog.value = false
+  currentRunningSuite.value = null
+  await router.push(uiExecutionLocation('UiReports', requestedProject, executionId))
+  return true
+}
+
+function isDefinitiveSubmissionRejection(error, body) {
+  const status = Number(error.response?.status)
+  return body?.accepted === false && [400, 403, 503].includes(status)
+}
+
+const runSuite = async (suite) => {
   if (!isPositiveId(projectId.value)) {
     ElMessage.warning(t('uiAutomation.suite.messages.selectProject'))
     return
   }
-  if (!suite.test_case_count || suite.test_case_count === 0) {
+  if ((!suite.test_case_count || suite.test_case_count === 0) && !readUiPendingRun(suitePendingKey(suite.id))) {
     ElMessage.warning(t('uiAutomation.suite.messages.noCases'))
     return
   }
@@ -591,54 +820,117 @@ const runSuite = (suite) => {
 
   currentRunningSuite.value = suite
   showRunDialog.value = true
+  await prepareRunDialog(suite)
 }
 
-// 确认运行套件
 const confirmRunSuite = async () => {
   const suite = currentRunningSuite.value
   if (!suite || !isPositiveId(suite.id) || !isPositiveId(projectId.value)) return
   if (running.value || isSuiteSubmitting(suite.id)) return
+  if (!readiness.value && !currentSubmission.value) return
 
-  const requestedProjectId = String(projectId.value)
-  const scopeVersion = projectScopeVersion
-  submittingSuiteIds.value.add(String(suite.id))
-  running.value = true
+  const readinessIssue = readinessErrorMessage.value
+  if (readinessIssue) {
+    ElMessage.error(readinessIssue)
+    return
+  }
+
+  const requestedProject = String(projectId.value)
+  const requestedActor = normalizeUiId(userId?.value ?? userId)
+  const scope = projectScopeVersion
+  const key = currentSuitePendingKey()
+  if (!key) {
+    ElMessage.error(t('uiAutomation.suite.pendingRequestSaveFailed'))
+    return
+  }
+  const submittingKey = `${normalizeUiId(requestedProject)}:${normalizeUiId(suite.id)}`
+  let record = currentSubmission.value
+  let requestId = submissionClientId(record)
+  if (!requestId) requestId = newUiSubmissionId()
+  record = { ...(record || {}), suite_id: String(suite.id), project_id: requestedProject, client_request_id: requestId, status: 'submitting',
+    engine: record?.engine || runConfig.engine, browser: record?.browser || runConfig.browser,
+    headless: typeof record?.headless === 'boolean' ? record.headless : runConfig.headless }
   try {
-    const response = await runTestSuite(suite.id, {
-      use_ai: false,
-      engine: runConfig.engine,
-      browser: runConfig.browser,
-      headless: runConfig.headless
-    })
-    const body = response?.data?.data ?? response?.data
-    const executionId = body?.execution_id
-    if (!isPositiveId(executionId)) {
-      throw new Error(t('uiAutomation.workbenchResults.executionUnavailable'))
-    }
-    if (scopeVersion !== projectScopeVersion || String(projectId.value) !== requestedProjectId) return
+    writeUiPendingRun(key, record)
+    if (submissionClientId(readUiPendingRun(key)) !== requestId) throw new Error('Pending request could not be persisted')
+  } catch {
+    ElMessage.error(t('uiAutomation.suite.pendingRequestSaveFailed'))
+    return
+  }
 
-    ElMessage.success(t('uiAutomation.suite.messages.startSuccess'))
-    showRunDialog.value = false
-    currentRunningSuite.value = null
-    await router.push(uiExecutionLocation('UiReports', requestedProjectId, executionId))
-  } catch (error) {
-    if (scopeVersion === projectScopeVersion && String(projectId.value) === requestedProjectId) {
-      console.error('执行测试套件失败:', error)
-      const backendMessage = error.response?.data?.error || error.response?.data?.detail
-      const errorMessage = error.message === t('uiAutomation.workbenchResults.executionUnavailable')
-        ? error.message
-        : backendMessage || t('uiAutomation.suite.messages.executeFailed')
-      ElMessage.error(errorMessage)
-      const executionId = error.response?.data?.execution_id
-      if (isPositiveId(executionId)) {
-        showRunDialog.value = false
-        currentRunningSuite.value = null
-        await router.push(uiExecutionLocation('UiReports', requestedProjectId, executionId))
+  submittingSuiteIds.value.add(submittingKey)
+  running.value = true
+  submissionState.value = 'submitting'
+  try {
+    if (currentSubmission.value) {
+      submissionState.value = 'checking'
+      const existing = await lookupSuiteSubmission(suite.id, requestId, requestedProject, requestedActor, scope)
+      if (existing.stale) {
+        if (existing.executionId) persistLateSuiteAcceptance(key, record, requestId, existing.executionId)
+        return
+      }
+      if (existing.executionId) {
+        await openAcceptedSuiteExecution(existing.executionId, key, requestedProject, requestedActor, scope)
+        return
+      }
+      if (!existing.notFound) {
+        markSubmissionUnknown(key, record, requestId)
+        return
       }
     }
+
+    record.status = 'submitting'
+    currentSubmission.value = record
+    try {
+      const response = await runTestSuite(suite.id, {
+        use_ai: false,
+        engine: record.engine,
+        browser: record.browser,
+        headless: record.headless,
+        client_request_id: requestId
+      })
+      const body = responseBody(response)
+      const executionId = body?.accepted === false ? '' : readSubmissionExecutionId(response)
+      if (scope !== projectScopeVersion || String(projectId.value) !== requestedProject || normalizeUiId(userId?.value ?? userId) !== requestedActor) {
+        if (executionId) persistLateSuiteAcceptance(key, record, requestId, executionId)
+        return
+      }
+      if (executionId) {
+        await openAcceptedSuiteExecution(executionId, key, requestedProject, requestedActor, scope)
+        return
+      }
+      if (body?.accepted === false) {
+        try { clearUiPendingRun(key) } catch {}
+        currentSubmission.value = null
+        submissionState.value = 'rejected'
+        ElMessage.error(body.message || body.error || t('uiAutomation.suite.messages.executeFailed'))
+        return
+      }
+    } catch (error) {
+      if (scope !== projectScopeVersion || String(projectId.value) !== requestedProject || normalizeUiId(userId?.value ?? userId) !== requestedActor) return
+      const body = error.response?.data?.data ?? error.response?.data ?? {}
+      if (isDefinitiveSubmissionRejection(error, body)) {
+        try { clearUiPendingRun(key) } catch {}
+        currentSubmission.value = null
+        submissionState.value = 'rejected'
+        ElMessage.error(body.message || body.error || t('uiAutomation.suite.messages.executeFailed'))
+        return
+      }
+    }
+
+    const recovered = await lookupSuiteSubmission(suite.id, requestId, requestedProject, requestedActor, scope)
+    if (recovered.stale) {
+      if (recovered.executionId) persistLateSuiteAcceptance(key, record, requestId, recovered.executionId)
+      return
+    }
+    if (recovered.executionId) {
+      await openAcceptedSuiteExecution(recovered.executionId, key, requestedProject, requestedActor, scope)
+      return
+    }
+    markSubmissionUnknown(key, record, requestId)
   } finally {
-    submittingSuiteIds.value.delete(String(suite.id))
-    running.value = false
+    submittingSuiteIds.value.delete(submittingKey)
+    if (scope === projectScopeVersion) running.value = false
   }
 }
 
@@ -772,9 +1064,10 @@ const getCaseStatusText = (status) => {
 }
 
 // 项目范围变化时丢弃旧响应并清理页面状态
-watch(projectId, (nextProjectId) => {
+watch([projectId, userId], ([nextProjectId]) => {
   projectScopeVersion += 1
   suiteRequestVersion += 1
+  readinessRequestVersion += 1
   pagination.currentPage = 1
   suites.value = []
   total.value = 0
@@ -784,12 +1077,21 @@ watch(projectId, (nextProjectId) => {
   showCreateDialog.value = false
   showRunDialog.value = false
   currentRunningSuite.value = null
+  readiness.value = null
+  readinessLoading.value = false
+  readinessLoadError.value = ''
+  currentSubmission.value = null
+  submissionState.value = 'idle'
+  submittingSuiteIds.value = new Set()
+  running.value = false
   if (isPositiveId(nextProjectId)) loadSuites()
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  pendingSuiteMemory.clear()
   projectScopeVersion += 1
   suiteRequestVersion += 1
+  readinessRequestVersion += 1
 })
 
 // 修改新增套件按钮点击事件
@@ -826,6 +1128,47 @@ const handleNewSuite = async () => {
 
 .project-alert {
   margin: 0 0 16px;
+}
+
+.readiness-alert {
+  margin-bottom: 12px;
+}
+
+.readiness-options {
+  display: grid;
+  gap: 8px;
+  max-height: 160px;
+  overflow: auto;
+  margin-bottom: 14px;
+  color: var(--el-text-color-regular);
+  font-size: 12px;
+}
+
+.readiness-engine {
+  display: grid;
+  grid-template-columns: minmax(80px, auto) minmax(0, 1fr);
+  gap: 4px 10px;
+}
+
+.readiness-engine ul {
+  grid-column: 2;
+  margin: 0;
+  padding-left: 16px;
+}
+
+.option-reason {
+  float: right;
+  max-width: 240px;
+  overflow: hidden;
+  color: var(--el-text-color-secondary);
+  text-overflow: ellipsis;
+}
+
+.headless-note {
+  flex-basis: 100%;
+  margin: 5px 0 0;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 .card-container {

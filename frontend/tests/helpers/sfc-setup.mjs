@@ -7,6 +7,9 @@ import { build } from 'esbuild'
 import { compileScript, parse } from '@vue/compiler-sfc'
 import * as vue from 'vue'
 import * as elementLinks from '../../src/utils/app-automation-element-links.mjs'
+import * as uiSubmissions from '../../src/utils/ui-execution-submission.mjs'
+import * as uiOptions from '../../src/utils/ui-execution-options.mjs'
+import * as uiCaseRunner from '../../src/utils/ui-case-run-controller.mjs'
 
 const frontend = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 
@@ -21,6 +24,9 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}, set
   const mounted = []
   const beforeUnmount = []
   const unmounted = []
+  const routeLeaveGuards = []
+  const routeUpdateGuards = []
+  const timers = []
   const messages = []
   const mocks = {
     vue: {
@@ -54,9 +60,28 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}, set
       },
     },
     '@/utils/app-automation-element-links.mjs': elementLinks,
+    '@/utils/ui-execution-submission.mjs': uiSubmissions,
+    '@/utils/ui-execution-options.mjs': uiOptions,
+    '@/utils/ui-case-run-controller.mjs': uiCaseRunner,
     '../components/SceneDataPanel.vue': { default: {} },
     '../components/NativeElementInspector.vue': { default: {} },
     ...imports,
+    'vue-router': {
+      onBeforeRouteLeave: callback => routeLeaveGuards.push(callback),
+      onBeforeRouteUpdate: callback => routeUpdateGuards.push(callback),
+      ...imports['vue-router'],
+    },
+    '@/api/ui_automation': {
+      getExecutionReadiness: async project => ({ data: {
+        project_id: project, base_url_ready: true, recommended_headless: true,
+        engines: ['playwright', 'selenium'].map(value => ({ value, available: true, browsers: ['chrome', 'firefox', 'edge'].map(browser => ({ value: browser, available: true })) })),
+      } }),
+      getTestCaseSubmission: async () => { throw Object.assign(new Error('Submission not found'), { response: { status: 404 } }) },
+      getSuiteSubmission: async () => { throw Object.assign(new Error('Submission not found'), { response: { status: 404 } }) },
+      getTestCaseExecutionDetail: async () => { throw new Error('Execution detail mock required') },
+      abortTestCaseExecution: async () => ({ data: { status: 'aborted' } }),
+      ...imports['@/api/ui_automation'],
+    },
     '@/api/app-automation': {
       getPackageList: async () => ({ data: { results: [] } }),
       ...imports['@/api/app-automation'],
@@ -91,7 +116,9 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}, set
   })
   const module = { exports: {} }
   runInNewContext(bundle.outputFiles[0].text, {
-    module, exports: module.exports, __sfcMocks: mocks, console, crypto: globalThis.crypto, ...globals,
+    module, exports: module.exports, __sfcMocks: mocks, console, crypto: globalThis.crypto,
+    setTimeout: callback => { timers.push(callback); return timers.length }, clearTimeout() {},
+    ...globals,
   }, { filename })
   const scope = vue.effectScope()
   const component = module.exports.default
@@ -105,6 +132,9 @@ export async function loadSfcSetup(relativePath, imports = {}, globals = {}, set
     events,
     props: setupProps,
     messages,
+    routeLeaveGuards,
+    routeUpdateGuards,
+    timers,
     mount: () => Promise.all(mounted.map(callback => callback())),
     dispose() {
       beforeUnmount.forEach(callback => callback())

@@ -47,6 +47,7 @@
               <el-option :label="$t('uiAutomation.status.passed')" value="passed" />
               <el-option :label="$t('uiAutomation.status.failed')" value="failed" />
               <el-option :label="$t('uiAutomation.status.error')" value="error" />
+              <el-option :label="$t('uiAutomation.workbenchExecution.aborted')" value="aborted" />
             </el-select>
           </el-form-item>
           <el-form-item :label="$t('uiAutomation.execution.browserFilter')">
@@ -205,8 +206,15 @@
           </figure>
           <p v-else class="muted-text">{{ $t(failure.screenshotIndex >= 0 ? 'uiAutomation.execution.imageLoadFailed' : 'uiAutomation.execution.noScreenshots') }}</p>
         </section>
-        <el-button v-else-if="['pending', 'running'].includes(currentExecution.status)" class="status-refresh" @click="loadExecutionDetail">
+        <div v-if="detailTrackingPaused" class="case-page-state" role="status">
+          {{ t(isUiRunTerminal(currentExecution.status) ? 'uiAutomation.workbenchExecution.terminalDetailsPending' : 'uiAutomation.workbenchExecution.trackingPaused') }}
+          <el-button link type="primary" @click="loadExecutionDetail(true)">{{ t('uiAutomation.workbenchExecution.reconnectRun') }}</el-button>
+        </div>
+        <el-button v-if="['pending', 'running'].includes(currentExecution.status)" class="status-refresh" @click="loadExecutionDetail(true)">
           {{ $t('uiAutomation.workbenchExecution.refreshStatus') }}
+        </el-button>
+        <el-button v-if="['pending', 'running'].includes(currentExecution.status)" type="danger" plain :loading="cancelling" @click="cancelExecution">
+          {{ t('uiAutomation.workbenchExecution.cancelRun') }}
         </el-button>
 
         <!-- 执行结果选项卡 -->
@@ -273,6 +281,7 @@
         </el-tabs>
       </div>
       <template #footer>
+        <RouterLink v-if="currentExecution?.test_case" class="el-button el-button--primary" :to="repairLocation(currentExecution)">{{ t('uiAutomation.workbenchExecution.editFailedCase') }}</RouterLink>
         <el-button v-if="failure" :disabled="rerunning" @click="showRerunDialog(currentExecution)">
           {{ $t('uiAutomation.common.rerun') }}
         </el-button>
@@ -282,19 +291,18 @@
 
     <!-- 重跑测试用例对话框 -->
     <el-dialog v-model="showRerunDialogVisible" :title="$t('uiAutomation.execution.rerunTitle')" width="min(500px, calc(100vw - 32px))" append-to-body>
-      <el-form :model="rerunFormData" label-width="100px">
+      <p v-if="rerunUnknown" class="list-error" role="status">{{ t('uiAutomation.workbenchExecution.submissionUnknown') }}</p>
+      <p v-else-if="rerunReadinessLoading" role="status">{{ t('uiAutomation.workbenchExecution.checkingReadiness') }}</p>
+      <p v-else-if="rerunReadinessError || rerunReadinessReason" class="list-error" role="alert">{{ rerunReadinessError ? t('uiAutomation.workbenchExecution.readinessUnavailable') : rerunReadinessReason }}</p>
+      <el-form :model="rerunFormData" :disabled="rerunning || rerunUnknown || rerunReadinessLoading" label-width="100px">
         <el-form-item :label="$t('uiAutomation.execution.testEngine')">
-          <el-radio-group v-model="rerunFormData.engine">
-            <el-radio label="playwright">Playwright</el-radio>
-            <el-radio label="selenium">Selenium</el-radio>
-          </el-radio-group>
+          <el-select v-model="rerunFormData.engine">
+            <el-option v-for="option in rerunEngineOptions" :key="option.value" :label="option.label" :value="option.value" :disabled="option.disabled" />
+          </el-select>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.execution.browserFilter')">
           <el-select v-model="rerunFormData.browser" style="width: 100%">
-            <el-option label="Chrome" value="chrome" />
-            <el-option label="Firefox" value="firefox" />
-            <el-option label="Safari" value="safari" />
-            <el-option label="Edge" value="edge" />
+            <el-option v-for="option in rerunBrowserOptions" :key="option.value" :label="option.label" :value="option.value" :disabled="option.disabled" />
           </el-select>
         </el-form-item>
         <el-form-item :label="$t('uiAutomation.execution.executionMode')">
@@ -306,14 +314,14 @@
       </el-form>
       <template #footer>
         <el-button @click="showRerunDialogVisible = false">{{ $t('uiAutomation.common.cancel') }}</el-button>
-        <el-button type="primary" @click="handleRerun" :loading="rerunning">{{ $t('uiAutomation.execution.confirmRerun') }}</el-button>
+        <el-button type="primary" @click="handleRerun" :loading="rerunning" :disabled="rerunReadinessLoading || (!rerunUnknown && (rerunReadinessError || Boolean(rerunReadinessReason)))">{{ t(rerunUnknown ? 'uiAutomation.workbenchExecution.retrySameSubmission' : 'uiAutomation.execution.confirmRerun') }}</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { computed, onScopeDispose, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onScopeDispose, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, WarningFilled, Refresh } from '@element-plus/icons-vue'
@@ -321,18 +329,23 @@ import { useI18n } from 'vue-i18n'
 import { useUiProjectContext } from '@/composables/useUiProjectContext'
 import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
 import { caseExecutionFailure, readCaseExecutionLog } from '@/utils/ui-case-execution.mjs'
+import { clearUiPendingRun, isUiRunActive, isUiSubmissionRejected, newUiSubmissionId, normalizeUiRunStatus, readUiPendingRun, uiPendingRunKey, writeUiPendingRun } from '@/utils/ui-execution-submission.mjs'
+import { uiBrowserOptions, uiEngineOptions, uiReadinessError } from '@/utils/ui-execution-options.mjs'
 import {
   getTestCaseExecutions,
   getTestCaseExecutionDetail,
   deleteTestCaseExecution,
   batchDeleteTestCaseExecutions,
+  getTestCaseSubmission,
+  abortTestCaseExecution,
+  getExecutionReadiness,
   runTestCase
 } from '@/api/ui_automation'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const { projects, projectId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
+const { projects, projectId, userId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
 const executions = ref([])
 const loading = ref(false)
 const listError = ref(false)
@@ -340,6 +353,37 @@ const total = ref(0)
 let listRequest = 0
 let detailRequest = 0
 let projectGeneration = 0
+let detailPollTimer = null
+let cancelRequest = 0
+const detailTrackingPaused = ref(false)
+const cancelling = ref(false)
+const confirmedDetails = new Map()
+const maxConfirmedDetails = 100
+const rerunPendingByScope = new Map()
+let rerunScopeKey = ''
+const isUiRunTerminal = status => ['passed', 'failed', 'error', 'aborted'].includes(normalizeUiRunStatus(status))
+const summarizeExecution = record => {
+  const summary = {}
+  for (const key of ['id', 'project', 'test_case']) {
+    const id = normalizeUiId(record?.[key])
+    if (id) summary[key] = id
+  }
+  for (const key of ['status', 'test_case_name', 'browser', 'engine', 'started_at', 'finished_at', 'created_at', 'created_by_name', 'error_message']) {
+    if (typeof record?.[key] === 'string') summary[key] = record[key].slice(0, key === 'error_message' ? 1000 : 300)
+  }
+  summary.status = normalizeUiRunStatus(record?.status)
+  if (typeof record?.headless === 'boolean') summary.headless = record.headless
+  if (Number.isFinite(Number(record?.execution_time))) summary.execution_time = Number(record.execution_time)
+  return summary
+}
+const rememberConfirmedDetail = record => {
+  const summary = summarizeExecution(record)
+  if (!summary.id || !isUiRunTerminal(summary.status)) return null
+  confirmedDetails.delete(summary.id)
+  confirmedDetails.set(summary.id, summary)
+  while (confirmedDetails.size > maxConfirmedDetails) confirmedDetails.delete(confirmedDetails.keys().next().value)
+  return summary
+}
 const pagination = reactive({
   currentPage: 1,
   pageSize: 20
@@ -366,11 +410,20 @@ const detailLocation = id => uiExecutionLocation('UiExecutions', projectId.value
 // 重跑对话框相关
 const showRerunDialogVisible = ref(false)
 const rerunning = ref(false)
+const rerunUnknown = ref(false)
+const rerunOrigin = ref(null)
+const rerunReadiness = ref(null)
+const rerunReadinessLoading = ref(false)
+const rerunReadinessError = ref(false)
+const rerunEngineOptions = computed(() => uiEngineOptions(rerunReadiness.value))
+const rerunBrowserOptions = computed(() => uiBrowserOptions(rerunReadiness.value, rerunFormData.engine))
+const rerunReadinessReason = computed(() => uiReadinessError(rerunReadiness.value, rerunFormData.engine, rerunFormData.browser))
+let rerunPending = null
 const rerunFormData = reactive({
   testCaseId: null,
   engine: 'playwright',
   browser: 'chrome',
-  headless: false
+  headless: true
 })
 
 // 格式化日期时间
@@ -425,7 +478,8 @@ const getStatusText = (status) => {
     'running': t('uiAutomation.status.running'),
     'passed': t('uiAutomation.status.passed'),
     'failed': t('uiAutomation.status.failed'),
-    'error': t('uiAutomation.status.error')
+    'error': t('uiAutomation.status.error'),
+    'aborted': t('uiAutomation.workbenchExecution.aborted')
   }
   return statusMap[status] || status
 }
@@ -468,6 +522,8 @@ const getActionText = (actionType) => {
 
 async function loadExecutions() {
   const request = ++listRequest
+  const generation = projectGeneration
+  const actor = userId?.value
   const project = projectId.value
   loading.value = Boolean(project)
   listError.value = false
@@ -479,38 +535,99 @@ async function loadExecutions() {
       ...queryParams,
       project,
     })
-    if (request !== listRequest || projectId.value !== project) return
+    if (request !== listRequest || generation !== projectGeneration || projectId.value !== project || userId?.value !== actor) return
     const rows = Array.isArray(data) ? data : data?.results
     if (!Array.isArray(rows)) throw new Error('Invalid UI execution list')
-    executions.value = rows
+    executions.value = rows.map(row => {
+      const known = confirmedDetails.get(normalizeUiId(row.id))
+      return known && isUiRunTerminal(known.status) ? { ...row, ...known } : row
+    })
     total.value = data.count ?? rows.length
   } catch {
-    if (request === listRequest && projectId.value === project) listError.value = true
+    if (request === listRequest && generation === projectGeneration && projectId.value === project && userId?.value === actor) listError.value = true
   } finally {
-    if (request === listRequest) loading.value = false
+    if (request === listRequest && generation === projectGeneration && userId?.value === actor) loading.value = false
   }
 }
 
-async function loadExecutionDetail() {
+async function loadExecutionDetail(preserve = false) {
   const request = ++detailRequest
+  const generation = projectGeneration
+  const actor = userId?.value
+  if (detailPollTimer !== null) globalThis.clearTimeout?.(detailPollTimer)
+  detailPollTimer = null
   const project = projectId.value
   const id = normalizeUiId(executionQuery.value)
-  currentExecution.value = null
-  detailState.value = 'idle'
-  failedImages.value = new Set()
-  activeTab.value = 'logs'
+  if (!preserve) {
+    currentExecution.value = null
+    detailState.value = 'idle'
+    failedImages.value = new Set()
+    activeTab.value = 'logs'
+  }
+  detailTrackingPaused.value = false
   if (!showDetailDialog.value || !project || !id) return
-  detailState.value = 'loading'
+  if (!preserve) detailState.value = 'loading'
   try {
     const { data } = await getTestCaseExecutionDetail(id)
-    if (request !== detailRequest || projectId.value !== project) return
+    if (request !== detailRequest || generation !== projectGeneration || projectId.value !== project || userId?.value !== actor || normalizeUiId(executionQuery.value) !== id) return
     if (normalizeUiId(data?.project) === project && normalizeUiId(data?.id) === id) {
-      currentExecution.value = data
-    }
+      const record = { ...data, status: normalizeUiRunStatus(data.status) }
+      const known = confirmedDetails.get(id)
+      const current = currentExecution.value
+      const currentTerminal = normalizeUiId(current?.id) === id && isUiRunTerminal(current.status)
+      if (known && isUiRunTerminal(known.status) && isUiRunActive(record.status)) {
+        currentExecution.value = currentTerminal ? current : { ...known, execution_logs: '', screenshots: [] }
+        // A summary can confirm status, but cannot turn an old active response
+        // into terminal evidence after the full detail has been released.
+        detailTrackingPaused.value = !currentTerminal
+      } else currentExecution.value = record
+      const summary = rememberConfirmedDetail(currentExecution.value)
+      executions.value = executions.value.map(row => row.id === id ? { ...row, ...(summary || summarizeExecution(currentExecution.value)) } : row)
+      if (isUiRunActive(currentExecution.value.status)) {
+        if (!globalThis.document?.hidden) detailPollTimer = globalThis.setTimeout(() => loadExecutionDetail(true), 3000)
+      } else {
+        const storageKey = uiPendingRunKey('case', actor, project, currentExecution.value.test_case)
+        const inMemory = rerunPendingByScope.get(storageKey)
+        const saved = readUiPendingRun(storageKey)
+        if (inMemory?.execution_id === id) {
+          rerunPendingByScope.delete(storageKey)
+          clearUiPendingRun(storageKey)
+          if (rerunScopeKey === storageKey && rerunPending === inMemory) {
+            rerunPending = null
+            rerunUnknown.value = false
+          }
+        } else if (!inMemory && saved?.execution_id === id) clearUiPendingRun(storageKey)
+      }
+    } else currentExecution.value = null
     detailState.value = 'idle'
   } catch (error) {
-    if (request !== detailRequest || projectId.value !== project) return
-    detailState.value = [403, 404].includes(error.response?.status) ? 'idle' : 'error'
+    if (request !== detailRequest || generation !== projectGeneration || projectId.value !== project || userId?.value !== actor || normalizeUiId(executionQuery.value) !== id) return
+    if (preserve && currentExecution.value && ![403, 404].includes(error.response?.status)) detailTrackingPaused.value = true
+    else {
+      currentExecution.value = null
+      detailState.value = [403, 404].includes(error.response?.status) ? 'idle' : 'error'
+    }
+  }
+}
+
+function repairLocation(execution) {
+  const step = caseExecutionFailure(execution, readCaseExecutionLog(execution.execution_logs))?.stepNumber
+  return { name: 'UiTestCases', query: { project: String(projectId.value), caseId: String(execution.test_case), fromExecutionId: String(execution.id), fromKind: 'case', ...(step ? { stepNumber: String(step) } : {}) } }
+}
+
+async function cancelExecution() {
+  const project = projectId.value
+  const id = currentExecution.value?.id
+  if (!id || cancelling.value) return
+  const request = ++cancelRequest
+  cancelling.value = true
+  try { await abortTestCaseExecution(id) }
+  catch (error) { if (request === cancelRequest) ElMessage.error(error.response?.data?.error || t('uiAutomation.workbenchExecution.detailError')) }
+  finally {
+    if (request === cancelRequest) {
+      cancelling.value = false
+      if (projectId.value === project && currentExecution.value?.id === id) await loadExecutionDetail(true)
+    }
   }
 }
 
@@ -522,7 +639,22 @@ function onDetailVisibility(visible) {
 }
 
 function resetProjectScope() {
+  if (detailPollTimer !== null) globalThis.clearTimeout?.(detailPollTimer)
+  detailPollTimer = null
+  listRequest += 1
+  detailRequest += 1
+  confirmedDetails.clear()
+  rerunPending = null
+  rerunScopeKey = ''
+  rerunning.value = false
+  rerunUnknown.value = false
+  rerunReadinessLoading.value = false
+  cancelRequest += 1
+  cancelling.value = false
   projectGeneration += 1
+  currentExecution.value = null
+  detailState.value = 'idle'
+  detailTrackingPaused.value = false
   executions.value = []
   total.value = 0
   selectedIds.value = []
@@ -603,63 +735,126 @@ const handleBatchDelete = () => {
 }
 
 // 显示重跑对话框
-const showRerunDialog = (execution) => {
+const showRerunDialog = async execution => {
   if (rerunning.value || !execution || normalizeUiId(execution.project) !== projectId.value) return
-  rerunFormData.testCaseId = execution.test_case
-  rerunFormData.engine = execution.engine || 'playwright'
-  rerunFormData.browser = execution.browser || 'chrome'
-  rerunFormData.headless = execution.headless || false
-  showRerunDialogVisible.value = true
-}
-
-// 执行重跑
-const handleRerun = async () => {
-  if (!rerunFormData.testCaseId) {
-    ElMessage.error(t('uiAutomation.execution.messages.invalidCaseId'))
-    return
-  }
-
-  if (rerunning.value || !projectId.value) return
   const project = projectId.value
+  const actor = userId?.value
   const generation = projectGeneration
-  const isCurrent = () => generation === projectGeneration && projectId.value === project && route.name === 'UiExecutions'
-  rerunning.value = true
-  let result
+  rerunOrigin.value = execution.id
+  rerunFormData.testCaseId = execution.test_case
+  const storageKey = uiPendingRunKey('case', userId?.value, project, execution.test_case)
+  if (!storageKey) return
+  rerunScopeKey = storageKey
+  rerunPending = rerunPendingByScope.get(storageKey) || readUiPendingRun(storageKey)
+  if (rerunPending) rerunPendingByScope.set(storageKey, rerunPending)
+  rerunUnknown.value = Boolean(rerunPending)
+  rerunOrigin.value = rerunPending?.rerun_of || execution.id
+  rerunFormData.engine = rerunPending?.engine || execution.engine || 'playwright'
+  rerunFormData.browser = rerunPending?.browser || execution.browser || 'chrome'
+  rerunFormData.headless = rerunPending?.headless ?? execution.headless ?? true
+  showRerunDialogVisible.value = true
+  rerunReadinessLoading.value = true
+  rerunReadinessError.value = false
   try {
-    const response = await runTestCase(rerunFormData.testCaseId, {
-      project_id: project,
-      engine: rerunFormData.engine,
-      browser: rerunFormData.browser,
-      headless: rerunFormData.headless
-    })
-    result = response.data
-    if (!isCurrent()) return
-    if (result.success) {
-      ElMessage.success(t('uiAutomation.execution.messages.rerunSuccess'))
-    } else {
-      ElMessage.warning(t('uiAutomation.execution.messages.rerunCompleteWithFailure') + ': ' + (result.errors?.[0]?.message || t('uiAutomation.execution.messages.viewDetails')))
-    }
-  } catch (error) {
-    result = error.response?.data
-    if (!isCurrent()) return
-    ElMessage.error(t('uiAutomation.execution.messages.rerunFailed') + ': ' + (result?.message || error.message || t('uiAutomation.messages.error.unknown')))
-  } finally {
-    rerunning.value = false
-    if (isCurrent()) {
-      showRerunDialogVisible.value = false
-      void loadExecutions()
-      const id = normalizeUiId(result?.execution_id)
-      if (id) void router.push(detailLocation(id))
-    }
-  }
+    const { data } = await getExecutionReadiness(project)
+    if (projectGeneration !== generation || projectId.value !== project || userId?.value !== actor) return
+    rerunReadiness.value = data
+    const available = uiEngineOptions(data).filter(item => !item.disabled)
+    if (!rerunPending && available.length && !available.some(item => item.value === rerunFormData.engine)) rerunFormData.engine = available[0].value
+    const browsers = uiBrowserOptions(data, rerunFormData.engine).filter(item => !item.disabled)
+    if (!rerunPending && browsers.length && !browsers.some(item => item.value === rerunFormData.browser)) rerunFormData.browser = browsers[0].value
+  } catch { if (projectGeneration === generation && userId?.value === actor) rerunReadinessError.value = true }
+  finally { if (projectGeneration === generation && userId?.value === actor) rerunReadinessLoading.value = false }
 }
 
-watch(projectId, resetProjectScope, { immediate: true })
-watch([projectId, executionQuery], loadExecutionDetail, { immediate: true })
+const handleRerun = async () => {
+  const caseId = normalizeUiId(rerunFormData.testCaseId)
+  if (!caseId || rerunning.value || !projectId.value || rerunReadinessLoading.value) return
+  if (!rerunPending && (rerunReadinessError.value || rerunReadinessReason.value)) return
+  const project = projectId.value
+  const actor = userId?.value
+  const generation = projectGeneration
+  const storageKey = uiPendingRunKey('case', actor, project, caseId)
+  if (!storageKey) return
+  const pending = rerunPendingByScope.get(storageKey) || (rerunScopeKey === storageKey ? rerunPending : null) || { client_request_id: newUiSubmissionId(), engine: rerunFormData.engine, browser: rerunFormData.browser, headless: rerunFormData.headless, rerun_of: rerunOrigin.value, rerun_kind: 'case' }
+  rerunPendingByScope.set(storageKey, pending)
+  rerunScopeKey = storageKey
+  rerunPending = pending
+  const isCurrentContext = () => generation === projectGeneration && projectId.value === project && userId?.value === actor && route.name === 'UiExecutions' && rerunScopeKey === storageKey
+  const isCurrent = () => isCurrentContext() && rerunPendingByScope.get(storageKey) === pending
+  writeUiPendingRun(storageKey, pending)
+  rerunning.value = true
+  const open = async id => {
+    if (rerunPendingByScope.get(storageKey) === pending) {
+      pending.execution_id = id
+      writeUiPendingRun(storageKey, pending)
+    }
+    if (!isCurrent()) return
+    rerunUnknown.value = false
+    showRerunDialogVisible.value = false
+    await router.push(detailLocation(id))
+    void loadExecutions()
+  }
+  try {
+    if (rerunUnknown.value || pending.execution_id) {
+      if (pending.execution_id) { await open(pending.execution_id); return }
+      try {
+        const { data } = await getTestCaseSubmission(caseId, { client_request_id: pending.client_request_id })
+        const id = normalizeUiId(data?.execution_id)
+        if (id) { await open(id); return }
+      } catch (error) { if (error.response?.status !== 404) throw error }
+    }
+    const { data } = await runTestCase(caseId, { ...pending, project_id: project })
+    if (isUiSubmissionRejected(data)) throw Object.assign(new Error(data.message || data.error), { response: { status: 200, data } })
+    const id = normalizeUiId(data?.execution_id)
+    if (id) await open(id)
+    else throw new Error(t('uiAutomation.workbenchExecution.submissionUnknown'))
+  } catch (error) {
+    const data = error.response?.data || {}
+    const id = normalizeUiId(data.execution_id)
+    const rejected = isUiSubmissionRejected(data)
+    if (id && !rejected) { await open(id); return }
+    if (rejected && id) { await open(id); return }
+    const current = isCurrent()
+    const definitive = rejected || (error.response && error.response.status < 500)
+    if (definitive && rerunPendingByScope.get(storageKey) === pending) {
+      rerunPendingByScope.delete(storageKey)
+      clearUiPendingRun(storageKey)
+      if (rerunScopeKey === storageKey && rerunPending === pending) rerunPending = null
+    }
+    if (!current) return
+    if (definitive) {
+      rerunUnknown.value = false
+      ElMessage.error(data.message || data.error || data.detail || t('uiAutomation.execution.messages.rerunFailed'))
+    } else {
+      rerunUnknown.value = true
+      try {
+        const { data } = await getTestCaseSubmission(caseId, { client_request_id: pending.client_request_id })
+        const recovered = normalizeUiId(data?.execution_id)
+        if (recovered) await open(recovered)
+      } catch { /* The same persisted identity remains available for explicit retry. */ }
+    }
+  } finally { if (isCurrentContext()) rerunning.value = false }
+}
+
+watch([projectId, () => userId?.value], resetProjectScope, { immediate: true })
+watch([projectId, () => userId?.value, executionQuery], () => loadExecutionDetail(), { immediate: true })
+const onVisibility = () => {
+  if (globalThis.document?.hidden) {
+    if (detailPollTimer !== null) globalThis.clearTimeout?.(detailPollTimer)
+    detailPollTimer = null
+  } else if (currentExecution.value && isUiRunActive(currentExecution.value.status)) void loadExecutionDetail(true)
+}
+onMounted(() => globalThis.document?.addEventListener('visibilitychange', onVisibility))
 onScopeDispose(() => {
+  if (detailPollTimer !== null) globalThis.clearTimeout?.(detailPollTimer)
+  globalThis.document?.removeEventListener('visibilitychange', onVisibility)
   listRequest += 1
   detailRequest += 1
   projectGeneration += 1
+  currentExecution.value = null
+  confirmedDetails.clear()
+  rerunPendingByScope.clear()
 })
 </script>
 

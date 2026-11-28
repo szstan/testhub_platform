@@ -9,7 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
-from django.db import models
+from django.db import models, transaction
 from django.db.models.functions import Lower, Trim
 from django.utils import timezone
 from apps.core.http_transport import guarded_post
@@ -22,6 +22,7 @@ import re
 import random
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from .models import (
     UiProject, LocatorStrategy, Element, TestScript, TestSuite,
@@ -35,7 +36,7 @@ from .models import (
 from .serializers import (
     UiProjectSerializer, UiProjectCreateSerializer, UiProjectUpdateSerializer,
     LocatorStrategySerializer,
-    ElementSerializer, ElementEnhancedSerializer,
+    ElementSerializer, ElementEnhancedSerializer, ElementOptionSerializer,
     TestScriptSerializer, TestScriptCreateSerializer, TestScriptUpdateSerializer,
     TestSuiteSerializer, TestSuiteCreateSerializer, TestSuiteUpdateSerializer, TestSuiteWithScriptsSerializer,
     TestSuiteScriptSerializer, TestSuiteTestCaseSerializer,
@@ -62,6 +63,308 @@ from .access import accessible_projects, is_ui_admin, selenium_compatibility_ena
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _preflight_error(message, http_status=status.HTTP_400_BAD_REQUEST):
+    return Response({
+        'accepted': False,
+        'failure_stage': 'preflight',
+        'message': message,
+        'error': message,
+    }, status=http_status)
+
+
+def _positive_request_id(value, field):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f'{field} must be a positive ID')
+    if isinstance(value, str) and not value.strip().isdigit():
+        raise ValueError(f'{field} must be a positive ID')
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f'{field} must be a positive ID')
+    return parsed
+
+
+def _parse_rerun_reference(data):
+    raw_id = data.get('rerun_of')
+    kind = str(data.get('rerun_kind') or '').lower()
+    if raw_id in (None, '') and not kind:
+        return None, ''
+    if raw_id in (None, '') or kind not in {'case', 'suite'}:
+        raise ValueError('rerun_of and rerun_kind must be provided together')
+    return _positive_request_id(raw_id, 'rerun_of'), kind
+
+
+def _requested_project_id(data):
+    value = data.get('project_id')
+    return None if value in (None, '') else _positive_request_id(value, 'project_id')
+
+
+def _suite_execution_contains_case(execution, test_case):
+    def contains(rows):
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            reference = row.get('test_case_id', row.get('test_case', row.get('id')))
+            if isinstance(reference, dict):
+                reference = reference.get('id')
+            try:
+                case_id = _positive_request_id(reference, 'case_id')
+                project_id = row.get('project_id')
+                if case_id == test_case.pk and (
+                    project_id is None or _positive_request_id(project_id, 'project_id') == test_case.project_id
+                ):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    snapshot = execution.request_snapshot
+    if isinstance(snapshot, dict) and 'cases' in snapshot:
+        return contains(snapshot['cases'])
+    # Historical runs may predate snapshots. Their recorded result or exact
+    # parent-child link is evidence; current suite membership is not.
+    result = execution.result_data
+    if contains(result.get('test_cases') if isinstance(result, dict) else result):
+        return True
+    return TestCaseExecution.objects.filter(
+        parent_execution_id=execution.pk, test_case_id=test_case.pk, project_id=test_case.project_id,
+    ).exists()
+
+
+def _resolve_rerun_source(user, kind, resource, data):
+    try:
+        execution_id, rerun_kind = _parse_rerun_reference(data)
+    except ValueError as exc:
+        return None, '', _preflight_error(str(exc))
+    if execution_id is None:
+        return None, '', None
+
+    project_scope = accessible_projects(user)
+    original = None
+    if kind == 'case' and rerun_kind == 'case':
+        original = TestCaseExecution.objects.filter(
+            pk=execution_id, project__in=project_scope,
+            project_id=resource.project_id, test_case_id=resource.pk,
+        ).first()
+    elif kind == 'case' and rerun_kind == 'suite':
+        original = TestExecution.objects.filter(
+            pk=execution_id, project__in=project_scope, project_id=resource.project_id,
+        ).first()
+        if original is not None and not _suite_execution_contains_case(original, resource):
+            original = None
+    elif kind == 'suite' and rerun_kind == 'suite':
+        original = TestExecution.objects.filter(
+            pk=execution_id, project__in=project_scope,
+            project_id=resource.project_id, test_suite=resource,
+        ).first()
+
+    if original is None:
+        return None, '', _preflight_error('原执行不存在、无权访问或与当前用例/套件不匹配', status.HTTP_404_NOT_FOUND)
+    return original, rerun_kind, None
+
+
+def _submission_conflict(kind, original_id):
+    return Response({
+        'accepted': False,
+        'error': 'client_request_id was already used for a different submission',
+        'original_execution_id': original_id, 'execution_id': original_id, 'kind': kind,
+    }, status=status.HTTP_409_CONFLICT)
+
+
+def _replay_workbench_submission(kind, resource, user, request_id, options, data, requested_project=None):
+    from .workbench import find_existing_submission
+
+    try:
+        source_id, source_kind = _parse_rerun_reference(data)
+    except ValueError as exc:
+        return _preflight_error(str(exc))
+    found = find_existing_submission(
+        user, kind, resource.pk, request_id, options, rerun_of=source_id, rerun_kind=source_kind,
+    )
+    if found is None:
+        return None
+    execution, conflict, original_id = found
+    if execution is not None:
+        if not accessible_projects(user).filter(pk=execution.project_id).exists():
+            return _preflight_error('原执行不存在或无权访问', status.HTTP_404_NOT_FOUND)
+        if requested_project is not None and requested_project != execution.project_id:
+            conflict = True
+    if conflict:
+        return _submission_conflict(kind, original_id)
+    response = _dispatch_workbench_submission(kind, execution, replayed=True)
+    if kind == 'suite':
+        response.data.update({'suite_id': resource.pk, 'test_case_count': execution.total_cases, **options})
+    return response
+
+
+def _mark_workbench_dispatch_failed(kind, execution):
+    message = '执行队列不可用，请检查Celery worker与broker后查询原执行记录。'
+    now = timezone.now()
+    if kind == 'case':
+        return TestCaseExecution.objects.filter(
+            pk=execution.pk,
+            dispatch_claim=execution.dispatch_claim,
+            status='pending',
+            cancel_requested_at__isnull=True,
+        ).update(
+            status='error',
+            error_message=message,
+            execution_logs=message,
+            execution_time=0,
+            finished_at=now,
+            failure_stage='dispatch',
+            failure_summary=build_failure_summary('error', message),
+        ) > 0
+
+    updated = TestExecution.objects.filter(
+        pk=execution.pk,
+        dispatch_claim=execution.dispatch_claim,
+        status='PENDING',
+        cancel_requested_at__isnull=True,
+    ).update(
+        status='FAILED',
+        error_message=message,
+        result_data={'test_cases': [], 'summary': {'message': message}},
+        finished_at=now,
+        failure_stage='dispatch',
+        failure_summary=build_failure_summary('FAILED', message, suite=True),
+    )
+    if updated:
+        TestSuite.objects.filter(pk=execution.test_suite_id).update(
+            execution_status='failed', updated_at=now,
+        )
+    return updated > 0
+
+
+def _dispatch_workbench_submission(kind, execution, *, replayed=False, resource_name='', user=None):
+    from .workbench import acceptance_payload, dispatch_execution
+
+    if replayed:
+        if execution.failure_stage == 'dispatch' and execution.status in {'error', 'FAILED'}:
+            return Response(
+                acceptance_payload(kind, execution, replayed=True, accepted=False, failure_stage='dispatch'),
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(acceptance_payload(kind, execution, replayed=True), status=status.HTTP_202_ACCEPTED)
+
+    try:
+        dispatch_execution(kind, execution)
+    except Exception:
+        logger.warning('UI workbench dispatch unavailable kind=%s execution_id=%s', kind, execution.pk)
+        if _mark_workbench_dispatch_failed(kind, execution):
+            execution.refresh_from_db()
+            return Response(
+                acceptance_payload(kind, execution, accepted=False, failure_stage='dispatch'),
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        execution.refresh_from_db()
+        if execution.status not in {'pending', 'PENDING'}:
+            return Response(acceptance_payload(kind, execution), status=status.HTTP_202_ACCEPTED)
+        return Response(
+            {
+                'accepted': False,
+                'execution_id': execution.pk,
+                'status': execution.status,
+                'kind': kind,
+                'failure_stage': 'dispatch',
+                'message': '执行队列不可用，执行状态暂时无法更新；请通过原执行记录查询。',
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    if user is not None:
+        try:
+            log_operation('run', 'test_case' if kind == 'case' else 'suite', execution.test_case_id if kind == 'case' else execution.test_suite_id, resource_name, user)
+        except Exception:
+            logger.warning('UI workbench operation logging failed kind=%s execution_id=%s', kind, execution.pk)
+    return Response(acceptance_payload(kind, execution), status=status.HTTP_202_ACCEPTED)
+
+
+def _abort_suite_execution(execution_id):
+    with transaction.atomic():
+        execution = TestExecution.objects.select_for_update().filter(pk=execution_id).first()
+        if execution is None:
+            return Response({'error': 'execution not found'}, status=status.HTTP_404_NOT_FOUND)
+        if execution.status == 'ABORTED':
+            return Response({'accepted': True, 'execution_id': execution.pk, 'kind': 'suite', 'status': 'ABORTED'})
+        if not execution.dispatch_claim or execution.status not in {'PENDING', 'RUNNING'}:
+            return Response({
+                'accepted': False,
+                'execution_id': execution.pk,
+                'kind': 'suite',
+                'status': execution.status,
+                'error': 'execution is not an active workbench submission',
+            }, status=status.HTTP_409_CONFLICT)
+        now = timezone.now()
+        message = '执行已由用户停止。'
+        TestExecution.objects.filter(
+            pk=execution.pk,
+            dispatch_claim=execution.dispatch_claim,
+            status__in=['PENDING', 'RUNNING'],
+        ).update(
+            status='ABORTED',
+            cancel_requested_at=now,
+            finished_at=now,
+            error_message=message,
+            failure_stage='cancelled',
+        )
+        TestCaseExecution.objects.filter(
+            parent_execution_id=execution.pk,
+            status__in=['pending', 'running'],
+        ).update(
+            status='aborted',
+            cancel_requested_at=now,
+            finished_at=now,
+            error_message=message,
+            execution_logs=message,
+            failure_stage='cancelled',
+        )
+        if execution.test_suite_id:
+            TestSuite.objects.filter(pk=execution.test_suite_id).update(
+                execution_status='failed', updated_at=now,
+            )
+        return Response({'accepted': True, 'execution_id': execution.pk, 'kind': 'suite', 'status': 'ABORTED'})
+
+
+def _abort_case_execution(execution_id):
+    identity = TestCaseExecution.objects.filter(pk=execution_id).values('parent_execution_id').first()
+    if identity is None:
+        return Response({'error': 'execution not found'}, status=status.HTTP_404_NOT_FOUND)
+    if identity['parent_execution_id']:
+        # Child saves take parent -> child locks. Delegate before taking any
+        # child lock so cancel uses the same order on row-locking databases.
+        return _abort_suite_execution(identity['parent_execution_id'])
+    parent_id = None
+    with transaction.atomic():
+        execution = TestCaseExecution.objects.select_for_update().filter(pk=execution_id).first()
+        if execution is None:
+            return Response({'error': 'execution not found'}, status=status.HTTP_404_NOT_FOUND)
+        parent_id = execution.parent_execution_id
+        if not parent_id:
+            if execution.status == 'aborted':
+                return Response({'accepted': True, 'execution_id': execution.pk, 'kind': 'case', 'status': 'aborted'})
+            if not execution.dispatch_claim or execution.status not in {'pending', 'running'}:
+                return Response({
+                    'accepted': False, 'execution_id': execution.pk, 'kind': 'case', 'status': execution.status,
+                    'error': 'execution is not an active workbench submission',
+                }, status=status.HTTP_409_CONFLICT)
+            now = timezone.now()
+            message = '执行已由用户停止。'
+            TestCaseExecution.objects.filter(
+                pk=execution.pk, dispatch_claim=execution.dispatch_claim, status__in=['pending', 'running'],
+            ).update(
+                status='aborted', cancel_requested_at=now, finished_at=now,
+                error_message=message, execution_logs=message, failure_stage='cancelled',
+            )
+            return Response({'accepted': True, 'execution_id': execution.pk, 'kind': 'case', 'status': 'aborted'})
+    # A savepoint may be nested in ATOMIC_REQUESTS and retain the child lock.
+    # Do not upgrade after observing a concurrent parent assignment: let the
+    # caller retry through the parent-first path in a new transaction.
+    return Response({
+        'accepted': False, 'execution_id': execution_id, 'kind': 'case',
+        'error': '执行所属套件发生变化，请刷新后重试取消。',
+    }, status=status.HTTP_409_CONFLICT)
 
 
 def _append_ai_gif_evidence(execution_record, gif_path):
@@ -209,6 +512,80 @@ class UiProjectViewSet(viewsets.ModelViewSet):
         log_operation('delete', 'project', instance.id, instance.name, self.request.user)
         instance.delete()
 
+    @action(detail=True, methods=['get'], url_path='execution-readiness')
+    def execution_readiness(self, request, pk=None):
+        from .readiness import cached_environment_check
+
+        project = self.get_object()
+        try:
+            from .network_policy import validate_ui_outbound_url
+
+            validate_ui_outbound_url(project.base_url)
+            base_url_ready = True
+            base_url_message = '项目基础地址通过UI出站网络策略检查。'
+        except Exception:
+            base_url_ready = False
+            base_url_message = '项目基础地址被UI出站网络策略拒绝；请调整项目地址或经过审核的UI网络配置。'
+
+        try:
+            from .network_policy import get_ui_network_policy
+
+            policy = get_ui_network_policy()
+            policy_ready, policy_message = True, ''
+        except Exception:
+            policy_ready, policy_message = False, 'UI网络策略配置无效，浏览器执行已禁用。'
+
+        engines = []
+        for engine in ('playwright', 'selenium'):
+            try:
+                import importlib.util
+
+                module_ready = importlib.util.find_spec(engine) is not None
+            except (ImportError, ValueError):
+                module_ready = False
+            enabled = engine != 'selenium' or selenium_compatibility_enabled(request.user)
+            engine_available = module_ready and policy_ready and enabled
+            if not enabled:
+                engine_message = 'Selenium兼容模式已被当前部署禁用。'
+            elif not module_ready:
+                engine_message = f'{engine}执行模块未安装。'
+            elif not policy_ready:
+                engine_message = policy_message
+            else:
+                engine_message = '执行模块与UI网络策略可用。'
+
+            browser_results = []
+            for browser in ('chrome', 'firefox', 'edge', 'safari'):
+                if not engine_available:
+                    ready, message = False, engine_message
+                elif engine == 'playwright':
+                    ready, message = cached_environment_check(engine, browser, policy)
+                elif browser == 'safari':
+                    ready, message = False, (
+                        'Selenium Safari已被UI受限网络策略禁用。请改用Chrome、Firefox或Edge。'
+                    )
+                else:
+                    ready, message = cached_environment_check(engine, browser, policy)
+                browser_results.append({
+                    'value': browser,
+                    'available': bool(ready),
+                    'message': str(message or ('浏览器与执行环境可用。' if ready else '浏览器执行环境不可用。')),
+                })
+            engines.append({
+                'value': engine,
+                'available': bool(engine_available),
+                'message': engine_message,
+                'browsers': browser_results,
+            })
+
+        return Response({
+            'project_id': project.pk,
+            'recommended_headless': True,
+            'base_url_ready': base_url_ready,
+            'base_url_message': base_url_message,
+            'engines': engines,
+        })
+
 
 class LocatorStrategyViewSet(viewsets.ModelViewSet):
     queryset = LocatorStrategy.objects.all()
@@ -228,8 +605,16 @@ class ElementViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['project', 'locator_strategy', 'element_type', 'validation_status', 'group']
     search_fields = ['name', 'description', 'page', 'component_name']
+    pagination_class = StandardPagination
+
+    def _is_option_list(self):
+        return getattr(self, 'action', None) == 'list' and str(
+            self.request.query_params.get('options_only', ''),
+        ).lower() in {'1', 'true'}
 
     def get_serializer_class(self):
+        if self._is_option_list():
+            return ElementOptionSerializer
         if self.action in ['list', 'retrieve']:
             return ElementEnhancedSerializer
         return ElementSerializer
@@ -238,6 +623,10 @@ class ElementViewSet(viewsets.ModelViewSet):
         # 只显示用户有权限访问的项目的元素
         user = self.request.user
         project_scope = accessible_projects(user)
+        if self._is_option_list():
+            return Element.objects.filter(project__in=project_scope).only(
+                'id', 'project_id', 'name', 'page', 'element_type', 'locator_strategy_id', 'locator_value',
+            ).order_by('id')
         return Element.objects.filter(project__in=project_scope).select_related(
             'project', 'group', 'locator_strategy', 'created_by', 'parent_element'
         ).prefetch_related('script_usages__script').order_by('page', 'order', 'name')
@@ -260,7 +649,14 @@ class ElementViewSet(viewsets.ModelViewSet):
         log_operation('create', 'element', instance.id, instance.name, self.request.user)
 
     def perform_update(self, serializer):
-        instance = serializer.save()
+        identity_fields = ('project_id', 'locator_strategy_id', 'locator_value', 'is_unique')
+        changed = any(
+            field in serializer.validated_data
+            and serializer.validated_data[field] != getattr(serializer.instance, field)
+            for field in identity_fields
+        )
+        reset = {'validation_status': 'UNKNOWN', 'validation_message': '', 'last_validated': None} if changed else {}
+        instance = serializer.save(**reset)
         # 记录操作
         log_operation('edit', 'element', instance.id, instance.name, self.request.user)
 
@@ -271,20 +667,31 @@ class ElementViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def validate_locator(self, request, pk=None):
-        """验证元素定位器有效性"""
+        """Validate format or perform a guarded live locator probe."""
         element = self.get_object()
-
-        # 这里可以集成实际的浏览器验证逻辑
-        # 现在只是模拟验证
-        validation_result = self._perform_element_validation(element)
-
-        element.validation_status = 'VALID' if validation_result['is_valid'] else 'INVALID'
-        element.validation_message = validation_result['validation_message']
-        element.last_validated = timezone.now()
-        element.save()
-
-        serializer = ElementValidationSerializer(validation_result)
-        return Response(serializer.data)
+        validation_result = self._perform_element_validation(element, request.data)
+        checked_at = timezone.now()
+        updated = Element.objects.filter(
+            pk=element.pk,
+            project_id=element.project_id,
+            locator_strategy_id=element.locator_strategy_id,
+            locator_value=element.locator_value,
+            is_unique=element.is_unique,
+            updated_at=element.updated_at,
+        ).update(
+            validation_status=validation_result['validation_status'],
+            validation_message=validation_result['validation_message'],
+            last_validated=checked_at,
+            updated_at=checked_at,
+        )
+        if not updated:
+            validation_result.update(
+                is_valid=False,
+                validation_status='UNKNOWN',
+                validation_message='定位器在校验期间已被修改或删除，请重新加载后再验证。',
+            )
+            validation_result.pop('match_count', None)
+        return Response(ElementValidationSerializer(validation_result).data)
 
     @action(detail=True, methods=['get'])
     def usages(self, request, pk=None):
@@ -329,36 +736,10 @@ class ElementViewSet(viewsets.ModelViewSet):
         suggestions = self._generate_element_suggestions(element)
         return Response({'suggestions': suggestions})
 
-    def _perform_element_validation(self, element):
-        """执行元素验证（模拟实现）"""
-        try:
-            # 这里可以集成实际的浏览器自动化工具进行验证
-            # 现在只是简单的语法检查
-            is_valid = True
-            message = "定位器验证通过"
-            suggestions = []
+    def _perform_element_validation(self, element, payload=None):
+        from .locator_validation import validate_locator
 
-            # 简单的语法检查
-            if element.locator_strategy.name == 'css':
-                if not element.locator_value.strip():
-                    is_valid = False
-                    message = "CSS选择器不能为空"
-            elif element.locator_strategy.name == 'xpath':
-                if not element.locator_value.strip():
-                    is_valid = False
-                    message = "XPath表达式不能为空"
-
-            return {
-                'is_valid': is_valid,
-                'validation_message': message,
-                'suggestions': suggestions
-            }
-        except Exception as e:
-            return {
-                'is_valid': False,
-                'validation_message': f'验证过程中出现错误: {str(e)}',
-                'suggestions': []
-            }
+        return validate_locator(element, payload or {'mode': 'format'})
 
     def _build_element_tree(self, elements):
         """构建元素树形结构 - 返回元素列表而不是页面分组，因为前端会自己处理页面关联"""
@@ -817,132 +1198,90 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def run_suite(self, request, pk=None):
-        """执行测试套件"""
-        test_suite = self.get_object()
-
-        # 传统模式执行（Playwright/Selenium）
-        # 检查是否包含测试用例
-        test_case_count = test_suite.suite_test_cases.count()
-        if test_case_count == 0:
-            return Response({
-                'error': '该测试套件未包含任何测试用例，无法执行'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        if test_suite.suite_test_cases.exclude(test_case__project_id=test_suite.project_id).exists():
-            return Response({
-                'error': '测试套件包含其他项目的测试用例，无法执行'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        engine = request.data.get('engine', 'playwright')
-        browser = request.data.get('browser', 'chrome')
-        headless = request.data.get('headless', False)
-
-        if engine == 'selenium' and not selenium_compatibility_enabled(request.user):
-            return Response({'error': 'Selenium 兼容模式已被当前部署禁用'}, status=status.HTTP_403_FORBIDDEN)
-
-        if engine == 'selenium':
-            from .selenium_engine import SeleniumTestEngine
-            is_ready, error_msg = SeleniumTestEngine.check_execution_environment(browser)
-            if not is_ready:
-                return Response({
-                    'error': error_msg,
-                    'message': '浏览器驱动未就绪，请先安装后再执行测试套件'
-                }, status=status.HTTP_400_BAD_REQUEST)
-        elif engine == 'playwright':
-            from .playwright_engine import PlaywrightTestEngine
-            is_ready, error_msg = PlaywrightTestEngine.check_execution_environment_sync(browser)
-            if not is_ready:
-                return Response({
-                    'error': error_msg,
-                    'message': 'Playwright 浏览器未就绪，请先安装后再执行测试套件'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-        # Create the executor dependencies before persisting the run record.
-        import threading
-        from .test_executor import TestExecutor
-
-        # Persist the aggregate before dispatch so every run has a stable, independent ID.
-        execution = TestExecution.objects.create(
-            project=test_suite.project,
-            test_suite=test_suite,
-            status='RUNNING',
-            total_cases=test_case_count,
-            started_at=timezone.now(),
-            executed_by=request.user,
-            engine=engine,
-            browser=browser,
-            headless=headless,
+        """Persist an idempotent suite submission and dispatch its durable worker."""
+        from .workbench import (
+            SubmissionValidationError,
+            create_suite_execution,
+            normalize_run_options,
+            parse_client_request_id,
         )
 
-        def mark_dispatch_failed():
-            logger.exception('套件执行失败 suite_id=%s execution_id=%s', test_suite.pk, execution.pk)
-            message = INTERNAL_SUITE_EXECUTION_ERROR
-            now = timezone.now()
-            TestExecution.objects.filter(pk=execution.pk).update(
-                status='FAILED', finished_at=now, error_message=message,
-                failure_summary=build_failure_summary('FAILED', message),
+        test_suite = self.get_object()
+        try:
+            options = normalize_run_options(request.data, request.user, default_headless=True, enforce_permissions=False)
+            client_request_id = parse_client_request_id(request.data.get('client_request_id'))
+            if client_request_id is None:
+                return _preflight_error('client_request_id is required for suite submissions')
+            requested_project = _requested_project_id(request.data)
+            replay = _replay_workbench_submission(
+                'suite', test_suite, request.user, client_request_id, options, request.data, requested_project,
             )
-            TestSuite.objects.filter(pk=test_suite.pk).update(execution_status='failed')
+            if replay is not None:
+                return replay
+            normalize_run_options(request.data, request.user, default_headless=True)
+            if requested_project is not None and requested_project != test_suite.project_id:
+                return _preflight_error('project_id does not match the selected suite')
+        except PermissionError as exc:
+            return _preflight_error(str(exc), status.HTTP_403_FORBIDDEN)
+        except (SubmissionValidationError, ValueError) as exc:
+            return _preflight_error(str(exc))
+
+        rerun_of, rerun_kind, rerun_error = _resolve_rerun_source(
+            request.user, 'suite', test_suite, request.data,
+        )
+        if rerun_error:
+            return rerun_error
 
         try:
-            test_suite.execution_status = 'running'
-            test_suite.save(update_fields=['execution_status', 'updated_at'])
+            execution, replayed, conflict, original_id = create_suite_execution(
+                test_suite,
+                request.user,
+                options,
+                client_request_id=client_request_id,
+                rerun_of=rerun_of,
+                rerun_kind=rerun_kind,
+            )
+        except SubmissionValidationError as exc:
+            return _preflight_error(str(exc))
         except Exception:
-            try:
-                mark_dispatch_failed()
-            except Exception:
-                logger.exception('[测试套件] 无法保存启动失败状态 execution_id=%s', execution.pk)
-            return Response({
-                'error': INTERNAL_SUITE_EXECUTION_ERROR,
-                'execution_id': execution.pk,
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.exception('Unable to persist UI suite submission suite_id=%s', test_suite.pk)
+            return _preflight_error('无法保存套件执行记录，请稍后查询并重试。', status.HTTP_503_SERVICE_UNAVAILABLE)
+        if conflict:
+            return _submission_conflict('suite', original_id)
 
-        # 在后台线程中执行测试
-        def run_test():
-            try:
-                print(f"[测试套件] 开始执行: {test_suite.name} (ID: {test_suite.id})")
-                print(f"[测试套件] 配置: engine={engine}, browser={browser}, headless={headless}")
+        response = _dispatch_workbench_submission(
+            'suite', execution, replayed=replayed, resource_name=test_suite.name, user=request.user,
+        )
+        response.data.update({
+            'suite_id': test_suite.pk,
+            'test_case_count': execution.total_cases,
+            **options,
+        })
+        return response
 
-                executor = TestExecutor(
-                    test_suite=test_suite,
-                    engine=engine,
-                    browser=browser,
-                    headless=headless,
-                    executed_by=request.user,
-                    execution=execution,
-                )
-                executor.run()
+    @action(detail=True, methods=['get'], url_path='submission')
+    def submission(self, request, pk=None):
+        from .workbench import (
+            SubmissionValidationError,
+            acceptance_payload,
+            parse_client_request_id,
+            resolve_submission,
+        )
 
-                print(f"[测试套件] 执行完成: {test_suite.name}")
-            except Exception:
-                try:
-                    mark_dispatch_failed()
-                except Exception:
-                    logger.exception('[测试套件] 无法保存执行失败状态 execution_id=%s', execution.pk)
-
-        # 启动后台线程执行测试
+        test_suite = self.get_object()
         try:
-            log_operation('run', 'suite', test_suite.id, test_suite.name, request.user)
-            thread = threading.Thread(target=run_test, daemon=False)
-            thread.start()
-        except Exception:
-            try:
-                mark_dispatch_failed()
-            except Exception:
-                logger.exception('[测试套件] 无法保存启动失败状态 execution_id=%s', execution.pk)
-            return Response({
-                'error': INTERNAL_SUITE_EXECUTION_ERROR,
-                'execution_id': execution.pk,
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        return Response({
-            'message': '测试套件开始执行',
-            'suite_id': test_suite.id,
-            'execution_id': execution.pk,
-            'test_case_count': test_case_count,
-            'engine': engine,
-            'browser': browser,
-            'headless': headless
-        }, status=status.HTTP_200_OK)
+            client_request_id = parse_client_request_id(request.query_params.get('client_request_id'))
+        except SubmissionValidationError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if client_request_id is None:
+            return Response({'error': 'client_request_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        execution = resolve_submission(request.user, 'suite', test_suite.pk, client_request_id)
+        if execution is None:
+            return Response({'error': 'submission not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(acceptance_payload(
+            'suite', execution, accepted=execution.failure_stage != 'dispatch',
+            failure_stage=execution.failure_stage,
+        ))
 
 
 def _execution_stacktrace_filter(*fields):
@@ -977,6 +1316,11 @@ class TestExecutionViewSet(viewsets.ModelViewSet):
             default=models.F('error_message'),
             output_field=models.TextField(),
         ))
+
+    @action(detail=True, methods=['post'], url_path='abort')
+    def abort(self, request, pk=None):
+        execution = self.get_object()
+        return _abort_suite_execution(execution.pk)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -1023,7 +1367,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
         return TestCase.objects.filter(project__in=project_scope).select_related('project', 'created_by')
 
     def _validate_step_relations(self, project, steps_data):
-        for step_data in steps_data or []:
+        if not isinstance(steps_data, list):
+            raise ValidationError({'steps': '步骤必须是数组'})
+        for step_data in steps_data:
             if not isinstance(step_data, dict):
                 raise ValidationError({'steps': '步骤数据格式错误'})
             element_id = step_data.get('element_id', step_data.get('element'))
@@ -1128,6 +1474,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             logger.error(f"复制测试用例失败: {str(e)}")
             return Response({'error': f"复制失败: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @transaction.atomic
     def perform_update(self, serializer):
         # 更新测试用例步骤
         project = serializer.validated_data.get('project', serializer.instance.project)
@@ -1141,7 +1488,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
         steps_data = self.request.data.get('steps', [])
         logger.info(f"更新测试用例 {instance.id} 的步骤数据: {len(steps_data)} 个步骤")
 
-        if steps_data:
+        if 'steps' in self.request.data:
             # 删除现有步骤
             existing_steps_count = instance.steps.count()
             instance.steps.all().delete()
@@ -1180,9 +1527,8 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         description=step_data.get('description', '')
                     )
                     created_count += 1
-                except Exception as e:
-                    logger.error(f"创建步骤 {i + 1} 失败: {str(e)}")
-                    logger.error(f"步骤数据: {step_data}")
+                except (TypeError, ValueError) as exc:
+                    raise ValidationError({'steps': f'第 {i + 1} 个步骤数据格式错误，未保存本次修改。'}) from exc
 
             logger.info(f"成功创建了 {created_count} 个新步骤")
 
@@ -1361,28 +1707,110 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def run(self, request, pk=None):
-        """运行单个测试用例 - 支持选择Playwright或Selenium执行引擎"""
-        test_case = self.get_object()
-        execution = None
+        """Run synchronously for legacy callers or accept a durable workbench run."""
+        from .case_runner import CaseExecutionCancelled, persist_case_result
+        from .workbench import (
+            SubmissionValidationError,
+            create_case_execution,
+            normalize_run_options,
+            parse_client_request_id,
+        )
+
+        is_worker = bool(getattr(request, '_ui_async_worker', False))
+        test_case = getattr(request, '_ui_test_case', None) or self.get_object()
+        execution = getattr(request, '_ui_execution', None)
+        raw_async = request.data.get('async', False) if hasattr(request, 'data') else False
+        if isinstance(raw_async, str):
+            if raw_async.lower() not in {'true', 'false'}:
+                return _preflight_error('async must be true or false')
+            async_requested = raw_async.lower() == 'true'
+        elif isinstance(raw_async, bool):
+            async_requested = raw_async
+        else:
+            return _preflight_error('async must be true or false')
 
         try:
-            # 获取执行引擎选择，默认使用playwright
-            engine_type = request.data.get('engine', 'playwright')
+            is_submission = async_requested and not is_worker
+            options = normalize_run_options(
+                request.data, request.user,
+                default_headless=True if async_requested else False,
+                enforce_permissions=not is_submission,
+            )
+            requested_project = _requested_project_id(request.data)
+            if is_submission:
+                client_request_id = parse_client_request_id(request.data.get('client_request_id'))
+                if client_request_id is None:
+                    return _preflight_error('client_request_id is required for async submissions')
+                replay = _replay_workbench_submission(
+                    'case', test_case, request.user, client_request_id, options, request.data, requested_project,
+                )
+                if replay is not None:
+                    return replay
+                normalize_run_options(request.data, request.user, default_headless=True)
+            if requested_project is not None and requested_project != test_case.project_id:
+                return _preflight_error('project_id does not match the selected test case')
+        except PermissionError as exc:
+            return _preflight_error(str(exc), status.HTTP_403_FORBIDDEN)
+        except (SubmissionValidationError, ValueError) as exc:
+            return _preflight_error(str(exc))
 
-            # 创建执行记录
-            execution = TestCaseExecution.objects.create(
-                test_case=test_case,
-                project=test_case.project,
-                execution_source='manual',
-                status='running',
-                engine=engine_type,
-                browser=request.data.get('browser', 'chrome'),
-                headless=request.data.get('headless', False),
-                created_by=request.user,
-                started_at=timezone.now()
+        rerun_of, rerun_kind, rerun_error = _resolve_rerun_source(
+            request.user, 'case', test_case, request.data,
+        )
+        if rerun_error:
+            return rerun_error
+
+        if async_requested and not is_worker:
+            try:
+                execution, replayed, conflict, original_id = create_case_execution(
+                    test_case,
+                    request.user,
+                    options,
+                    client_request_id=client_request_id,
+                    rerun_of=rerun_of,
+                    rerun_kind=rerun_kind,
+                )
+            except SubmissionValidationError as exc:
+                return _preflight_error(str(exc))
+            except Exception:
+                logger.exception('Unable to persist UI case submission case_id=%s', test_case.pk)
+                return _preflight_error(
+                    '无法保存用例执行记录，请稍后查询并重试。',
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            if conflict:
+                return _submission_conflict('case', original_id)
+            return _dispatch_workbench_submission(
+                'case', execution, replayed=replayed,
+                resource_name=test_case.name, user=request.user,
             )
 
-            # 根据引擎类型导入对应的执行引擎
+        engine_type = options['engine']
+        if is_worker:
+            execution._ui_dispatch_claim = str(request._ui_dispatch_claim)
+        else:
+            try:
+                execution = TestCaseExecution.objects.create(
+                    test_case=test_case,
+                    project=test_case.project,
+                    execution_source='manual',
+                    status='running',
+                    engine=engine_type,
+                    browser=options['browser'],
+                    headless=options['headless'],
+                    created_by=request.user,
+                    started_at=timezone.now(),
+                    rerun_of=rerun_of if rerun_kind == 'case' else None,
+                    rerun_kind=rerun_kind,
+                    rerun_origin_id=rerun_of.pk if rerun_of is not None else None,
+                )
+            except Exception:
+                logger.exception('Unable to create synchronous UI case execution case_id=%s', test_case.pk)
+                return Response({'error': '无法创建用例执行记录'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        execution_base_url = getattr(request, '_ui_base_url', None) or test_case.project.base_url
+        # 根据引擎类型导入对应的执行引擎
+        try:
             if engine_type == 'selenium':
                 from .selenium_engine import SeleniumTestEngine
 
@@ -1402,7 +1830,21 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         f"4. 或者使用 Playwright 引擎（支持自动下载浏览器）"
                     )
                     execution.finished_at = timezone.now()
-                    execution.save()
+                    if is_worker:
+                        persist_case_result(
+                            execution.pk,
+                            request._ui_dispatch_claim,
+                            status='error',
+                            fields={
+                                'error_message': error_msg,
+                                'execution_logs': execution.execution_logs,
+                                'execution_time': 0,
+                                'finished_at': execution.finished_at,
+                            },
+                            failure_stage='preflight',
+                        )
+                    else:
+                        execution.save()
 
                     return Response({
                         'success': False,
@@ -1437,7 +1879,21 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                         f"3. 或者切换到 Selenium 引擎并安装对应浏览器驱动"
                     )
                     execution.finished_at = timezone.now()
-                    execution.save()
+                    if is_worker:
+                        persist_case_result(
+                            execution.pk,
+                            request._ui_dispatch_claim,
+                            status='error',
+                            fields={
+                                'error_message': error_msg,
+                                'execution_logs': execution.execution_logs,
+                                'execution_time': 0,
+                                'finished_at': execution.finished_at,
+                            },
+                            failure_stage='preflight',
+                        )
+                    else:
+                        execution.save()
 
                     return Response({
                         'success': False,
@@ -1457,35 +1913,55 @@ class TestCaseViewSet(viewsets.ModelViewSet):
 
             start_time = time.time()
 
-            # 获取测试用例的所有步骤
-            test_steps = list(test_case.steps.all().order_by('step_number'))
-
-            # 预先获取所有步骤的数据,避免在异步上下文中访问ORM
+            snapshot_steps = getattr(request, '_ui_step_snapshot', None)
             steps_data = []
-            for step in test_steps:
-                step_data = {
-                    'step': step,
-                    'action_type': step.action_type,
-                    'description': step.description,
-                    'input_value': step.input_value,
-                    'wait_time': step.wait_time,
-                    'assert_type': step.assert_type,
-                    'assert_value': step.assert_value,
-                }
-
-                # 获取元素数据
-                if step.element:
-                    step_data['element_data'] = {
-                        'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'css',
-                        'locator_value': step.element.locator_value,
-                        'name': step.element.name,
-                        'wait_timeout': step.element.wait_timeout,  # 添加元素的等待超时设置（秒）
-                        'force_action': step.element.force_action  # 添加强制操作选项
+            if snapshot_steps is not None:
+                for item in snapshot_steps:
+                    step = SimpleNamespace(
+                        id=item.get('id'),
+                        step_number=item.get('step_number'),
+                        action_type=item.get('action_type'),
+                        input_value=item.get('input_value', ''),
+                        wait_time=item.get('wait_time', 1000),
+                        assert_type=item.get('assert_type', ''),
+                        assert_value=item.get('assert_value', ''),
+                        description=item.get('description', ''),
+                    )
+                    steps_data.append({
+                        'step': step,
+                        'action_type': step.action_type,
+                        'description': step.description,
+                        'input_value': step.input_value,
+                        'wait_time': step.wait_time,
+                        'assert_type': step.assert_type,
+                        'assert_value': step.assert_value,
+                        'element_data': item.get('element_data'),
+                    })
+            else:
+                test_steps = list(test_case.steps.all().order_by('step_number'))
+                for step in test_steps:
+                    step_data = {
+                        'step': step,
+                        'action_type': step.action_type,
+                        'description': step.description,
+                        'input_value': step.input_value,
+                        'wait_time': step.wait_time,
+                        'assert_type': step.assert_type,
+                        'assert_value': step.assert_value,
                     }
-                else:
-                    step_data['element_data'] = None
+                    if step.element:
+                        step_data['element_data'] = {
+                            'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'css',
+                            'locator_value': step.element.locator_value,
+                            'name': step.element.name,
+                            'wait_timeout': step.element.wait_timeout,
+                            'force_action': step.element.force_action,
+                        }
+                    else:
+                        step_data['element_data'] = None
+                    steps_data.append(step_data)
 
-                steps_data.append(step_data)
+            # 存储步骤执行结果（用于JSON格式的execution_logs）
 
             # 存储步骤执行结果（用于JSON格式的execution_logs）
             step_results = []
@@ -1495,12 +1971,12 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             execution_logs.append(f"测试用例 '{test_case.name}' 开始执行")
             execution_logs.append(f"执行时间: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}")
             execution_logs.append(f"执行引擎: {engine_type.upper()}")
-            execution_logs.append(f"浏览器: {request.data.get('browser', 'chrome').capitalize()}")
-            headless_mode = request.data.get('headless', False)
+            execution_logs.append(f"浏览器: {options['browser'].capitalize()}")
+            headless_mode = options['headless']
             mode_text = "无头模式" if headless_mode else "有头模式"
             execution_logs.append(f"执行模式: {mode_text}")
             execution_logs.append(f"执行用户: {request.user.username}")
-            execution_logs.append(f"项目基础URL: {test_case.project.base_url}")
+            execution_logs.append(f"项目基础URL: {execution_base_url}")
             execution_logs.append("")
 
             # 截图列表
@@ -1526,6 +2002,8 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             def run_case_worker(worker):
                 try:
                     worker()
+                except CaseExecutionCancelled:
+                    execution_result.update(status='aborted', error_message='执行已由用户停止。')
                 except Exception:
                     logger.exception('用例执行线程异常 execution_id=%s', execution.id)
                     execution_result.update(status='error', error_message=INTERNAL_CASE_EXECUTION_ERROR)
@@ -1568,9 +2046,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             return False
 
                         # 导航到项目基础URL
-                        if test_case.project.base_url:
+                        if execution_base_url:
                             execution_logs.append("========== 导航到测试页面 ==========")
-                            success, nav_log = engine.navigate(test_case.project.base_url)
+                            success, nav_log = engine.navigate(execution_base_url)
                             execution_logs.append(nav_log)
                             execution_logs.append("")
 
@@ -1586,6 +2064,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             execution_logs.append("")
 
                             for i, step_info in enumerate(steps_data, 1):
+                                cancel_check = getattr(request, '_ui_cancel_check', None)
+                                if cancel_check:
+                                    cancel_check()
                                 execution_logs.append(f"========== 开始执行步骤 {i}/{step_count} ==========")
                                 execution_logs.append(f"步骤 {i}/{step_count}:")
 
@@ -1732,9 +2213,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                             execution_logs.append("")
 
                             # 导航到项目基础URL
-                            if test_case.project.base_url:
+                            if execution_base_url:
                                 execution_logs.append("========== 导航到测试页面 ==========")
-                                success, nav_log = await engine.navigate(test_case.project.base_url)
+                                success, nav_log = await engine.navigate(execution_base_url)
                                 execution_logs.append(nav_log)
                                 execution_logs.append("")
 
@@ -1750,6 +2231,9 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                                 execution_logs.append("")
 
                                 for i, step_info in enumerate(steps_data, 1):
+                                    cancel_check = getattr(request, '_ui_cancel_check', None)
+                                    if cancel_check:
+                                        cancel_check()
                                     execution_logs.append(f"========== 开始执行步骤 {i}/{step_count} ==========")
                                     execution_logs.append(f"步骤 {i}/{step_count}:")
 
@@ -1897,7 +2381,7 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             execution_logs.append("")
             execution_logs.append("执行环境信息:")
             execution_logs.append(f"- 执行引擎: {engine_type.upper()}")
-            execution_logs.append(f"- 浏览器: {request.data.get('browser', 'chrome').capitalize()}")
+            execution_logs.append(f"- 浏览器: {options['browser'].capitalize()}")
             execution_logs.append(f"- 屏幕分辨率: 1920x1080")
             execution_logs.append(f"- 总执行时间: {total_time}秒")
 
@@ -1921,7 +2405,25 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                 execution_id=execution.id,
                 item_id=execution.test_case_id,
             )
-            execution.save()
+            if is_worker:
+                failure_stage = 'cancelled' if execution.status == 'aborted' else (
+                    'worker' if execution.status == 'error' else ('execution' if execution.status == 'failed' else '')
+                )
+                persist_case_result(
+                    execution.pk,
+                    request._ui_dispatch_claim,
+                    status=execution.status,
+                    fields={
+                        'error_message': execution.error_message,
+                        'execution_logs': execution.execution_logs,
+                        'execution_time': execution.execution_time,
+                        'finished_at': execution.finished_at,
+                        'screenshots': execution.screenshots,
+                    },
+                    failure_stage=failure_stage,
+                )
+            else:
+                execution.save()
             logger.info(f"[调试] 执行结果已保存: execution.status = {execution.status}")
 
             serializer = TestCaseExecutionSerializer(execution)
@@ -1946,7 +2448,8 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                 })
 
             # 记录运行操作
-            log_operation('run', 'test_case', test_case.id, test_case.name, request.user)
+            if not is_worker:
+                log_operation('run', 'test_case', test_case.id, test_case.name, request.user)
 
             return Response({
                 'success': execution.status == 'passed',
@@ -1957,6 +2460,21 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                 'errors': errors
             })
 
+        except CaseExecutionCancelled:
+            if is_worker:
+                persist_case_result(
+                    execution.pk,
+                    request._ui_dispatch_claim,
+                    status='aborted',
+                    fields={
+                        'error_message': '执行已由用户停止。',
+                        'execution_logs': '执行已由用户停止。',
+                        'execution_time': 0,
+                        'finished_at': timezone.now(),
+                    },
+                )
+                return Response({'success': False, 'execution_id': execution.pk})
+            return Response({'success': False, 'execution_id': execution.pk}, status=status.HTTP_409_CONFLICT)
         except Exception:
             logger.exception(
                 '运行用例时出现内部错误 case_id=%s execution_id=%s',
@@ -1972,16 +2490,54 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             if execution is not None:
                 response_data['execution_id'] = execution.id
                 try:
-                    execution.status = 'error'
-                    execution.error_message = INTERNAL_CASE_EXECUTION_ERROR
-                    execution.execution_logs = INTERNAL_CASE_EXECUTION_ERROR
-                    execution.finished_at = timezone.now()
-                    execution.save(update_fields=[
-                        'status', 'error_message', 'execution_logs', 'finished_at'
-                    ])
+                    if is_worker:
+                        persist_case_result(
+                            execution.pk,
+                            request._ui_dispatch_claim,
+                            status='error',
+                            fields={
+                                'error_message': INTERNAL_CASE_EXECUTION_ERROR,
+                                'execution_logs': INTERNAL_CASE_EXECUTION_ERROR,
+                                'execution_time': 0,
+                                'finished_at': timezone.now(),
+                            },
+                            failure_stage='worker',
+                        )
+                    else:
+                        execution.status = 'error'
+                        execution.error_message = INTERNAL_CASE_EXECUTION_ERROR
+                        execution.execution_logs = INTERNAL_CASE_EXECUTION_ERROR
+                        execution.finished_at = timezone.now()
+                        execution.save(update_fields=[
+                            'status', 'error_message', 'execution_logs', 'finished_at'
+                        ])
                 except Exception:
                     logger.exception('保存用例执行失败状态失败 execution_id=%s', execution.id)
             return Response(response_data, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['get'], url_path='submission')
+    def submission(self, request, pk=None):
+        from .workbench import (
+            SubmissionValidationError,
+            acceptance_payload,
+            parse_client_request_id,
+            resolve_submission,
+        )
+
+        test_case = self.get_object()
+        try:
+            client_request_id = parse_client_request_id(request.query_params.get('client_request_id'))
+        except SubmissionValidationError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if client_request_id is None:
+            return Response({'error': 'client_request_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        execution = resolve_submission(request.user, 'case', test_case.pk, client_request_id)
+        if execution is None:
+            return Response({'error': 'submission not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(acceptance_payload(
+            'case', execution, accepted=execution.failure_stage != 'dispatch',
+            failure_stage=execution.failure_stage,
+        ))
 
     @action(detail=False, methods=['post'])
     def batch_run(self, request):
@@ -2067,6 +2623,11 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
             default=models.F('error_message'),
             output_field=models.TextField(),
         ))
+
+    @action(detail=True, methods=['post'], url_path='abort')
+    def abort(self, request, pk=None):
+        execution = self.get_object()
+        return _abort_case_execution(execution.pk)
 
     def perform_destroy(self, instance):
         # 记录操作

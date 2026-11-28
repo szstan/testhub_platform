@@ -41,6 +41,9 @@ export function useUiProjectContext() {
       const query = { ...route.query, project: String(next) }
       delete query.executionId
       delete query.caseId
+      delete query.stepNumber
+      delete query.fromExecutionId
+      delete query.fromKind
       delete query.setup
       void router.push({ name: page, query, hash: route.hash })
     },
@@ -81,5 +84,5 @@ export function useUiProjectContext() {
   onMounted(reloadProjects)
   onScopeDispose(() => { generation += 1 })
 
-  return { projects, projectId, projectsLoading, projectsError, invalidProject, reloadProjects }
+  return { projects, projectId, userId, projectsLoading, projectsError, invalidProject, reloadProjects }
 }

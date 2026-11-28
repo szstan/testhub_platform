@@ -99,17 +99,13 @@
                 <el-icon><Check /></el-icon>
                 {{ t('uiAutomation.testCase.saveTestCase') }}
               </el-button>
-              <el-select v-model="selectedEngine" :aria-label="t('uiAutomation.testCase.selectEngine')" size="small" style="width: 130px">
-                <el-option label="Playwright" value="playwright" />
-                <el-option label="Selenium" value="selenium" />
+              <el-select v-model="selectedEngine" :disabled="readinessLoading || isRunning" :aria-label="t('uiAutomation.testCase.selectEngine')" size="small" style="width: 130px">
+                <el-option v-for="item in engineOptions" :key="item.value" :label="item.label" :value="item.value" :disabled="item.disabled" />
               </el-select>
-              <el-select v-model="selectedBrowser" :aria-label="t('uiAutomation.testCase.selectBrowser')" size="small" style="width: 120px">
-                <el-option label="Chrome" value="chrome" />
-                <el-option label="Firefox" value="firefox" />
-                <el-option label="Safari" value="safari" />
-                <el-option label="Edge" value="edge" />
+              <el-select v-model="selectedBrowser" :disabled="readinessLoading || isRunning" :aria-label="t('uiAutomation.testCase.selectBrowser')" size="small" style="width: 120px">
+                <el-option v-for="item in browserOptions" :key="item.value" :label="item.label" :value="item.value" :disabled="item.disabled" />
               </el-select>
-              <el-select v-model="headlessMode" :aria-label="t('uiAutomation.testCase.runModeLabel')" size="small" style="width: 110px">
+              <el-select v-model="headlessMode" :disabled="isRunning" :aria-label="t('uiAutomation.testCase.runModeLabel')" size="small" style="width: 110px">
                 <el-option :label="t('uiAutomation.testCase.headedMode')" :value="false" />
                 <el-option :label="t('uiAutomation.testCase.headlessMode')" :value="true" />
               </el-select>
@@ -130,7 +126,30 @@
             </RouterLink>
           </p>
           <p v-else-if="hasUnsavedSteps" class="case-guide">{{ t('uiAutomation.workbenchOnboarding.saveSteps') }}</p>
-          <p v-if="isRunning" class="case-guide" role="status">{{ t('uiAutomation.testCase.running') }}</p>
+          <p v-if="readinessLoading" class="case-guide" role="status">{{ t('uiAutomation.workbenchExecution.checkingReadiness') }}</p>
+          <div v-else-if="readinessError || readinessReason" class="case-guide" role="alert">
+            {{ readinessError ? t('uiAutomation.workbenchExecution.readinessUnavailable') : readinessReason }}
+            <el-button link type="primary" @click="loadReadiness">{{ t('uiAutomation.workbenchExecution.retry') }}</el-button>
+          </div>
+          <div v-if="elementsError" class="case-guide" role="alert">
+            {{ t('uiAutomation.workbenchOnboarding.elementsError') }}
+            <el-button link type="primary" @click="loadElements(projectId, projectGeneration)">{{ t('uiAutomation.workbenchExecution.retry') }}</el-button>
+          </div>
+          <p v-if="sourceExecutionLocation" class="case-guide">
+            {{ t('uiAutomation.workbenchExecution.repairHint') }}
+            <RouterLink :to="sourceExecutionLocation">{{ t('uiAutomation.workbenchExecution.originalExecution') }}</RouterLink>
+          </p>
+          <section v-if="currentRun" class="case-guide run-tracking" role="status">
+            <strong>{{ runPhaseLabel }}</strong>
+            <span v-if="currentRun.executionId"> #{{ currentRun.executionId }}</span>
+            <p v-if="currentRun.phase === 'unknown'">{{ t('uiAutomation.workbenchExecution.submissionUnknown') }}</p>
+            <p v-else-if="currentRun.phase === 'paused'">{{ t('uiAutomation.workbenchExecution.trackingPaused') }}</p>
+            <p v-if="currentRun.error">{{ currentRun.error }}</p>
+            <RouterLink v-if="currentRun.executionId" :to="uiExecutionLocation('UiExecutions', projectId, currentRun.executionId)">{{ t('uiAutomation.workbenchOnboarding.viewThisExecution') }}</RouterLink>
+            <el-button v-if="['unknown', 'paused'].includes(currentRun.phase)" link type="primary" @click="resumeRun">{{ t('uiAutomation.workbenchExecution.reconnectRun') }}</el-button>
+            <el-button v-if="currentRun.phase === 'unknown' && !currentRun.executionId" link type="primary" @click="retrySameRun">{{ t('uiAutomation.workbenchExecution.retrySameSubmission') }}</el-button>
+            <el-button v-if="currentRun.executionId" link type="danger" :loading="currentRun.cancelling" @click="cancelRun">{{ t('uiAutomation.workbenchExecution.cancelRun') }}</el-button>
+          </section>
 
           <!-- 测试步骤编辑 -->
           <div class="steps-container" v-show="showSteps">
@@ -150,7 +169,7 @@
                   @change="onStepsReorder"
                 >
                   <template #item="{ element, index }">
-                    <div class="step-item" :class="{ expanded: element.expanded }">
+                    <div :id="`ui-case-step-${index + 1}`" class="step-item" :class="{ expanded: element.expanded, 'repair-step': repairStep === index + 1 }">
                       <div class="step-header">
                         <div class="step-left">
                           <el-icon class="drag-handle"><Rank /></el-icon>
@@ -302,8 +321,8 @@
           <div v-if="executionResult" class="execution-result" v-show="!showSteps">
             <div class="result-header">
               <h4>{{ t('uiAutomation.testCase.executionResult') }}</h4>
-              <el-tag :type="executionResult.success ? 'success' : 'danger'">
-                {{ executionResult.success ? t('uiAutomation.testCase.executionSuccess') : t('uiAutomation.testCase.executionFailed') }}
+              <el-tag :type="executionResult.status === 'aborted' ? 'info' : executionResult.success ? 'success' : 'danger'">
+                {{ executionResult.status === 'aborted' ? t('uiAutomation.workbenchExecution.aborted') : executionResult.success ? t('uiAutomation.testCase.executionSuccess') : t('uiAutomation.testCase.executionFailed') }}
               </el-tag>
               <RouterLink v-if="executionResult.executionId" :to="uiExecutionLocation('UiExecutions', projectId, executionResult.executionId)">
                 {{ t('uiAutomation.workbenchOnboarding.viewThisExecution') }}
@@ -426,6 +445,7 @@
       v-model="showCreateDialog"
       :title="editingTestCase ? t('uiAutomation.testCase.editTestCase') : t('uiAutomation.testCase.createTestCase')"
       :close-on-click-modal="false"
+      :before-close="requestCloseCaseForm"
       width="min(500px, calc(100vw - 32px))"
       @closed="closeCaseForm"
     >
@@ -451,9 +471,19 @@
       </el-form>
       <template #footer>
         <span class="dialog-footer">
-          <el-button @click="showCreateDialog = false">{{ t('uiAutomation.common.cancel') }}</el-button>
+          <el-button :disabled="savingForm" @click="requestCloseCaseForm">{{ t('uiAutomation.common.cancel') }}</el-button>
           <el-button type="primary" :loading="savingForm" @click="saveTestCaseForm">{{ t('uiAutomation.common.confirm') }}</el-button>
         </span>
+      </template>
+    </el-dialog>
+
+    <el-dialog :model-value="unsavedVisible" :title="t('uiAutomation.workbenchExecution.unsavedTitle')" width="min(460px, calc(100vw - 32px))" :close-on-click-modal="false" :close-on-press-escape="!unsavedSaving" :show-close="!unsavedSaving" @update:model-value="value => !value && chooseUnsaved('cancel')">
+      <p>{{ t('uiAutomation.workbenchExecution.unsavedDescription') }}</p>
+      <p v-if="saveRequestPending" role="status">{{ t('uiAutomation.workbenchExecution.savePendingNavigation') }}</p>
+      <template #footer>
+        <el-button :disabled="unsavedSaving" @click="chooseUnsaved('cancel')">{{ t('uiAutomation.workbenchExecution.keepEditing') }}</el-button>
+        <el-button :disabled="unsavedSaving || saveRequestPending" @click="chooseUnsaved('discard')">{{ t('uiAutomation.workbenchExecution.discardChanges') }}</el-button>
+        <el-button type="primary" :loading="unsavedSaving" :disabled="saveRequestPending" @click="chooseUnsaved('save')">{{ t('uiAutomation.workbenchExecution.saveAndContinue') }}</el-button>
       </template>
     </el-dialog>
 
@@ -524,8 +554,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onScopeDispose, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, reactive, computed, nextTick, onMounted, onScopeDispose, watch } from 'vue'
+import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Search, Plus, Edit, Delete, Check, CaretRight, ArrowUp, ArrowDown, Rank, Picture, Warning, View, ZoomIn, WarningFilled, MagicStick
@@ -534,8 +564,10 @@ import draggable from 'vuedraggable'
 import DataFactorySelector from '@/components/DataFactorySelector.vue'
 import { useI18n } from 'vue-i18n'
 import { useUiProjectContext } from '@/composables/useUiProjectContext'
-import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
+import { loadUiElementOptions, normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
 import { readCaseExecutionLog } from '@/utils/ui-case-execution.mjs'
+import { createUiCaseRunController } from '@/utils/ui-case-run-controller.mjs'
+import { uiBrowserOptions, uiEngineOptions, uiReadinessError } from '@/utils/ui-execution-options.mjs'
 import {
   getElements,
   createTestCase,
@@ -543,6 +575,10 @@ import {
   deleteTestCase as deleteTestCaseApi,
   getTestCases,
   runTestCase as runTestCaseApi,
+  getTestCaseExecutionDetail,
+  getTestCaseSubmission,
+  abortTestCaseExecution,
+  getExecutionReadiness,
   copyTestCase as copyTestCaseApi,
   getLocatorStrategies
 } from '@/api/ui_automation'
@@ -551,11 +587,12 @@ import { getVariableFunctions } from '@/api/data-factory'
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const { projects, projectId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
+const { projects, projectId, userId, projectsLoading, projectsError, invalidProject, reloadProjects } = useUiProjectContext()
 const casesLoading = ref(false)
 const casesError = ref(false)
 const savingForm = ref(false)
 const savingSteps = ref(false)
+const saveRequestPending = computed(() => savingForm.value || savingSteps.value)
 let projectGeneration = 0
 let caseListRequest = 0
 let caseMutationVersion = 0
@@ -564,6 +601,18 @@ const testCases = ref([])
 const selectedTestCase = ref(null)
 const currentSteps = ref([])
 const availableElements = ref([])
+const elementsError = ref(false)
+const readiness = ref(null)
+const readinessLoading = ref(false)
+const readinessError = ref(false)
+const unsavedVisible = ref(false)
+const unsavedSaving = ref(false)
+const formInitialKey = ref('')
+let unsavedResolver = null
+let unsavedTarget = 'all'
+let readinessRequest = 0
+let elementRequest = 0
+const caseResults = new Map()
 const searchKeyword = ref('')
 const showCreateDialog = ref(false)
 const editingTestCase = ref(null)
@@ -573,10 +622,24 @@ const allStepsExpanded = ref(false)
 const showSteps = ref(true)
 const showScreenshotPreview = ref(false)
 const currentScreenshot = ref(null)
-const runningRuns = reactive(new Map())
-const selectedEngine = ref('playwright')  // 默认使用Playwright
-const selectedBrowser = ref('chrome')  // 默认使用Chrome
-const headlessMode = ref(false)  // 默认使用有头模式
+const runController = createUiCaseRunController({
+  reactive,
+  actorId: () => userId?.value,
+  projectId: () => projectId.value,
+  storage: () => globalThis.sessionStorage,
+  hidden: () => Boolean(globalThis.document?.hidden),
+  schedule: (callback, delay) => globalThis.setTimeout(callback, delay),
+  clearTimer: timer => globalThis.clearTimeout?.(timer),
+  submit: runTestCaseApi, lookup: getTestCaseSubmission, detail: getTestCaseExecutionDetail, abort: abortTestCaseExecution,
+  onResult(project, caseId, result) {
+    caseResults.set(runController.key(project, caseId), result)
+    if (projectId.value === project && selectedTestCase.value?.id === caseId) setExecutionResult(result)
+  },
+})
+const runningRuns = runController.runs
+const selectedEngine = ref('playwright')
+const selectedBrowser = ref('chrome')
+const headlessMode = ref(true)
 const showVariableHelper = ref(false)
 const currentEditingStep = ref(null)
 const currentEditingField = ref('')
@@ -608,11 +671,30 @@ const savedStepKeys = ref('[]')
 const stepFields = ['action_type', 'element_id', 'input_value', 'wait_time', 'assert_type', 'assert_value', 'description']
 const serializeSteps = steps => JSON.stringify(steps.map(step => stepFields.map(key => step[key])))
 const hasUnsavedSteps = computed(() => serializeSteps(currentSteps.value) !== savedStepKeys.value)
-const runKey = (project, caseId) => JSON.stringify([String(project), normalizeUiId(caseId)])
-const isRunning = computed(() => Boolean(
-  selectedTestCase.value && runningRuns.has(runKey(projectId.value, selectedTestCase.value.id))
+const formKey = () => JSON.stringify([testCaseForm.name, testCaseForm.description, testCaseForm.priority])
+const hasUnsavedForm = computed(() => showCreateDialog.value && formKey() !== formInitialKey.value)
+const hasUnsavedChanges = computed(() => hasUnsavedForm.value || Boolean(selectedTestCase.value && hasUnsavedSteps.value))
+const runKey = (project, caseId) => runController.key(project, caseId)
+const currentRun = computed(() => selectedTestCase.value ? runController.currentRun(selectedTestCase.value.id) : null)
+const isRunning = computed(() => Boolean(currentRun.value))
+const engineOptions = computed(() => uiEngineOptions(readiness.value))
+const browserOptions = computed(() => uiBrowserOptions(readiness.value, selectedEngine.value))
+const readinessReason = computed(() => uiReadinessError(readiness.value, selectedEngine.value, selectedBrowser.value))
+const canRunSelectedCase = computed(() => Boolean(selectedTestCase.value?.steps?.length && !hasUnsavedSteps.value && !savingSteps.value && !isRunning.value && !readinessLoading.value && !readinessError.value && !readinessReason.value))
+const runPhaseLabel = computed(() => t(`uiAutomation.workbenchExecution.${currentRun.value?.cancelling ? 'cancelling' : ({ unknown: 'submissionUnknownTitle', paused: 'trackingPaused', recovering: 'recoveringRun', submitting: 'submittingRun' }[currentRun.value?.phase] || 'trackingRun')}`))
+const sourceExecutionId = ref(normalizeUiId(route.query.fromExecutionId))
+const sourceCaseId = ref(sourceExecutionId.value ? normalizeUiId(route.query.caseId) : '')
+const sourceMatchesSelectedCase = computed(() => Boolean(
+  sourceExecutionId.value &&
+  normalizeUiId(route.query.fromExecutionId) === sourceExecutionId.value &&
+  sourceCaseId.value &&
+  sourceCaseId.value === normalizeUiId(selectedTestCase.value?.id)
 ))
-const canRunSelectedCase = computed(() => Boolean(selectedTestCase.value?.steps?.length && !hasUnsavedSteps.value && !savingSteps.value && !isRunning.value))
+const repairStep = computed(() => sourceMatchesSelectedCase.value ? normalizeUiId(route.query.stepNumber) : '')
+const sourceExecutionLocation = computed(() => {
+  const id = sourceMatchesSelectedCase.value ? sourceExecutionId.value : ''
+  return id && ['case', 'suite'].includes(route.query.fromKind) ? uiExecutionLocation(route.query.fromKind === 'suite' ? 'UiReports' : 'UiExecutions', projectId.value, id) : null
+})
 const executionLog = computed(() => readCaseExecutionLog(executionResult.value?.logs))
 const parsedExecutionLogs = computed(() => executionLog.value.steps)
 const plainExecutionLog = computed(() => executionLog.value.text)
@@ -717,15 +799,40 @@ const loadTestCases = async () => {
 }
 
 const loadElements = async (project, generation) => {
+  const request = ++elementRequest
+  elementsError.value = false
   try {
-    const { data } = await getElements({ project })
-    if (isProjectCurrent(project, generation)) availableElements.value = data.results || data
+    const rows = await loadUiElementOptions(getElements, project)
+    if (request === elementRequest && isProjectCurrent(project, generation)) availableElements.value = rows
   } catch {
-    if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.workbenchOnboarding.elementsError'))
+    if (request === elementRequest && isProjectCurrent(project, generation)) elementsError.value = true
   }
 }
 
+async function loadReadiness() {
+  const request = ++readinessRequest
+  const project = projectId.value
+  readiness.value = null
+  readinessError.value = false
+  readinessLoading.value = Boolean(project)
+  if (!project) return
+  try {
+    const { data } = await getExecutionReadiness(project)
+    if (request !== readinessRequest || projectId.value !== project) return
+    readiness.value = data
+    const engine = uiEngineOptions(data).find(item => item.value === selectedEngine.value && !item.disabled) || uiEngineOptions(data).find(item => !item.disabled)
+    if (engine) selectedEngine.value = engine.value
+    const browsers = uiBrowserOptions(data, selectedEngine.value)
+    if (!browsers.some(item => item.value === selectedBrowser.value && !item.disabled)) selectedBrowser.value = browsers.find(item => !item.disabled)?.value || selectedBrowser.value
+  } catch {
+    if (request === readinessRequest && projectId.value === project) readinessError.value = true
+  } finally { if (request === readinessRequest) readinessLoading.value = false }
+}
+
 const onProjectChange = project => {
+  runController.resetScope()
+  caseResults.clear()
+  settleUnsaved(false)
   const generation = ++projectGeneration
   caseMutationVersion = 0
   caseMutationLog = []
@@ -740,12 +847,70 @@ const onProjectChange = project => {
   showSteps.value = true
   casesLoading.value = false
   casesError.value = false
+  void loadReadiness()
   if (!project) return
   void loadTestCases()
   void loadElements(project, generation)
 }
 
+function settleUnsaved(allow) {
+  const resolve = unsavedResolver
+  unsavedResolver = null
+  unsavedVisible.value = false
+  resolve?.(allow)
+}
+
+function confirmUnsaved(target = 'all') {
+  if (saveRequestPending.value) {
+    ElMessage.warning(t('uiAutomation.workbenchExecution.savePendingNavigation'))
+    return false
+  }
+  if (!(target === 'form' ? hasUnsavedForm.value : hasUnsavedChanges.value)) return true
+  if (unsavedResolver) return false
+  unsavedTarget = target
+  unsavedVisible.value = true
+  return new Promise(resolve => { unsavedResolver = resolve })
+}
+
+async function requestCloseCaseForm(done) {
+  if (unsavedSaving.value) return false
+  if (!await confirmUnsaved('form')) return false
+  showCreateDialog.value = false
+  if (typeof done === 'function') done()
+  return true
+}
+
+async function chooseUnsaved(choice) {
+  if (unsavedSaving.value || !unsavedResolver) return
+  if (choice === 'cancel') { settleUnsaved(false); return }
+  if (saveRequestPending.value) {
+    ElMessage.warning(t('uiAutomation.workbenchExecution.savePendingNavigation'))
+    return
+  }
+  if (choice === 'discard') {
+    if (unsavedTarget === 'all' && selectedTestCase.value) {
+      currentSteps.value = (selectedTestCase.value.steps || []).map(step => ({ ...step, element_id: step.element || step.element_id || '', expanded: false }))
+      savedStepKeys.value = serializeSteps(currentSteps.value)
+    }
+    showCreateDialog.value = false
+    settleUnsaved(true)
+    return
+  }
+  unsavedSaving.value = true
+  try {
+    if (hasUnsavedForm.value && !await saveTestCaseForm({ preserveSelection: true })) return
+    if (unsavedTarget === 'all' && selectedTestCase.value && hasUnsavedSteps.value && !await saveTestCase()) return
+    if (!(unsavedTarget === 'form' ? hasUnsavedForm.value : hasUnsavedChanges.value)) settleUnsaved(true)
+  } finally { unsavedSaving.value = false }
+}
+
 const selectTestCase = (testCase, explicit = true) => {
+  if (selectedTestCase.value?.id === testCase.id) return true
+  if (explicit && (hasUnsavedChanges.value || saveRequestPending.value)) {
+    const project = projectId.value
+    const generation = projectGeneration
+    return Promise.resolve(confirmUnsaved()).then(allow => allow && isProjectCurrent(project, generation) ? selectTestCase(testCase, explicit) : false)
+  }
   if (explicit) {
     const project = normalizeUiId(projectId.value)
     const caseId = normalizeUiId(route.query.caseId)
@@ -760,6 +925,17 @@ const selectTestCase = (testCase, explicit = true) => {
     return
   }
 
+  const targetCaseId = normalizeUiId(testCase.id)
+  let repairContextChanged = false
+  const nextRouteQuery = { ...route.query }
+  if (normalizeUiId(route.query.fromExecutionId) && sourceCaseId.value !== targetCaseId) {
+    sourceExecutionId.value = ''
+    sourceCaseId.value = ''
+    delete nextRouteQuery.fromExecutionId
+    delete nextRouteQuery.fromKind
+    delete nextRouteQuery.stepNumber
+    repairContextChanged = true
+  }
   selectedTestCase.value = testCase
   // 确保步骤数据格式正确，添加前端需要的字段
   if (testCase.steps && testCase.steps.length > 0) {
@@ -775,6 +951,26 @@ const selectTestCase = (testCase, explicit = true) => {
   executionResult.value = null
   showSteps.value = true
   allStepsExpanded.value = false
+  const previous = caseResults.get(runKey(projectId.value, testCase.id))
+  if (previous) setExecutionResult(previous)
+  void runController.restore(testCase.id)
+  focusRepairStep()
+  if (route.name === 'UiTestCases' && (repairContextChanged || (explicit && normalizeUiId(route.query.caseId) !== targetCaseId))) {
+    if (explicit) {
+      nextRouteQuery.project = String(projectId.value)
+      nextRouteQuery.caseId = String(targetCaseId)
+    }
+    void router.replace({ name: 'UiTestCases', query: nextRouteQuery, hash: route.hash })
+  }
+  return true
+}
+
+function focusRepairStep() {
+  if (normalizeUiId(route.query.caseId) !== selectedTestCase.value?.id) return
+  const step = currentSteps.value[repairStep.value - 1]
+  if (!step) return
+  step.expanded = true
+  void nextTick(() => globalThis.document?.getElementById(`ui-case-step-${repairStep.value}`)?.scrollIntoView?.({ block: 'center' }))
 }
 
 const addStep = () => {
@@ -843,7 +1039,7 @@ const expandAllSteps = () => {
 }
 
 const saveTestCase = async () => {
-  if (!selectedTestCase.value || !projectId.value || savingSteps.value || isRunning.value) return
+  if (!selectedTestCase.value || !projectId.value || savingSteps.value || isRunning.value) return false
   const testCase = selectedTestCase.value
   const project = projectId.value
   const generation = projectGeneration
@@ -852,7 +1048,7 @@ const saveTestCase = async () => {
   savingSteps.value = true
   try {
     const { data } = await updateTestCase(testCase.id, { steps })
-    if (!isProjectCurrent(project, generation)) return
+    if (!isProjectCurrent(project, generation)) return false
     const updated = { ...testCase, ...data, steps: data?.steps || steps }
     testCases.value = testCases.value.map(item => item.id === testCase.id ? updated : item)
     recordCaseMutation(project, generation, updated)
@@ -861,50 +1057,35 @@ const saveTestCase = async () => {
       savedStepKeys.value = savedKeys
     }
     ElMessage.success(t('uiAutomation.testCase.save.success'))
+    return true
   } catch {
     if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.testCase.save.failed'))
+    return false
   } finally {
     savingSteps.value = false
   }
 }
 
 const runTestCase = async testCase => {
-  const project = projectId.value
-  const generation = projectGeneration
-  const key = runKey(project, testCase?.id)
-  if (!project || testCase?.id !== selectedTestCase.value?.id || !canRunSelectedCase.value || runningRuns.has(key)) return
-  const runOwner = Symbol('test-case-run')
-  const isCurrent = () => isProjectCurrent(project, generation) &&
-    selectedTestCase.value?.id === testCase.id && runningRuns.get(key) === runOwner
-  runningRuns.set(key, runOwner)
+  if (!projectId.value || testCase?.id !== selectedTestCase.value?.id || !canRunSelectedCase.value) return
   executionResult.value = null
-  try {
-    const { data } = await runTestCaseApi(testCase.id, {
-      project_id: project,
-      engine: selectedEngine.value,
-      browser: selectedBrowser.value,
-      headless: headlessMode.value
-    })
-    if (!isCurrent()) return
-    setExecutionResult(data)
-  } catch (error) {
-    if (!isCurrent()) return
-    const data = error.response?.data || {}
-    const message = data.message || data.error || data.detail || error.message || t('uiAutomation.testCase.executionFailed')
-    setExecutionResult({
-      ...data,
-      success: false,
-      logs: data.logs || message,
-      errors: data.errors?.length ? data.errors : [{ message }],
-    })
-  } finally {
-    if (runningRuns.get(key) === runOwner) runningRuns.delete(key)
-  }
+  caseResults.delete(runKey(projectId.value, testCase.id))
+  showSteps.value = false
+  const origin = sourceMatchesSelectedCase.value && sourceCaseId.value === normalizeUiId(testCase.id)
+    ? sourceExecutionId.value
+    : ''
+  await runController.start(testCase.id, {
+    engine: selectedEngine.value, browser: selectedBrowser.value, headless: headlessMode.value,
+    ...(origin && ['case', 'suite'].includes(route.query.fromKind) ? { rerun_of: origin, rerun_kind: route.query.fromKind } : {}),
+  })
 }
+const resumeRun = () => selectedTestCase.value && runController.resume(selectedTestCase.value.id)
+const retrySameRun = () => selectedTestCase.value && runController.retry(selectedTestCase.value.id)
+const cancelRun = () => selectedTestCase.value && runController.cancel(selectedTestCase.value.id)
 
 function setExecutionResult(data) {
   const executionId = normalizeUiId(data.execution_id)
-  const preflight = !data.success && (!executionId || data.errors?.some(item => item.step_number === 0))
+  const preflight = !data.success && (data.failure_stage === 'preflight' || data.errors?.some(item => item.step_number === 0))
   executionResult.value = { ...data, executionId, preflight }
   resultActiveTab.value = preflight && data.errors?.length ? 'errors' : 'logs'
   showSteps.value = false
@@ -919,6 +1100,7 @@ const editTestCase = (testCase) => {
   testCaseForm.name = testCase.name
   testCaseForm.description = testCase.description || ''
   testCaseForm.priority = testCase.priority || 'medium'
+  formInitialKey.value = formKey()
   showCreateDialog.value = true
 }
 
@@ -1178,21 +1360,26 @@ const insertVariable = (variable) => {
   }
 }
 
-const saveTestCaseForm = async () => {
-  if (!projectId.value || savingForm.value) return
+const saveTestCaseForm = async (options = {}) => {
+  if (!projectId.value || savingForm.value) return false
   if (!testCaseForm.name.trim()) {
     ElMessage.warning(t('uiAutomation.testCase.form.nameRequired'))
-    return
+    return false
   }
 
   const project = projectId.value
   const generation = projectGeneration
   const editing = editingTestCase.value
   const data = { ...testCaseForm, name: testCaseForm.name.trim(), project }
+  const submittedFormKey = formKey()
   savingForm.value = true
   try {
     const response = editing ? await updateTestCase(editing.id, data) : await createTestCase(data)
-    if (!isProjectCurrent(project, generation)) return
+    if (!isProjectCurrent(project, generation)) return false
+    const formUnchanged = formKey() === submittedFormKey
+    // The API has settled. Internal selection of a newly created case must
+    // not be blocked by the pending-save guard for an already completed write.
+    savingForm.value = false
     if (editing) {
       const existing = testCases.value.find(item => item.id === editing.id) || editing
       const updated = { ...existing, ...response.data }
@@ -1204,12 +1391,19 @@ const saveTestCaseForm = async () => {
       testCases.value = [response.data, ...testCases.value.filter(item => item.id !== response.data.id)]
       recordCaseMutation(project, generation, response.data, 'create')
       searchKeyword.value = ''
-      selectTestCase(response.data)
+      if (!options.preserveSelection && formUnchanged) {
+        showCreateDialog.value = false
+        selectTestCase(response.data)
+      }
+      if (!formUnchanged) editingTestCase.value = response.data
       ElMessage.success(t('uiAutomation.testCase.create.success'))
     }
-    showCreateDialog.value = false
+    formInitialKey.value = submittedFormKey
+    if (formUnchanged) showCreateDialog.value = false
+    return formUnchanged
   } catch {
     if (isProjectCurrent(project, generation)) ElMessage.error(t('uiAutomation.testCase.save.failed'))
+    return false
   } finally {
     savingForm.value = false
   }
@@ -1229,10 +1423,17 @@ const closeCaseForm = () => {
 }
 
 const openCreateCase = () => {
-  if (!projectId.value || savingForm.value) return
+  if (!projectId.value || savingForm.value) return false
+  if (hasUnsavedChanges.value || saveRequestPending.value) {
+    const project = projectId.value
+    const generation = projectGeneration
+    return Promise.resolve(confirmUnsaved()).then(allow => allow && isProjectCurrent(project, generation) ? openCreateCase() : false)
+  }
   editingTestCase.value = null
   resetForm()
+  formInitialKey.value = formKey()
   showCreateDialog.value = true
+  return true
 }
 
 // 辅助方法
@@ -1319,7 +1520,7 @@ const previewScreenshot = (screenshot) => {
   showScreenshotPreview.value = true
 }
 
-watch(projectId, onProjectChange, { immediate: true })
+watch([projectId, () => userId?.value], ([project]) => onProjectChange(project), { immediate: true })
 let consumedCaseSelection = ''
 let cancelledCaseSelection = ''
 let lastCaseSelection = normalizeUiId(route.query.caseId)
@@ -1355,8 +1556,46 @@ watch([projectId, () => route.query.setup], ([project, setup]) => {
   void router.replace({ name: 'UiTestCases', query, hash: route.hash })
 }, { immediate: true })
 
+watch(() => [route.query.fromExecutionId, route.query.caseId], ([executionValue, caseValue]) => {
+  const nextExecutionId = normalizeUiId(executionValue)
+  if (!nextExecutionId) {
+    sourceExecutionId.value = ''
+    sourceCaseId.value = ''
+  } else if (nextExecutionId !== sourceExecutionId.value) {
+    sourceExecutionId.value = nextExecutionId
+    sourceCaseId.value = normalizeUiId(caseValue)
+  }
+}, { flush: 'sync' })
+watch(() => route.query.stepNumber, focusRepairStep)
+watch(selectedEngine, () => {
+  const available = browserOptions.value.filter(item => !item.disabled)
+  if (available.length && !available.some(item => item.value === selectedBrowser.value)) selectedBrowser.value = available[0].value
+})
+onBeforeRouteLeave(() => confirmUnsaved())
+onBeforeRouteUpdate((to, from) => {
+  if (to.name !== from.name || normalizeUiId(to.query?.project) !== normalizeUiId(from.query?.project) || normalizeUiId(to.query?.caseId) !== normalizeUiId(from.query?.caseId)) return confirmUnsaved()
+  return true
+})
+const beforeUnload = event => {
+  if (!hasUnsavedChanges.value && !saveRequestPending.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+const onVisibility = () => runController.visible()
+onMounted(() => {
+  globalThis.addEventListener?.('beforeunload', beforeUnload)
+  globalThis.document?.addEventListener('visibilitychange', onVisibility)
+})
 onMounted(loadVariableFunctions)
-onScopeDispose(() => { projectGeneration += 1 })
+onScopeDispose(() => {
+  projectGeneration += 1
+  readinessRequest += 1
+  elementRequest += 1
+  settleUnsaved(false)
+  runController.dispose()
+  globalThis.removeEventListener?.('beforeunload', beforeUnload)
+  globalThis.document?.removeEventListener('visibilitychange', onVisibility)
+})
 </script>
 
 <style scoped>
@@ -1542,6 +1781,9 @@ onScopeDispose(() => { projectGeneration += 1 })
   color: var(--el-text-color-regular);
   background: var(--el-color-primary-light-9);
 }
+
+.repair-step { outline: 2px solid var(--el-color-primary); outline-offset: -2px; }
+.run-tracking p { margin: 8px 0; overflow-wrap: anywhere; }
 
 .plain-case-log {
   white-space: pre-wrap;

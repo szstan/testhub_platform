@@ -42,6 +42,9 @@
           <span v-if="trackingState === 'polling'">{{ t('uiAutomation.workbenchResults.trackingActive') }}</span>
           <span v-else-if="trackingState === 'paused'">{{ t('uiAutomation.workbenchResults.trackingPaused') }}</span>
           <span v-else-if="trackingState === 'timeout'">{{ t('uiAutomation.workbenchResults.trackingTimedOut') }}</span>
+          <el-button v-if="isRunActive(currentReport.status)" link type="warning" :loading="isAbortPending(currentReport)" @click="abortExecution(currentReport)">
+            {{ t('uiAutomation.workbenchResults.abortExecution') }}
+          </el-button>
           <el-button link type="primary" @click="openCurrentReport">{{ t('uiAutomation.workbenchResults.openReport') }}</el-button>
           <el-button v-if="trackingState === 'paused' || trackingState === 'timeout'" link type="primary" @click="resumeTracking">
             {{ t('uiAutomation.workbenchResults.resumeTracking') }}
@@ -105,11 +108,14 @@
             {{ formatDate(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column :label="$t('uiAutomation.common.operation')" width="200" fixed="right">
+        <el-table-column :label="$t('uiAutomation.common.operation')" width="250" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="viewReportDetail(row)">
               <el-icon><Document /></el-icon>
               {{ $t('uiAutomation.report.viewDetail') }}
+            </el-button>
+            <el-button v-if="isRunActive(row.status)" link type="warning" size="small" :loading="isAbortPending(row)" @click="abortExecution(row)">
+              {{ t('uiAutomation.workbenchResults.abortExecution') }}
             </el-button>
             <el-button link type="danger" size="small" @click="deleteReport(row)">
               <el-icon><Delete /></el-icon>
@@ -164,6 +170,11 @@
           <el-descriptions-item :label="$t('uiAutomation.report.endTime')">{{ formatDate(currentReport.finished_at) }}</el-descriptions-item>
         </el-descriptions>
 
+        <div v-if="rerunSource" class="rerun-origin">
+          {{ t('uiAutomation.workbenchResults.rerunOrigin') }}
+          <el-button link type="primary" @click="openRerunSource">#{{ rerunSource.id }}</el-button>
+        </div>
+
         <div v-if="failureSummary" class="failure-summary">
           <h4>{{ $t('uiAutomation.workbenchResults.failureSummary') }}</h4>
           <el-descriptions :column="2" border>
@@ -185,8 +196,11 @@
             <img :src="failureSummary.screenshotUrl" :alt="$t('uiAutomation.workbenchResults.failureScreenshot')" @error="failedScreenshot = true" />
           </div>
           <p v-else>{{ $t(failedScreenshot ? 'uiAutomation.execution.imageLoadFailed' : 'uiAutomation.execution.noScreenshots') }}</p>
-          <el-button v-if="failureSummary.caseData" link type="primary" @click="viewCaseDetail(failureSummary.caseData)">
+          <el-button v-if="failedCaseEditorLocation" link type="primary" @click="openFailedCaseInEditor">
             {{ $t('uiAutomation.workbenchResults.openFailedCase') }}
+          </el-button>
+          <el-button v-if="failureSummary.caseData" link type="primary" @click="viewCaseDetail(failureSummary.caseData)">
+            {{ $t('uiAutomation.report.viewDetail') }}
           </el-button>
         </div>
 
@@ -365,11 +379,12 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Document, Delete, WarningFilled } from '@element-plus/icons-vue'
+import * as uiAutomationApi from '@/api/ui_automation'
 import { getTestExecutions, getTestExecutionDetail, deleteTestExecution } from '@/api/ui_automation'
 import { useUiProjectContext } from '@/composables/useUiProjectContext'
 import { normalizeUiId, uiExecutionLocation } from '@/utils/ui-project-context.mjs'
@@ -380,6 +395,7 @@ const router = useRouter()
 const {
   projects,
   projectId,
+  userId,
   projectsLoading,
   projectsError,
   invalidProject,
@@ -400,7 +416,10 @@ const exactDetailState = ref('idle')
 const trackingState = ref('idle')
 const hasExecutionLink = computed(() => route.name === 'UiReports' && route.query.executionId !== undefined)
 const failureSummary = computed(() => buildFailureSummary(currentReport.value))
+const failedCaseEditorLocation = computed(() => buildFailedCaseEditorLocation(failureSummary.value, currentReport.value, projectId.value))
+const rerunSource = computed(() => buildRerunSource(currentReport.value, projectId.value))
 const failedScreenshot = ref(false)
+const abortingExecutionKeys = ref(new Set())
 const trackingLabel = computed(() => ({ polling: 'trackingActive', paused: 'trackingPaused', timeout: 'trackingTimedOut' }[trackingState.value]))
 
 let scopeVersion = 0
@@ -408,6 +427,7 @@ let listRequestVersion = 0
 let exactRequestVersion = 0
 let pollGeneration = 0
 let pollTimer = null
+let pollSession = null
 const pollIntervalMs = 3000
 const maxPolls = 40
 const maxConfirmedReports = 100
@@ -428,6 +448,8 @@ const isRunActive = status => ['PENDING', 'RUNNING'].includes(status)
 const isUnavailable = error => [403, 404].includes(error.response?.status)
 const reportProgress = report => ({ PENDING: 0, RUNNING: 1, SUCCESS: 2, FAILED: 2, ABORTED: 2 }[report?.status] ?? -1)
 const reportKey = (project, id) => JSON.stringify([normalizeUiId(project), normalizeUiId(id)])
+const abortKey = report => reportKey(projectId.value, report?.id)
+const isAbortPending = report => abortingExecutionKeys.value.has(abortKey(report))
 
 const rememberConfirmedReport = (record, scopedProjectId) => {
   const projectKey = normalizeUiId(scopedProjectId)
@@ -524,9 +546,21 @@ const mergeCurrentExactReport = (rows, scopedProjectId, requestConfirmedRevision
 
 const stopTracking = () => {
   pollGeneration += 1
-  if (pollTimer) clearTimeout(pollTimer)
+  if (pollTimer !== null) clearTimeout(pollTimer)
   pollTimer = null
+  pollSession = null
   trackingState.value = 'idle'
+}
+
+const pauseTracking = () => {
+  if (pollTimer !== null) clearTimeout(pollTimer)
+  pollTimer = null
+  if (!pollSession || !isRunActive(currentReport.value?.status)) {
+    stopTracking()
+    return
+  }
+  pollGeneration += 1
+  trackingState.value = 'paused'
 }
 
 const clearExactReport = () => {
@@ -540,6 +574,7 @@ const clearExactReport = () => {
 
 const loadReports = async () => {
   const requestedProjectId = projectId.value
+  const requestedActorId = userId?.value
   const currentScope = scopeVersion
   const requestVersion = ++listRequestVersion
   const requestConfirmedRevision = confirmedReportRevision
@@ -559,7 +594,7 @@ const loadReports = async () => {
       page_size: pagination.pageSize
     })
     const resultList = responseList(response)
-    if (currentScope !== scopeVersion || requestVersion !== listRequestVersion || String(projectId.value) !== String(requestedProjectId)) return
+    if (currentScope !== scopeVersion || requestVersion !== listRequestVersion || String(projectId.value) !== String(requestedProjectId) || userId?.value !== requestedActorId) return
     if (!resultList) throw new Error('Invalid execution list response')
 
     const scopedReports = resultList.filter(report => {
@@ -572,9 +607,9 @@ const loadReports = async () => {
     const count = body?.count
     total.value = Number.isSafeInteger(Number(count)) && Number(count) >= 0 ? Number(count) : reports.value.length
   } catch {
-    if (currentScope === scopeVersion && requestVersion === listRequestVersion) listError.value = true
+    if (currentScope === scopeVersion && requestVersion === listRequestVersion && userId?.value === requestedActorId) listError.value = true
   } finally {
-    if (currentScope === scopeVersion && requestVersion === listRequestVersion) loading.value = false
+    if (currentScope === scopeVersion && requestVersion === listRequestVersion && userId?.value === requestedActorId) loading.value = false
   }
 }
 
@@ -583,16 +618,26 @@ const loadExactReport = async ({ preserveDialog = false, preserveKnown = false }
   const activeProjectId = projectId.value
   const currentScope = scopeVersion
   const requestVersion = ++exactRequestVersion
-  stopTracking()
+  const requestedActorId = userId?.value
 
-  if (!isPositiveId(activeProjectId)) return
+  if (!isPositiveId(activeProjectId)) {
+    stopTracking()
+    return
+  }
   if (!requestedExecutionId) {
+    stopTracking()
     exactDetailState.value = 'invalid'
     currentReport.value = null
     showDetailDialog.value = false
     return
   }
+  if (globalThis.document?.hidden) {
+    exactDetailState.value = preserveKnown && currentReport.value ? 'ready' : 'idle'
+    if (currentReport.value && isRunActive(currentReport.value.status)) trackingState.value = 'paused'
+    return
+  }
 
+  stopTracking()
   exactDetailState.value = 'loading'
   if (!preserveKnown) currentReport.value = null
   if (!preserveDialog) showDetailDialog.value = false
@@ -600,7 +645,7 @@ const loadExactReport = async ({ preserveDialog = false, preserveKnown = false }
     const response = await getTestExecutionDetail(requestedExecutionId)
     const record = responseBody(response)
     const returnedProjectId = normalizeUiId(normalizeProjectId(record?.project))
-    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId) return
+    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId || userId?.value !== requestedActorId) return
     if (normalizeUiId(record?.id) !== requestedExecutionId || returnedProjectId !== activeProjectId) {
       exactDetailState.value = 'notFound'
       currentReport.value = null
@@ -613,7 +658,7 @@ const loadExactReport = async ({ preserveDialog = false, preserveKnown = false }
     if (!preserveDialog || showDetailDialog.value) showDetailDialog.value = true
     if (isRunActive(currentReport.value.status)) startTracking()
   } catch (error) {
-    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId) return
+    if (currentScope !== scopeVersion || requestVersion !== exactRequestVersion || projectId.value !== activeProjectId || userId?.value !== requestedActorId) return
     if (isUnavailable(error)) {
       clearExactReport()
       exactDetailState.value = 'notFound'
@@ -628,30 +673,48 @@ const loadExactReport = async ({ preserveDialog = false, preserveKnown = false }
   }
 }
 
-const startTracking = (immediate = false) => {
-  stopTracking()
+const startTracking = (immediate = false, preserveBudget = false) => {
   const record = currentReport.value
-  if (!record || !isRunActive(record.status)) return
+  if (!record || !isRunActive(record.status)) {
+    stopTracking()
+    return
+  }
+  const executionId = String(record.id)
+  const requestedProjectId = String(projectId.value)
+  const requestedActorId = userId?.value
+  const key = reportKey(requestedProjectId, executionId)
+  const previousAttempts = preserveBudget && pollSession?.key === key ? pollSession.attempts : 0
+  stopTracking()
 
   const currentPollGeneration = ++pollGeneration
   const currentScope = scopeVersion
-  const executionId = String(record.id)
-  const requestedProjectId = String(projectId.value)
+  const session = { key, attempts: previousAttempts }
+  pollSession = session
   const isCurrentPoll = () => currentPollGeneration === pollGeneration &&
+    pollSession === session &&
     currentScope === scopeVersion &&
     String(projectId.value) === requestedProjectId &&
+    userId?.value === requestedActorId &&
     route.name === 'UiReports' &&
     normalizeUiId(route.query.executionId) === normalizeUiId(executionId)
-  let attempts = 0
-  trackingState.value = 'polling'
+  trackingState.value = globalThis.document?.hidden ? 'paused' : 'polling'
 
   const poll = async () => {
+    pollTimer = null
     if (!isCurrentPoll()) return
+    if (globalThis.document?.hidden) {
+      pauseTracking()
+      return
+    }
     try {
       const response = await getTestExecutionDetail(executionId)
       const updated = responseBody(response)
       const returnedProjectId = normalizeProjectId(updated?.project)
       if (!isCurrentPoll()) return
+      if (globalThis.document?.hidden) {
+        pauseTracking()
+        return
+      }
       if (!updated || normalizeUiId(updated.id) !== normalizeUiId(executionId) || !isPositiveId(returnedProjectId) || String(returnedProjectId) !== requestedProjectId) {
         stopTracking()
         exactDetailState.value = 'notFound'
@@ -662,13 +725,13 @@ const startTracking = (immediate = false) => {
 
       exactDetailState.value = 'ready'
       applyExactReport(updated, requestedProjectId)
-      attempts += 1
+      session.attempts += 1
       if (!isRunActive(currentReport.value.status)) {
-        trackingState.value = 'idle'
-        pollTimer = null
+        stopTracking()
         return
       }
-      if (attempts >= maxPolls) {
+      if (session.attempts >= maxPolls) {
+        pollSession = null
         trackingState.value = 'timeout'
         pollTimer = null
         return
@@ -686,14 +749,39 @@ const startTracking = (immediate = false) => {
     }
   }
 
-  if (immediate) poll()
+  if (globalThis.document?.hidden) return
+  if (immediate) void poll()
   else pollTimer = setTimeout(poll, pollIntervalMs)
+}
+
+const onVisibilityChange = () => {
+  if (globalThis.document?.hidden) {
+    if (trackingState.value === 'polling') pauseTracking()
+    return
+  }
+  if (currentReport.value) {
+    if (isRunActive(currentReport.value.status) && pollSession && trackingState.value === 'paused') startTracking(true, true)
+    return
+  }
+  if (hasExecutionLink.value && projectId.value) {
+    void loadExactReport({ preserveKnown: Boolean(currentReport.value) })
+  }
 }
 
 const retryExactReport = () => loadExactReport()
 const resumeTracking = () => startTracking(true)
 const openCurrentReport = () => {
   if (currentReport.value) showDetailDialog.value = true
+}
+const openRerunSource = () => {
+  if (rerunSource.value) void router.push(rerunSource.value.location)
+}
+const openFailedCaseInEditor = () => {
+  const location = failedCaseEditorLocation.value
+  if (!location) return
+  showCaseDetailDialog.value = false
+  showDetailDialog.value = false
+  void router.push(location)
 }
 
 const returnToReportList = async () => {
@@ -749,7 +837,36 @@ const buildFailureSummary = (report) => {
   const screenshotUrl = getScreenshotUrl(matched) || screenshots.map(getScreenshotUrl).find(Boolean) || getScreenshotUrl(failedCase?.screenshot || failedCase?.screenshot_url)
   const caseName = firstText(failedCase?.test_case_name, failedCase?.name, resultData.failed_case_name, report.failed_case_name)
   if (!failedCase && !failedStep && !stage && !error && !screenshotUrl) return null
-  return { caseData: failedCase, caseName, stage, step: failedStep, error, screenshotUrl }
+  return { caseData: failedCase, caseName, stage, step: failedStep, stepNumber: normalizeUiId(failedStep?.step_number || failedCase?.failed_step_number || resultData.failed_step_number), error, screenshotUrl }
+}
+
+function buildFailedCaseEditorLocation(summary, report, project) {
+  const caseData = summary?.caseData
+  const caseId = normalizeUiId(caseData?.test_case_id || caseData?.case_id || caseData?.test_case?.id)
+  const executionId = normalizeUiId(report?.id)
+  const projectIdValue = normalizeUiId(project)
+  if (!caseId || !executionId || !projectIdValue) return null
+  return {
+    name: 'UiTestCases',
+    query: {
+      project: String(projectIdValue),
+      caseId: String(caseId),
+      ...(summary.stepNumber ? { stepNumber: String(summary.stepNumber) } : {}),
+      fromExecutionId: String(executionId),
+      fromKind: 'suite'
+    }
+  }
+}
+
+function buildRerunSource(report, project) {
+  const id = normalizeUiId(report?.rerun_of)
+  const kind = report?.rerun_kind
+  const projectIdValue = normalizeUiId(normalizeProjectId(report?.project) || project)
+  if (!id || !projectIdValue || !['case', 'suite'].includes(kind)) return null
+  return {
+    id,
+    location: uiExecutionLocation(kind === 'suite' ? 'UiReports' : 'UiExecutions', projectIdValue, id)
+  }
 }
 
 const viewCaseDetail = (caseData) => {
@@ -772,6 +889,43 @@ const getActionText = (actionType) => {
     wait: t('uiAutomation.actionTypes.wait')
   }
   return actionMap[actionType] || actionType || t('uiAutomation.status.unknown')
+}
+
+const abortExecution = async (report) => {
+  const executionId = normalizeUiId(report?.id)
+  const requestedProject = normalizeUiId(projectId.value)
+  const requestedActor = userId?.value
+  const currentScope = scopeVersion
+  if (!executionId || !requestedProject || !isRunActive(report?.status) || isAbortPending(report)) return
+  try {
+    await ElMessageBox.confirm(
+      t('uiAutomation.workbenchResults.abortConfirm', { id: executionId }),
+      t('uiAutomation.common.confirm'),
+      { confirmButtonText: t('uiAutomation.workbenchResults.abortExecution'), cancelButtonText: t('uiAutomation.common.cancel'), type: 'warning' }
+    )
+    if (currentScope !== scopeVersion || normalizeUiId(projectId.value) !== requestedProject || userId?.value !== requestedActor) return
+    const key = reportKey(requestedProject, executionId)
+    abortingExecutionKeys.value = new Set([...abortingExecutionKeys.value, key])
+    const abortRequest = Object.entries(uiAutomationApi).find(([name]) => name === 'abortTestExecution')?.[1]
+    if (typeof abortRequest !== 'function') throw new Error(t('uiAutomation.workbenchResults.abortFailed'))
+    await abortRequest(executionId)
+    if (currentScope !== scopeVersion || normalizeUiId(projectId.value) !== requestedProject || userId?.value !== requestedActor) return
+    ElMessage.success(t('uiAutomation.workbenchResults.abortRequested'))
+    if (hasExecutionLink && normalizeUiId(route.query.executionId) === executionId) {
+      await loadExactReport({ preserveDialog: true, preserveKnown: true })
+    } else {
+      await loadReports()
+    }
+  } catch (error) {
+    if (error !== 'cancel' && currentScope === scopeVersion && userId?.value === requestedActor) {
+      ElMessage.error(error.response?.data?.message || t('uiAutomation.workbenchResults.abortFailed'))
+    }
+  } finally {
+    const key = reportKey(requestedProject, executionId)
+    const next = new Set(abortingExecutionKeys.value)
+    next.delete(key)
+    abortingExecutionKeys.value = next
+  }
 }
 
 const deleteReport = async (report) => {
@@ -837,7 +991,7 @@ const formatDuration = (seconds) => {
 
 watch(() => failureSummary.value?.screenshotUrl, () => { failedScreenshot.value = false })
 
-watch(projectId, nextProject => {
+watch([projectId, () => userId?.value], ([nextProject]) => {
   scopeVersion += 1
   listRequestVersion += 1
   confirmedReports.clear()
@@ -849,14 +1003,16 @@ watch(projectId, nextProject => {
   if (nextProject) void loadReports()
 }, { immediate: true })
 
-watch([projectId, hasExecutionLink, () => route.query.executionId, projectsLoading, invalidProject], ([project, hasLink]) => {
+watch([projectId, () => userId?.value, hasExecutionLink, () => route.query.executionId, projectsLoading, invalidProject], ([project, , hasLink]) => {
   clearExactReport()
   if (!hasLink) return
   if (project) void loadExactReport()
   else if (invalidProject.value || (!projectsLoading.value && !projectsError.value)) exactDetailState.value = 'invalid'
 }, { immediate: true })
 
+onMounted(() => globalThis.document?.addEventListener('visibilitychange', onVisibilityChange))
 onBeforeUnmount(() => {
+  globalThis.document?.removeEventListener('visibilitychange', onVisibilityChange)
   scopeVersion += 1
   listRequestVersion += 1
   exactRequestVersion += 1
@@ -942,6 +1098,16 @@ onBeforeUnmount(() => {
 
 // 报告详情样式
 .report-detail {
+  .rerun-origin {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 12px;
+    color: var(--el-text-color-secondary);
+    font-size: 13px;
+  }
+
   .failure-summary {
     margin: 24px 0 8px;
     padding: 16px;

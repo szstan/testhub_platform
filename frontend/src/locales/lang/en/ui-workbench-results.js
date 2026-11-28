@@ -15,10 +15,15 @@ export default {
   trackingTimedOut: 'Status refresh reached its time limit. The last known status is shown.',
   openReport: 'Open report details',
   resumeTracking: 'Resume status refresh',
+  abortExecution: 'Request cancellation',
+  abortConfirm: 'Request cancellation for execution #{id}? The worker may take a moment to stop.',
+  abortRequested: 'Cancellation requested. The worker status will update when it stops.',
+  abortFailed: 'Could not request execution cancellation.',
+  rerunOrigin: 'Rerun source:',
   failureSummary: 'Failure summary',
   failedCase: 'Failed case',
   failureStage: 'Failure stage',
   firstFailedStep: 'First failed step',
   failureScreenshot: 'Failure screenshot',
-  openFailedCase: 'Open failed case details'
+  openFailedCase: 'Open failed case in the editor to repair or rerun'
 }

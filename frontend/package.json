@@ -15,7 +15,7 @@
     "test:interface-management-pagination": "node --test tests/interface-management-pagination.test.mjs",
     "test:app-screenshot-diagnostics": "node --test tests/app-screenshot-diagnostics.test.mjs",
     "test:ui-project-base-url": "node --test tests/ui-project-base-url.test.mjs",
-    "test:ui-workbench": "node --test tests/ui-workbench.test.mjs"
+    "test:ui-workbench": "node --test \"tests/ui-workbench*.test.mjs\""
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.1.0",

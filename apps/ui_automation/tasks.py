@@ -14,6 +14,20 @@ from apps.core.scheduler import ScheduleClaimLost, ScheduleLeaseHeartbeat, clear
 logger = logging.getLogger(__name__)
 
 
+@shared_task(name='apps.ui_automation.tasks.execute_workbench_case')
+def execute_workbench_case(execution_id, claim_token):
+    from .case_runner import execute_case_execution
+
+    return execute_case_execution(execution_id, claim_token)
+
+
+@shared_task(name='apps.ui_automation.tasks.execute_workbench_suite')
+def execute_workbench_suite(execution_id, claim_token):
+    from .suite_runner import execute_suite_execution
+
+    return execute_suite_execution(execution_id, claim_token)
+
+
 def _load_task(task_id, scheduler_lease_token=''):
     from .models import UiScheduledTask
 

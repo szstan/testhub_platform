@@ -74,21 +74,43 @@
               <h2 id="latest-executions-heading">{{ t('uiAutomation.workbenchDashboard.latestExecutions') }}</h2>
               <p>{{ t('uiAutomation.workbenchDashboard.latestExecutionsDescription') }}</p>
             </div>
-            <el-radio-group
-              v-model="executionFilter"
-              size="small"
-              :aria-label="t('uiAutomation.workbenchDashboard.executionFilter')"
-            >
-              <el-radio-button value="all">{{ t('uiAutomation.workbenchDashboard.filters.all') }}</el-radio-button>
-              <el-radio-button value="failures">{{ t('uiAutomation.workbenchDashboard.filters.failures') }}</el-radio-button>
-            </el-radio-group>
+            <div class="execution-controls">
+              <el-radio-group
+                v-model="executionFilter"
+                size="small"
+                :aria-label="t('uiAutomation.workbenchDashboard.executionFilter')"
+              >
+                <el-radio-button value="all">{{ t('uiAutomation.workbenchDashboard.filters.all') }}</el-radio-button>
+                <el-radio-button value="failures">{{ t('uiAutomation.workbenchDashboard.filters.failures') }}</el-radio-button>
+              </el-radio-group>
+              <el-tooltip :content="t('uiAutomation.workbenchDashboard.actions.refresh')">
+                <el-button
+                  circle
+                  plain
+                  :loading="executionLoading"
+                  :aria-label="t('uiAutomation.workbenchDashboard.actions.refresh')"
+                  @click="loadExecutions"
+                >
+                  <el-icon><Refresh /></el-icon>
+                </el-button>
+              </el-tooltip>
+              <div v-if="executionsUpdatedAt" class="execution-updated">
+                <span>{{ t('uiAutomation.workbenchDashboard.snapshot') }}</span>
+                <time :datetime="executionsUpdatedAt">{{ formatDate(executionsUpdatedAt) }}</time>
+              </div>
+            </div>
           </div>
 
-          <div v-if="executionLoading" class="panel-state" role="status">
+          <el-alert v-if="executionError && executions.length" :title="t('uiAutomation.workbenchDashboard.states.executionsError')" type="error" :closable="false" show-icon class="execution-inline-error">
+            <el-button link type="primary" @click="loadExecutions">
+              {{ t('uiAutomation.workbenchDashboard.actions.retry') }}
+            </el-button>
+          </el-alert>
+          <div v-if="executionLoading && executions.length === 0" class="panel-state" role="status">
             <el-icon class="state-icon is-loading"><Loading /></el-icon>
             <span>{{ t('uiAutomation.workbenchDashboard.states.executionsLoading') }}</span>
           </div>
-          <div v-else-if="executionError" class="panel-state is-error" role="alert">
+          <div v-else-if="executionError && executions.length === 0" class="panel-state is-error" role="alert">
             <span>{{ t('uiAutomation.workbenchDashboard.states.executionsError') }}</span>
             <el-button link type="primary" @click="loadExecutions">
               {{ t('uiAutomation.workbenchDashboard.actions.retry') }}
@@ -242,7 +264,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   ArrowRight,
@@ -250,11 +272,13 @@ import {
   Loading,
   Plus,
   QuestionFilled,
+  Refresh,
   VideoPlay
 } from '@element-plus/icons-vue'
 import { getDashboardRecentExecutions, getDashboardStats, getOperationRecords } from '@/api/ui_automation'
 import { useUiProjectContext } from '@/composables/useUiProjectContext'
 import { uiExecutionLocation } from '@/utils/ui-project-context.mjs'
+import { isUiRunActive, normalizeUiRunStatus } from '@/utils/ui-execution-submission.mjs'
 
 const { t, locale } = useI18n()
 const {
@@ -263,13 +287,15 @@ const {
   projectsLoading,
   projectsError,
   invalidProject,
-  reloadProjects
+  reloadProjects,
+  userId
 } = useUiProjectContext()
 
 const executionFilter = ref('all')
 const executions = ref([])
 const executionLoading = ref(false)
 const executionError = ref(false)
+const executionsUpdatedAt = ref(null)
 const testCaseCount = ref(0)
 const suiteCount = ref(0)
 const assetsLoading = ref(false)
@@ -282,6 +308,11 @@ const helpVisible = ref(false)
 let assetsRequestGeneration = 0
 let executionsRequestGeneration = 0
 let activityRequestGeneration = 0
+let executionsLoadInFlight = null
+let executionPollTimer = null
+let resumeRefreshPending = false
+const executionPollIntervalMs = 5000
+const knownTerminalExecutions = new Map()
 
 const validProjectId = projectId
 const hasValidProject = computed(() => Boolean(validProjectId.value))
@@ -346,11 +377,52 @@ async function loadAssets() {
   }
 }
 
+function clearExecutionPoll() {
+  if (executionPollTimer !== null) clearTimeout(executionPollTimer)
+  executionPollTimer = null
+}
+
+function isPageVisible() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden'
+}
+
+function hasActiveExecutions() {
+  return executions.value.some(execution => ['pending', 'running'].includes(String(execution.status || '').toLowerCase()))
+}
+
+function scheduleExecutionPoll() {
+  clearExecutionPoll()
+  if (!hasActiveExecutions() || !isPageVisible()) return
+  executionPollTimer = setTimeout(() => {
+    executionPollTimer = null
+    void loadExecutions()
+  }, executionPollIntervalMs)
+}
+
+function refreshActiveExecutions() {
+  if (!hasActiveExecutions() || !isPageVisible() || resumeRefreshPending || executionLoading.value) return
+  clearExecutionPoll()
+  resumeRefreshPending = true
+  void loadExecutions().finally(() => { resumeRefreshPending = false })
+}
+
+function onVisibilityChange() {
+  if (isPageVisible()) refreshActiveExecutions()
+  else clearExecutionPoll()
+}
+
+function onWindowFocus() {
+  refreshActiveExecutions()
+}
+
 async function loadExecutions() {
+  clearExecutionPoll()
   const generation = ++executionsRequestGeneration
   const requestedProject = validProjectId.value
+  const requestedActor = userId?.value
   if (!requestedProject) {
     executions.value = []
+    executionsUpdatedAt.value = null
     executionLoading.value = false
     executionError.value = false
     return
@@ -359,17 +431,50 @@ async function loadExecutions() {
   const params = { project: requestedProject }
   const requestedFilter = executionFilter.value
   if (requestedFilter === 'failures') params.status = 'failed'
-  const isCurrent = () => generation === executionsRequestGeneration && validProjectId.value === requestedProject && executionFilter.value === requestedFilter
-  executions.value = []
+  const requestKey = JSON.stringify([requestedActor, requestedProject, requestedFilter])
+  const isCurrent = () => generation === executionsRequestGeneration && userId?.value === requestedActor && validProjectId.value === requestedProject && executionFilter.value === requestedFilter
   executionLoading.value = true
   executionError.value = false
+
+  if (executionsLoadInFlight?.key === requestKey) await executionsLoadInFlight.promise.catch(() => {})
+  if (!isCurrent()) return
+
+  const request = (async () => {
+    try {
+      const response = await getDashboardRecentExecutions(params)
+      if (isCurrent()) {
+        executions.value = unwrapResults(response).slice(0, 5).map(row => {
+          const record = { ...row, status: normalizeUiRunStatus(row.status) }
+          const key = `${record.kind}:${record.id}`
+          const known = knownTerminalExecutions.get(key)
+          if (known && isUiRunActive(record.status)) return known
+          if (['passed', 'failed', 'error', 'aborted'].includes(record.status)) knownTerminalExecutions.set(key, record)
+          return record
+        })
+        executionsUpdatedAt.value = new Date().toISOString()
+      }
+    } catch (error) {
+      if (isCurrent()) {
+        executionError.value = true
+        if ([401, 403, 404].includes(error.response?.status)) {
+          executions.value = []
+          knownTerminalExecutions.clear()
+          executionsUpdatedAt.value = null
+        }
+      }
+    } finally {
+      if (isCurrent()) {
+        executionLoading.value = false
+        scheduleExecutionPoll()
+      }
+    }
+  })()
+  const inFlight = { key: requestKey, promise: request }
+  executionsLoadInFlight = inFlight
   try {
-    const response = await getDashboardRecentExecutions(params)
-    if (isCurrent()) executions.value = unwrapResults(response).slice(0, 5)
-  } catch {
-    if (isCurrent()) executionError.value = true
+    await request
   } finally {
-    if (isCurrent()) executionLoading.value = false
+    if (executionsLoadInFlight === inFlight) executionsLoadInFlight = null
   }
 }
 
@@ -433,11 +538,28 @@ watch(validProjectId, () => {
   void loadAssets()
 }, { immediate: true })
 
-watch([validProjectId, executionFilter], () => {
+watch([validProjectId, () => userId?.value], () => {
+  knownTerminalExecutions.clear()
+  executions.value = []
+  executionsUpdatedAt.value = null
+})
+
+watch([validProjectId, () => userId?.value, executionFilter], () => {
+  clearExecutionPoll()
+  executions.value = []
+  executionsUpdatedAt.value = null
   void loadExecutions()
 }, { immediate: true })
 
+onMounted(() => {
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibilityChange)
+  if (typeof window !== 'undefined') window.addEventListener('focus', onWindowFocus)
+})
+
 onBeforeUnmount(() => {
+  clearExecutionPoll()
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange)
+  if (typeof window !== 'undefined') window.removeEventListener('focus', onWindowFocus)
   assetsRequestGeneration += 1
   executionsRequestGeneration += 1
   activityRequestGeneration += 1
@@ -583,6 +705,27 @@ onBeforeUnmount(() => {
   margin: 4px 0 0;
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+
+.execution-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.execution-inline-error {
+  margin-bottom: 10px;
+}
+
+.execution-updated {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .panel-state {
@@ -906,6 +1049,11 @@ onBeforeUnmount(() => {
     align-items: flex-start;
     flex-direction: column;
     gap: 9px;
+  }
+
+  .execution-controls {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .execution-main,

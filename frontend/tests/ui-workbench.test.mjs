@@ -75,7 +75,7 @@ test('dashboard data requests fail independently and stale results cannot replac
   const result = { id: 42, kind: 'suite', name: 'Checkout', status: 'failed', failed_step_number: 3 }
   const { state, dispose } = await loadSfcSetup('src/views/ui-automation/dashboard/Dashboard.vue', {
     ...projectMocks(scope),
-    '@element-plus/icons-vue': icons('ArrowRight', 'CaretRight', 'Loading', 'Plus', 'QuestionFilled', 'VideoPlay'),
+    '@element-plus/icons-vue': icons('ArrowRight', 'CaretRight', 'Loading', 'Plus', 'QuestionFilled', 'VideoPlay', 'Refresh'),
     '@/api/ui_automation': {
       getDashboardStats: ({ project }) => project === 1 ? statsForFirst.promise : Promise.resolve({ data: { test_case_count: 4, suite_entity_count: 2 } }),
       getDashboardRecentExecutions: params => {

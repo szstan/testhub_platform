@@ -5,6 +5,7 @@ export default {
   latestExecutions: 'Latest executions',
   latestExecutionsDescription: 'The five most recent runs in this project.',
   executionFilter: 'Filter executions',
+  snapshot: 'Execution snapshot, updated',
   unnamedExecution: 'Untitled execution',
   unknownDate: 'Time unavailable',
   failedStep: 'Step {number} failed',
@@ -21,7 +22,8 @@ export default {
     openCases: 'Open test cases',
     viewAllExecutions: 'Case executions',
     viewSuiteReports: 'Suite reports',
-    retry: 'Retry'
+    retry: 'Retry',
+    refresh: 'Refresh recent executions'
   },
   assets: {
     title: 'Project assets',

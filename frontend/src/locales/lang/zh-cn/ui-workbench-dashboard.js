@@ -5,6 +5,7 @@ export default {
   latestExecutions: '最近执行',
   latestExecutionsDescription: '当前项目最近五次执行。',
   executionFilter: '筛选执行结果',
+  snapshot: '执行快照，更新于',
   unnamedExecution: '未命名执行',
   unknownDate: '时间不可用',
   failedStep: '第 {number} 步失败',
@@ -22,6 +23,7 @@ export default {
     viewAllExecutions: '用例执行记录',
     viewSuiteReports: '套件报告',
     retry: '重试',
+    refresh: '刷新最近执行',
   },
   assets: {
     title: '项目资产',

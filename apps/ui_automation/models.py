@@ -1,4 +1,4 @@
-from django.db import models, router
+from django.db import models, router, transaction
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 import json
@@ -513,6 +513,8 @@ class TestExecution(ExecutionFailureSummaryModel):
         ('ABORTED', '中止'),
     ]
 
+    RERUN_KIND_CHOICES = [('case', '用例'), ('suite', '套件')]
+
     ENVIRONMENT_CHOICES = [
         ('CHROME', 'Chrome'),
         ('FIREFOX', 'Firefox'),
@@ -543,6 +545,14 @@ class TestExecution(ExecutionFailureSummaryModel):
     engine = models.CharField(max_length=20, default='playwright', verbose_name='测试引擎')
     browser = models.CharField(max_length=20, default='chrome', verbose_name='浏览器')
     headless = models.BooleanField(default=False, verbose_name='无头模式')
+    dispatch_claim = models.UUIDField(null=True, blank=True, editable=False)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True, editable=False)
+    failure_stage = models.CharField(max_length=20, blank=True, editable=False)
+    request_snapshot = models.JSONField(default=dict, blank=True, editable=False)
+    rerun_of = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='reruns',
+    )
+    rerun_kind = models.CharField(max_length=10, choices=RERUN_KIND_CHOICES, blank=True)
 
     # 结果数据
     result_data = models.JSONField(blank=True, null=True, verbose_name='执行结果数据')
@@ -556,6 +566,31 @@ class TestExecution(ExecutionFailureSummaryModel):
         verbose_name = 'UI测试执行记录'
         verbose_name_plural = 'UI测试执行记录'
         ordering = ['-created_at']
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        if self.dispatch_claim and not self._state.adding:
+            with transaction.atomic(using=using):
+                current = type(self).objects.using(using or self._state.db).select_for_update().filter(pk=self.pk).first()
+                if (
+                    current is None
+                    or str(current.dispatch_claim) != str(getattr(self, '_ui_dispatch_claim', ''))
+                    or current.status not in {'PENDING', 'RUNNING'}
+                    or (current.status == 'PENDING' and self.status != 'RUNNING')
+                    or current.cancel_requested_at is not None
+                ):
+                    return
+                return super().save(
+                    force_insert=force_insert,
+                    force_update=force_update,
+                    using=using,
+                    update_fields=update_fields,
+                )
+        return super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
 
     def __str__(self):
         if self.test_suite:
@@ -701,7 +736,10 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
         ('passed', '通过'),
         ('failed', '失败'),
         ('error', '错误'),
+        ('aborted', '中止'),
     ]
+
+    RERUN_KIND_CHOICES = [('case', '用例'), ('suite', '套件')]
 
     ENGINE_CHOICES = [
         ('playwright', 'Playwright'),
@@ -717,6 +755,14 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
     test_case = models.ForeignKey(TestCase, on_delete=models.CASCADE, related_name='executions', verbose_name='测试用例')
     project = models.ForeignKey(UiProject, on_delete=models.CASCADE, related_name='test_case_executions', verbose_name='项目')
     test_suite = models.ForeignKey('TestSuite', on_delete=models.CASCADE, null=True, blank=True, related_name='case_executions', verbose_name='所属测试套件')
+    parent_execution = models.ForeignKey(
+        'TestExecution', on_delete=models.CASCADE, null=True, blank=True, related_name='case_execution_records',
+    )
+    rerun_of = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='reruns',
+    )
+    rerun_kind = models.CharField(max_length=10, choices=RERUN_KIND_CHOICES, blank=True)
+    rerun_origin_id = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     execution_source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='manual', verbose_name='执行来源')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='执行状态')
     engine = models.CharField(max_length=20, choices=ENGINE_CHOICES, default='playwright', verbose_name='测试引擎')
@@ -728,6 +774,10 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
     execution_time = models.FloatField(null=True, blank=True, verbose_name='执行时长(秒)')
     started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
     finished_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    dispatch_claim = models.UUIDField(null=True, blank=True, editable=False)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True, editable=False)
+    failure_stage = models.CharField(max_length=20, blank=True, editable=False)
+    request_snapshot = models.JSONField(default=dict, blank=True, editable=False)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='test_case_executions', verbose_name='执行人')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
 
@@ -737,8 +787,75 @@ class TestCaseExecution(ExecutionFailureSummaryModel):
         verbose_name_plural = 'UI测试用例执行记录'
         ordering = ['-created_at']
 
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        database = using or self._state.db
+        if self.parent_execution_id:
+            with transaction.atomic(using=database):
+                parent = TestExecution.objects.using(database).select_for_update().filter(
+                    pk=self.parent_execution_id,
+                ).first()
+                if parent is None or parent.status != 'RUNNING' or parent.cancel_requested_at is not None:
+                    return
+                return super().save(
+                    force_insert=force_insert,
+                    force_update=force_update,
+                    using=using,
+                    update_fields=update_fields,
+                )
+        if self.dispatch_claim and not self._state.adding:
+            with transaction.atomic(using=database):
+                current = type(self).objects.using(database).select_for_update().filter(pk=self.pk).first()
+                if (
+                    current is None
+                    or str(current.dispatch_claim) != str(getattr(self, '_ui_dispatch_claim', ''))
+                    or current.status not in {'pending', 'running'}
+                    or (current.status == 'pending' and self.status != 'running')
+                    or current.cancel_requested_at is not None
+                ):
+                    return
+                return super().save(
+                    force_insert=force_insert,
+                    force_update=force_update,
+                    using=using,
+                    update_fields=update_fields,
+                )
+        return super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
+        )
+
     def __str__(self):
         return f"{self.test_case.name} - {self.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
+
+
+class UiExecutionSubmission(models.Model):
+    """Actor-scoped idempotency index for UI workbench submissions."""
+    KIND_CHOICES = [('case', '用例'), ('suite', '套件')]
+
+    actor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='ui_execution_submissions')
+    client_request_id = models.UUIDField(null=True, blank=True)
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+    resource_id = models.PositiveBigIntegerField()
+    request_fingerprint = models.CharField(max_length=64)
+    case_execution = models.OneToOneField(
+        TestCaseExecution, on_delete=models.SET_NULL, null=True, blank=True, related_name='submission',
+    )
+    suite_execution = models.OneToOneField(
+        TestExecution, on_delete=models.SET_NULL, null=True, blank=True, related_name='submission',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ui_execution_submissions'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['actor', 'client_request_id'],
+                name='ui_sub_actor_req_id_uniq',
+            ),
+        ]
+        indexes = [models.Index(fields=['actor', 'kind', 'resource_id'])]
 
 
 class OperationRecord(models.Model):

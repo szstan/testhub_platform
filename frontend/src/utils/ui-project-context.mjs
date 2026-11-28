@@ -25,10 +25,11 @@ const workbenchRoutes = new Set(['UiDashboard', 'UiProjects', 'UiTestCases', 'Ui
 export function uiWorkbenchReturnLocation(name, params) {
   if (!workbenchRoutes.has(name)) return null
   const query = {}
-  for (const key of ['project', 'executionId', 'caseId']) {
+  for (const key of ['project', 'executionId', 'caseId', 'stepNumber', 'fromExecutionId']) {
     const id = normalizeUiId(params[key])
     if (id) query[key] = String(id)
   }
+  if (query.fromExecutionId && ['case', 'suite'].includes(params.fromKind)) query.fromKind = params.fromKind
   if ((name === 'UiProjects' && params.setup === 'project') || (name === 'UiTestCases' && params.setup === 'case')) {
     query.setup = params.setup
   }
@@ -50,4 +51,35 @@ export async function loadUiProjectOptions(requestPage) {
     if (!data.next) return [...projects.values()]
     if (projects.size === previousSize) throw new Error('UI project pagination did not advance')
   }
+}
+
+export async function loadUiElementOptions(requestPage, project) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const elements = new Map()
+    let count
+    let inconsistent = false
+    for (let page = 1; page <= 1000; page += 1) {
+      const { data } = await requestPage({ project, page, page_size: 100, options_only: true })
+      const rows = Array.isArray(data) ? data : data?.results
+      if (!Array.isArray(rows)) throw new Error('Invalid UI element response')
+      if (Number.isInteger(data?.count)) {
+        if (count !== undefined && count !== data.count) inconsistent = true
+        count = data.count
+      }
+      const previousSize = elements.size
+      for (const row of rows) {
+        const id = normalizeUiId(row?.id)
+        if (!id) throw new Error('Invalid UI element identifier')
+        if (elements.has(id)) inconsistent = true
+        elements.set(id, { ...row, id })
+      }
+      if (!data?.next) {
+        if (!inconsistent && (count === undefined || elements.size === count)) return [...elements.values()]
+        break
+      }
+      if (elements.size === previousSize) throw new Error('UI element pagination did not advance')
+      if (page === 1000) throw new Error('UI element pagination exceeded its safety limit')
+    }
+  }
+  throw new Error('UI elements changed during pagination; reload the list')
 }
